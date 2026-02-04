@@ -12,7 +12,7 @@ Should *you* use it? That depends. Do you:
 - Read the manual before assembling furniture? **Maybe wait for 1.0**
 - Shoot first? **Welcome aboard**
 
-There are known issues. The code review agents found SQL injection vulnerabilities, timestamp comparison bugs, and a complete lack of rate limiting. We're fixing them. Eventually. The Kessel Run wasn't built in a day.
+There are [known issues](https://github.com/ezmode-games/smuggler/issues). We're fixing them. Eventually. The Kessel Run wasn't built in a day.
 
 ## What It Does
 
@@ -167,20 +167,6 @@ Things we don't do:
 - **BLOB wizardry** - Binary data compared as hex strings. It works but it's not pretty.
 - **Tables without primary keys** - We need something to compare. Add a PK.
 
-## Known Issues (The Honest Section)
-
-The code review bots found some things:
-
-1. **Table names are string-interpolated into SQL** - Yes, that's SQL injection waiting to happen. We validate against the actual schema, but it should use an allowlist.
-
-2. **Timestamp comparison is string-based** - Works for ISO8601, probably fails for Unix timestamps stored as integers.
-
-3. **No rate limiting** - D1's API has limits. We'll hit them on large syncs. Retry logic coming Soon(tm).
-
-4. **Row-by-row upserts** - Should batch. Would be faster. Will fix.
-
-PRs welcome. Tests more welcome.
-
 ## Troubleshooting
 
 ### "401 Unauthorized"
@@ -193,7 +179,7 @@ Run your migrations on both databases. We don't create tables.
 Check that column order and types match. NULL vs empty string will cause hash mismatches.
 
 ### It's slow
-Yeah. We upsert row by row. Batching is on the roadmap.
+Large syncs take time. Check the GitHub issues for performance improvements in progress.
 
 ## Development
 
