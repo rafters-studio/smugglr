@@ -1,0 +1,20 @@
+# Build artifacts
+/target/
+
+# Config with credentials (use config.example.toml as template)
+config.toml
+
+# State files (not needed, tool is stateless)
+.d1-sync-state.json
+failed_rows.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
