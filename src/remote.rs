@@ -91,7 +91,7 @@ where
                     // Not retryable or exhausted retries
                     if attempt > 0 {
                         return Err(SyncError::RetryExhausted {
-                            attempts: attempt + 1,
+                            attempts: attempt.saturating_add(1),
                             last_error: e.to_string(),
                         });
                     }
@@ -121,14 +121,20 @@ where
 }
 
 /// Parse HTTP response status into appropriate SyncError.
-fn parse_http_error(status: reqwest::StatusCode, body: &str) -> SyncError {
+///
+/// `retry_after_header` should be the value of the HTTP Retry-After header if present.
+fn parse_http_error(
+    status: reqwest::StatusCode,
+    body: &str,
+    retry_after_header: Option<u64>,
+) -> SyncError {
     let status_code = status.as_u16();
     let truncated_body = body.chars().take(500).collect::<String>();
 
     match status_code {
         429 => {
-            // Try to extract Retry-After from body (D1 may include it)
-            let retry_after = extract_retry_after(body);
+            // Prefer HTTP Retry-After header, fall back to JSON body
+            let retry_after = retry_after_header.or_else(|| extract_retry_after(body));
             SyncError::RateLimited { retry_after }
         }
         400..=499 => SyncError::BadRequest {
@@ -141,6 +147,14 @@ fn parse_http_error(status: reqwest::StatusCode, body: &str) -> SyncError {
         },
         _ => SyncError::Remote(format!("HTTP {}: {}", status_code, truncated_body)),
     }
+}
+
+/// Extract Retry-After value from HTTP headers.
+fn extract_retry_after_header(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
 }
 
 /// Try to extract Retry-After value from error response.
@@ -220,10 +234,12 @@ impl D1Client {
             })?;
 
         let status = response.status();
+        // Extract Retry-After header before consuming response body
+        let retry_after = extract_retry_after_header(response.headers());
         let body = response.text().await?;
 
         if !status.is_success() {
-            return Err(parse_http_error(status, &body));
+            return Err(parse_http_error(status, &body, retry_after));
         }
 
         let d1_response: D1Response = serde_json::from_str(&body)?;
@@ -289,10 +305,12 @@ impl D1Client {
             })?;
 
         let status = response.status();
+        // Extract Retry-After header before consuming response body
+        let retry_after = extract_retry_after_header(response.headers());
         let body = response.text().await?;
 
         if !status.is_success() {
-            return Err(parse_http_error(status, &body));
+            return Err(parse_http_error(status, &body, retry_after));
         }
 
         let d1_response: D1Response = serde_json::from_str(&body)?;
@@ -664,14 +682,27 @@ mod tests {
 
     #[test]
     fn test_parse_http_error_429() {
-        let err = parse_http_error(reqwest::StatusCode::TOO_MANY_REQUESTS, "rate limited");
+        let err = parse_http_error(reqwest::StatusCode::TOO_MANY_REQUESTS, "rate limited", None);
         assert!(matches!(err, SyncError::RateLimited { .. }));
     }
 
     #[test]
-    fn test_parse_http_error_429_with_retry_after() {
+    fn test_parse_http_error_429_with_retry_after_header() {
+        // HTTP header takes precedence
+        let err = parse_http_error(reqwest::StatusCode::TOO_MANY_REQUESTS, "{}", Some(60));
+        match err {
+            SyncError::RateLimited { retry_after } => {
+                assert_eq!(retry_after, Some(60));
+            }
+            _ => panic!("Expected RateLimited"),
+        }
+    }
+
+    #[test]
+    fn test_parse_http_error_429_with_retry_after_body() {
+        // Falls back to JSON body if no header
         let body = r#"{"retry_after": 30}"#;
-        let err = parse_http_error(reqwest::StatusCode::TOO_MANY_REQUESTS, body);
+        let err = parse_http_error(reqwest::StatusCode::TOO_MANY_REQUESTS, body, None);
         match err {
             SyncError::RateLimited { retry_after } => {
                 assert_eq!(retry_after, Some(30));
@@ -682,7 +713,7 @@ mod tests {
 
     #[test]
     fn test_parse_http_error_500() {
-        let err = parse_http_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, "server error");
+        let err = parse_http_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, "server error", None);
         match err {
             SyncError::ServerError { status, message } => {
                 assert_eq!(status, 500);
@@ -694,7 +725,7 @@ mod tests {
 
     #[test]
     fn test_parse_http_error_400() {
-        let err = parse_http_error(reqwest::StatusCode::BAD_REQUEST, "invalid sql");
+        let err = parse_http_error(reqwest::StatusCode::BAD_REQUEST, "invalid sql", None);
         match err {
             SyncError::BadRequest { status, message } => {
                 assert_eq!(status, 400);
@@ -720,5 +751,25 @@ mod tests {
     fn test_extract_retry_after_missing_field() {
         let body = r#"{"error": "rate limited"}"#;
         assert_eq!(extract_retry_after(body), None);
+    }
+
+    #[test]
+    fn test_extract_retry_after_header() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "120".parse().unwrap());
+        assert_eq!(extract_retry_after_header(&headers), Some(120));
+    }
+
+    #[test]
+    fn test_extract_retry_after_header_missing() {
+        let headers = reqwest::header::HeaderMap::new();
+        assert_eq!(extract_retry_after_header(&headers), None);
+    }
+
+    #[test]
+    fn test_extract_retry_after_header_invalid() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "not-a-number".parse().unwrap());
+        assert_eq!(extract_retry_after_header(&headers), None);
     }
 }

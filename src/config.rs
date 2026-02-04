@@ -73,11 +73,11 @@ fn default_max_retries() -> u32 {
 }
 
 fn default_initial_retry_delay_ms() -> u64 {
-    1000
+    100 // per issue #3 spec
 }
 
 fn default_max_retry_delay_ms() -> u64 {
-    60000
+    30_000 // per issue #3 spec
 }
 
 fn default_backoff_multiplier() -> f64 {
@@ -135,13 +135,16 @@ impl Default for RetryConfig {
 
 #[allow(dead_code)]
 impl RetryConfig {
-    /// Create RetryConfig from SyncConfig settings
+    /// Create RetryConfig from SyncConfig settings.
+    ///
+    /// Validates that backoff_multiplier >= 1.0 (clamps invalid values).
     pub fn from_sync_config(sync: &SyncConfig) -> Self {
         Self {
-            max_retries: sync.max_retries,
+            max_retries: sync.max_retries.min(100), // cap at reasonable max
             initial_delay_ms: sync.initial_retry_delay_ms,
             max_delay_ms: sync.max_retry_delay_ms,
-            backoff_multiplier: sync.backoff_multiplier,
+            // Ensure multiplier is at least 1.0 to avoid zero/negative delays
+            backoff_multiplier: sync.backoff_multiplier.max(1.0),
         }
     }
 
@@ -291,9 +294,29 @@ mod tests {
     fn test_retry_config_defaults() {
         let config = RetryConfig::default();
         assert_eq!(config.max_retries, 5);
-        assert_eq!(config.initial_delay_ms, 1000);
-        assert_eq!(config.max_delay_ms, 60000);
+        assert_eq!(config.initial_delay_ms, 100); // per issue #3 spec
+        assert_eq!(config.max_delay_ms, 30_000); // per issue #3 spec
         assert_eq!(config.backoff_multiplier, 2.0);
+    }
+
+    #[test]
+    fn test_backoff_multiplier_clamped() {
+        let sync = SyncConfig {
+            backoff_multiplier: 0.5, // invalid - less than 1.0
+            ..Default::default()
+        };
+        let retry = RetryConfig::from_sync_config(&sync);
+        assert_eq!(retry.backoff_multiplier, 1.0); // should be clamped to 1.0
+    }
+
+    #[test]
+    fn test_max_retries_capped() {
+        let sync = SyncConfig {
+            max_retries: 1000, // unreasonably high
+            ..Default::default()
+        };
+        let retry = RetryConfig::from_sync_config(&sync);
+        assert_eq!(retry.max_retries, 100); // should be capped at 100
     }
 
     #[test]

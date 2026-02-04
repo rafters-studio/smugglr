@@ -96,7 +96,8 @@ impl SyncError {
     /// `None` for other errors (use exponential backoff default).
     pub fn retry_after_ms(&self) -> Option<u64> {
         match self {
-            SyncError::RateLimited { retry_after } => retry_after.map(|s| s * 1000),
+            // Use saturating_mul to prevent overflow on large retry_after values
+            SyncError::RateLimited { retry_after } => retry_after.map(|s| s.saturating_mul(1000)),
             _ => None,
         }
     }
