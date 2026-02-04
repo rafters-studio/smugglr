@@ -21,6 +21,18 @@ pub struct ParseTimestampError {
     message: String,
 }
 
+impl ParseTimestampError {
+    /// Returns the original input string that failed to parse.
+    pub fn input(&self) -> &str {
+        &self.input
+    }
+
+    /// Returns a human-readable description of the parse error.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
 impl fmt::Display for ParseTimestampError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "failed to parse timestamp '{}': {}", self.input, self.message)
@@ -46,6 +58,10 @@ impl Timestamp {
     /// - Unix timestamp: "1704067200"
     /// - ISO 8601: "2024-01-01T00:00:00Z" or "2024-01-01T00:00:00+00:00"
     /// - SQLite datetime: "2024-01-01 00:00:00"
+    ///
+    /// **Note:** Timezone offsets in ISO 8601 format are stripped and the time
+    /// is treated as-is (effectively UTC). For sync purposes, this assumes both
+    /// local and remote databases store timestamps in the same timezone.
     pub fn parse(s: &str) -> Result<Self, ParseTimestampError> {
         let s = s.trim();
 
@@ -160,7 +176,10 @@ impl Timestamp {
             .map(|s| s.split('.').next().unwrap_or("0"))
             .unwrap_or("0")
             .parse()
-            .unwrap_or(0);
+            .map_err(|_| ParseTimestampError {
+                input: s.to_string(),
+                message: "invalid second".to_string(),
+            })?;
 
         // Validate ranges
         if !(1..=12).contains(&month) {
@@ -169,12 +188,21 @@ impl Timestamp {
                 message: "month out of range (1-12)".to_string(),
             });
         }
-        if !(1..=31).contains(&day) {
+
+        // Validate day for the specific month (accounting for leap years)
+        let days_in_month = match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 => if is_leap_year(year) { 29 } else { 28 },
+            _ => unreachable!(), // month already validated above
+        };
+        if !(1..=days_in_month).contains(&day) {
             return Err(ParseTimestampError {
                 input: s.to_string(),
-                message: "day out of range (1-31)".to_string(),
+                message: format!("day out of range (1-{}) for month {}", days_in_month, month),
             });
         }
+
         if hour > 23 || minute > 59 || second > 59 {
             return Err(ParseTimestampError {
                 input: s.to_string(),
@@ -183,28 +211,46 @@ impl Timestamp {
         }
 
         // Convert to Unix timestamp (simplified, assumes UTC)
+        // Use checked arithmetic to prevent overflow on extreme dates
+        let overflow_err = || ParseTimestampError {
+            input: s.to_string(),
+            message: "timestamp value out of range".to_string(),
+        };
+
         // Days since epoch for each year
         let mut days: i64 = 0;
         for y in 1970..year {
-            days += if is_leap_year(y) { 366 } else { 365 };
+            let year_days = if is_leap_year(y) { 366i64 } else { 365i64 };
+            days = days.checked_add(year_days).ok_or_else(overflow_err)?;
         }
         for y in (year..1970).rev() {
-            days -= if is_leap_year(y) { 366 } else { 365 };
+            let year_days = if is_leap_year(y) { 366i64 } else { 365i64 };
+            days = days.checked_sub(year_days).ok_or_else(overflow_err)?;
         }
 
         // Days for completed months in current year
-        let month_days = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        let month_days = [31i64, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
         for m in 0..(month - 1) as usize {
-            days += month_days[m] as i64;
+            days = days.checked_add(month_days[m]).ok_or_else(overflow_err)?;
             if m == 1 && is_leap_year(year) {
-                days += 1;
+                days = days.checked_add(1).ok_or_else(overflow_err)?;
             }
         }
 
         // Add days in current month (minus 1 since day 1 = 0 days elapsed)
-        days += (day - 1) as i64;
+        days = days.checked_add((day - 1) as i64).ok_or_else(overflow_err)?;
 
-        let secs = days * 86400 + hour as i64 * 3600 + minute as i64 * 60 + second as i64;
+        // Convert to seconds with overflow checking
+        let day_secs = days.checked_mul(86400).ok_or_else(overflow_err)?;
+        let hour_secs = (hour as i64).checked_mul(3600).ok_or_else(overflow_err)?;
+        let minute_secs = (minute as i64).checked_mul(60).ok_or_else(overflow_err)?;
+
+        let secs = day_secs
+            .checked_add(hour_secs)
+            .and_then(|v| v.checked_add(minute_secs))
+            .and_then(|v| v.checked_add(second as i64))
+            .ok_or_else(overflow_err)?;
+
         Ok(Self(secs))
     }
 }
@@ -313,5 +359,54 @@ mod tests {
         assert_eq!(Timestamp::parse("1704067200").unwrap().as_unix(), expected);
         assert_eq!(Timestamp::parse("2024-01-01T00:00:00Z").unwrap().as_unix(), expected);
         assert_eq!(Timestamp::parse("2024-01-01 00:00:00").unwrap().as_unix(), expected);
+    }
+
+    #[test]
+    fn parse_leap_year_feb_29() {
+        // 2024 is a leap year
+        let ts = Timestamp::parse("2024-02-29T00:00:00Z").unwrap();
+        // 2020 is also a leap year
+        let ts2 = Timestamp::parse("2020-02-29T12:00:00Z").unwrap();
+        assert!(ts.as_unix() > 0);
+        assert!(ts2.as_unix() > 0);
+    }
+
+    #[test]
+    fn reject_invalid_feb_29_non_leap_year() {
+        // 2023 is not a leap year
+        let result = Timestamp::parse("2023-02-29T00:00:00Z");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message().contains("day out of range"));
+    }
+
+    #[test]
+    fn reject_invalid_day_for_month() {
+        // February 31st is never valid
+        assert!(Timestamp::parse("2024-02-31T00:00:00Z").is_err());
+        // April 31st is never valid
+        assert!(Timestamp::parse("2024-04-31T00:00:00Z").is_err());
+        // June 31st is never valid
+        assert!(Timestamp::parse("2024-06-31T00:00:00Z").is_err());
+    }
+
+    #[test]
+    fn parse_epoch_boundary() {
+        // Unix epoch: 1970-01-01 00:00:00 UTC
+        let ts = Timestamp::parse("1970-01-01T00:00:00Z").unwrap();
+        assert_eq!(ts.as_unix(), 0);
+    }
+
+    #[test]
+    fn parse_pre_epoch() {
+        // Day before epoch
+        let ts = Timestamp::parse("1969-12-31T23:59:59Z").unwrap();
+        assert_eq!(ts.as_unix(), -1);
+    }
+
+    #[test]
+    fn error_accessor_methods() {
+        let err = Timestamp::parse("invalid").unwrap_err();
+        assert_eq!(err.input(), "invalid");
+        assert!(!err.message().is_empty());
     }
 }
