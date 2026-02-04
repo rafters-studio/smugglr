@@ -54,12 +54,10 @@ pub struct SyncConfig {
 
     /// Maximum number of rows per batch for upsert operations
     #[serde(default = "default_batch_size")]
-    #[allow(dead_code)]
     pub batch_size: usize,
 
     /// Maximum bytes per SQL statement (D1 has limits)
     #[serde(default = "default_max_statement_bytes")]
-    #[allow(dead_code)]
     pub max_statement_bytes: usize,
 }
 

@@ -6,6 +6,7 @@
 use crate::config::BatchConfig;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
+use tracing::warn;
 
 /// A batch of rows ready for insertion
 #[derive(Debug)]
@@ -80,9 +81,26 @@ fn estimate_row_size(row: &HashMap<String, JsonValue>, columns: &[String]) -> us
                 JsonValue::Null => 4,
                 JsonValue::Bool(_) => 5,
                 JsonValue::Number(n) => n.to_string().len(),
-                JsonValue::String(s) => s.len() + 2, // quotes
-                JsonValue::Array(a) => serde_json::to_string(a).map(|s| s.len()).unwrap_or(10),
-                JsonValue::Object(o) => serde_json::to_string(o).map(|s| s.len()).unwrap_or(10),
+                JsonValue::String(s) => {
+                    // Account for quotes plus ~20% overhead for SQL/JSON escaping
+                    // (quotes, backslashes, special characters)
+                    let escaped_overhead = s.len() / 5;
+                    s.len() + escaped_overhead + 2
+                }
+                JsonValue::Array(a) => match serde_json::to_string(a) {
+                    Ok(s) => s.len(),
+                    Err(e) => {
+                        warn!("Failed to serialize array for size estimation: {}", e);
+                        1024 // Conservative fallback for failed serialization
+                    }
+                },
+                JsonValue::Object(o) => match serde_json::to_string(o) {
+                    Ok(s) => s.len(),
+                    Err(e) => {
+                        warn!("Failed to serialize object for size estimation: {}", e);
+                        1024 // Conservative fallback for failed serialization
+                    }
+                },
             };
         }
     }
@@ -236,5 +254,43 @@ mod tests {
         let config = BatchConfig::default();
         assert_eq!(config.batch_size, 100);
         assert_eq!(config.max_statement_bytes, 90 * 1024);
+    }
+
+    #[test]
+    fn oversized_single_row_still_batched() {
+        // A single row that exceeds max_statement_bytes should still be included
+        // (the D1 API will reject it, but we don't silently drop data)
+        let mut row = HashMap::new();
+        row.insert("id".to_string(), JsonValue::Number(1.into()));
+        row.insert("data".to_string(), JsonValue::String("x".repeat(10_000)));
+
+        let rows = vec![row];
+        let columns = vec!["id".to_string(), "data".to_string()];
+        let config = BatchConfig {
+            batch_size: 100,
+            max_statement_bytes: 1000, // Deliberately small
+        };
+
+        let batches = batch_rows(&rows, &columns, &config);
+
+        // Should still produce one batch with the oversized row
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].rows.len(), 1);
+    }
+
+    #[test]
+    fn string_escaping_overhead() {
+        // Verify that strings with special characters get extra overhead
+        let row_size = estimate_row_size(
+            &{
+                let mut row = HashMap::new();
+                row.insert("text".to_string(), JsonValue::String("hello\"world".to_string()));
+                row
+            },
+            &["text".to_string()],
+        );
+
+        // Should be more than just len + 2 due to escaping overhead
+        assert!(row_size > "hello\"world".len() + 2);
     }
 }
