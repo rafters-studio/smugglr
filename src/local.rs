@@ -1,6 +1,7 @@
 //! Local SQLite database operations
 
 use crate::error::{Result, SyncError};
+use crate::table::TableSchema;
 use rusqlite::{Connection, OpenFlags, Row};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
@@ -83,6 +84,17 @@ impl LocalDb {
 
         debug!("Found {} tables", tables.len());
         Ok(tables)
+    }
+
+    /// Get the database schema for table name validation.
+    ///
+    /// Queries sqlite_master to get all user tables.
+    #[allow(dead_code)]
+    pub fn get_schema(&self) -> Result<TableSchema> {
+        let tables = self.list_tables().map_err(|e| {
+            SyncError::SchemaQueryFailed(format!("Failed to query local schema: {}", e))
+        })?;
+        Ok(TableSchema::new(tables))
     }
 
     /// Get schema info for a table

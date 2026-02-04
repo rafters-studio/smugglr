@@ -63,6 +63,13 @@ pub enum SyncError {
     /// Retry exhausted after max attempts
     #[error("Retry exhausted after {attempts} attempts: {last_error}")]
     RetryExhausted { attempts: u32, last_error: String },
+
+    #[error("Invalid table name '{name}'. Available tables: [{available}]")]
+    InvalidTableName { name: String, available: String },
+
+    #[error("Failed to query database schema: {0}")]
+    #[allow(dead_code)]
+    SchemaQueryFailed(String),
 }
 
 impl SyncError {

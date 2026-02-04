@@ -20,6 +20,7 @@
 //! - [`diff`] - Change detection algorithm
 //! - [`sync`] - Push/pull orchestration
 //! - [`error`] - Error types
+//! - [`table`] - Table name validation
 
 mod config;
 mod diff;
@@ -27,6 +28,7 @@ mod error;
 mod local;
 mod remote;
 mod sync;
+mod table;
 
 use crate::config::Config;
 use crate::diff::diff_table;

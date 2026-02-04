@@ -3,6 +3,7 @@
 use crate::config::RetryConfig;
 use crate::error::{Result, SyncError};
 use crate::local::RowMeta;
+use crate::table::TableSchema;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -360,6 +361,17 @@ impl D1Client {
 
         debug!("Found {} tables in D1", tables.len());
         Ok(tables)
+    }
+
+    /// Get the database schema for table name validation.
+    ///
+    /// Queries sqlite_master to get all user tables from D1.
+    #[allow(dead_code)]
+    pub async fn get_schema(&self) -> Result<TableSchema> {
+        let tables = self.list_tables().await.map_err(|e| {
+            SyncError::SchemaQueryFailed(format!("Failed to query D1 schema: {}", e))
+        })?;
+        Ok(TableSchema::new(tables))
     }
 
     /// Get table column info
