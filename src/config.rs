@@ -35,6 +35,22 @@ pub struct SyncConfig {
     /// How to resolve conflicts
     #[serde(default)]
     pub conflict_resolution: ConflictResolution,
+
+    /// Maximum number of retry attempts for transient failures
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+
+    /// Initial delay in milliseconds before first retry (doubles each attempt)
+    #[serde(default = "default_initial_retry_delay_ms")]
+    pub initial_retry_delay_ms: u64,
+
+    /// Maximum delay in milliseconds between retries (cap for exponential backoff)
+    #[serde(default = "default_max_retry_delay_ms")]
+    pub max_retry_delay_ms: u64,
+
+    /// Backoff multiplier for exponential backoff (default: 2.0)
+    #[serde(default = "default_backoff_multiplier")]
+    pub backoff_multiplier: f64,
 }
 
 impl Default for SyncConfig {
@@ -44,8 +60,28 @@ impl Default for SyncConfig {
             exclude_tables: default_exclude_tables(),
             timestamp_column: default_timestamp_column(),
             conflict_resolution: ConflictResolution::default(),
+            max_retries: default_max_retries(),
+            initial_retry_delay_ms: default_initial_retry_delay_ms(),
+            max_retry_delay_ms: default_max_retry_delay_ms(),
+            backoff_multiplier: default_backoff_multiplier(),
         }
     }
+}
+
+fn default_max_retries() -> u32 {
+    5
+}
+
+fn default_initial_retry_delay_ms() -> u64 {
+    1000
+}
+
+fn default_max_retry_delay_ms() -> u64 {
+    60000
+}
+
+fn default_backoff_multiplier() -> f64 {
+    2.0
 }
 
 fn default_exclude_tables() -> Vec<String> {
@@ -71,6 +107,49 @@ pub enum ConflictResolution {
     RemoteWins,
     /// Newer timestamp wins
     NewerWins,
+}
+
+/// Retry configuration for D1 API calls
+#[derive(Debug, Clone)]
+pub struct RetryConfig {
+    /// Maximum number of retry attempts
+    pub max_retries: u32,
+    /// Initial delay in milliseconds before first retry
+    pub initial_delay_ms: u64,
+    /// Maximum delay in milliseconds (cap for exponential backoff)
+    pub max_delay_ms: u64,
+    /// Backoff multiplier for exponential backoff
+    pub backoff_multiplier: f64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: default_max_retries(),
+            initial_delay_ms: default_initial_retry_delay_ms(),
+            max_delay_ms: default_max_retry_delay_ms(),
+            backoff_multiplier: default_backoff_multiplier(),
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl RetryConfig {
+    /// Create RetryConfig from SyncConfig settings
+    pub fn from_sync_config(sync: &SyncConfig) -> Self {
+        Self {
+            max_retries: sync.max_retries,
+            initial_delay_ms: sync.initial_retry_delay_ms,
+            max_delay_ms: sync.max_retry_delay_ms,
+            backoff_multiplier: sync.backoff_multiplier,
+        }
+    }
+
+    /// Calculate delay for a given attempt (0-indexed)
+    pub fn delay_for_attempt(&self, attempt: u32) -> u64 {
+        let delay = self.initial_delay_ms as f64 * self.backoff_multiplier.powi(attempt as i32);
+        (delay as u64).min(self.max_delay_ms)
+    }
 }
 
 impl Config {
@@ -113,6 +192,12 @@ impl Config {
         // Otherwise sync all non-excluded tables
         true
     }
+
+    /// Get retry configuration from sync settings
+    #[allow(dead_code)]
+    pub fn retry_config(&self) -> RetryConfig {
+        RetryConfig::from_sync_config(&self.sync)
+    }
 }
 
 /// Auto-detect the local D1 database from wrangler's state directory
@@ -144,7 +229,7 @@ fn detect_local_db() -> Result<String> {
             debug!("Found sqlite: {} ({} bytes)", path.display(), size);
 
             // Prefer larger files (more data = more likely the active one)
-            if best_file.as_ref().is_none_or(|(_, best_size)| size > *best_size) {
+            if best_file.as_ref().map_or(true, |(_, best_size)| size > *best_size) {
                 best_file = Some((path, size));
             }
         }
@@ -200,5 +285,81 @@ mod tests {
         assert!(config.should_sync_table("abilities"));
         assert!(config.should_sync_table("talents"));
         assert!(!config.should_sync_table("disciplines"));
+    }
+
+    #[test]
+    fn test_retry_config_defaults() {
+        let config = RetryConfig::default();
+        assert_eq!(config.max_retries, 5);
+        assert_eq!(config.initial_delay_ms, 1000);
+        assert_eq!(config.max_delay_ms, 60000);
+        assert_eq!(config.backoff_multiplier, 2.0);
+    }
+
+    #[test]
+    fn test_retry_config_from_sync_config() {
+        let sync = SyncConfig {
+            max_retries: 3,
+            initial_retry_delay_ms: 500,
+            max_retry_delay_ms: 30000,
+            backoff_multiplier: 1.5,
+            ..Default::default()
+        };
+        let retry = RetryConfig::from_sync_config(&sync);
+        assert_eq!(retry.max_retries, 3);
+        assert_eq!(retry.initial_delay_ms, 500);
+        assert_eq!(retry.max_delay_ms, 30000);
+        assert_eq!(retry.backoff_multiplier, 1.5);
+    }
+
+    #[test]
+    fn test_delay_for_attempt_exponential() {
+        let config = RetryConfig {
+            max_retries: 5,
+            initial_delay_ms: 1000,
+            max_delay_ms: 60000,
+            backoff_multiplier: 2.0,
+        };
+
+        assert_eq!(config.delay_for_attempt(0), 1000);  // 1000 * 2^0 = 1000
+        assert_eq!(config.delay_for_attempt(1), 2000);  // 1000 * 2^1 = 2000
+        assert_eq!(config.delay_for_attempt(2), 4000);  // 1000 * 2^2 = 4000
+        assert_eq!(config.delay_for_attempt(3), 8000);  // 1000 * 2^3 = 8000
+        assert_eq!(config.delay_for_attempt(4), 16000); // 1000 * 2^4 = 16000
+    }
+
+    #[test]
+    fn test_delay_capped_at_max() {
+        let config = RetryConfig {
+            max_retries: 10,
+            initial_delay_ms: 1000,
+            max_delay_ms: 5000,
+            backoff_multiplier: 2.0,
+        };
+
+        assert_eq!(config.delay_for_attempt(0), 1000);
+        assert_eq!(config.delay_for_attempt(1), 2000);
+        assert_eq!(config.delay_for_attempt(2), 4000);
+        assert_eq!(config.delay_for_attempt(3), 5000); // capped at max
+        assert_eq!(config.delay_for_attempt(4), 5000); // still capped
+    }
+
+    #[test]
+    fn test_config_retry_config() {
+        let config = Config {
+            cloudflare_account_id: "test".into(),
+            cloudflare_api_token: "test".into(),
+            database_id: "test".into(),
+            local_db: Some("test.db".into()),
+            sync: SyncConfig {
+                max_retries: 10,
+                initial_retry_delay_ms: 500,
+                ..Default::default()
+            },
+        };
+
+        let retry = config.retry_config();
+        assert_eq!(retry.max_retries, 10);
+        assert_eq!(retry.initial_delay_ms, 500);
     }
 }
