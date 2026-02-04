@@ -63,3 +63,26 @@ timestamp_column = "updated_at"
 #                   Best for: master-master replication
 #                   Note: Rows without timestamps are skipped in conflicts
 conflict_resolution = "local_wins"
+
+# =============================================================================
+# Retry Settings
+# =============================================================================
+# Configure retry behavior for transient failures (rate limits, server errors).
+# The tool uses exponential backoff: delay = initial_retry_delay_ms * (backoff_multiplier ^ attempt)
+
+# Maximum number of retry attempts before giving up (default: 5)
+# Set to 0 to disable retries
+max_retries = 5
+
+# Initial delay in milliseconds before the first retry (default: 1000)
+# Subsequent retries will be exponentially longer
+initial_retry_delay_ms = 1000
+
+# Maximum delay in milliseconds between retries (default: 60000)
+# Caps the exponential backoff to prevent extremely long waits
+max_retry_delay_ms = 60000
+
+# Multiplier for exponential backoff (default: 2.0)
+# Each retry waits (previous_delay * backoff_multiplier)
+# Example with defaults: 1s -> 2s -> 4s -> 8s -> 16s
+backoff_multiplier = 2.0

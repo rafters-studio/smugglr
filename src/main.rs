@@ -20,6 +20,7 @@
 //! - [`diff`] - Change detection algorithm
 //! - [`sync`] - Push/pull orchestration
 //! - [`error`] - Error types
+//! - [`table`] - Table name validation
 
 mod config;
 mod diff;
@@ -27,6 +28,7 @@ mod error;
 mod local;
 mod remote;
 mod sync;
+mod table;
 
 use crate::config::Config;
 use crate::diff::diff_table;
@@ -139,10 +141,11 @@ async fn run_push(config: &Config, table: Option<String>, dry_run: bool) -> erro
     info!("Push mode: local -> D1");
 
     let local = LocalDb::open_readonly(config.local_db_path())?;
-    let remote = D1Client::new(
+    let remote = D1Client::with_retry_config(
         config.cloudflare_account_id.clone(),
         config.database_id.clone(),
         config.cloudflare_api_token.clone(),
+        config.retry_config(),
     );
 
     // Test connection
@@ -174,10 +177,11 @@ async fn run_pull(config: &Config, table: Option<String>, dry_run: bool) -> erro
     info!("Pull mode: D1 -> local");
 
     let mut local = LocalDb::open(config.local_db_path())?;
-    let remote = D1Client::new(
+    let remote = D1Client::with_retry_config(
         config.cloudflare_account_id.clone(),
         config.database_id.clone(),
         config.cloudflare_api_token.clone(),
+        config.retry_config(),
     );
 
     // Test connection
@@ -209,10 +213,11 @@ async fn run_diff(config: &Config, table: Option<String>) -> error::Result<()> {
     info!("Computing differences...");
 
     let local = LocalDb::open_readonly(config.local_db_path())?;
-    let remote = D1Client::new(
+    let remote = D1Client::with_retry_config(
         config.cloudflare_account_id.clone(),
         config.database_id.clone(),
         config.cloudflare_api_token.clone(),
+        config.retry_config(),
     );
 
     // Test connection
@@ -372,10 +377,11 @@ async fn run_status(config: &Config) -> error::Result<()> {
 
     // Test remote connection
     println!("\n--- Remote D1 ---");
-    let remote = D1Client::new(
+    let remote = D1Client::with_retry_config(
         config.cloudflare_account_id.clone(),
         config.database_id.clone(),
         config.cloudflare_api_token.clone(),
+        config.retry_config(),
     );
 
     match remote.test_connection().await {
