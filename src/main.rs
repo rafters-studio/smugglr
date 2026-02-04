@@ -21,6 +21,7 @@
 //! - [`sync`] - Push/pull orchestration
 //! - [`error`] - Error types
 //! - [`table`] - Table name validation
+//! - [`timestamp`] - Timestamp parsing and comparison
 
 mod config;
 mod diff;
@@ -29,6 +30,7 @@ mod local;
 mod remote;
 mod sync;
 mod table;
+mod timestamp;
 
 use crate::config::Config;
 use crate::diff::diff_table;
