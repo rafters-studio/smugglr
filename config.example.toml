@@ -1,0 +1,65 @@
+# d1-sync Configuration
+# Copy to config.toml and fill in your values
+
+# =============================================================================
+# Cloudflare Credentials
+# =============================================================================
+# Find these in the Cloudflare dashboard:
+# - Account ID: Account Home > right sidebar
+# - Database ID: Workers & Pages > D1 > your database > Database ID
+# - API Token: Create at https://dash.cloudflare.com/profile/api-tokens
+#   Required permissions: D1:Read, D1:Write
+
+cloudflare_account_id = "your-32-char-account-id"
+cloudflare_api_token = "your-api-token-with-d1-permissions"
+database_id = "your-d1-database-uuid"
+
+# =============================================================================
+# Local Database
+# =============================================================================
+# Path to your local SQLite database.
+#
+# If using Wrangler for local D1 development, it creates databases at:
+#   .wrangler/state/v3/d1/miniflare-D1DatabaseObject/<hash>.sqlite
+#
+# The hash is derived from your database binding name. If you have multiple
+# databases, check file sizes or `ls -lt` to find the right one.
+
+local_db = ".wrangler/state/v3/d1/miniflare-D1DatabaseObject/xxx.sqlite"
+
+# =============================================================================
+# Sync Settings
+# =============================================================================
+[sync]
+
+# Tables to sync (empty array = all tables except excluded)
+# Example: tables = ["users", "posts", "comments"]
+tables = []
+
+# Tables to never sync (system tables, migrations, etc.)
+exclude_tables = [
+    "sqlite_sequence",
+    "_cf_KV",
+    "_cf_METADATA",
+    "__drizzle_migrations",
+    "d1_migrations",
+]
+
+# Column name used for timestamp-based change detection.
+# If a table has this column, timestamps are compared to determine which
+# side has newer data. If the column doesn't exist, falls back to content hash.
+timestamp_column = "updated_at"
+
+# How to resolve conflicts when both sides have changes to the same row.
+#
+# Options:
+#   "local_wins"  - Local version overwrites remote (default)
+#                   Best for: dev -> prod workflows
+#
+#   "remote_wins" - Remote version overwrites local
+#                   Best for: prod -> dev sync, pulling latest data
+#
+#   "newer_wins"  - Most recent updated_at wins
+#                   Best for: master-master replication
+#                   Note: Rows without timestamps are skipped in conflicts
+conflict_resolution = "local_wins"

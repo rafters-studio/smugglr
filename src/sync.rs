@@ -1,0 +1,308 @@
+//! Sync orchestration
+
+use crate::config::{Config, ConflictResolution};
+use crate::diff::{diff_table, TableDiff};
+use crate::error::Result;
+use crate::local::LocalDb;
+use crate::remote::D1Client;
+use indicatif::{ProgressBar, ProgressStyle};
+use tracing::{info, warn};
+
+/// Result of a sync operation
+#[derive(Debug, Default)]
+pub struct SyncResult {
+    pub table: String,
+    pub rows_pushed: usize,
+    pub rows_pulled: usize,
+    #[allow(dead_code)]
+    pub rows_deleted_local: usize,
+    #[allow(dead_code)]
+    pub rows_deleted_remote: usize,
+    #[allow(dead_code)]
+    pub errors: Vec<String>,
+}
+
+impl SyncResult {
+    pub fn new(table: &str) -> Self {
+        Self {
+            table: table.to_string(),
+            ..Default::default()
+        }
+    }
+
+    pub fn has_changes(&self) -> bool {
+        self.rows_pushed > 0
+            || self.rows_pulled > 0
+            || self.rows_deleted_local > 0
+            || self.rows_deleted_remote > 0
+    }
+}
+
+/// Push local changes to remote (local -> D1)
+pub async fn push_table(
+    local: &LocalDb,
+    remote: &D1Client,
+    table: &str,
+    diff: &TableDiff,
+    conflict_resolution: ConflictResolution,
+    dry_run: bool,
+) -> Result<SyncResult> {
+    let mut result = SyncResult::new(table);
+    let rows_to_push = diff.rows_to_push(conflict_resolution);
+
+    if rows_to_push.is_empty() {
+        info!("No changes to push for table: {}", table);
+        return Ok(result);
+    }
+
+    info!(
+        "Pushing {} rows to table: {} (dry_run={})",
+        rows_to_push.len(),
+        table,
+        dry_run
+    );
+
+    if dry_run {
+        result.rows_pushed = rows_to_push.len();
+        return Ok(result);
+    }
+
+    // Fetch full row data from local
+    let rows = local.get_rows(table, &rows_to_push)?;
+
+    if rows.is_empty() {
+        warn!("No rows found locally for push");
+        return Ok(result);
+    }
+
+    // Upsert to remote
+    let pb = ProgressBar::new(rows.len() as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} {msg}")
+            .unwrap(),
+    );
+    pb.set_message(format!("Pushing {}", table));
+
+    // Push in batches to avoid overwhelming D1
+    let batch_size = 50;
+    for chunk in rows.chunks(batch_size) {
+        let count = remote.upsert_rows(table, chunk).await?;
+        result.rows_pushed += count;
+        pb.inc(chunk.len() as u64);
+    }
+
+    pb.finish_with_message(format!("Pushed {} rows", result.rows_pushed));
+
+    Ok(result)
+}
+
+/// Pull remote changes to local (D1 -> local)
+pub async fn pull_table(
+    local: &mut LocalDb,
+    remote: &D1Client,
+    table: &str,
+    diff: &TableDiff,
+    conflict_resolution: ConflictResolution,
+    dry_run: bool,
+) -> Result<SyncResult> {
+    let mut result = SyncResult::new(table);
+    let rows_to_pull = diff.rows_to_pull(conflict_resolution);
+
+    if rows_to_pull.is_empty() {
+        info!("No changes to pull for table: {}", table);
+        return Ok(result);
+    }
+
+    info!(
+        "Pulling {} rows to table: {} (dry_run={})",
+        rows_to_pull.len(),
+        table,
+        dry_run
+    );
+
+    if dry_run {
+        result.rows_pulled = rows_to_pull.len();
+        return Ok(result);
+    }
+
+    // Fetch full row data from remote
+    let rows = remote.get_rows(table, &rows_to_pull).await?;
+
+    if rows.is_empty() {
+        warn!("No rows found remotely for pull");
+        return Ok(result);
+    }
+
+    // Upsert to local
+    let pb = ProgressBar::new(rows.len() as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} {msg}")
+            .unwrap(),
+    );
+    pb.set_message(format!("Pulling {}", table));
+
+    let count = local.upsert_rows(table, &rows)?;
+    result.rows_pulled = count;
+
+    pb.finish_with_message(format!("Pulled {} rows", result.rows_pulled));
+
+    Ok(result)
+}
+
+/// Bidirectional sync
+/// Reserved for full bidirectional sync mode
+#[allow(dead_code)]
+pub async fn sync_table(
+    local: &mut LocalDb,
+    remote: &D1Client,
+    table: &str,
+    diff: &TableDiff,
+    conflict_resolution: ConflictResolution,
+    dry_run: bool,
+) -> Result<SyncResult> {
+    let mut result = SyncResult::new(table);
+
+    // Push local changes
+    let push_result = push_table(local, remote, table, diff, conflict_resolution, dry_run).await?;
+    result.rows_pushed = push_result.rows_pushed;
+
+    // Pull remote changes
+    let pull_result = pull_table(local, remote, table, diff, conflict_resolution, dry_run).await?;
+    result.rows_pulled = pull_result.rows_pulled;
+
+    Ok(result)
+}
+
+/// Get list of tables to sync based on config
+pub async fn get_tables_to_sync(
+    local: &LocalDb,
+    remote: &D1Client,
+    config: &Config,
+) -> Result<Vec<String>> {
+    // Get tables from both sides
+    let local_tables: std::collections::HashSet<_> = local.list_tables()?.into_iter().collect();
+    let remote_tables: std::collections::HashSet<_> =
+        remote.list_tables().await?.into_iter().collect();
+
+    // Find common tables
+    let common: Vec<String> = local_tables
+        .intersection(&remote_tables)
+        .filter(|t| config.should_sync_table(t))
+        .cloned()
+        .collect();
+
+    // Filter out tables without primary keys (required for change detection)
+    let mut syncable = Vec::new();
+    for table in common {
+        match local.table_info(&table) {
+            Ok(info) if !info.primary_key.is_empty() => {
+                syncable.push(table);
+            }
+            Ok(_) => {
+                warn!(
+                    "Skipping table '{}': no primary key (required for change detection)",
+                    table
+                );
+            }
+            Err(e) => {
+                warn!("Skipping table '{}': {}", table, e);
+            }
+        }
+    }
+
+    // Warn about tables only on one side
+    for table in local_tables.difference(&remote_tables) {
+        if config.should_sync_table(table) {
+            warn!("Table '{}' exists only in local database", table);
+        }
+    }
+
+    for table in remote_tables.difference(&local_tables) {
+        if config.should_sync_table(table) {
+            warn!("Table '{}' exists only in remote D1", table);
+        }
+    }
+
+    info!("Found {} tables to sync", syncable.len());
+    Ok(syncable)
+}
+
+/// Push all tables
+pub async fn push_all(
+    local: &LocalDb,
+    remote: &D1Client,
+    config: &Config,
+    tables: Option<Vec<String>>,
+    dry_run: bool,
+) -> Result<Vec<SyncResult>> {
+    let tables_to_sync = match tables {
+        Some(t) => t,
+        None => get_tables_to_sync(local, remote, config).await?,
+    };
+
+    let mut results = Vec::new();
+
+    for table in &tables_to_sync {
+        let diff = diff_table(local, remote, table, &config.sync.timestamp_column).await?;
+
+        if !diff.has_changes() {
+            info!("Table {} is in sync", table);
+            results.push(SyncResult::new(table));
+            continue;
+        }
+
+        let result = push_table(
+            local,
+            remote,
+            table,
+            &diff,
+            config.sync.conflict_resolution,
+            dry_run,
+        )
+        .await?;
+        results.push(result);
+    }
+
+    Ok(results)
+}
+
+/// Pull all tables
+pub async fn pull_all(
+    local: &mut LocalDb,
+    remote: &D1Client,
+    config: &Config,
+    tables: Option<Vec<String>>,
+    dry_run: bool,
+) -> Result<Vec<SyncResult>> {
+    let tables_to_sync = match tables {
+        Some(t) => t,
+        None => get_tables_to_sync(local, remote, config).await?,
+    };
+
+    let mut results = Vec::new();
+
+    for table in &tables_to_sync {
+        let diff = diff_table(local, remote, table, &config.sync.timestamp_column).await?;
+
+        if !diff.has_changes() {
+            info!("Table {} is in sync", table);
+            results.push(SyncResult::new(table));
+            continue;
+        }
+
+        let result = pull_table(
+            local,
+            remote,
+            table,
+            &diff,
+            config.sync.conflict_resolution,
+            dry_run,
+        )
+        .await?;
+        results.push(result);
+    }
+
+    Ok(results)
+}
