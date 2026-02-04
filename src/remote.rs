@@ -772,4 +772,108 @@ mod tests {
         headers.insert(reqwest::header::RETRY_AFTER, "not-a-number".parse().unwrap());
         assert_eq!(extract_retry_after_header(&headers), None);
     }
+
+    // Integration tests for with_retry function
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn test_with_retry_retries_on_429() {
+        let config = RetryConfig {
+            max_retries: 3,
+            initial_delay_ms: 1, // minimal delay for tests
+            max_delay_ms: 10,
+            backoff_multiplier: 2.0,
+        };
+
+        let call_count = Arc::new(AtomicU32::new(0));
+        let call_count_clone = call_count.clone();
+
+        let result: Result<()> = with_retry(&config, || {
+            let count = call_count_clone.clone();
+            async move {
+                let calls = count.fetch_add(1, Ordering::SeqCst);
+                if calls < 2 {
+                    // First two calls fail with 429 (retryable)
+                    Err(SyncError::RateLimited { retry_after: None })
+                } else {
+                    // Third call succeeds
+                    Ok(())
+                }
+            }
+        })
+        .await;
+
+        assert!(result.is_ok(), "Should succeed after retries");
+        assert_eq!(call_count.load(Ordering::SeqCst), 3, "Should have called operation 3 times");
+    }
+
+    #[tokio::test]
+    async fn test_with_retry_does_not_retry_on_400() {
+        let config = RetryConfig {
+            max_retries: 3,
+            initial_delay_ms: 1,
+            max_delay_ms: 10,
+            backoff_multiplier: 2.0,
+        };
+
+        let call_count = Arc::new(AtomicU32::new(0));
+        let call_count_clone = call_count.clone();
+
+        let result: Result<()> = with_retry(&config, || {
+            let count = call_count_clone.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                // 400 Bad Request is not retryable
+                Err(SyncError::BadRequest {
+                    status: 400,
+                    message: "invalid sql".to_string(),
+                })
+            }
+        })
+        .await;
+
+        assert!(result.is_err(), "Should fail immediately on 400");
+        assert_eq!(call_count.load(Ordering::SeqCst), 1, "Should only call operation once");
+
+        match result.unwrap_err() {
+            SyncError::BadRequest { status, .. } => assert_eq!(status, 400),
+            _ => panic!("Expected BadRequest error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_with_retry_respects_max_retries() {
+        let config = RetryConfig {
+            max_retries: 2,
+            initial_delay_ms: 1,
+            max_delay_ms: 10,
+            backoff_multiplier: 2.0,
+        };
+
+        let call_count = Arc::new(AtomicU32::new(0));
+        let call_count_clone = call_count.clone();
+
+        let result: Result<()> = with_retry(&config, || {
+            let count = call_count_clone.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                // Always fail with retryable error
+                Err(SyncError::RateLimited { retry_after: None })
+            }
+        })
+        .await;
+
+        assert!(result.is_err(), "Should fail after exhausting retries");
+        // Initial attempt + max_retries = 1 + 2 = 3 calls
+        assert_eq!(call_count.load(Ordering::SeqCst), 3, "Should call operation max_retries + 1 times");
+
+        match result.unwrap_err() {
+            SyncError::RetryExhausted { attempts, .. } => {
+                assert_eq!(attempts, 3, "Should report 3 attempts");
+            }
+            _ => panic!("Expected RetryExhausted error"),
+        }
+    }
+
 }
