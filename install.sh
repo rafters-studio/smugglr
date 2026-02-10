@@ -224,9 +224,12 @@ ensure_path() {
   fi
 
   info "Adding ${INSTALL_DIR} to PATH in ${config_file}..."
-  mkdir -p "$(dirname "${config_file}")"
-  printf '\n# Added by Smuggler installer\n%s\n' "${path_line}" >> "${config_file}"
-  warn "Restart your shell or run:  source ${config_file}"
+  if mkdir -p "$(dirname "${config_file}")" 2>/dev/null && \
+     printf '\n# Added by Smuggler installer\n%s\n' "${path_line}" >> "${config_file}" 2>/dev/null; then
+    warn "Restart your shell or run:  source ${config_file}"
+  else
+    warn "Could not update ${config_file}. Add ${INSTALL_DIR} to your PATH manually."
+  fi
 }
 
 # Main installation flow.
