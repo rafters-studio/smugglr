@@ -115,8 +115,8 @@ smuggler pull      # D1 -> Local (safer YOLO)
 For each table, Smuggler:
 
 1. Grabs all primary keys from both databases
-2. SHA256 hashes each row's content (minus timestamp columns)
-3. Compares timestamps when available
+2. SHA256 hashes each row's content (excluding timestamp columns)
+3. When content differs, compares timestamps to determine which side is newer
 4. Sorts rows into buckets:
 
 | Bucket | What it means | Push | Pull |
@@ -151,7 +151,7 @@ exclude_tables = [
     "__drizzle_migrations",
 ]
 
-# Column for timestamp-based detection (falls back to content hash)
+# Optional column for timestamp ordering when content differs
 timestamp_column = "updated_at"
 
 # When both sides changed: "local_wins", "remote_wins", "newer_wins"
@@ -196,9 +196,6 @@ Smuggler validates `--table` input against your database schema before touching 
 
 ### All rows show as "content_differs"
 Check that column order and types match. NULL vs empty string will cause hash mismatches.
-
-### It's slow
-Large syncs take time. Check the GitHub issues for performance improvements in progress.
 
 ## Development
 
