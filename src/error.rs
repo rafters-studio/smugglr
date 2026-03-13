@@ -56,6 +56,19 @@ pub enum SyncError {
 
     #[error("Invalid table name '{name}'. Available tables: [{available}]")]
     InvalidTableName { name: String, available: String },
+
+    #[error(
+        "D1 bind parameter limit exceeded for table '{table}': \
+         query needs {} params ({row_count} rows x {col_count} columns), \
+         but D1 allows at most {limit}. This is a smuggler bug -- please report it.",
+        row_count * col_count
+    )]
+    ParamLimitExceeded {
+        table: String,
+        row_count: usize,
+        col_count: usize,
+        limit: usize,
+    },
 }
 
 impl SyncError {
@@ -149,6 +162,21 @@ mod tests {
             code: Some(1),
         };
         assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn test_param_limit_exceeded_not_retryable() {
+        let err = SyncError::ParamLimitExceeded {
+            table: "wide_table".to_string(),
+            row_count: 1,
+            col_count: 150,
+            limit: 100,
+        };
+        assert!(!err.is_retryable());
+        let msg = format!("{}", err);
+        assert!(msg.contains("wide_table"));
+        assert!(msg.contains("150 params"));
+        assert!(msg.contains("1 rows x 150 columns"));
     }
 
     #[test]

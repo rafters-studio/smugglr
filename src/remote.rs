@@ -526,8 +526,11 @@ impl D1Client {
             .collect::<Vec<_>>()
             .join(", ");
 
-        // D1 has a limit on query size, so we batch
-        let batch_size = 100;
+        // D1 allows at most 100 bind params per query.
+        // For single-column PKs that's 100 rows; for composite PKs
+        // each row still contributes one param to the IN clause (the
+        // concatenated PK expression is compared server-side), so 100 is safe.
+        let batch_size = crate::batch::D1_MAX_BIND_PARAMS;
         let mut all_results = Vec::new();
 
         for chunk in pk_values.chunks(batch_size) {
@@ -548,43 +551,70 @@ impl D1Client {
 
     /// Insert or replace rows using multi-row INSERT statements.
     ///
-    /// Uses the default batch configuration (100 rows, 90KB max).
+    /// Uses the default batch configuration. Effective batch size depends on
+    /// column count due to D1's 100 bind-parameter limit.
+    #[allow(dead_code)]
     pub async fn upsert_rows(
         &self,
         table: &str,
         rows: &[HashMap<String, JsonValue>],
     ) -> Result<usize> {
         use crate::config::BatchConfig;
-        self.upsert_rows_batched(table, rows, &BatchConfig::default())
+        self.upsert_rows_batched(table, rows, &BatchConfig::default(), |_| {})
             .await
     }
 
     /// Insert or replace rows with custom batch configuration.
     ///
-    /// Groups rows into batches respecting both count and size limits,
-    /// then executes multi-row INSERT statements for better performance.
+    /// Groups rows into batches respecting count, size, and D1 bind parameter
+    /// limits, then executes multi-row INSERT statements for better performance.
+    ///
+    /// `on_batch` is called after each batch completes with the number of rows
+    /// in that batch, allowing callers to update progress indicators.
     pub async fn upsert_rows_batched(
         &self,
         table: &str,
         rows: &[HashMap<String, JsonValue>],
         batch_config: &crate::config::BatchConfig,
+        on_batch: impl Fn(usize),
     ) -> Result<usize> {
-        use crate::batch::{batch_rows, generate_batch_insert};
+        use crate::batch::{batch_rows, generate_batch_insert, D1_MAX_BIND_PARAMS};
 
         if rows.is_empty() {
             return Ok(0);
         }
 
         let columns = self.table_columns(table).await?;
+
+        // Fail fast if a single row already exceeds D1's param limit
+        if columns.len() > D1_MAX_BIND_PARAMS {
+            return Err(SyncError::ParamLimitExceeded {
+                table: table.to_string(),
+                row_count: 1,
+                col_count: columns.len(),
+                limit: D1_MAX_BIND_PARAMS,
+            });
+        }
+
+        // Guard against empty columns (would cause division by zero)
+        if columns.is_empty() {
+            return Err(SyncError::Remote(format!(
+                "Table '{}' has no columns",
+                table
+            )));
+        }
+
         let batches = batch_rows(rows, &columns, batch_config);
 
         let mut total_changes = 0;
 
         debug!(
-            "Upserting {} rows in {} batches to table {}",
+            "Upserting {} rows in {} batches to table {} ({} cols, max {} rows/batch by param limit)",
             rows.len(),
             batches.len(),
-            table
+            table,
+            columns.len(),
+            D1_MAX_BIND_PARAMS / columns.len(),
         );
 
         for (i, batch) in batches.iter().enumerate() {
@@ -594,16 +624,28 @@ impl D1Client {
                 continue;
             }
 
+            // Defense in depth: catch batch_rows bugs before hitting D1
+            if params.len() > D1_MAX_BIND_PARAMS {
+                return Err(SyncError::ParamLimitExceeded {
+                    table: table.to_string(),
+                    row_count: batch.rows.len(),
+                    col_count: columns.len(),
+                    limit: D1_MAX_BIND_PARAMS,
+                });
+            }
+
             debug!(
-                "Batch {}/{}: {} rows, ~{} bytes",
+                "Batch {}/{}: {} rows, {} params, ~{} bytes",
                 i + 1,
                 batches.len(),
                 batch.rows.len(),
+                params.len(),
                 batch.estimated_bytes
             );
 
             let changes = self.execute(&sql, params).await?;
             total_changes += changes as usize;
+            on_batch(batch.rows.len());
         }
 
         info!(
@@ -631,8 +673,8 @@ impl D1Client {
 
         let mut total_changes = 0;
 
-        // Delete in batches
-        let batch_size = 100;
+        // Delete in batches respecting D1 bind parameter limit
+        let batch_size = crate::batch::D1_MAX_BIND_PARAMS;
         for chunk in pk_values.chunks(batch_size) {
             let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
             let sql = format!(
