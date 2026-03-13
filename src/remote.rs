@@ -553,13 +553,14 @@ impl D1Client {
     ///
     /// Uses the default batch configuration. Effective batch size depends on
     /// column count due to D1's 100 bind-parameter limit.
+    #[allow(dead_code)]
     pub async fn upsert_rows(
         &self,
         table: &str,
         rows: &[HashMap<String, JsonValue>],
     ) -> Result<usize> {
         use crate::config::BatchConfig;
-        self.upsert_rows_batched(table, rows, &BatchConfig::default())
+        self.upsert_rows_batched(table, rows, &BatchConfig::default(), |_| {})
             .await
     }
 
@@ -567,11 +568,15 @@ impl D1Client {
     ///
     /// Groups rows into batches respecting count, size, and D1 bind parameter
     /// limits, then executes multi-row INSERT statements for better performance.
+    ///
+    /// `on_batch` is called after each batch completes with the number of rows
+    /// in that batch, allowing callers to update progress indicators.
     pub async fn upsert_rows_batched(
         &self,
         table: &str,
         rows: &[HashMap<String, JsonValue>],
         batch_config: &crate::config::BatchConfig,
+        on_batch: impl Fn(usize),
     ) -> Result<usize> {
         use crate::batch::{batch_rows, generate_batch_insert, D1_MAX_BIND_PARAMS};
 
@@ -640,6 +645,7 @@ impl D1Client {
 
             let changes = self.execute(&sql, params).await?;
             total_changes += changes as usize;
+            on_batch(batch.rows.len());
         }
 
         info!(

@@ -76,9 +76,13 @@ pub async fn push_table(
     );
     pb.set_message(format!("Pushing {}", table));
 
-    let count = remote.upsert_rows(table, &rows).await?;
+    let batch_config = crate::config::BatchConfig::default();
+    let count = remote
+        .upsert_rows_batched(table, &rows, &batch_config, |batch_len| {
+            pb.inc(batch_len as u64);
+        })
+        .await?;
     result.rows_pushed = count;
-    pb.inc(rows.len() as u64);
 
     pb.finish_with_message(format!("Pushed {} rows", result.rows_pushed));
 
