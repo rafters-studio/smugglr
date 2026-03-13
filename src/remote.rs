@@ -648,8 +648,8 @@ impl D1Client {
 
         let mut total_changes = 0;
 
-        // Delete in batches
-        let batch_size = 100;
+        // Delete in batches respecting D1 bind parameter limit
+        let batch_size = crate::batch::D1_MAX_BIND_PARAMS;
         for chunk in pk_values.chunks(batch_size) {
             let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
             let sql = format!(

@@ -34,11 +34,10 @@ pub fn batch_rows(
     }
 
     // D1 caps bind params at 100. Each row needs one param per column.
-    let max_rows_by_params = D1_MAX_BIND_PARAMS / columns.len();
-    if max_rows_by_params == 0 {
-        // Table has more columns than D1 allows params -- single-row batches
-        // will still exceed the limit, but we emit them so the caller gets a
-        // clear error from D1 rather than silently dropping data.
+    // Use max(1, ...) so tables wider than 100 columns still emit rows
+    // (the caller gets a clear D1 error rather than silently dropped data).
+    let max_rows_by_params = (D1_MAX_BIND_PARAMS / columns.len()).max(1);
+    if columns.len() > D1_MAX_BIND_PARAMS {
         warn!(
             "Table has {} columns which exceeds D1's {} bind-parameter limit; \
              single-row inserts will fail",
@@ -47,11 +46,7 @@ pub fn batch_rows(
         );
     }
 
-    let effective_max = if max_rows_by_params == 0 {
-        1 // still emit rows so the error surfaces
-    } else {
-        batch_config.batch_size.min(max_rows_by_params)
-    };
+    let effective_max = batch_config.batch_size.min(max_rows_by_params);
 
     let mut batches = Vec::new();
     let mut current_batch = Vec::new();
@@ -167,7 +162,7 @@ pub fn generate_batch_insert(
         .collect::<Vec<_>>()
         .join(", ");
 
-    let placeholders_per_row = columns.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+    let placeholders_per_row = vec!["?"; columns.len()].join(", ");
     let all_placeholders = rows
         .iter()
         .map(|_| format!("({})", placeholders_per_row))
