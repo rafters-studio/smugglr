@@ -8,24 +8,26 @@
 
 Smuggle data between SQLite and Cloudflare D1. Fast. Stateless. Questionable life choices.
 
-## Status: Alpha (Han Solo Approved)
+## Status: Beta (Kessel Run Certified)
 
-We use this in production at [huttspawn.com](https://huttspawn.com). It works. Mostly.
+Running in production at [huttspawn.com](https://huttspawn.com) since early 2026. Pluggable data source architecture. CI across Linux, macOS, and Windows. Checksummed releases with a one-line installer.
 
-Should *you* use it? That depends. Do you:
-- Read the manual before assembling furniture? **Maybe wait for 1.0**
-- Shoot first? **Welcome aboard**
+Not 1.0 yet -- the API surface may shift as we add [S3-compatible relay sync](https://github.com/ezmode-games/smuggler/issues/20). But the core sync engine is solid and battle-tested.
 
-There are [known issues](https://github.com/ezmode-games/smuggler/issues). We're shaving parsecs, not days.
+There are [open issues](https://github.com/ezmode-games/smuggler/issues). We're shaving parsecs, not days.
 
 ## What It Does
 
 D1 is SQLite at the edge, but Cloudflare doesn't give you a way to sync your local dev database with production. Smuggler fills that gap:
 
-- **Content hashing** - Compares actual row data, not just timestamps
+- **Content hashing** - SHA256 comparison of actual row data, not just timestamps
 - **Delta sync** - Only moves rows that changed
 - **Bidirectional** - Push to D1, pull from D1, or both
 - **No state files** - Fresh comparison every run, no stale state to haunt you
+- **Pluggable backends** - `DataSource` trait abstracts any database backend
+- **Automatic retries** - Exponential backoff with configurable limits for transient D1 failures
+- **Batched writes** - Respects D1's 100-parameter bind limit, splits large upserts automatically
+- **Table validation** - `--table` input validated against live schema before any SQL runs
 
 ## Installation
 
@@ -35,12 +37,12 @@ D1 is SQLite at the edge, but Cloudflare doesn't give you a way to sync your loc
 curl -fsSL https://ezmode.games/oss/smuggler/install.sh | bash
 ```
 
-Detects your platform, downloads the right binary, verifies the checksum, and installs to `~/.local/bin/`. Supports Linux x64, macOS x64, and macOS ARM64.
+Detects your platform, downloads the right binary, verifies the SHA256 checksum, and installs to `~/.local/bin/`. Supports Linux x64, macOS x64, and macOS ARM64. Detects Rosetta 2 and installs the native arm64 binary.
 
 Install a specific version:
 
 ```bash
-curl -fsSL https://ezmode.games/oss/smuggler/install.sh | bash -s v0.1.0
+curl -fsSL https://ezmode.games/oss/smuggler/install.sh | bash -s v0.1.2
 ```
 
 ### Manual download
@@ -50,12 +52,15 @@ curl -fsSL https://ezmode.games/oss/smuggler/install.sh | bash -s v0.1.0
 | Linux x64 | [smuggler-linux-x64.tar.gz](https://github.com/ezmode-games/smuggler/releases/latest/download/smuggler-linux-x64.tar.gz) |
 | macOS x64 | [smuggler-macos-x64.tar.gz](https://github.com/ezmode-games/smuggler/releases/latest/download/smuggler-macos-x64.tar.gz) |
 | macOS ARM64 | [smuggler-macos-arm64.tar.gz](https://github.com/ezmode-games/smuggler/releases/latest/download/smuggler-macos-arm64.tar.gz) |
+| Windows x64 | [smuggler-windows-x64.zip](https://github.com/ezmode-games/smuggler/releases/latest/download/smuggler-windows-x64.zip) |
 
 ### From source
 
 ```bash
 cargo install --git https://github.com/ezmode-games/smuggler
 ```
+
+Requires Rust 1.75+.
 
 ## Quick Start
 
@@ -128,9 +133,28 @@ For each table, Smuggler:
 | `content_differs` | Same timestamp, different data | Configurable | Configurable |
 | `identical` | Exactly the same | Skip | Skip |
 
+5. Batches writes to stay within D1's bind parameter limits (100 params per statement)
+6. Retries transient failures with exponential backoff
+
 ### Why content hashing?
 
 Timestamps lie. Clocks drift. Bulk imports set everything to "now". Content hashing catches actual changes regardless of what the timestamps say.
+
+### Tables without timestamp columns
+
+Smuggler gracefully handles tables missing the configured timestamp column. Rows with different content land in the `content_differs` bucket and are resolved by your `conflict_resolution` setting. Use `local_wins` or `remote_wins` for deterministic behavior on these tables -- `newer_wins` will skip them since there's no timestamp to compare.
+
+## Architecture
+
+Smuggler's sync engine is built on the `DataSource` trait, which abstracts any database backend:
+
+```
+DataSource (trait)
+  |-- LocalDb    (rusqlite, synchronous)
+  |-- D1Client   (reqwest HTTP, async with retries)
+```
+
+The diff engine (`diff_table`) and table resolution (`get_tables_to_sync`) are generic over any two `DataSource` implementations. This means the same comparison logic works whether you're syncing local-to-D1, local-to-local, or any future backend.
 
 ## Configuration
 
@@ -151,11 +175,21 @@ exclude_tables = [
     "__drizzle_migrations",
 ]
 
-# Optional column for timestamp ordering when content differs
+# Column for timestamp ordering when content differs
 timestamp_column = "updated_at"
 
 # When both sides changed: "local_wins", "remote_wins", "newer_wins"
 conflict_resolution = "local_wins"
+
+# Retry settings for transient D1 failures
+max_retries = 5
+initial_retry_delay_ms = 100
+max_retry_delay_ms = 30000
+backoff_multiplier = 2.0
+
+# Batch settings for large tables
+batch_size = 100
+max_statement_bytes = 92160
 ```
 
 ### Finding Your Local D1 Database
@@ -179,17 +213,21 @@ Pro tip: Create one token with both permissions. Fewer tokens to lose.
 
 ## Limitations
 
-Things we don't do:
+Things we don't do (yet):
 
 - **Schema sync** - Run your migrations separately, we're data movers not DDL runners
-- **Transactions** - Each batch is atomic, but the whole sync isn't. Re-run if interrupted.
+- **Full-sync transactions** - Each batch is atomic, but the whole sync isn't. Re-run if interrupted.
 - **BLOB wizardry** - Binary data compared as hex strings. It works but it's not pretty.
 - **Tables without primary keys** - We need something to compare. Add a PK.
+- **Linux ARM64** - Not available yet. See [issues](https://github.com/ezmode-games/smuggler/issues) for updates.
 
 ## Troubleshooting
 
 ### "401 Unauthorized"
 Your token is expired or wrong. Make a new one.
+
+### "429 Too Many Requests"
+Smuggler retries automatically with exponential backoff. If you're still hitting rate limits, increase `initial_retry_delay_ms` or reduce `batch_size` in your config.
 
 ### "Invalid table name"
 Smuggler validates `--table` input against your database schema before touching any SQL. If the table doesn't exist, you'll get a list of available tables. Run your migrations on both databases first. We don't create tables.
@@ -200,7 +238,7 @@ Check that column order and types match. NULL vs empty string will cause hash mi
 ## Development
 
 ```bash
-cargo test                       # Run the tests
+cargo test                       # Run the tests (55 and counting)
 cargo fmt                        # Format code
 cargo clippy --all-targets       # Lint (including tests)
 RUST_LOG=debug cargo run -- diff # Debug output
