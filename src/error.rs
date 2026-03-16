@@ -70,7 +70,9 @@ pub enum SyncError {
     RelayNotFound(String),
 
     #[error(
-        "Concurrent write conflict: relay was modified by another machine. Retry the operation."
+        "Concurrent write conflict: the relay was modified by another machine \
+         between download and upload. Re-run the stash command to download the \
+         latest relay and merge."
     )]
     ConcurrentWrite,
 

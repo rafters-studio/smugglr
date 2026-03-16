@@ -73,14 +73,17 @@ fn build_store(config: &StashConfig) -> Result<(Arc<dyn ObjectStore>, ObjectPath
             let filename = file_path
                 .file_name()
                 .ok_or_else(|| SyncError::InvalidUrl("File URL must have a filename".into()))?
-                .to_string_lossy();
+                .to_str()
+                .ok_or_else(|| {
+                    SyncError::InvalidUrl("File URL filename is not valid UTF-8".into())
+                })?;
 
             let store =
                 object_store::local::LocalFileSystem::new_with_prefix(parent).map_err(|e| {
                     SyncError::Stash(format!("Failed to build local file store: {}", e))
                 })?;
 
-            Ok((Arc::new(store), ObjectPath::from(filename.as_ref())))
+            Ok((Arc::new(store), ObjectPath::from(filename)))
         }
         scheme => Err(SyncError::InvalidUrl(format!(
             "Unsupported URL scheme '{}'. Use s3://, or file:///",
@@ -105,7 +108,12 @@ async fn download_relay(
         Ok(result) => {
             let etag = result.meta.e_tag.clone();
 
-            let bytes = result.bytes().await?;
+            let bytes = result.bytes().await.map_err(|e| {
+                SyncError::Stash(format!(
+                    "Failed to download relay body from {}: {}",
+                    path, e
+                ))
+            })?;
             std::fs::write(temp_file.path(), &bytes).map_err(|e| {
                 SyncError::Stash(format!("Failed to write relay to temp file: {}", e))
             })?;
@@ -144,7 +152,10 @@ async fn upload_relay(
     // First upload (no existing relay) -- unconditional put
     let Some(tag) = etag else {
         debug!("Uploading relay (first upload)");
-        store.put(path, payload).await?;
+        store
+            .put(path, payload)
+            .await
+            .map_err(|e| SyncError::Stash(format!("Failed to upload relay to {}: {}", path, e)))?;
         info!("Relay uploaded successfully");
         return Ok(());
     };
@@ -167,10 +178,13 @@ async fn upload_relay(
         Err(object_store::Error::Precondition { .. }) => Err(SyncError::ConcurrentWrite),
         Err(object_store::Error::NotImplemented) => {
             // Backend does not support conditional writes (e.g., local filesystem).
-            debug!(
-                "Backend does not support conditional writes, falling back to unconditional put"
+            warn!(
+                "Backend does not support conditional writes (ETag). \
+                 Concurrent stash from multiple machines may overwrite each other."
             );
-            store.put(path, payload).await?;
+            store.put(path, payload).await.map_err(|e| {
+                SyncError::Stash(format!("Failed to upload relay to {}: {}", path, e))
+            })?;
             info!("Relay uploaded successfully (unconditional)");
             Ok(())
         }
@@ -284,8 +298,17 @@ async fn get_stash_tables(
                     table
                 );
             }
+            Err(SyncError::NoPrimaryKey(_)) => {
+                warn!(
+                    "Skipping table '{}': no primary key (required for change detection)",
+                    table
+                );
+            }
             Err(e) => {
-                warn!("Skipping table '{}': {}", table, e);
+                return Err(SyncError::Stash(format!(
+                    "Failed to inspect table '{}': {}",
+                    table, e
+                )));
             }
         }
     }
@@ -319,7 +342,12 @@ fn init_relay_schema(source: &LocalDb, relay_path: &Path) -> Result<()> {
                 [name],
                 |row| row.get(0),
             )
-            .unwrap_or(false);
+            .map_err(|e| {
+                SyncError::Stash(format!(
+                    "Failed to check if table '{}' exists in relay: {}",
+                    name, e
+                ))
+            })?;
 
         if !exists {
             debug!("Creating table '{}' in relay", name);
@@ -345,7 +373,8 @@ pub async fn stash(
     // Open local database (read-only -- we only read from it)
     let local = LocalDb::open_readonly(local_db_path)?;
 
-    // Download existing relay (or create new one)
+    // Download existing relay (or create new one).
+    // IMPORTANT: temp_file must live until end of function -- dropping it deletes the file.
     let (temp_file, etag) = download_relay(store.as_ref(), &obj_path, true).await?;
     let relay_path = temp_file.path().to_path_buf();
 
@@ -403,7 +432,8 @@ pub async fn retrieve(
 ) -> Result<Vec<SyncResult>> {
     let (store, obj_path) = build_store(config)?;
 
-    // Download relay (must exist for retrieve)
+    // Download relay (must exist for retrieve).
+    // IMPORTANT: temp_file must live until end of function -- dropping it deletes the file.
     let (temp_file, _etag) = download_relay(store.as_ref(), &obj_path, false).await?;
     let relay_path = temp_file.path().to_path_buf();
 
