@@ -994,6 +994,178 @@ mod tests {
         assert_eq!(items[0].2, "2024-01-02");
     }
 
+    #[tokio::test]
+    async fn test_retrieve_conflict_resolution_newer_wins() {
+        let dir = TempDir::new().unwrap();
+        let local_path = dir.path().join("local.sqlite");
+        let relay_dir = dir.path().join("relay_store");
+        std::fs::create_dir_all(&relay_dir).unwrap();
+        let relay_path = relay_dir.join("relay.sqlite");
+
+        // Local has older data
+        create_test_db(&local_path, &[(1, "local_version", "2024-01-01")]);
+
+        // Relay has newer data
+        create_test_db(&relay_path, &[(1, "relay_version", "2024-01-02")]);
+
+        let config = StashConfig {
+            url: format!("file://{}/relay.sqlite", relay_dir.display()),
+            access_key_id: None,
+            secret_access_key: None,
+            region: None,
+            endpoint: None,
+        };
+
+        // NewerWins: relay is newer, so it should win
+        let results = retrieve(
+            &config,
+            local_path.to_str().unwrap(),
+            "updated_at",
+            ConflictResolution::NewerWins,
+            None,
+            false,
+            &default_excludes(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results[0].rows_pulled, 1);
+        let items = read_items(&local_path);
+        assert_eq!(items[0].1, "relay_version");
+    }
+
+    #[tokio::test]
+    async fn test_retrieve_conflict_resolution_remote_wins() {
+        let dir = TempDir::new().unwrap();
+        let local_path = dir.path().join("local.sqlite");
+        let relay_dir = dir.path().join("relay_store");
+        std::fs::create_dir_all(&relay_dir).unwrap();
+        let relay_path = relay_dir.join("relay.sqlite");
+
+        // Both have same row, different content, same timestamp
+        create_test_db(&local_path, &[(1, "local_version", "2024-01-01")]);
+        create_test_db(&relay_path, &[(1, "relay_version", "2024-01-01")]);
+
+        let config = StashConfig {
+            url: format!("file://{}/relay.sqlite", relay_dir.display()),
+            access_key_id: None,
+            secret_access_key: None,
+            region: None,
+            endpoint: None,
+        };
+
+        // RemoteWins in retrieve context: local (dest) wins, relay changes are NOT applied
+        let _results = retrieve(
+            &config,
+            local_path.to_str().unwrap(),
+            "updated_at",
+            ConflictResolution::RemoteWins,
+            None,
+            false,
+            &default_excludes(),
+        )
+        .await
+        .unwrap();
+
+        // RemoteWins means the destination (local) wins for content_differs
+        let items = read_items(&local_path);
+        assert_eq!(items[0].1, "local_version");
+    }
+
+    #[tokio::test]
+    async fn test_upload_relay_first_upload() {
+        let dir = TempDir::new().unwrap();
+        let relay_dir = dir.path().join("relay_store");
+        std::fs::create_dir_all(&relay_dir).unwrap();
+
+        // Create a file to upload
+        let source_path = dir.path().join("source.sqlite");
+        create_test_db(&source_path, &[(1, "test", "2024-01-01")]);
+
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&relay_dir).unwrap());
+        let path = ObjectPath::from("relay.sqlite");
+
+        // First upload -- no etag
+        upload_relay(&*store, &path, &source_path, None)
+            .await
+            .unwrap();
+
+        // File should exist
+        assert!(relay_dir.join("relay.sqlite").exists());
+    }
+
+    #[tokio::test]
+    async fn test_upload_relay_with_etag_fallback() {
+        let dir = TempDir::new().unwrap();
+        let relay_dir = dir.path().join("relay_store");
+        std::fs::create_dir_all(&relay_dir).unwrap();
+
+        let source_path = dir.path().join("source.sqlite");
+        create_test_db(&source_path, &[(1, "test", "2024-01-01")]);
+
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&relay_dir).unwrap());
+        let path = ObjectPath::from("relay.sqlite");
+
+        // Upload with an etag -- local filesystem doesn't support conditional writes,
+        // so this exercises the NotImplemented fallback path
+        upload_relay(&*store, &path, &source_path, Some("fake-etag"))
+            .await
+            .unwrap();
+
+        assert!(relay_dir.join("relay.sqlite").exists());
+    }
+
+    #[tokio::test]
+    async fn test_retrieve_source_only_table_skipped() {
+        let dir = TempDir::new().unwrap();
+        let local_path = dir.path().join("local.sqlite");
+        let relay_dir = dir.path().join("relay_store");
+        std::fs::create_dir_all(&relay_dir).unwrap();
+        let relay_path = relay_dir.join("relay.sqlite");
+
+        // Local has one table
+        create_test_db(&local_path, &[(1, "alpha", "2024-01-01")]);
+
+        // Relay has two tables
+        let conn = Connection::open(&relay_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, updated_at TEXT);
+             CREATE TABLE extra (id INTEGER PRIMARY KEY, value TEXT, updated_at TEXT);
+             INSERT INTO items VALUES (1, 'alpha', '2024-01-01');
+             INSERT INTO items VALUES (2, 'beta', '2024-01-02');
+             INSERT INTO extra VALUES (1, 'data', '2024-01-01');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let config = StashConfig {
+            url: format!("file://{}/relay.sqlite", relay_dir.display()),
+            access_key_id: None,
+            secret_access_key: None,
+            region: None,
+            endpoint: None,
+        };
+
+        // Should only sync "items" (shared table), skip "extra" (relay-only)
+        let results = retrieve(
+            &config,
+            local_path.to_str().unwrap(),
+            "updated_at",
+            ConflictResolution::LocalWins,
+            None,
+            false,
+            &default_excludes(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].table, "items");
+        assert_eq!(results[0].rows_pulled, 1); // only "beta" is new
+    }
+
     fn default_excludes() -> Vec<String> {
         vec![
             "sqlite_sequence".to_string(),
