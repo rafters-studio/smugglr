@@ -163,10 +163,26 @@ pub async fn sync_table<A: DataSource, B: DataSource>(
         return Ok(SyncResult::new(table));
     }
 
-    let push_result =
-        push_table(a, b, table, &diff, conflict_resolution, batch_config, dry_run).await?;
-    let pull_result =
-        pull_table(a, b, table, &diff, conflict_resolution, batch_config, dry_run).await?;
+    let push_result = push_table(
+        a,
+        b,
+        table,
+        &diff,
+        conflict_resolution,
+        batch_config,
+        dry_run,
+    )
+    .await?;
+    let pull_result = pull_table(
+        a,
+        b,
+        table,
+        &diff,
+        conflict_resolution,
+        batch_config,
+        dry_run,
+    )
+    .await?;
 
     Ok(SyncResult {
         table: table.to_string(),
