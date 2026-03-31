@@ -61,6 +61,9 @@ indicatif = "0.17"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Unix process checking (PID lock)
+libc = "0.2"
+
 [profile.release]
 lto = true
 codegen-units = 1

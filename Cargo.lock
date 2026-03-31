@@ -1674,6 +1674,7 @@ dependencies = [
  "clap",
  "hex",
  "indicatif",
+ "libc",
  "object_store",
  "reqwest",
  "rusqlite",
