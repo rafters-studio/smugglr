@@ -78,9 +78,20 @@ fn is_process_running(pid: u32) -> bool {
     {
         unsafe { libc::kill(pid as i32, 0) == 0 }
     }
-    #[cfg(not(unix))]
+    // On Windows, use the command-based check
+    #[cfg(windows)]
     {
-        // On non-Unix, assume stale
+        std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {}", pid), "/NH"])
+            .output()
+            .map(|o| {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                stdout.contains(&pid.to_string())
+            })
+            .unwrap_or(false)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
         let _ = pid;
         false
     }
