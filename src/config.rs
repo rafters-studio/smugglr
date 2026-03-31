@@ -7,9 +7,10 @@ use tracing::{debug, info};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
-    pub cloudflare_account_id: String,
-    pub cloudflare_api_token: String,
-    pub database_id: String,
+    /// Legacy flat D1 fields (use [target] section instead for new configs)
+    pub cloudflare_account_id: Option<String>,
+    pub cloudflare_api_token: Option<String>,
+    pub database_id: Option<String>,
 
     /// Path to local SQLite database (optional - auto-detected from wrangler if not set)
     pub local_db: Option<String>,
@@ -19,6 +20,36 @@ pub struct Config {
 
     /// Optional stash config for S3-compatible relay sync
     pub stash: Option<StashConfig>,
+
+    /// Target database configuration (sqlite or d1)
+    pub target: Option<TargetConfig>,
+}
+
+/// Target database configuration
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum TargetConfig {
+    /// Cloudflare D1 target
+    D1 {
+        account_id: String,
+        database_id: String,
+        api_token: String,
+    },
+    /// Local SQLite target
+    Sqlite { database: String },
+}
+
+/// Resolved target after merging legacy fields with [target] section
+#[derive(Debug, Clone)]
+pub enum ResolvedTarget {
+    D1 {
+        account_id: String,
+        database_id: String,
+        api_token: String,
+    },
+    Sqlite {
+        database: String,
+    },
 }
 
 /// Configuration for S3-compatible relay sync (stash/retrieve).
@@ -241,10 +272,55 @@ impl Config {
 
         // Auto-detect local_db if not specified
         if config.local_db.is_none() {
-            config.local_db = Some(detect_local_db()?);
+            match detect_local_db() {
+                Ok(path) => config.local_db = Some(path),
+                Err(e) => {
+                    // local_db is always required (it's the source database)
+                    return Err(e);
+                }
+            }
         }
 
+        // Validate that we have a resolvable target
+        config.resolve_target()?;
+
         Ok(config)
+    }
+
+    /// Resolve the target from either [target] section or legacy flat fields.
+    pub fn resolve_target(&self) -> Result<ResolvedTarget> {
+        if let Some(ref target) = self.target {
+            return Ok(match target {
+                TargetConfig::D1 {
+                    account_id,
+                    database_id,
+                    api_token,
+                } => ResolvedTarget::D1 {
+                    account_id: account_id.clone(),
+                    database_id: database_id.clone(),
+                    api_token: api_token.clone(),
+                },
+                TargetConfig::Sqlite { database } => ResolvedTarget::Sqlite {
+                    database: database.clone(),
+                },
+            });
+        }
+
+        // Fall back to legacy flat fields
+        match (
+            &self.cloudflare_account_id,
+            &self.database_id,
+            &self.cloudflare_api_token,
+        ) {
+            (Some(account_id), Some(database_id), Some(api_token)) => Ok(ResolvedTarget::D1 {
+                account_id: account_id.clone(),
+                database_id: database_id.clone(),
+                api_token: api_token.clone(),
+            }),
+            _ => Err(SyncError::Config(
+                "No target configured. Add a [target] section or set cloudflare_account_id, database_id, and cloudflare_api_token.".to_string()
+            )),
+        }
     }
 
     /// Get the local database path (guaranteed to be Some after load)
@@ -334,16 +410,35 @@ fn detect_local_db() -> Result<String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_default_excludes() {
-        let config = Config {
-            cloudflare_account_id: "test".into(),
-            cloudflare_api_token: "test".into(),
-            database_id: "test".into(),
+    fn test_config_d1() -> Config {
+        Config {
+            cloudflare_account_id: Some("test_acct".into()),
+            cloudflare_api_token: Some("test_token".into()),
+            database_id: Some("test_db".into()),
             local_db: Some("test.db".into()),
             sync: SyncConfig::default(),
             stash: None,
-        };
+            target: None,
+        }
+    }
+
+    fn test_config_sqlite_target() -> Config {
+        Config {
+            cloudflare_account_id: None,
+            cloudflare_api_token: None,
+            database_id: None,
+            local_db: Some("source.db".into()),
+            sync: SyncConfig::default(),
+            stash: None,
+            target: Some(TargetConfig::Sqlite {
+                database: "backup.db".into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn test_default_excludes() {
+        let config = test_config_d1();
 
         assert!(!config.should_sync_table("sqlite_sequence"));
         assert!(!config.should_sync_table("_cf_KV"));
@@ -352,17 +447,8 @@ mod tests {
 
     #[test]
     fn test_specific_tables() {
-        let config = Config {
-            cloudflare_account_id: "test".into(),
-            cloudflare_api_token: "test".into(),
-            database_id: "test".into(),
-            local_db: Some("test.db".into()),
-            sync: SyncConfig {
-                tables: vec!["abilities".into(), "talents".into()],
-                ..Default::default()
-            },
-            stash: None,
-        };
+        let mut config = test_config_d1();
+        config.sync.tables = vec!["abilities".into(), "talents".into()];
 
         assert!(config.should_sync_table("abilities"));
         assert!(config.should_sync_table("talents"));
@@ -370,32 +456,99 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_target_legacy_d1() {
+        let config = test_config_d1();
+        let target = config.resolve_target().unwrap();
+        assert!(matches!(target, ResolvedTarget::D1 { .. }));
+    }
+
+    #[test]
+    fn test_resolve_target_sqlite() {
+        let config = test_config_sqlite_target();
+        let target = config.resolve_target().unwrap();
+        match target {
+            ResolvedTarget::Sqlite { database } => assert_eq!(database, "backup.db"),
+            _ => panic!("expected SQLite target"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_target_explicit_d1() {
+        let config = Config {
+            cloudflare_account_id: None,
+            cloudflare_api_token: None,
+            database_id: None,
+            local_db: Some("test.db".into()),
+            sync: SyncConfig::default(),
+            stash: None,
+            target: Some(TargetConfig::D1 {
+                account_id: "acct".into(),
+                database_id: "db".into(),
+                api_token: "tok".into(),
+            }),
+        };
+        let target = config.resolve_target().unwrap();
+        assert!(matches!(target, ResolvedTarget::D1 { .. }));
+    }
+
+    #[test]
+    fn test_resolve_target_explicit_overrides_legacy() {
+        let config = Config {
+            cloudflare_account_id: Some("old_acct".into()),
+            cloudflare_api_token: Some("old_token".into()),
+            database_id: Some("old_db".into()),
+            local_db: Some("test.db".into()),
+            sync: SyncConfig::default(),
+            stash: None,
+            target: Some(TargetConfig::Sqlite {
+                database: "backup.db".into(),
+            }),
+        };
+        let target = config.resolve_target().unwrap();
+        assert!(matches!(target, ResolvedTarget::Sqlite { .. }));
+    }
+
+    #[test]
+    fn test_resolve_target_no_config() {
+        let config = Config {
+            cloudflare_account_id: None,
+            cloudflare_api_token: None,
+            database_id: None,
+            local_db: Some("test.db".into()),
+            sync: SyncConfig::default(),
+            stash: None,
+            target: None,
+        };
+        assert!(config.resolve_target().is_err());
+    }
+
+    #[test]
     fn test_retry_config_defaults() {
         let config = RetryConfig::default();
         assert_eq!(config.max_retries, 5);
-        assert_eq!(config.initial_delay_ms, 100); // per issue #3 spec
-        assert_eq!(config.max_delay_ms, 30_000); // per issue #3 spec
+        assert_eq!(config.initial_delay_ms, 100);
+        assert_eq!(config.max_delay_ms, 30_000);
         assert_eq!(config.backoff_multiplier, 2.0);
     }
 
     #[test]
     fn test_backoff_multiplier_clamped() {
         let sync = SyncConfig {
-            backoff_multiplier: 0.5, // invalid - less than 1.0
+            backoff_multiplier: 0.5,
             ..Default::default()
         };
         let retry = RetryConfig::from_sync_config(&sync);
-        assert_eq!(retry.backoff_multiplier, 1.0); // should be clamped to 1.0
+        assert_eq!(retry.backoff_multiplier, 1.0);
     }
 
     #[test]
     fn test_max_retries_capped() {
         let sync = SyncConfig {
-            max_retries: 1000, // unreasonably high
+            max_retries: 1000,
             ..Default::default()
         };
         let retry = RetryConfig::from_sync_config(&sync);
-        assert_eq!(retry.max_retries, 100); // should be capped at 100
+        assert_eq!(retry.max_retries, 100);
     }
 
     #[test]
@@ -423,11 +576,11 @@ mod tests {
             backoff_multiplier: 2.0,
         };
 
-        assert_eq!(config.delay_for_attempt(0), 1000); // 1000 * 2^0 = 1000
-        assert_eq!(config.delay_for_attempt(1), 2000); // 1000 * 2^1 = 2000
-        assert_eq!(config.delay_for_attempt(2), 4000); // 1000 * 2^2 = 4000
-        assert_eq!(config.delay_for_attempt(3), 8000); // 1000 * 2^3 = 8000
-        assert_eq!(config.delay_for_attempt(4), 16000); // 1000 * 2^4 = 16000
+        assert_eq!(config.delay_for_attempt(0), 1000);
+        assert_eq!(config.delay_for_attempt(1), 2000);
+        assert_eq!(config.delay_for_attempt(2), 4000);
+        assert_eq!(config.delay_for_attempt(3), 8000);
+        assert_eq!(config.delay_for_attempt(4), 16000);
     }
 
     #[test]
@@ -442,27 +595,80 @@ mod tests {
         assert_eq!(config.delay_for_attempt(0), 1000);
         assert_eq!(config.delay_for_attempt(1), 2000);
         assert_eq!(config.delay_for_attempt(2), 4000);
-        assert_eq!(config.delay_for_attempt(3), 5000); // capped at max
-        assert_eq!(config.delay_for_attempt(4), 5000); // still capped
+        assert_eq!(config.delay_for_attempt(3), 5000);
+        assert_eq!(config.delay_for_attempt(4), 5000);
     }
 
     #[test]
     fn test_config_retry_config() {
-        let config = Config {
-            cloudflare_account_id: "test".into(),
-            cloudflare_api_token: "test".into(),
-            database_id: "test".into(),
-            local_db: Some("test.db".into()),
-            sync: SyncConfig {
-                max_retries: 10,
-                initial_retry_delay_ms: 500,
-                ..Default::default()
-            },
-            stash: None,
-        };
+        let mut config = test_config_d1();
+        config.sync.max_retries = 10;
+        config.sync.initial_retry_delay_ms = 500;
 
         let retry = config.retry_config();
         assert_eq!(retry.max_retries, 10);
         assert_eq!(retry.initial_delay_ms, 500);
+    }
+
+    #[test]
+    fn test_parse_toml_sqlite_target() {
+        let toml_str = r#"
+local_db = "game.db"
+
+[target]
+type = "sqlite"
+database = "backup.db"
+
+[sync]
+tables = ["abilities"]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(matches!(config.target, Some(TargetConfig::Sqlite { .. })));
+        let target = config.resolve_target().unwrap();
+        match target {
+            ResolvedTarget::Sqlite { database } => assert_eq!(database, "backup.db"),
+            _ => panic!("expected sqlite"),
+        }
+    }
+
+    #[test]
+    fn test_parse_toml_d1_target() {
+        let toml_str = r#"
+local_db = "game.db"
+
+[target]
+type = "d1"
+account_id = "acct123"
+database_id = "db456"
+api_token = "tok789"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let target = config.resolve_target().unwrap();
+        match target {
+            ResolvedTarget::D1 {
+                account_id,
+                database_id,
+                api_token,
+            } => {
+                assert_eq!(account_id, "acct123");
+                assert_eq!(database_id, "db456");
+                assert_eq!(api_token, "tok789");
+            }
+            _ => panic!("expected d1"),
+        }
+    }
+
+    #[test]
+    fn test_parse_toml_legacy_d1() {
+        let toml_str = r#"
+cloudflare_account_id = "acct"
+cloudflare_api_token = "tok"
+database_id = "db"
+local_db = "game.db"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.target.is_none());
+        let target = config.resolve_target().unwrap();
+        assert!(matches!(target, ResolvedTarget::D1 { .. }));
     }
 }

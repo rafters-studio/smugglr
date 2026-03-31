@@ -34,8 +34,9 @@ mod remote;
 mod stash;
 mod sync;
 mod table;
+mod watch;
 
-use crate::config::Config;
+use crate::config::{Config, ResolvedTarget};
 use crate::datasource::DataSource;
 use crate::diff::diff_table;
 use crate::local::LocalDb;
@@ -132,6 +133,17 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Watch for changes and sync periodically (daemon mode)
+    Watch {
+        /// Sync interval in seconds
+        #[arg(short, long, default_value = "30")]
+        interval: u64,
+
+        /// Show what would be synced without actually syncing
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[tokio::main]
@@ -162,15 +174,34 @@ async fn main() {
         }
     };
 
+    // Resolve target once upfront (stash/retrieve don't need it)
+    let config_path = cli.config.clone();
+    let target = match &cli.command {
+        Commands::Stash { .. } | Commands::Retrieve { .. } => None,
+        _ => Some(config.resolve_target().unwrap_or_else(|e| {
+            error!("Failed to resolve target: {}", e);
+            std::process::exit(1);
+        })),
+    };
+
     // Execute command
     let result = match cli.command {
-        Commands::Push { table, dry_run } => run_push(&config, table, dry_run).await,
-        Commands::Pull { table, dry_run } => run_pull(&config, table, dry_run).await,
-        Commands::Sync { table, dry_run } => run_sync(&config, table, dry_run).await,
-        Commands::Diff { table } => run_diff(&config, table).await,
-        Commands::Status => run_status(&config).await,
+        Commands::Push { table, dry_run } => {
+            run_push(&config, target.unwrap(), table, dry_run).await
+        }
+        Commands::Pull { table, dry_run } => {
+            run_pull(&config, target.unwrap(), table, dry_run).await
+        }
+        Commands::Sync { table, dry_run } => {
+            run_sync(&config, target.unwrap(), table, dry_run).await
+        }
+        Commands::Diff { table } => run_diff(&config, target.unwrap(), table).await,
+        Commands::Status => run_status(&config, target.unwrap()).await,
         Commands::Stash { table, dry_run } => run_stash(&config, table, dry_run).await,
         Commands::Retrieve { table, dry_run } => run_retrieve(&config, table, dry_run).await,
+        Commands::Watch { interval, dry_run } => {
+            watch::run_watch(&config, &config_path, target.unwrap(), interval, dry_run).await
+        }
     };
 
     if let Err(e) = result {
@@ -179,84 +210,116 @@ async fn main() {
     }
 }
 
-async fn run_push(config: &Config, table: Option<String>, dry_run: bool) -> error::Result<()> {
-    info!("Push mode: local -> D1");
+/// Open a D1Client from resolved target fields.
+fn open_d1(account_id: &str, database_id: &str, api_token: &str, config: &Config) -> D1Client {
+    D1Client::with_retry_config(
+        account_id.to_string(),
+        database_id.to_string(),
+        api_token.to_string(),
+        config.retry_config(),
+    )
+}
 
+/// Resolve table filter from CLI --table arg using local schema validation.
+fn resolve_tables(local: &LocalDb, table: Option<String>) -> error::Result<Option<Vec<String>>> {
+    match table {
+        Some(t) => {
+            let schema = local.get_schema()?;
+            let _ = schema.validate(&t)?;
+            Ok(Some(vec![t]))
+        }
+        None => Ok(None),
+    }
+}
+
+async fn run_push(
+    config: &Config,
+    target: ResolvedTarget,
+    table: Option<String>,
+    dry_run: bool,
+) -> error::Result<()> {
     let local = LocalDb::open_readonly(config.local_db_path())?;
-    let remote = D1Client::with_retry_config(
-        config.cloudflare_account_id.clone(),
-        config.database_id.clone(),
-        config.cloudflare_api_token.clone(),
-        config.retry_config(),
-    );
+    let tables = resolve_tables(&local, table)?;
 
-    // Test connection
-    remote.test_connection().await?;
-
-    let tables = match table {
-        Some(t) => {
-            let schema = local.get_schema()?;
-            let _ = schema.validate(&t)?;
-            Some(vec![t])
+    match target {
+        ResolvedTarget::D1 {
+            account_id,
+            database_id,
+            api_token,
+        } => {
+            info!("Push mode: local -> D1");
+            let remote = open_d1(&account_id, &database_id, &api_token, config);
+            remote.test_connection().await?;
+            let results = push_all(&local, &remote, config, tables, dry_run).await?;
+            print_summary("Push", &results, |r| r.rows_pushed, "push", dry_run);
         }
-        None => None,
-    };
-    let results = push_all(&local, &remote, config, tables, dry_run).await?;
-
-    print_summary("Push", &results, |r| r.rows_pushed, "push", dry_run);
+        ResolvedTarget::Sqlite { database } => {
+            info!("Push mode: local -> SQLite ({})", database);
+            let target_db = LocalDb::open(&database)?;
+            let results = push_all(&local, &target_db, config, tables, dry_run).await?;
+            print_summary("Push", &results, |r| r.rows_pushed, "push", dry_run);
+        }
+    }
     Ok(())
 }
 
-async fn run_pull(config: &Config, table: Option<String>, dry_run: bool) -> error::Result<()> {
-    info!("Pull mode: D1 -> local");
-
+async fn run_pull(
+    config: &Config,
+    target: ResolvedTarget,
+    table: Option<String>,
+    dry_run: bool,
+) -> error::Result<()> {
     let local = LocalDb::open(config.local_db_path())?;
-    let remote = D1Client::with_retry_config(
-        config.cloudflare_account_id.clone(),
-        config.database_id.clone(),
-        config.cloudflare_api_token.clone(),
-        config.retry_config(),
-    );
+    let tables = resolve_tables(&local, table)?;
 
-    // Test connection
-    remote.test_connection().await?;
-
-    let tables = match table {
-        Some(t) => {
-            let schema = local.get_schema()?;
-            let _ = schema.validate(&t)?;
-            Some(vec![t])
+    match target {
+        ResolvedTarget::D1 {
+            account_id,
+            database_id,
+            api_token,
+        } => {
+            info!("Pull mode: D1 -> local");
+            let remote = open_d1(&account_id, &database_id, &api_token, config);
+            remote.test_connection().await?;
+            let results = pull_all(&local, &remote, config, tables, dry_run).await?;
+            print_summary("Pull", &results, |r| r.rows_pulled, "pull", dry_run);
         }
-        None => None,
-    };
-    let results = pull_all(&local, &remote, config, tables, dry_run).await?;
-
-    print_summary("Pull", &results, |r| r.rows_pulled, "pull", dry_run);
+        ResolvedTarget::Sqlite { database } => {
+            info!("Pull mode: SQLite ({}) -> local", database);
+            let source_db = LocalDb::open_readonly(&database)?;
+            let results = pull_all(&local, &source_db, config, tables, dry_run).await?;
+            print_summary("Pull", &results, |r| r.rows_pulled, "pull", dry_run);
+        }
+    }
     Ok(())
 }
 
-async fn run_sync(config: &Config, table: Option<String>, dry_run: bool) -> error::Result<()> {
-    info!("Sync mode: bidirectional");
-
+async fn run_sync(
+    config: &Config,
+    target: ResolvedTarget,
+    table: Option<String>,
+    dry_run: bool,
+) -> error::Result<()> {
     let local = LocalDb::open(config.local_db_path())?;
-    let remote = D1Client::with_retry_config(
-        config.cloudflare_account_id.clone(),
-        config.database_id.clone(),
-        config.cloudflare_api_token.clone(),
-        config.retry_config(),
-    );
+    let tables = resolve_tables(&local, table)?;
 
-    remote.test_connection().await?;
-
-    let tables = match table {
-        Some(t) => {
-            let schema = local.get_schema()?;
-            let _ = schema.validate(&t)?;
-            Some(vec![t])
+    let results = match target {
+        ResolvedTarget::D1 {
+            account_id,
+            database_id,
+            api_token,
+        } => {
+            info!("Sync mode: bidirectional (local <-> D1)");
+            let remote = open_d1(&account_id, &database_id, &api_token, config);
+            remote.test_connection().await?;
+            sync_all(&local, &remote, config, tables, dry_run).await?
         }
-        None => None,
+        ResolvedTarget::Sqlite { database } => {
+            info!("Sync mode: bidirectional (local <-> SQLite {})", database);
+            let target_db = LocalDb::open(&database)?;
+            sync_all(&local, &target_db, config, tables, dry_run).await?
+        }
     };
-    let results = sync_all(&local, &remote, config, tables, dry_run).await?;
 
     println!("\n--- Sync Summary ---");
     let mut total_pushed = 0;
@@ -281,42 +344,64 @@ async fn run_sync(config: &Config, table: Option<String>, dry_run: bool) -> erro
     Ok(())
 }
 
-async fn run_diff(config: &Config, table: Option<String>) -> error::Result<()> {
+async fn run_diff(
+    config: &Config,
+    target: ResolvedTarget,
+    table: Option<String>,
+) -> error::Result<()> {
     info!("Computing differences...");
-
     let local = LocalDb::open_readonly(config.local_db_path())?;
-    let remote = D1Client::with_retry_config(
-        config.cloudflare_account_id.clone(),
-        config.database_id.clone(),
-        config.cloudflare_api_token.clone(),
-        config.retry_config(),
-    );
 
-    // Test connection
-    remote.test_connection().await?;
-
-    let tables = match table {
-        Some(t) => {
-            let schema = local.get_schema()?;
-            let _ = schema.validate(&t)?;
-            vec![t]
+    match target {
+        ResolvedTarget::D1 {
+            account_id,
+            database_id,
+            api_token,
+        } => {
+            let remote = open_d1(&account_id, &database_id, &api_token, config);
+            remote.test_connection().await?;
+            let tables = match table {
+                Some(t) => {
+                    let schema = local.get_schema()?;
+                    let _ = schema.validate(&t)?;
+                    vec![t]
+                }
+                None => get_tables_to_sync(&local, &remote, config).await?,
+            };
+            print_diffs(&local, &remote, &tables, &config.sync.timestamp_column).await
         }
-        None => get_tables_to_sync(&local, &remote, config).await?,
-    };
+        ResolvedTarget::Sqlite { database } => {
+            let target_db = LocalDb::open_readonly(&database)?;
+            let tables = match table {
+                Some(t) => {
+                    let schema = local.get_schema()?;
+                    let _ = schema.validate(&t)?;
+                    vec![t]
+                }
+                None => get_tables_to_sync(&local, &target_db, config).await?,
+            };
+            print_diffs(&local, &target_db, &tables, &config.sync.timestamp_column).await
+        }
+    }
+}
 
+async fn print_diffs<A: DataSource, B: DataSource>(
+    local: &A,
+    remote: &B,
+    tables: &[String],
+    timestamp_column: &str,
+) -> error::Result<()> {
     println!("\n--- Differences ---");
-
     let mut has_any_changes = false;
 
-    for table_name in &tables {
-        let diff = diff_table(&local, &remote, table_name, &config.sync.timestamp_column).await?;
+    for table_name in tables {
+        let diff = diff_table(local, remote, table_name, timestamp_column).await?;
 
         if diff.has_changes() {
             has_any_changes = true;
             println!("\n{}", table_name);
             println!("  {}", diff.summary());
 
-            // Show details
             print_diff_category("Local only", &diff.local_only);
             print_diff_category("Remote only", &diff.remote_only);
             print_diff_category("Local newer", &diff.local_newer);
@@ -374,18 +459,32 @@ fn print_diff_category(label: &str, keys: &[String]) {
     }
 }
 
-async fn run_status(config: &Config) -> error::Result<()> {
+async fn run_status(config: &Config, target: ResolvedTarget) -> error::Result<()> {
     println!("--- Configuration ---");
     println!("  Config file: loaded");
     println!("  Local DB: {}", config.local_db_path());
-    println!(
-        "  Account ID: {}...",
-        &config.cloudflare_account_id[..8.min(config.cloudflare_account_id.len())]
-    );
-    println!(
-        "  Database ID: {}...",
-        &config.database_id[..8.min(config.database_id.len())]
-    );
+
+    match &target {
+        ResolvedTarget::D1 {
+            account_id,
+            database_id,
+            ..
+        } => {
+            println!("  Target: D1");
+            println!(
+                "  Account ID: {}...",
+                &account_id[..8.min(account_id.len())]
+            );
+            println!(
+                "  Database ID: {}...",
+                &database_id[..8.min(database_id.len())]
+            );
+        }
+        ResolvedTarget::Sqlite { database } => {
+            println!("  Target: SQLite ({})", database);
+        }
+    }
+
     println!("  Timestamp column: {}", config.sync.timestamp_column);
     println!(
         "  Conflict resolution: {:?}",
@@ -422,30 +521,46 @@ async fn run_status(config: &Config) -> error::Result<()> {
         }
     }
 
-    // Test remote connection
-    println!("\n--- Remote D1 ---");
-    let remote = D1Client::with_retry_config(
-        config.cloudflare_account_id.clone(),
-        config.database_id.clone(),
-        config.cloudflare_api_token.clone(),
-        config.retry_config(),
-    );
-
-    match remote.test_connection().await {
-        Ok(()) => {
-            println!("  Connection: OK");
-            let tables = remote.list_tables().await?;
-            println!("  Tables: {}", tables.len());
-
-            for table in &tables {
-                if config.should_sync_table(table) {
-                    let count = remote.row_count(table).await?;
-                    println!("    {}: {} rows", table, count);
+    // Test target connection
+    match target {
+        ResolvedTarget::D1 {
+            account_id,
+            database_id,
+            api_token,
+        } => {
+            println!("\n--- Remote D1 ---");
+            let remote = open_d1(&account_id, &database_id, &api_token, config);
+            match remote.test_connection().await {
+                Ok(()) => {
+                    println!("  Connection: OK");
+                    let tables = remote.list_tables().await?;
+                    println!("  Tables: {}", tables.len());
+                    for table in &tables {
+                        if config.should_sync_table(table) {
+                            let count = remote.row_count(table).await?;
+                            println!("    {}: {} rows", table, count);
+                        }
+                    }
                 }
+                Err(e) => println!("  Connection: FAILED - {}", e),
             }
         }
-        Err(e) => {
-            println!("  Connection: FAILED - {}", e);
+        ResolvedTarget::Sqlite { database } => {
+            println!("\n--- Target SQLite ---");
+            match LocalDb::open_readonly(&database) {
+                Ok(target_db) => {
+                    println!("  Connection: OK");
+                    let tables = target_db.list_tables().await?;
+                    println!("  Tables: {}", tables.len());
+                    for table in &tables {
+                        if config.should_sync_table(table) {
+                            let count = target_db.row_count(table).await?;
+                            println!("    {}: {} rows", table, count);
+                        }
+                    }
+                }
+                Err(e) => println!("  Connection: FAILED - {}", e),
+            }
         }
     }
 
