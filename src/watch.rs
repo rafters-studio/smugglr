@@ -8,6 +8,7 @@
 use crate::config::{Config, ResolvedTarget};
 use crate::error::{Result, SyncError};
 use crate::local::LocalDb;
+use crate::output::{OutputFormat, WatchTickOutput};
 use crate::remote::D1Client;
 use crate::sync::sync_all;
 use std::fs;
@@ -218,6 +219,7 @@ pub async fn run_watch(
     target: ResolvedTarget,
     interval_secs: u64,
     dry_run: bool,
+    fmt: OutputFormat,
 ) -> Result<()> {
     let pid_path = pid_lock_path(config_path);
     let _pid_lock = PidLock::acquire(&pid_path)?;
@@ -247,6 +249,10 @@ pub async fn run_watch(
                         );
                         if let Err(e) = remote.test_connection().await {
                             warn!("Connection test failed on tick #{}: {}. Will retry next tick.", tick_count, e);
+                            if fmt == OutputFormat::Json {
+                                let out = WatchTickOutput::from_error(tick_count, &e.to_string());
+                                println!("{}", serde_json::to_string(&out).unwrap());
+                            }
                             continue;
                         }
                         sync_all(&local, &remote, config, None, dry_run).await
@@ -263,7 +269,10 @@ pub async fn run_watch(
                         let total_pushed: usize = results.iter().map(|r| r.rows_pushed).sum();
                         let total_pulled: usize = results.iter().map(|r| r.rows_pulled).sum();
 
-                        if total_pushed > 0 || total_pulled > 0 {
+                        if fmt == OutputFormat::Json {
+                            let out = WatchTickOutput::from_results(tick_count, &results);
+                            println!("{}", serde_json::to_string(&out).unwrap());
+                        } else if total_pushed > 0 || total_pulled > 0 {
                             info!(
                                 "Tick #{}: {} pushed, {} pulled across {} tables",
                                 tick_count, total_pushed, total_pulled, results.len()
@@ -282,8 +291,16 @@ pub async fn run_watch(
                     Err(e) => {
                         if is_transient_error(&e) {
                             warn!("Transient error on tick #{}: {}. Will retry next tick.", tick_count, e);
+                            if fmt == OutputFormat::Json {
+                                let out = WatchTickOutput::from_error(tick_count, &e.to_string());
+                                println!("{}", serde_json::to_string(&out).unwrap());
+                            }
                         } else {
                             error!("Fatal error on tick #{}: {}", tick_count, e);
+                            if fmt == OutputFormat::Json {
+                                let out = WatchTickOutput::from_error(tick_count, &e.to_string());
+                                println!("{}", serde_json::to_string(&out).unwrap());
+                            }
                             return Err(e);
                         }
                     }
