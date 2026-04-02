@@ -88,6 +88,10 @@ pub enum SyncError {
         col_count: usize,
         limit: usize,
     },
+
+    #[error("Broadcast error: {0}")]
+    #[allow(dead_code)] // Used by broadcast module, not yet wired to CLI (#39)
+    Broadcast(String),
 }
 
 impl SyncError {
