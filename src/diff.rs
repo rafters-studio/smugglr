@@ -55,18 +55,28 @@ impl TableDiff {
             ConflictResolution::RemoteWins => {
                 // Don't push content_differs
             }
-            ConflictResolution::NewerWins | ConflictResolution::UuidV7Wins => {
+            ConflictResolution::NewerWins => {
                 if !self.content_differs.is_empty() {
                     warn!(
                         "{} row(s) in '{}' have different content but no usable timestamps -- \
-                         skipped under {}. Use local_wins or remote_wins to resolve.",
+                         skipped under newer_wins. Use local_wins or remote_wins to resolve.",
                         self.content_differs.len(),
                         self.table,
-                        if conflict_resolution == ConflictResolution::UuidV7Wins {
-                            "uuid_v7_wins"
-                        } else {
-                            "newer_wins"
-                        }
+                    );
+                }
+            }
+            ConflictResolution::UuidV7Wins => {
+                // UUIDv7 PKs prevent insert collisions. For same-row modifications
+                // without usable timestamps, we can't determine which is newer.
+                // UUIDv7 creation time is the same on both sides (same PK).
+                if !self.content_differs.is_empty() {
+                    warn!(
+                        "{} row(s) in '{}' have different content but no usable timestamps -- \
+                         skipped under uuid_v7_wins. UUIDv7 prevents insert collisions but \
+                         cannot resolve same-row modification conflicts without an updated_at \
+                         column. Add a timestamp column or use local_wins/remote_wins.",
+                        self.content_differs.len(),
+                        self.table,
                     );
                 }
             }
@@ -145,12 +155,26 @@ impl TableDiff {
     }
 }
 
-/// Compare two data sources for a table
+/// Compare two data sources for a table.
+///
+/// When `conflict_resolution` is provided, performs additional validation
+/// (e.g. checking for UUIDv7 PKs when using `UuidV7Wins`).
 pub async fn diff_table<A: DataSource, B: DataSource>(
     local: &A,
     remote: &B,
     table: &str,
     timestamp_column: &str,
+) -> Result<TableDiff> {
+    diff_table_with_resolution(local, remote, table, timestamp_column, None).await
+}
+
+/// Compare two data sources for a table, with optional conflict resolution validation.
+pub async fn diff_table_with_resolution<A: DataSource, B: DataSource>(
+    local: &A,
+    remote: &B,
+    table: &str,
+    timestamp_column: &str,
+    conflict_resolution: Option<ConflictResolution>,
 ) -> Result<TableDiff> {
     info!("Computing diff for table: {}", table);
 
@@ -171,6 +195,32 @@ pub async fn diff_table<A: DataSource, B: DataSource>(
     // Find rows only in remote
     for pk in remote_keys.difference(&local_keys) {
         diff.remote_only.push((*pk).clone());
+    }
+
+    // If using UuidV7Wins, validate that PKs are UUIDv7.
+    // Master-master sync with non-UUIDv7 PKs is unsafe (insert collisions).
+    if conflict_resolution == Some(ConflictResolution::UuidV7Wins) && !local_keys.is_empty() {
+        let sample_pks: Vec<&String> = local_keys.iter().take(10).copied().collect();
+        let non_uuid_count = sample_pks.iter().filter(|pk| !is_uuidv7(pk)).count();
+
+        if non_uuid_count == sample_pks.len() {
+            return Err(crate::error::SyncError::Config(format!(
+                "Table '{}': uuid_v7_wins requires UUIDv7 primary keys, but all sampled \
+                 PKs are non-UUIDv7 (e.g. '{}'). Master-master sync with integer or UUIDv4 \
+                 PKs will cause insert collisions. Migrate to UUIDv7 PKs or use a different \
+                 conflict_resolution strategy.",
+                table,
+                sample_pks.first().map(|s| s.as_str()).unwrap_or("?")
+            )));
+        } else if non_uuid_count > 0 {
+            warn!(
+                "Table '{}': uuid_v7_wins configured but {}/{} sampled PKs are not UUIDv7. \
+                 Mixed PK types may cause collisions for non-UUIDv7 rows.",
+                table,
+                non_uuid_count,
+                sample_pks.len()
+            );
+        }
     }
 
     // Compare rows that exist in both
@@ -361,6 +411,29 @@ mod tests {
 
         let pull = diff.rows_to_pull(ConflictResolution::UuidV7Wins);
         assert_eq!(pull, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn test_uuidv7_wins_content_differs_warns_about_timestamps() {
+        // UuidV7Wins with content_differs rows should not include them
+        // in push (same behavior as NewerWins -- can't resolve without timestamps)
+        let diff = TableDiff {
+            table: "test".to_string(),
+            local_only: vec![],
+            remote_only: vec![],
+            local_newer: vec!["newer-local".to_string()],
+            remote_newer: vec!["newer-remote".to_string()],
+            content_differs: vec!["conflict-row".to_string()],
+            identical: vec![],
+        };
+
+        let push = diff.rows_to_push(ConflictResolution::UuidV7Wins);
+        assert!(push.contains(&"newer-local".to_string()));
+        assert!(!push.contains(&"conflict-row".to_string()));
+
+        let pull = diff.rows_to_pull(ConflictResolution::UuidV7Wins);
+        assert!(pull.contains(&"newer-remote".to_string()));
+        assert!(!pull.contains(&"conflict-row".to_string()));
     }
 
     #[test]

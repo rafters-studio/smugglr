@@ -210,8 +210,11 @@ pub enum ConflictResolution {
     RemoteWins,
     /// Newer timestamp wins
     NewerWins,
-    /// Compare UUIDv7 primary keys -- higher (newer) UUID wins.
-    /// Falls back to NewerWins for non-UUIDv7 primary keys.
+    /// Requires UUIDv7 primary keys. Prevents insert collisions across
+    /// machines (each insert gets a globally unique, time-ordered PK).
+    /// For same-row modifications, uses timestamp column (newer wins).
+    /// Errors if PKs are not UUIDv7 -- master-master sync without
+    /// globally unique PKs is unsafe.
     UuidV7Wins,
 }
 
