@@ -282,6 +282,9 @@ pub enum ConflictResolution {
     RemoteWins,
     /// Newer timestamp wins
     NewerWins,
+    /// UUIDv7 primary key with higher embedded timestamp wins.
+    /// Falls back to NewerWins when PKs are not valid UUIDv7.
+    UuidV7Wins,
 }
 
 /// Retry configuration for D1 API calls
