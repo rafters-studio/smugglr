@@ -6,25 +6,29 @@
 
 > "Look, I ain't in this for your revolution, and I'm not in it for you, Princess. I expect to be well paid. I'm in it for the money." - Han Solo
 
-Smuggle data between SQLite and Cloudflare D1. Fast. Stateless. Questionable life choices.
+Smuggle data between SQLite databases, Cloudflare D1, and S3-compatible stores. Fast. Stateless. Encrypted. Questionable life choices.
 
 ## Status: Beta (Kessel Run Certified)
 
 Running in production at [huttspawn.com](https://huttspawn.com) since early 2026. Pluggable data source architecture. CI across Linux, macOS, and Windows. Checksummed releases with a one-line installer.
 
-Not 1.0 yet -- the API surface may still shift. But the core sync engine is solid and battle-tested, with S3-compatible relay sync for cross-machine workflows.
+Not 1.0 yet -- the API surface may still shift. But the core sync engine is solid and battle-tested, with LAN broadcast sync, S3 relay, and agent-friendly JSON output.
 
 There are [open issues](https://github.com/rafters-studio/smuggler/issues). We're shaving parsecs, not days.
 
 ## What It Does
 
-D1 is SQLite at the edge, but Cloudflare doesn't give you a way to sync your local dev database with production. Smuggler fills that gap:
+Smuggler is a universal SQLite sync engine. It started as a way to sync local dev databases with Cloudflare D1, but now handles SQLite-to-SQLite, cross-machine LAN sync, and S3 relay workflows.
 
 - **Content hashing** - SHA256 comparison of actual row data, not just timestamps
 - **Delta sync** - Only moves rows that changed
-- **Bidirectional** - Push to D1, pull from D1, or both
+- **Bidirectional** - Push, pull, or both with configurable conflict resolution
+- **LAN broadcast sync** - UDP peer discovery + encrypted delta exchange between machines on the same subnet
+- **Agent-friendly** - `--output json` across all commands, structured exit codes for programmatic callers
 - **No state files** - Fresh comparison every run, no stale state to haunt you
 - **Pluggable backends** - `DataSource` trait abstracts any database backend
+- **Watch daemon** - Background sync on a configurable interval
+- **Column exclusion** - Skip embedding BLOBs and other large columns with glob patterns
 - **Automatic retries** - Exponential backoff with configurable limits for transient D1 failures
 - **Batched writes** - Respects D1's 100-parameter bind limit, splits large upserts automatically
 - **Table validation** - `--table` input validated against live schema before any SQL runs
@@ -104,17 +108,21 @@ smuggler status      # Can we phone home?
 smuggler diff        # What's different?
 smuggler push        # Local -> D1 (YOLO)
 smuggler pull        # D1 -> Local (safer YOLO)
+smuggler sync        # Bidirectional (push + pull in one shot)
 smuggler stash       # Local -> S3 relay (cross-machine sync)
 smuggler retrieve    # S3 relay -> Local (cross-machine sync)
+smuggler watch       # Daemon mode (sync on interval)
+smuggler broadcast   # LAN sync (peer discovery + encrypted deltas)
 ```
 
 ### Options
 
 ```
--c, --config <FILE>   Config file [default: config.toml]
--v, --verbose         See what's happening under the hood
---dry-run             Coward mode (just kidding, it's smart)
---table <NAME>        Sync one table only (validated against schema)
+-c, --config <FILE>     Config file [default: config.toml]
+-v, --verbose           See what's happening under the hood
+-o, --output <FORMAT>   Output format: text or json [default: text]
+--dry-run               Coward mode (just kidding, it's smart)
+--table <NAME>          Sync one table only (validated against schema)
 ```
 
 ## How It Works
@@ -211,6 +219,46 @@ smuggler retrieve && legion reindex
 smuggler stash
 ```
 
+## LAN Broadcast Sync
+
+Smuggler can keep SQLite databases in sync across machines on the same LAN. No relay server, no cloud dependency -- just encrypted UDP broadcast for peer discovery and TCP for delta exchange.
+
+```
+Machine A                  LAN (port 31337)               Machine B
+  legion.db  --broadcast-->  [encrypted deltas]  <--broadcast--  legion.db
+```
+
+### How it works
+
+1. `smuggler broadcast` sends UDP announcements on port 31337
+2. Peers on the same subnet discover each other automatically
+3. On discovery, peers exchange deltas over TCP (only changed rows)
+4. All traffic is encrypted with XChaCha20-Poly1305 (pre-shared key)
+5. UUIDv7 primary keys prevent insert collisions across machines
+
+### Broadcast configuration
+
+```toml
+[broadcast]
+port = 31337
+interval_secs = 30
+
+# 256-bit key, hex-encoded. Generate with: openssl rand -hex 32
+# ALL broadcast traffic is encrypted when this is set.
+secret = "your-256-bit-hex-key"
+
+[sync]
+# Skip large columns (embeddings, vectors) from broadcast
+exclude_columns = ["*_embedding", "vector"]
+
+# UUIDv7 required for master-master sync
+conflict_resolution = "uuid_v7_wins"
+```
+
+### Security model
+
+Designed for **known/trusted networks** (home LAN, office LAN). The pre-shared key prevents eavesdropping and tampering on the local subnet. This is not designed for hostile networks or the open internet. If you need that, run smuggler inside a WireGuard tunnel.
+
 ## Configuration
 
 ```toml
@@ -233,8 +281,11 @@ exclude_tables = [
 # Column for timestamp ordering when content differs
 timestamp_column = "updated_at"
 
-# When both sides changed: "local_wins", "remote_wins", "newer_wins"
+# When both sides changed: "local_wins", "remote_wins", "newer_wins", "uuid_v7_wins"
 conflict_resolution = "local_wins"
+
+# Columns to exclude from sync (glob patterns)
+exclude_columns = ["*_embedding", "vector"]
 
 # Retry settings for transient D1 failures
 max_retries = 5
@@ -293,7 +344,7 @@ Check that column order and types match. NULL vs empty string will cause hash mi
 ## Development
 
 ```bash
-cargo test                       # Run the tests (55 and counting)
+cargo test                       # Run the tests (165 and counting)
 cargo fmt                        # Format code
 cargo clippy --all-targets       # Lint (including tests)
 RUST_LOG=debug cargo run -- diff # Debug output
