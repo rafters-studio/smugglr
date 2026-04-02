@@ -55,13 +55,18 @@ impl TableDiff {
             ConflictResolution::RemoteWins => {
                 // Don't push content_differs
             }
-            ConflictResolution::NewerWins => {
+            ConflictResolution::NewerWins | ConflictResolution::UuidV7Wins => {
                 if !self.content_differs.is_empty() {
                     warn!(
                         "{} row(s) in '{}' have different content but no usable timestamps -- \
-                         skipped under newer_wins. Use local_wins or remote_wins to resolve.",
+                         skipped under {}. Use local_wins or remote_wins to resolve.",
                         self.content_differs.len(),
-                        self.table
+                        self.table,
+                        if conflict_resolution == ConflictResolution::UuidV7Wins {
+                            "uuid_v7_wins"
+                        } else {
+                            "newer_wins"
+                        }
                     );
                 }
             }
@@ -83,7 +88,7 @@ impl TableDiff {
             ConflictResolution::RemoteWins => {
                 rows.extend(self.content_differs.clone());
             }
-            ConflictResolution::NewerWins => {
+            ConflictResolution::NewerWins | ConflictResolution::UuidV7Wins => {
                 // Warning already emitted in rows_to_push
             }
         }
@@ -229,4 +234,167 @@ pub async fn diff_all<A: DataSource, B: DataSource>(
     }
 
     Ok(diffs)
+}
+
+/// Extract the Unix millisecond timestamp from a UUIDv7 string.
+///
+/// UUIDv7 format: `xxxxxxxx-xxxx-7xxx-yxxx-xxxxxxxxxxxx`
+/// The first 48 bits (12 hex chars) encode Unix timestamp in milliseconds.
+/// The version nibble (position 13) must be `7`.
+///
+/// Returns `None` if the string is not a valid UUIDv7.
+#[allow(dead_code)] // Used by broadcast sync (#39)
+pub fn extract_uuidv7_timestamp(uuid_str: &str) -> Option<u64> {
+    // Strip hyphens: 32 hex chars
+    let hex: String = uuid_str.chars().filter(|c| *c != '-').collect();
+
+    if hex.len() != 32 {
+        return None;
+    }
+
+    // Check version nibble (13th hex char, index 12) == 7
+    if hex.as_bytes().get(12) != Some(&b'7') {
+        return None;
+    }
+
+    // First 12 hex chars = 48-bit timestamp in milliseconds
+    let ts_hex = &hex[..12];
+    u64::from_str_radix(ts_hex, 16).ok()
+}
+
+/// Check if a string looks like a UUIDv7.
+#[allow(dead_code)]
+pub fn is_uuidv7(s: &str) -> bool {
+    extract_uuidv7_timestamp(s).is_some()
+}
+
+/// Compare two UUIDv7 strings by their embedded timestamps.
+///
+/// Returns `Ordering::Greater` if `a` is newer than `b`.
+/// Returns `None` if either string is not a valid UUIDv7.
+#[allow(dead_code)]
+pub fn compare_uuidv7(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    let ts_a = extract_uuidv7_timestamp(a)?;
+    let ts_b = extract_uuidv7_timestamp(b)?;
+    Some(ts_a.cmp(&ts_b))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_uuidv7_timestamp_valid() {
+        // UUIDv7: 018cc6b0-c000-7000-8000-000000000000
+        // First 12 hex chars (sans hyphens): 018cc6b0c000
+        // 0x018cc6b0c000 = 1704140521472 ms
+        let uuid = "018cc6b0-c000-7000-8000-000000000000";
+        let ts = extract_uuidv7_timestamp(uuid);
+        assert_eq!(ts, Some(1704140521472));
+    }
+
+    #[test]
+    fn test_extract_uuidv7_timestamp_v4_rejected() {
+        // UUIDv4 has version nibble 4, not 7
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        assert_eq!(extract_uuidv7_timestamp(uuid), None);
+    }
+
+    #[test]
+    fn test_extract_uuidv7_timestamp_invalid_string() {
+        assert_eq!(extract_uuidv7_timestamp("not-a-uuid"), None);
+        assert_eq!(extract_uuidv7_timestamp(""), None);
+        assert_eq!(extract_uuidv7_timestamp("12345"), None);
+    }
+
+    #[test]
+    fn test_is_uuidv7() {
+        assert!(is_uuidv7("018cc6b0-c000-7000-8000-000000000000"));
+        assert!(!is_uuidv7("550e8400-e29b-41d4-a716-446655440000")); // v4
+        assert!(!is_uuidv7("12345"));
+        assert!(!is_uuidv7(""));
+    }
+
+    #[test]
+    fn test_compare_uuidv7_ordering() {
+        // Earlier timestamp
+        let earlier = "018cc6b0-c000-7000-8000-000000000000";
+        // Later timestamp (1 ms later)
+        let later = "018cc6b0-c001-7000-8000-000000000000";
+
+        assert_eq!(
+            compare_uuidv7(earlier, later),
+            Some(std::cmp::Ordering::Less)
+        );
+        assert_eq!(
+            compare_uuidv7(later, earlier),
+            Some(std::cmp::Ordering::Greater)
+        );
+        assert_eq!(
+            compare_uuidv7(earlier, earlier),
+            Some(std::cmp::Ordering::Equal)
+        );
+    }
+
+    #[test]
+    fn test_compare_uuidv7_non_uuid_returns_none() {
+        let valid = "018cc6b0-c000-7000-8000-000000000000";
+        assert_eq!(compare_uuidv7(valid, "not-uuid"), None);
+        assert_eq!(compare_uuidv7("not-uuid", valid), None);
+    }
+
+    #[test]
+    fn test_uuidv7_wins_behaves_like_newer_wins_for_content_differs() {
+        let diff = TableDiff {
+            table: "test".to_string(),
+            local_only: vec!["a".to_string()],
+            remote_only: vec!["b".to_string()],
+            local_newer: vec![],
+            remote_newer: vec![],
+            content_differs: vec!["c".to_string()],
+            identical: vec![],
+        };
+
+        // UuidV7Wins skips content_differs (like NewerWins)
+        let push = diff.rows_to_push(ConflictResolution::UuidV7Wins);
+        assert_eq!(push, vec!["a".to_string()]);
+
+        let pull = diff.rows_to_pull(ConflictResolution::UuidV7Wins);
+        assert_eq!(pull, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn test_rows_to_push_local_wins() {
+        let diff = TableDiff {
+            table: "test".to_string(),
+            local_only: vec!["a".to_string()],
+            remote_only: vec![],
+            local_newer: vec!["b".to_string()],
+            remote_newer: vec![],
+            content_differs: vec!["c".to_string()],
+            identical: vec![],
+        };
+
+        let push = diff.rows_to_push(ConflictResolution::LocalWins);
+        assert!(push.contains(&"a".to_string()));
+        assert!(push.contains(&"b".to_string()));
+        assert!(push.contains(&"c".to_string()));
+    }
+
+    #[test]
+    fn test_rows_to_push_remote_wins() {
+        let diff = TableDiff {
+            table: "test".to_string(),
+            local_only: vec!["a".to_string()],
+            remote_only: vec![],
+            local_newer: vec![],
+            remote_newer: vec![],
+            content_differs: vec!["c".to_string()],
+            identical: vec![],
+        };
+
+        let push = diff.rows_to_push(ConflictResolution::RemoteWins);
+        assert!(push.contains(&"a".to_string()));
+        assert!(!push.contains(&"c".to_string()));
+    }
 }

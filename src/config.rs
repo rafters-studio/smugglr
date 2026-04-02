@@ -210,6 +210,9 @@ pub enum ConflictResolution {
     RemoteWins,
     /// Newer timestamp wins
     NewerWins,
+    /// Compare UUIDv7 primary keys -- higher (newer) UUID wins.
+    /// Falls back to NewerWins for non-UUIDv7 primary keys.
+    UuidV7Wins,
 }
 
 /// Retry configuration for D1 API calls
