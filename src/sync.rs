@@ -4,11 +4,12 @@
 //! any pair of data sources (local<->local, local<->D1, local<->S3, etc.)
 //! to sync using the same diff-and-apply engine.
 
-use crate::config::{BatchConfig, Config, ConflictResolution};
+use crate::config::{column_excluded, BatchConfig, Config, ConflictResolution};
 use crate::datasource::DataSource;
 use crate::diff::{diff_table, TableDiff};
 use crate::error::Result;
 use indicatif::{ProgressBar, ProgressStyle};
+use std::collections::HashMap;
 use tracing::{info, warn};
 
 /// Result of a sync operation
@@ -44,16 +45,38 @@ fn progress_bar(total: u64, message: String) -> ProgressBar {
     pb
 }
 
+/// Strip excluded columns from row data before transfer.
+///
+/// Returns rows unchanged if `exclude_columns` is empty (fast path).
+fn strip_excluded_columns(
+    rows: Vec<HashMap<String, serde_json::Value>>,
+    exclude_columns: &[String],
+) -> Vec<HashMap<String, serde_json::Value>> {
+    if exclude_columns.is_empty() {
+        return rows;
+    }
+
+    rows.into_iter()
+        .map(|row| {
+            row.into_iter()
+                .filter(|(col, _)| !column_excluded(col, exclude_columns))
+                .collect()
+        })
+        .collect()
+}
+
 /// Transfer rows from one DataSource to another.
 ///
 /// Fetches rows by primary key from `source`, then upserts into `dest`
 /// in chunks (sized by `batch_config.batch_size`) with progress display.
+/// Excluded columns are stripped before upserting.
 async fn transfer_rows<Src: DataSource, Dst: DataSource>(
     source: &Src,
     dest: &Dst,
     table: &str,
     pk_values: &[String],
     batch_config: &BatchConfig,
+    exclude_columns: &[String],
     label: &str,
 ) -> Result<usize> {
     let rows = source.get_rows(table, pk_values).await?;
@@ -62,6 +85,8 @@ async fn transfer_rows<Src: DataSource, Dst: DataSource>(
         warn!("No rows found in source for {}", label);
         return Ok(0);
     }
+
+    let rows = strip_excluded_columns(rows, exclude_columns);
 
     let pb = progress_bar(rows.len() as u64, format!("{} {}", label, table));
     let mut total = 0;
@@ -77,6 +102,7 @@ async fn transfer_rows<Src: DataSource, Dst: DataSource>(
 }
 
 /// Push changes from source to destination for a single table.
+#[allow(clippy::too_many_arguments)]
 pub async fn push_table<Src: DataSource, Dst: DataSource>(
     source: &Src,
     dest: &Dst,
@@ -84,6 +110,7 @@ pub async fn push_table<Src: DataSource, Dst: DataSource>(
     diff: &TableDiff,
     conflict_resolution: ConflictResolution,
     batch_config: &BatchConfig,
+    exclude_columns: &[String],
     dry_run: bool,
 ) -> Result<SyncResult> {
     let mut result = SyncResult::new(table);
@@ -106,12 +133,21 @@ pub async fn push_table<Src: DataSource, Dst: DataSource>(
         return Ok(result);
     }
 
-    result.rows_pushed =
-        transfer_rows(source, dest, table, &rows_to_push, batch_config, "Pushing").await?;
+    result.rows_pushed = transfer_rows(
+        source,
+        dest,
+        table,
+        &rows_to_push,
+        batch_config,
+        exclude_columns,
+        "Pushing",
+    )
+    .await?;
     Ok(result)
 }
 
 /// Pull changes from source to destination for a single table.
+#[allow(clippy::too_many_arguments)]
 pub async fn pull_table<Src: DataSource, Dst: DataSource>(
     local: &Dst,
     remote: &Src,
@@ -119,6 +155,7 @@ pub async fn pull_table<Src: DataSource, Dst: DataSource>(
     diff: &TableDiff,
     conflict_resolution: ConflictResolution,
     batch_config: &BatchConfig,
+    exclude_columns: &[String],
     dry_run: bool,
 ) -> Result<SyncResult> {
     let mut result = SyncResult::new(table);
@@ -141,12 +178,21 @@ pub async fn pull_table<Src: DataSource, Dst: DataSource>(
         return Ok(result);
     }
 
-    result.rows_pulled =
-        transfer_rows(remote, local, table, &rows_to_pull, batch_config, "Pulling").await?;
+    result.rows_pulled = transfer_rows(
+        remote,
+        local,
+        table,
+        &rows_to_pull,
+        batch_config,
+        exclude_columns,
+        "Pulling",
+    )
+    .await?;
     Ok(result)
 }
 
 /// Bidirectional sync of a single table: push source->dest and pull dest->source.
+#[allow(clippy::too_many_arguments)]
 pub async fn sync_table<A: DataSource, B: DataSource>(
     a: &A,
     b: &B,
@@ -154,9 +200,10 @@ pub async fn sync_table<A: DataSource, B: DataSource>(
     timestamp_column: &str,
     conflict_resolution: ConflictResolution,
     batch_config: &BatchConfig,
+    exclude_columns: &[String],
     dry_run: bool,
 ) -> Result<SyncResult> {
-    let diff = diff_table(a, b, table, timestamp_column).await?;
+    let diff = diff_table(a, b, table, timestamp_column, exclude_columns).await?;
 
     if !diff.has_changes() {
         info!("Table {} is in sync", table);
@@ -170,6 +217,7 @@ pub async fn sync_table<A: DataSource, B: DataSource>(
         &diff,
         conflict_resolution,
         batch_config,
+        exclude_columns,
         dry_run,
     )
     .await?;
@@ -180,6 +228,7 @@ pub async fn sync_table<A: DataSource, B: DataSource>(
         &diff,
         conflict_resolution,
         batch_config,
+        exclude_columns,
         dry_run,
     )
     .await?;
@@ -259,7 +308,14 @@ pub async fn push_all<Src: DataSource, Dst: DataSource>(
     let mut results = Vec::new();
 
     for table in &tables_to_sync {
-        let diff = diff_table(source, dest, table, &config.sync.timestamp_column).await?;
+        let diff = diff_table(
+            source,
+            dest,
+            table,
+            &config.sync.timestamp_column,
+            &config.sync.exclude_columns,
+        )
+        .await?;
 
         if !diff.has_changes() {
             info!("Table {} is in sync", table);
@@ -274,6 +330,7 @@ pub async fn push_all<Src: DataSource, Dst: DataSource>(
             &diff,
             config.sync.conflict_resolution,
             &batch_config,
+            &config.sync.exclude_columns,
             dry_run,
         )
         .await?;
@@ -300,7 +357,14 @@ pub async fn pull_all<Src: DataSource, Dst: DataSource>(
     let mut results = Vec::new();
 
     for table in &tables_to_sync {
-        let diff = diff_table(local, remote, table, &config.sync.timestamp_column).await?;
+        let diff = diff_table(
+            local,
+            remote,
+            table,
+            &config.sync.timestamp_column,
+            &config.sync.exclude_columns,
+        )
+        .await?;
 
         if !diff.has_changes() {
             info!("Table {} is in sync", table);
@@ -315,6 +379,7 @@ pub async fn pull_all<Src: DataSource, Dst: DataSource>(
             &diff,
             config.sync.conflict_resolution,
             &batch_config,
+            &config.sync.exclude_columns,
             dry_run,
         )
         .await?;
@@ -348,6 +413,7 @@ pub async fn sync_all<A: DataSource, B: DataSource>(
             &config.sync.timestamp_column,
             config.sync.conflict_resolution,
             &batch_config,
+            &config.sync.exclude_columns,
             dry_run,
         )
         .await?;
@@ -355,4 +421,68 @@ pub async fn sync_all<A: DataSource, B: DataSource>(
     }
 
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_excluded_columns_stripped_from_rows() {
+        let rows = vec![
+            HashMap::from([
+                ("id".to_string(), json!(1)),
+                ("name".to_string(), json!("Alice")),
+                ("title_embedding".to_string(), json!([0.1, 0.2, 0.3])),
+                ("vector".to_string(), json!([1, 2, 3])),
+            ]),
+            HashMap::from([
+                ("id".to_string(), json!(2)),
+                ("name".to_string(), json!("Bob")),
+                ("title_embedding".to_string(), json!([0.4, 0.5, 0.6])),
+                ("vector".to_string(), json!([4, 5, 6])),
+            ]),
+        ];
+
+        let exclude = vec!["*_embedding".to_string(), "vector".to_string()];
+        let stripped = strip_excluded_columns(rows, &exclude);
+
+        assert_eq!(stripped.len(), 2);
+        for row in &stripped {
+            assert!(row.contains_key("id"));
+            assert!(row.contains_key("name"));
+            assert!(!row.contains_key("title_embedding"));
+            assert!(!row.contains_key("vector"));
+        }
+    }
+
+    #[test]
+    fn test_empty_exclusion_preserves_all_columns() {
+        let rows = vec![HashMap::from([
+            ("id".to_string(), json!(1)),
+            ("name".to_string(), json!("Alice")),
+            ("embedding".to_string(), json!([0.1, 0.2])),
+        ])];
+
+        let stripped = strip_excluded_columns(rows.clone(), &[]);
+        assert_eq!(stripped, rows);
+    }
+
+    #[test]
+    fn test_strip_with_prefix_pattern() {
+        let rows = vec![HashMap::from([
+            ("id".to_string(), json!(1)),
+            ("blob_image".to_string(), json!("base64data")),
+            ("blob_thumb".to_string(), json!("base64thumb")),
+            ("title".to_string(), json!("Photo")),
+        ])];
+
+        let exclude = vec!["blob_*".to_string()];
+        let stripped = strip_excluded_columns(rows, &exclude);
+
+        assert_eq!(stripped[0].len(), 2);
+        assert!(stripped[0].contains_key("id"));
+        assert!(stripped[0].contains_key("title"));
+    }
 }

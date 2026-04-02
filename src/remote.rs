@@ -503,6 +503,7 @@ impl DataSource for D1Client {
         &self,
         table: &str,
         timestamp_column: &str,
+        exclude_columns: &[String],
     ) -> Result<HashMap<String, RowMeta>> {
         let info = self.table_info(table).await?;
         let columns: Vec<String> = info.columns.iter().map(|c| c.name.clone()).collect();
@@ -540,12 +541,14 @@ impl DataSource for D1Client {
                 })
                 .unwrap_or_default();
 
-            // Build content hash from columns (excluding timestamp columns)
+            // Build content hash from columns (excluding timestamps and user exclusions)
             let timestamp_columns = ["updated_at", "created_at"];
             let mut hasher = Sha256::new();
             for col in &columns {
-                // Skip timestamp columns in content hash
                 if timestamp_columns.contains(&col.as_str()) {
+                    continue;
+                }
+                if crate::config::column_excluded(col, exclude_columns) {
                     continue;
                 }
                 let val = row
