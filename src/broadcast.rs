@@ -1,4 +1,4 @@
-//! LAN broadcast sync: peer discovery and delta serialization.
+//! LAN broadcast sync: peer discovery, delta serialization, and encryption.
 //!
 //! Smuggler instances on the same subnet discover each other via UDP broadcast
 //! on a configurable port (default: 31337). Each instance periodically announces
@@ -6,8 +6,14 @@
 //!
 //! The delta protocol serializes table diffs into packets for network transport,
 //! handling UDP size limits by splitting large deltas into multiple parts.
+//!
+//! When a pre-shared key is configured, all broadcast traffic is encrypted with
+//! XChaCha20-Poly1305 AEAD. Plaintext and encrypted modes are mutually exclusive.
 
 use crate::error::{Result, SyncError};
+use chacha20poly1305::aead::{Aead, NewAead};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -32,6 +38,9 @@ const PEER_TTL_MULTIPLIER: u64 = 3;
 /// Maximum size of a UDP announcement packet.
 const MAX_PACKET_SIZE: usize = 1024;
 
+/// Minimum encrypted packet size: 24-byte nonce + 16-byte Poly1305 tag.
+const ENCRYPTION_OVERHEAD: usize = 24 + 16;
+
 /// Configuration for LAN broadcast sync.
 #[derive(Debug, Clone, Deserialize)]
 pub struct BroadcastConfig {
@@ -45,6 +54,10 @@ pub struct BroadcastConfig {
 
     /// Instance identity (defaults to hostname)
     pub instance_id: Option<String>,
+
+    /// 256-bit pre-shared key, hex-encoded (64 hex chars).
+    /// When set, all broadcast traffic is encrypted with XChaCha20-Poly1305.
+    pub secret: Option<String>,
 }
 
 fn default_port() -> u16 {
@@ -61,6 +74,7 @@ impl Default for BroadcastConfig {
             port: DEFAULT_PORT,
             interval_secs: DEFAULT_INTERVAL_SECS,
             instance_id: None,
+            secret: None,
         }
     }
 }
@@ -76,6 +90,27 @@ impl BroadcastConfig {
     /// Peer TTL based on broadcast interval.
     pub fn peer_ttl(&self) -> Duration {
         Duration::from_secs(self.interval_secs * PEER_TTL_MULTIPLIER)
+    }
+
+    /// Parse the hex-encoded secret into a 256-bit key.
+    /// Returns None if no secret is configured.
+    pub fn encryption_key(&self) -> Result<Option<[u8; 32]>> {
+        match &self.secret {
+            None => Ok(None),
+            Some(hex_key) => {
+                let bytes = hex::decode(hex_key).map_err(|_| {
+                    SyncError::Config(
+                        "broadcast secret must be 64 hex characters (256-bit key)".to_string(),
+                    )
+                })?;
+                let key: [u8; 32] = bytes.try_into().map_err(|_| {
+                    SyncError::Config(
+                        "broadcast secret must be 64 hex characters (256-bit key)".to_string(),
+                    )
+                })?;
+                Ok(Some(key))
+            }
+        }
     }
 }
 
@@ -138,6 +173,86 @@ impl Announcement {
     }
 }
 
+// ---------------------------------------------------------------------------
+// XChaCha20-Poly1305 encryption
+// ---------------------------------------------------------------------------
+
+/// Encrypt a serialized packet for broadcast.
+///
+/// Wire format: `[24-byte nonce][ciphertext + 16-byte Poly1305 tag]`
+fn encrypt_packet(plaintext: &[u8], key: &[u8; 32]) -> Result<Vec<u8>> {
+    let cipher = XChaCha20Poly1305::new(key.into());
+
+    let mut nonce_bytes = [0u8; 24];
+    rand::rng().fill_bytes(&mut nonce_bytes);
+    let nonce = XNonce::from_slice(&nonce_bytes);
+
+    let ciphertext = cipher
+        .encrypt(nonce, plaintext)
+        .map_err(|_| SyncError::Broadcast("encryption failed".to_string()))?;
+
+    let mut packet = Vec::with_capacity(24 + ciphertext.len());
+    packet.extend_from_slice(&nonce_bytes);
+    packet.extend_from_slice(&ciphertext);
+    Ok(packet)
+}
+
+/// Decrypt a received packet.
+///
+/// Expects wire format: `[24-byte nonce][ciphertext + 16-byte Poly1305 tag]`
+fn decrypt_packet(data: &[u8], key: &[u8; 32]) -> Result<Vec<u8>> {
+    if data.len() < ENCRYPTION_OVERHEAD {
+        return Err(SyncError::Broadcast(format!(
+            "packet too short ({} bytes, minimum {})",
+            data.len(),
+            ENCRYPTION_OVERHEAD
+        )));
+    }
+
+    let (nonce_bytes, ciphertext) = data.split_at(24);
+    let nonce = XNonce::from_slice(nonce_bytes);
+    let cipher = XChaCha20Poly1305::new(key.into());
+
+    cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|_| SyncError::Broadcast("authentication failed".to_string()))
+}
+
+/// Wrap plaintext in an encryption envelope if a key is provided.
+pub fn maybe_encrypt(plaintext: &[u8], key: &Option<[u8; 32]>) -> Result<Vec<u8>> {
+    match key {
+        Some(k) => encrypt_packet(plaintext, k),
+        None => Ok(plaintext.to_vec()),
+    }
+}
+
+/// Unwrap a potentially encrypted packet. Returns None to signal "drop this packet".
+pub fn maybe_decrypt(data: &[u8], key: &Option<[u8; 32]>) -> Result<Option<Vec<u8>>> {
+    match key {
+        Some(k) => {
+            if data.len() < ENCRYPTION_OVERHEAD {
+                warn!(
+                    "Dropping packet: too short for encrypted mode ({} bytes)",
+                    data.len()
+                );
+                return Ok(None);
+            }
+            Ok(Some(decrypt_packet(data, k)?))
+        }
+        None => {
+            if data.first() != Some(&b'{') && data.first() != Some(&b'[') {
+                warn!("Dropping encrypted packet: no secret configured");
+                return Ok(None);
+            }
+            Ok(Some(data.to_vec()))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Peer discovery
+// ---------------------------------------------------------------------------
+
 /// Manages peer discovery via UDP subnet broadcast.
 pub struct PeerDiscovery {
     config: BroadcastConfig,
@@ -193,8 +308,6 @@ impl PeerDiscovery {
                 Ok(())
             }
             Err(e) => {
-                // Non-fatal: log and continue. Peer may still discover us
-                // via their own broadcast.
                 warn!("Broadcast send failed: {}", e);
                 Ok(())
             }
@@ -202,9 +315,6 @@ impl PeerDiscovery {
     }
 
     /// Listen for a single announcement from the network.
-    ///
-    /// Returns the parsed announcement and the sender's address,
-    /// or None if the packet was from ourselves or unparseable.
     pub async fn receive_one(&self) -> Result<Option<(Announcement, SocketAddr)>> {
         let mut buf = [0u8; MAX_PACKET_SIZE];
 
@@ -222,12 +332,10 @@ impl PeerDiscovery {
             }
         };
 
-        // Ignore our own announcements
         if announcement.instance_id == self.instance_id {
             return Ok(None);
         }
 
-        // Ignore incompatible protocol versions
         if announcement.version != PROTOCOL_VERSION {
             debug!(
                 "Ignoring peer {} with protocol version {} (ours: {})",
@@ -299,9 +407,6 @@ impl PeerDiscovery {
     }
 
     /// Run the announce-listen-prune loop for a single cycle.
-    ///
-    /// Sends an announcement, listens for responses for a short window,
-    /// prunes expired peers, and returns the current peer list.
     pub async fn discover_once(&self, listen_duration: Duration) -> Result<Vec<Peer>> {
         self.announce().await?;
 
@@ -316,14 +421,11 @@ impl PeerDiscovery {
                 Ok(Ok(Some((announcement, addr)))) => {
                     self.register_peer(&announcement, addr).await;
                 }
-                Ok(Ok(None)) => {
-                    // Own packet or unparseable, continue listening
-                }
+                Ok(Ok(None)) => {}
                 Ok(Err(e)) => {
                     warn!("Error receiving announcement: {}", e);
                 }
                 Err(_) => {
-                    // Timeout reached
                     break;
                 }
             }
@@ -367,9 +469,6 @@ fn hostname() -> Option<String> {
 }
 
 /// Compute a SHA256 hash of a database path for use in announcements.
-///
-/// We hash the path rather than sending it raw to avoid leaking filesystem
-/// structure over the network.
 pub fn hash_db_path(path: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -385,36 +484,21 @@ pub fn hash_db_path(path: &str) -> String {
 const MAX_UDP_PAYLOAD: usize = 65507;
 
 /// Conservative packet size to avoid IP fragmentation on most networks.
-/// MTU 1500 - 20 IP - 8 UDP = 1472 bytes. Use 1400 for safety.
 const SAFE_PACKET_SIZE: usize = 1400;
 
-/// A serializable delta packet for network transmission.
-///
-/// Encodes changes to a single table that can be sent over UDP.
-/// Large deltas are split into multiple packets sharing the same
-/// `seq` number with different `part` indices.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DeltaPacket {
-    /// Protocol version (for forward compatibility)
     pub version: u8,
-    /// Source instance ID
     pub source_id: String,
-    /// Monotonic sequence number (per source, for ordering and gap detection)
     pub seq: u64,
-    /// Part index for multi-part deltas (0-indexed)
     pub part: u16,
-    /// Total number of parts (1 if delta fits in a single packet)
     pub total_parts: u16,
-    /// Table name
     pub table: String,
-    /// Rows that were inserted or updated (column name -> JSON value)
     pub upserts: Vec<HashMap<String, serde_json::Value>>,
-    /// Primary key values of deleted rows
     pub deletes: Vec<String>,
 }
 
 impl DeltaPacket {
-    /// Create a single-part delta packet.
     pub fn new(source_id: String, seq: u64, table: String) -> Self {
         Self {
             version: PROTOCOL_VERSION,
@@ -428,29 +512,21 @@ impl DeltaPacket {
         }
     }
 
-    /// Serialize to JSON bytes.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         serde_json::to_vec(self)
             .map_err(|e| SyncError::Broadcast(format!("delta serialize: {}", e)))
     }
 
-    /// Deserialize from JSON bytes.
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         serde_json::from_slice(data)
             .map_err(|e| SyncError::Broadcast(format!("delta deserialize: {}", e)))
     }
 
-    /// Check if this packet has any changes.
     pub fn is_empty(&self) -> bool {
         self.upserts.is_empty() && self.deletes.is_empty()
     }
 }
 
-/// Split a large delta into multiple packets that fit within the UDP safe size.
-///
-/// Each packet gets the same `seq` and `table`, with incrementing `part` indices.
-/// Upsert rows are distributed across packets; deletes go in the first packet
-/// (they're just PK strings and are small).
 pub fn split_delta(
     source_id: &str,
     seq: u64,
@@ -458,7 +534,6 @@ pub fn split_delta(
     upserts: Vec<HashMap<String, serde_json::Value>>,
     deletes: Vec<String>,
 ) -> Result<Vec<DeltaPacket>> {
-    // Start with a single packet containing all deletes
     let mut base = DeltaPacket {
         version: PROTOCOL_VERSION,
         source_id: source_id.to_string(),
@@ -470,27 +545,23 @@ pub fn split_delta(
         deletes,
     };
 
-    // If no upserts, return the single packet (even if empty -- signals "no changes")
     if upserts.is_empty() {
         return Ok(vec![base]);
     }
 
-    // Try fitting all upserts in one packet
     base.upserts = upserts.clone();
     let serialized = base.to_bytes()?;
     if serialized.len() <= SAFE_PACKET_SIZE {
         return Ok(vec![base]);
     }
 
-    // Too large -- split upserts across multiple packets.
-    // Strategy: add rows one at a time until the packet is full, then start a new one.
     let mut packets: Vec<DeltaPacket> = Vec::new();
     let mut current = DeltaPacket {
         version: PROTOCOL_VERSION,
         source_id: source_id.to_string(),
         seq,
         part: 0,
-        total_parts: 0, // will be set at the end
+        total_parts: 0,
         table: table.to_string(),
         upserts: Vec::new(),
         deletes: base.deletes.clone(),
@@ -501,11 +572,9 @@ pub fn split_delta(
 
         let size = current.to_bytes()?.len();
         if size > SAFE_PACKET_SIZE && current.upserts.len() > 1 {
-            // Back off: remove the last row and finalize this packet
             let overflow = current.upserts.pop().unwrap();
             packets.push(current);
 
-            // Start new packet (no deletes in continuation packets)
             current = DeltaPacket {
                 version: PROTOCOL_VERSION,
                 source_id: source_id.to_string(),
@@ -519,19 +588,16 @@ pub fn split_delta(
         }
     }
 
-    // Push the last packet
     if !current.upserts.is_empty() || !current.deletes.is_empty() {
         current.part = packets.len() as u16;
         packets.push(current);
     }
 
-    // Set total_parts on all packets
     let total = packets.len() as u16;
     for p in &mut packets {
         p.total_parts = total;
     }
 
-    // Safety check: no single packet should exceed MAX_UDP_PAYLOAD
     for p in &packets {
         let size = p.to_bytes()?.len();
         if size > MAX_UDP_PAYLOAD {
@@ -545,7 +611,6 @@ pub fn split_delta(
     Ok(packets)
 }
 
-/// Manages per-table sequence numbers for delta ordering.
 #[derive(Debug, Default)]
 pub struct SequenceTracker {
     sequences: HashMap<String, u64>,
@@ -556,7 +621,6 @@ impl SequenceTracker {
         Self::default()
     }
 
-    /// Get the next sequence number for a table and increment.
     pub fn next(&mut self, table: &str) -> u64 {
         let seq = self.sequences.entry(table.to_string()).or_insert(0);
         let current = *seq;
@@ -564,15 +628,11 @@ impl SequenceTracker {
         current
     }
 
-    /// Get the current sequence number for a table (without incrementing).
     pub fn current(&self, table: &str) -> u64 {
         self.sequences.get(table).copied().unwrap_or(0)
     }
 }
 
-/// Reassemble multi-part delta packets into a single logical delta.
-///
-/// Returns `None` if not all parts have been received yet.
 pub fn reassemble_delta(parts: &[DeltaPacket]) -> Option<DeltaPacket> {
     if parts.is_empty() {
         return None;
@@ -583,19 +643,17 @@ pub fn reassemble_delta(parts: &[DeltaPacket]) -> Option<DeltaPacket> {
         return None;
     }
 
-    // Verify all parts share the same seq and table
     let seq = parts[0].seq;
     let table = &parts[0].table;
     if parts.iter().any(|p| p.seq != seq || p.table != *table) {
         return None;
     }
 
-    // Sort by part index and merge
     let mut sorted: Vec<&DeltaPacket> = parts.iter().collect();
     sorted.sort_by_key(|p| p.part);
 
     let mut merged = DeltaPacket::new(parts[0].source_id.clone(), seq, table.clone());
-    merged.total_parts = 1; // Reassembled = single logical packet
+    merged.total_parts = 1;
 
     for part in sorted {
         merged.upserts.extend(part.upserts.clone());
@@ -613,21 +671,15 @@ mod tests {
     fn test_announcement_roundtrip() {
         let original =
             Announcement::new("test-machine".to_string(), "abc123hash".to_string(), 31337);
-
         let bytes = original.to_bytes().expect("serialize");
         let decoded = Announcement::from_bytes(&bytes).expect("deserialize");
-
         assert_eq!(original, decoded);
     }
 
     #[test]
     fn test_announcement_fits_in_udp() {
-        // Worst case: long instance ID and full hash
         let announcement = Announcement::new("a".repeat(128), "f".repeat(64), 31337);
-
         let bytes = announcement.to_bytes().expect("serialize");
-        // UDP payload limit is 65507, but we want to stay well under for
-        // fragmentation avoidance. Announcement should be tiny.
         assert!(bytes.len() < MAX_PACKET_SIZE);
     }
 
@@ -642,7 +694,6 @@ mod tests {
         let h1 = hash_db_path("/home/user/legion.db");
         let h2 = hash_db_path("/home/user/legion.db");
         assert_eq!(h1, h2);
-
         let h3 = hash_db_path("/home/other/legion.db");
         assert_ne!(h1, h3);
     }
@@ -656,7 +707,6 @@ mod tests {
             last_seen: Instant::now() - Duration::from_secs(100),
             protocol_version: 1,
         };
-
         assert!(peer.is_expired(Duration::from_secs(90)));
         assert!(!peer.is_expired(Duration::from_secs(110)));
     }
@@ -667,32 +717,32 @@ mod tests {
         assert_eq!(config.port, 31337);
         assert_eq!(config.interval_secs, 30);
         assert!(config.instance_id.is_none());
+        assert!(config.secret.is_none());
         assert_eq!(config.peer_ttl(), Duration::from_secs(90));
     }
 
     #[tokio::test]
     async fn test_peer_discovery_loopback() {
-        // Two discovery instances on different ports to avoid bind conflict
         let config_a = BroadcastConfig {
-            port: 0, // OS-assigned port
+            port: 0,
             interval_secs: 1,
             instance_id: Some("machine-a".to_string()),
+            ..Default::default()
         };
         let config_b = BroadcastConfig {
             port: 0,
             interval_secs: 1,
             instance_id: Some("machine-b".to_string()),
+            ..Default::default()
         };
 
         let hash = hash_db_path("/test/legion.db");
         let discovery_a = PeerDiscovery::new(config_a, hash.clone()).await.unwrap();
         let discovery_b = PeerDiscovery::new(config_b, hash.clone()).await.unwrap();
 
-        // Get the actual bound ports
         let _port_a = discovery_a.socket.local_addr().unwrap().port();
         let port_b = discovery_b.socket.local_addr().unwrap().port();
 
-        // Manually send announcement from A to B's port
         let announcement_a = discovery_a.announcement.to_bytes().unwrap();
         let addr_b = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port_b);
         discovery_a
@@ -701,7 +751,6 @@ mod tests {
             .await
             .unwrap();
 
-        // B should receive A's announcement
         let result = tokio::time::timeout(Duration::from_secs(2), discovery_b.receive_one())
             .await
             .expect("timeout")
@@ -716,28 +765,25 @@ mod tests {
     async fn test_register_and_prune_peers() {
         let config = BroadcastConfig {
             port: 0,
-            interval_secs: 1, // 1s interval = 3s TTL
+            interval_secs: 1,
             instance_id: Some("test-host".to_string()),
+            ..Default::default()
         };
 
         let hash = hash_db_path("/test/db.sqlite");
         let discovery = PeerDiscovery::new(config, hash.clone()).await.unwrap();
 
-        // Register a peer
         let announcement = Announcement::new("remote-peer".to_string(), hash.clone(), 31337);
         let addr: SocketAddr = "192.168.1.100:31337".parse().unwrap();
         discovery.register_peer(&announcement, addr).await;
 
-        // Peer should be visible
         let peers = discovery.peers().await;
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].instance_id, "remote-peer");
 
-        // Compatible peers should include it
         let compatible = discovery.compatible_peers(&hash).await;
         assert_eq!(compatible.len(), 1);
 
-        // Incompatible hash should not match
         let incompatible = discovery.compatible_peers("different-hash").await;
         assert_eq!(incompatible.len(), 0);
     }
@@ -761,10 +807,8 @@ mod tests {
         let mut packet = DeltaPacket::new("machine-a".to_string(), 1, "users".to_string());
         packet.upserts.push(make_row("1", "Alice"));
         packet.deletes.push("2".to_string());
-
         let bytes = packet.to_bytes().expect("serialize");
         let decoded = DeltaPacket::from_bytes(&bytes).expect("deserialize");
-
         assert_eq!(packet, decoded);
     }
 
@@ -772,7 +816,6 @@ mod tests {
     fn test_delta_packet_empty() {
         let packet = DeltaPacket::new("machine-a".to_string(), 0, "users".to_string());
         assert!(packet.is_empty());
-
         let mut non_empty = packet.clone();
         non_empty.upserts.push(make_row("1", "Bob"));
         assert!(!non_empty.is_empty());
@@ -782,10 +825,8 @@ mod tests {
     fn test_split_delta_small_fits_one_packet() {
         let upserts = vec![make_row("1", "Alice"), make_row("2", "Bob")];
         let deletes = vec!["3".to_string()];
-
         let packets =
             split_delta("machine-a", 1, "users", upserts.clone(), deletes.clone()).unwrap();
-
         assert_eq!(packets.len(), 1);
         assert_eq!(packets[0].upserts.len(), 2);
         assert_eq!(packets[0].deletes.len(), 1);
@@ -795,7 +836,6 @@ mod tests {
 
     #[test]
     fn test_split_delta_large_splits() {
-        // Create rows large enough to exceed SAFE_PACKET_SIZE
         let big_value = "x".repeat(500);
         let upserts: Vec<HashMap<String, serde_json::Value>> = (0..20)
             .map(|i| {
@@ -810,22 +850,18 @@ mod tests {
             .collect();
 
         let packets = split_delta("machine-a", 5, "big_table", upserts, vec![]).unwrap();
-
         assert!(packets.len() > 1, "should split into multiple packets");
 
-        // All packets share the same seq
         for p in &packets {
             assert_eq!(p.seq, 5);
             assert_eq!(p.table, "big_table");
             assert_eq!(p.total_parts, packets.len() as u16);
         }
 
-        // Parts are sequential
         for (i, p) in packets.iter().enumerate() {
             assert_eq!(p.part, i as u16);
         }
 
-        // Each packet fits within safe size
         for p in &packets {
             let size = p.to_bytes().unwrap().len();
             assert!(
@@ -849,11 +885,9 @@ mod tests {
         let mut packet = DeltaPacket::new("machine-a".to_string(), 1, "users".to_string());
         packet.upserts.push(make_row("1", "Alice"));
         packet.total_parts = 1;
-
         let reassembled = reassemble_delta(&[packet.clone()]);
         assert!(reassembled.is_some());
-        let merged = reassembled.unwrap();
-        assert_eq!(merged.upserts.len(), 1);
+        assert_eq!(reassembled.unwrap().upserts.len(), 1);
     }
 
     #[test]
@@ -893,22 +927,17 @@ mod tests {
             upserts: vec![make_row("1", "Alice")],
             deletes: vec![],
         };
-
-        // Only 1 of 3 parts
         assert!(reassemble_delta(&[part0]).is_none());
     }
 
     #[test]
     fn test_sequence_tracker() {
         let mut tracker = SequenceTracker::new();
-
         assert_eq!(tracker.current("users"), 0);
         assert_eq!(tracker.next("users"), 0);
         assert_eq!(tracker.next("users"), 1);
         assert_eq!(tracker.next("users"), 2);
         assert_eq!(tracker.current("users"), 3);
-
-        // Different table has independent sequence
         assert_eq!(tracker.next("orders"), 0);
         assert_eq!(tracker.current("users"), 3);
     }
@@ -931,12 +960,166 @@ mod tests {
         let original_count = upserts.len();
         let packets =
             split_delta("machine-a", 7, "data", upserts, vec!["del1".to_string()]).unwrap();
-
         assert!(packets.len() > 1);
 
         let reassembled = reassemble_delta(&packets).unwrap();
         assert_eq!(reassembled.upserts.len(), original_count);
         assert_eq!(reassembled.deletes, vec!["del1".to_string()]);
         assert_eq!(reassembled.seq, 7);
+    }
+
+    // -----------------------------------------------------------------------
+    // Encryption tests
+    // -----------------------------------------------------------------------
+
+    fn test_key() -> [u8; 32] {
+        let mut key = [0u8; 32];
+        for (i, byte) in key.iter_mut().enumerate() {
+            *byte = i as u8;
+        }
+        key
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_roundtrip() {
+        let key = test_key();
+        let plaintext = b"hello smuggler broadcast";
+        let encrypted = encrypt_packet(plaintext, &key).expect("encrypt");
+        let decrypted = decrypt_packet(&encrypted, &key).expect("decrypt");
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_wrong_key_fails_authentication() {
+        let key_a = test_key();
+        let mut key_b = test_key();
+        key_b[0] = 0xFF;
+        let encrypted = encrypt_packet(b"secret data", &key_a).expect("encrypt");
+        let result = decrypt_packet(&encrypted, &key_b);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("authentication failed"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_tampered_ciphertext_fails() {
+        let key = test_key();
+        let mut encrypted = encrypt_packet(b"important data", &key).expect("encrypt");
+        encrypted[30] ^= 0xFF;
+        let result = decrypt_packet(&encrypted, &key);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("authentication failed"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_nonce_uniqueness() {
+        let key = test_key();
+        let plaintext = b"same plaintext twice";
+        let encrypted_1 = encrypt_packet(plaintext, &key).expect("encrypt 1");
+        let encrypted_2 = encrypt_packet(plaintext, &key).expect("encrypt 2");
+        assert_ne!(encrypted_1, encrypted_2);
+        assert_eq!(decrypt_packet(&encrypted_1, &key).unwrap(), plaintext);
+        assert_eq!(decrypt_packet(&encrypted_2, &key).unwrap(), plaintext);
+    }
+
+    #[test]
+    fn test_packet_too_short() {
+        let key = test_key();
+        let short_data = vec![0u8; 20];
+        let result = decrypt_packet(&short_data, &key);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("packet too short"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_maybe_encrypt_decrypt_with_key() {
+        let key = Some(test_key());
+        let plaintext = b"broadcast payload";
+        let encrypted = maybe_encrypt(plaintext, &key).expect("encrypt");
+        assert_ne!(&encrypted[..], &plaintext[..]);
+        let decrypted = maybe_decrypt(&encrypted, &key)
+            .expect("decrypt")
+            .expect("should not be dropped");
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_maybe_encrypt_decrypt_without_key() {
+        let plaintext = b"{\"version\":1}";
+        let result = maybe_encrypt(plaintext, &None).expect("passthrough");
+        assert_eq!(&result[..], &plaintext[..]);
+        let decrypted = maybe_decrypt(&result, &None)
+            .expect("passthrough")
+            .expect("should not be dropped");
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_plaintext_mode_drops_encrypted_packet() {
+        let key = test_key();
+        let encrypted = encrypt_packet(b"secret", &key).expect("encrypt");
+        let result = maybe_decrypt(&encrypted, &None).expect("should not error");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_encrypted_mode_drops_short_plaintext_packet() {
+        let key = Some(test_key());
+        let plaintext = b"{\"v\":1}";
+        let result = maybe_decrypt(plaintext, &key).expect("should not error");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_encryption_key_parsing() {
+        let config = BroadcastConfig {
+            secret: Some("a".repeat(64)),
+            ..Default::default()
+        };
+        let key = config.encryption_key().unwrap();
+        assert!(key.is_some());
+        assert_eq!(key.unwrap(), [0xAA; 32]);
+
+        let config = BroadcastConfig::default();
+        assert!(config.encryption_key().unwrap().is_none());
+
+        let config = BroadcastConfig {
+            secret: Some("not-hex".to_string()),
+            ..Default::default()
+        };
+        assert!(config.encryption_key().is_err());
+
+        let config = BroadcastConfig {
+            secret: Some("aabb".to_string()),
+            ..Default::default()
+        };
+        assert!(config.encryption_key().is_err());
+    }
+
+    #[test]
+    fn test_announcement_encrypt_decrypt_roundtrip() {
+        let key = test_key();
+        let announcement =
+            Announcement::new("test-machine".to_string(), "abc123hash".to_string(), 31337);
+        let plaintext = announcement.to_bytes().expect("serialize");
+        let encrypted = encrypt_packet(&plaintext, &key).expect("encrypt");
+        let decrypted = decrypt_packet(&encrypted, &key).expect("decrypt");
+        let decoded = Announcement::from_bytes(&decrypted).expect("deserialize");
+        assert_eq!(announcement, decoded);
+    }
+
+    #[test]
+    fn test_delta_packet_encrypt_decrypt_roundtrip() {
+        let key = test_key();
+        let mut packet = DeltaPacket::new("machine-a".to_string(), 1, "users".to_string());
+        packet.upserts.push(make_row("1", "Alice"));
+        packet.deletes.push("2".to_string());
+        let plaintext = packet.to_bytes().expect("serialize");
+        let encrypted = encrypt_packet(&plaintext, &key).expect("encrypt");
+        let decrypted = decrypt_packet(&encrypted, &key).expect("decrypt");
+        let decoded = DeltaPacket::from_bytes(&decrypted).expect("deserialize");
+        assert_eq!(packet, decoded);
     }
 }
