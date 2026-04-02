@@ -25,6 +25,8 @@
 //! - [`batch`] - Batch operations for multi-row upserts
 
 mod batch;
+#[allow(dead_code)]
+mod broadcast;
 mod config;
 mod datasource;
 mod diff;
