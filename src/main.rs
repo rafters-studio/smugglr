@@ -30,6 +30,7 @@ mod datasource;
 mod diff;
 mod error;
 mod local;
+mod output;
 mod remote;
 mod stash;
 mod sync;
@@ -40,6 +41,10 @@ use crate::config::{Config, ResolvedTarget};
 use crate::datasource::DataSource;
 use crate::diff::diff_table;
 use crate::local::LocalDb;
+use crate::output::{
+    CommandOutput, DiffOutput, ErrorOutput, OutputFormat, StatusConfig, StatusDb, StatusOutput,
+    StatusTable,
+};
 use crate::remote::D1Client;
 use crate::sync::{get_tables_to_sync, pull_all, push_all, sync_all};
 use clap::{Parser, Subcommand};
@@ -62,6 +67,10 @@ struct Cli {
     /// Enable verbose output
     #[arg(short, long)]
     verbose: bool,
+
+    /// Output format: text (default) or json
+    #[arg(short, long, default_value = "text")]
+    output: OutputFormat,
 
     #[command(subcommand)]
     command: Commands,
@@ -146,31 +155,62 @@ enum Commands {
     },
 }
 
+/// Print a JSON error and exit with the appropriate code.
+fn exit_json_error(command: &'static str, err: &error::SyncError) -> ! {
+    let out = ErrorOutput {
+        command,
+        status: "error",
+        error: err.to_string(),
+        exit_code: err.exit_code(),
+    };
+    println!("{}", serde_json::to_string(&out).unwrap());
+    std::process::exit(err.exit_code());
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    let fmt = cli.output;
 
-    // Set up logging
-    let level = if cli.verbose {
-        Level::DEBUG
-    } else {
-        Level::INFO
+    // Set up logging -- suppress tracing output in JSON mode so stdout is clean
+    let level = match fmt {
+        OutputFormat::Json => Level::WARN,
+        OutputFormat::Text if cli.verbose => Level::DEBUG,
+        OutputFormat::Text => Level::INFO,
     };
 
     let subscriber = FmtSubscriber::builder()
         .with_max_level(level)
         .with_target(false)
+        .with_writer(std::io::stderr)
         .compact()
         .finish();
 
     tracing::subscriber::set_global_default(subscriber).expect("Failed to set tracing subscriber");
 
+    // Determine command name for JSON output
+    let command_name: &'static str = match &cli.command {
+        Commands::Push { .. } => "push",
+        Commands::Pull { .. } => "pull",
+        Commands::Sync { .. } => "sync",
+        Commands::Diff { .. } => "diff",
+        Commands::Status => "status",
+        Commands::Stash { .. } => "stash",
+        Commands::Retrieve { .. } => "retrieve",
+        Commands::Watch { .. } => "watch",
+    };
+
     // Load config
     let config = match Config::load(&cli.config) {
         Ok(c) => c,
         Err(e) => {
-            error!("Failed to load config from {}: {}", cli.config.display(), e);
-            std::process::exit(1);
+            match fmt {
+                OutputFormat::Json => exit_json_error(command_name, &e),
+                OutputFormat::Text => {
+                    error!("Failed to load config from {}: {}", cli.config.display(), e)
+                }
+            }
+            std::process::exit(e.exit_code());
         }
     };
 
@@ -179,34 +219,48 @@ async fn main() {
     let target = match &cli.command {
         Commands::Stash { .. } | Commands::Retrieve { .. } => None,
         _ => Some(config.resolve_target().unwrap_or_else(|e| {
-            error!("Failed to resolve target: {}", e);
-            std::process::exit(1);
+            match fmt {
+                OutputFormat::Json => exit_json_error(command_name, &e),
+                OutputFormat::Text => error!("Failed to resolve target: {}", e),
+            }
+            std::process::exit(e.exit_code());
         })),
     };
 
     // Execute command
     let result = match cli.command {
         Commands::Push { table, dry_run } => {
-            run_push(&config, target.unwrap(), table, dry_run).await
+            run_push(&config, target.unwrap(), table, dry_run, fmt).await
         }
         Commands::Pull { table, dry_run } => {
-            run_pull(&config, target.unwrap(), table, dry_run).await
+            run_pull(&config, target.unwrap(), table, dry_run, fmt).await
         }
         Commands::Sync { table, dry_run } => {
-            run_sync(&config, target.unwrap(), table, dry_run).await
+            run_sync(&config, target.unwrap(), table, dry_run, fmt).await
         }
-        Commands::Diff { table } => run_diff(&config, target.unwrap(), table).await,
-        Commands::Status => run_status(&config, target.unwrap()).await,
-        Commands::Stash { table, dry_run } => run_stash(&config, table, dry_run).await,
-        Commands::Retrieve { table, dry_run } => run_retrieve(&config, table, dry_run).await,
+        Commands::Diff { table } => run_diff(&config, target.unwrap(), table, fmt).await,
+        Commands::Status => run_status(&config, target.unwrap(), fmt).await,
+        Commands::Stash { table, dry_run } => run_stash(&config, table, dry_run, fmt).await,
+        Commands::Retrieve { table, dry_run } => run_retrieve(&config, table, dry_run, fmt).await,
         Commands::Watch { interval, dry_run } => {
-            watch::run_watch(&config, &config_path, target.unwrap(), interval, dry_run).await
+            watch::run_watch(
+                &config,
+                &config_path,
+                target.unwrap(),
+                interval,
+                dry_run,
+                fmt,
+            )
+            .await
         }
     };
 
     if let Err(e) = result {
-        error!("Error: {}", e);
-        std::process::exit(1);
+        match fmt {
+            OutputFormat::Json => exit_json_error(command_name, &e),
+            OutputFormat::Text => error!("Error: {}", e),
+        }
+        std::process::exit(e.exit_code());
     }
 }
 
@@ -237,11 +291,12 @@ async fn run_push(
     target: ResolvedTarget,
     table: Option<String>,
     dry_run: bool,
+    fmt: OutputFormat,
 ) -> error::Result<()> {
     let local = LocalDb::open_readonly(config.local_db_path())?;
     let tables = resolve_tables(&local, table)?;
 
-    match target {
+    let results = match target {
         ResolvedTarget::D1 {
             account_id,
             database_id,
@@ -250,13 +305,21 @@ async fn run_push(
             info!("Push mode: local -> D1");
             let remote = open_d1(&account_id, &database_id, &api_token, config);
             remote.test_connection().await?;
-            let results = push_all(&local, &remote, config, tables, dry_run).await?;
-            print_summary("Push", &results, |r| r.rows_pushed, "push", dry_run);
+            push_all(&local, &remote, config, tables, dry_run).await?
         }
         ResolvedTarget::Sqlite { database } => {
             info!("Push mode: local -> SQLite ({})", database);
             let target_db = LocalDb::open(&database)?;
-            let results = push_all(&local, &target_db, config, tables, dry_run).await?;
+            push_all(&local, &target_db, config, tables, dry_run).await?
+        }
+    };
+
+    match fmt {
+        OutputFormat::Json => {
+            let out = CommandOutput::from_sync_results("push", &results, dry_run);
+            println!("{}", serde_json::to_string(&out).unwrap());
+        }
+        OutputFormat::Text => {
             print_summary("Push", &results, |r| r.rows_pushed, "push", dry_run);
         }
     }
@@ -268,11 +331,12 @@ async fn run_pull(
     target: ResolvedTarget,
     table: Option<String>,
     dry_run: bool,
+    fmt: OutputFormat,
 ) -> error::Result<()> {
     let local = LocalDb::open(config.local_db_path())?;
     let tables = resolve_tables(&local, table)?;
 
-    match target {
+    let results = match target {
         ResolvedTarget::D1 {
             account_id,
             database_id,
@@ -281,13 +345,21 @@ async fn run_pull(
             info!("Pull mode: D1 -> local");
             let remote = open_d1(&account_id, &database_id, &api_token, config);
             remote.test_connection().await?;
-            let results = pull_all(&local, &remote, config, tables, dry_run).await?;
-            print_summary("Pull", &results, |r| r.rows_pulled, "pull", dry_run);
+            pull_all(&local, &remote, config, tables, dry_run).await?
         }
         ResolvedTarget::Sqlite { database } => {
             info!("Pull mode: SQLite ({}) -> local", database);
             let source_db = LocalDb::open_readonly(&database)?;
-            let results = pull_all(&local, &source_db, config, tables, dry_run).await?;
+            pull_all(&local, &source_db, config, tables, dry_run).await?
+        }
+    };
+
+    match fmt {
+        OutputFormat::Json => {
+            let out = CommandOutput::from_sync_results("pull", &results, dry_run);
+            println!("{}", serde_json::to_string(&out).unwrap());
+        }
+        OutputFormat::Text => {
             print_summary("Pull", &results, |r| r.rows_pulled, "pull", dry_run);
         }
     }
@@ -299,6 +371,7 @@ async fn run_sync(
     target: ResolvedTarget,
     table: Option<String>,
     dry_run: bool,
+    fmt: OutputFormat,
 ) -> error::Result<()> {
     let local = LocalDb::open(config.local_db_path())?;
     let tables = resolve_tables(&local, table)?;
@@ -321,24 +394,31 @@ async fn run_sync(
         }
     };
 
-    println!("\n--- Sync Summary ---");
-    let mut total_pushed = 0;
-    let mut total_pulled = 0;
-    for result in &results {
-        if result.has_changes() {
-            println!(
-                "  {}: {} pushed, {} pulled",
-                result.table, result.rows_pushed, result.rows_pulled
-            );
-            total_pushed += result.rows_pushed;
-            total_pulled += result.rows_pulled;
+    match fmt {
+        OutputFormat::Json => {
+            let out = CommandOutput::from_sync_results("sync", &results, dry_run);
+            println!("{}", serde_json::to_string(&out).unwrap());
         }
-    }
-
-    if total_pushed == 0 && total_pulled == 0 {
-        println!("  No changes to sync");
-    } else if dry_run {
-        println!("\n  (dry run - no actual changes made)");
+        OutputFormat::Text => {
+            println!("\n--- Sync Summary ---");
+            let mut total_pushed = 0;
+            let mut total_pulled = 0;
+            for result in &results {
+                if result.has_changes() {
+                    println!(
+                        "  {}: {} pushed, {} pulled",
+                        result.table, result.rows_pushed, result.rows_pulled
+                    );
+                    total_pushed += result.rows_pushed;
+                    total_pulled += result.rows_pulled;
+                }
+            }
+            if total_pushed == 0 && total_pulled == 0 {
+                println!("  No changes to sync");
+            } else if dry_run {
+                println!("\n  (dry run - no actual changes made)");
+            }
+        }
     }
 
     Ok(())
@@ -348,6 +428,7 @@ async fn run_diff(
     config: &Config,
     target: ResolvedTarget,
     table: Option<String>,
+    fmt: OutputFormat,
 ) -> error::Result<()> {
     info!("Computing differences...");
     let local = LocalDb::open_readonly(config.local_db_path())?;
@@ -368,7 +449,7 @@ async fn run_diff(
                 }
                 None => get_tables_to_sync(&local, &remote, config).await?,
             };
-            print_diffs(&local, &remote, &tables, &config.sync.timestamp_column).await
+            output_diffs(&local, &remote, &tables, &config.sync.timestamp_column, fmt).await
         }
         ResolvedTarget::Sqlite { database } => {
             let target_db = LocalDb::open_readonly(&database)?;
@@ -380,40 +461,60 @@ async fn run_diff(
                 }
                 None => get_tables_to_sync(&local, &target_db, config).await?,
             };
-            print_diffs(&local, &target_db, &tables, &config.sync.timestamp_column).await
+            output_diffs(
+                &local,
+                &target_db,
+                &tables,
+                &config.sync.timestamp_column,
+                fmt,
+            )
+            .await
         }
     }
 }
 
-async fn print_diffs<A: DataSource, B: DataSource>(
+async fn output_diffs<A: DataSource, B: DataSource>(
     local: &A,
     remote: &B,
     tables: &[String],
     timestamp_column: &str,
+    fmt: OutputFormat,
 ) -> error::Result<()> {
-    println!("\n--- Differences ---");
-    let mut has_any_changes = false;
-
+    let mut diffs = Vec::new();
     for table_name in tables {
         let diff = diff_table(local, remote, table_name, timestamp_column).await?;
-
-        if diff.has_changes() {
-            has_any_changes = true;
-            println!("\n{}", table_name);
-            println!("  {}", diff.summary());
-
-            print_diff_category("Local only", &diff.local_only);
-            print_diff_category("Remote only", &diff.remote_only);
-            print_diff_category("Local newer", &diff.local_newer);
-            print_diff_category("Remote newer", &diff.remote_newer);
-            print_diff_category("Content differs", &diff.content_differs);
-        } else {
-            println!("\n{}: in sync ({} rows)", table_name, diff.identical.len());
-        }
+        diffs.push((table_name.clone(), diff));
     }
 
-    if !has_any_changes {
-        println!("\nAll tables are in sync!");
+    match fmt {
+        OutputFormat::Json => {
+            let out = DiffOutput::from_diffs(diffs);
+            println!("{}", serde_json::to_string(&out).unwrap());
+        }
+        OutputFormat::Text => {
+            println!("\n--- Differences ---");
+            let mut has_any_changes = false;
+
+            for (table_name, diff) in &diffs {
+                if diff.has_changes() {
+                    has_any_changes = true;
+                    println!("\n{}", table_name);
+                    println!("  {}", diff.summary());
+
+                    print_diff_category("Local only", &diff.local_only);
+                    print_diff_category("Remote only", &diff.remote_only);
+                    print_diff_category("Local newer", &diff.local_newer);
+                    print_diff_category("Remote newer", &diff.remote_newer);
+                    print_diff_category("Content differs", &diff.content_differs);
+                } else {
+                    println!("\n{}: in sync ({} rows)", table_name, diff.identical.len());
+                }
+            }
+
+            if !has_any_changes {
+                println!("\nAll tables are in sync!");
+            }
+        }
     }
 
     Ok(())
@@ -459,107 +560,195 @@ fn print_diff_category(label: &str, keys: &[String]) {
     }
 }
 
-async fn run_status(config: &Config, target: ResolvedTarget) -> error::Result<()> {
-    println!("--- Configuration ---");
-    println!("  Config file: loaded");
-    println!("  Local DB: {}", config.local_db_path());
+async fn run_status(
+    config: &Config,
+    target: ResolvedTarget,
+    fmt: OutputFormat,
+) -> error::Result<()> {
+    let target_type = match &target {
+        ResolvedTarget::D1 { .. } => "d1",
+        ResolvedTarget::Sqlite { .. } => "sqlite",
+    };
 
-    match &target {
-        ResolvedTarget::D1 {
-            account_id,
-            database_id,
-            ..
-        } => {
-            println!("  Target: D1");
-            println!(
-                "  Account ID: {}...",
-                &account_id[..8.min(account_id.len())]
-            );
-            println!(
-                "  Database ID: {}...",
-                &database_id[..8.min(database_id.len())]
-            );
-        }
-        ResolvedTarget::Sqlite { database } => {
-            println!("  Target: SQLite ({})", database);
-        }
-    }
-
-    println!("  Timestamp column: {}", config.sync.timestamp_column);
-    println!(
-        "  Conflict resolution: {:?}",
-        config.sync.conflict_resolution
-    );
-
-    if !config.sync.tables.is_empty() {
-        println!("  Tables (explicit): {}", config.sync.tables.join(", "));
-    }
-    if !config.sync.exclude_tables.is_empty() {
-        println!(
-            "  Excluded tables: {}",
-            config.sync.exclude_tables.join(", ")
-        );
-    }
-
-    // Test local connection
-    println!("\n--- Local Database ---");
-    match LocalDb::open_readonly(config.local_db_path()) {
+    // Gather local DB info
+    let local_status = match LocalDb::open_readonly(config.local_db_path()) {
         Ok(local) => {
-            println!("  Connection: OK");
             let tables = local.list_tables().await?;
-            println!("  Tables: {}", tables.len());
-
+            let mut table_rows = Vec::new();
             for table in &tables {
                 if config.should_sync_table(table) {
                     let count = local.row_count(table).await?;
-                    println!("    {}: {} rows", table, count);
+                    table_rows.push(StatusTable {
+                        name: table.clone(),
+                        rows: count,
+                    });
                 }
             }
+            StatusDb {
+                connected: true,
+                error: None,
+                tables: table_rows,
+            }
         }
-        Err(e) => {
-            println!("  Connection: FAILED - {}", e);
-        }
-    }
+        Err(e) => StatusDb {
+            connected: false,
+            error: Some(e.to_string()),
+            tables: vec![],
+        },
+    };
 
-    // Test target connection
-    match target {
+    // Gather target info
+    let target_status = match &target {
         ResolvedTarget::D1 {
             account_id,
             database_id,
             api_token,
         } => {
-            println!("\n--- Remote D1 ---");
-            let remote = open_d1(&account_id, &database_id, &api_token, config);
+            let remote = open_d1(account_id, database_id, api_token, config);
             match remote.test_connection().await {
                 Ok(()) => {
-                    println!("  Connection: OK");
                     let tables = remote.list_tables().await?;
-                    println!("  Tables: {}", tables.len());
+                    let mut table_rows = Vec::new();
                     for table in &tables {
                         if config.should_sync_table(table) {
                             let count = remote.row_count(table).await?;
-                            println!("    {}: {} rows", table, count);
+                            table_rows.push(StatusTable {
+                                name: table.clone(),
+                                rows: count,
+                            });
                         }
                     }
+                    StatusDb {
+                        connected: true,
+                        error: None,
+                        tables: table_rows,
+                    }
                 }
-                Err(e) => println!("  Connection: FAILED - {}", e),
+                Err(e) => StatusDb {
+                    connected: false,
+                    error: Some(e.to_string()),
+                    tables: vec![],
+                },
             }
         }
-        ResolvedTarget::Sqlite { database } => {
-            println!("\n--- Target SQLite ---");
-            match LocalDb::open_readonly(&database) {
-                Ok(target_db) => {
-                    println!("  Connection: OK");
-                    let tables = target_db.list_tables().await?;
-                    println!("  Tables: {}", tables.len());
-                    for table in &tables {
-                        if config.should_sync_table(table) {
-                            let count = target_db.row_count(table).await?;
-                            println!("    {}: {} rows", table, count);
-                        }
+        ResolvedTarget::Sqlite { database } => match LocalDb::open_readonly(database) {
+            Ok(target_db) => {
+                let tables = target_db.list_tables().await?;
+                let mut table_rows = Vec::new();
+                for table in &tables {
+                    if config.should_sync_table(table) {
+                        let count = target_db.row_count(table).await?;
+                        table_rows.push(StatusTable {
+                            name: table.clone(),
+                            rows: count,
+                        });
                     }
                 }
-                Err(e) => println!("  Connection: FAILED - {}", e),
+                StatusDb {
+                    connected: true,
+                    error: None,
+                    tables: table_rows,
+                }
+            }
+            Err(e) => StatusDb {
+                connected: false,
+                error: Some(e.to_string()),
+                tables: vec![],
+            },
+        },
+    };
+
+    match fmt {
+        OutputFormat::Json => {
+            let out = StatusOutput {
+                command: "status",
+                status: "ok",
+                config: StatusConfig {
+                    local_db: config.local_db_path().to_string(),
+                    target_type: target_type.to_string(),
+                    timestamp_column: config.sync.timestamp_column.clone(),
+                    conflict_resolution: format!("{:?}", config.sync.conflict_resolution),
+                    tables: config.sync.tables.clone(),
+                    exclude_tables: config.sync.exclude_tables.clone(),
+                },
+                local: local_status,
+                target: target_status,
+            };
+            println!("{}", serde_json::to_string(&out).unwrap());
+        }
+        OutputFormat::Text => {
+            println!("--- Configuration ---");
+            println!("  Config file: loaded");
+            println!("  Local DB: {}", config.local_db_path());
+
+            match &target {
+                ResolvedTarget::D1 {
+                    account_id,
+                    database_id,
+                    ..
+                } => {
+                    println!("  Target: D1");
+                    println!(
+                        "  Account ID: {}...",
+                        &account_id[..8.min(account_id.len())]
+                    );
+                    println!(
+                        "  Database ID: {}...",
+                        &database_id[..8.min(database_id.len())]
+                    );
+                }
+                ResolvedTarget::Sqlite { database } => {
+                    println!("  Target: SQLite ({})", database);
+                }
+            }
+
+            println!("  Timestamp column: {}", config.sync.timestamp_column);
+            println!(
+                "  Conflict resolution: {:?}",
+                config.sync.conflict_resolution
+            );
+
+            if !config.sync.tables.is_empty() {
+                println!("  Tables (explicit): {}", config.sync.tables.join(", "));
+            }
+            if !config.sync.exclude_tables.is_empty() {
+                println!(
+                    "  Excluded tables: {}",
+                    config.sync.exclude_tables.join(", ")
+                );
+            }
+
+            // Local DB
+            println!("\n--- Local Database ---");
+            if local_status.connected {
+                println!("  Connection: OK");
+                println!("  Tables: {}", local_status.tables.len());
+                for t in &local_status.tables {
+                    println!("    {}: {} rows", t.name, t.rows);
+                }
+            } else {
+                println!(
+                    "  Connection: FAILED - {}",
+                    local_status.error.as_deref().unwrap_or("unknown")
+                );
+            }
+
+            // Target
+            match &target {
+                ResolvedTarget::D1 { .. } => println!("\n--- Remote D1 ---"),
+                ResolvedTarget::Sqlite { .. } => println!("\n--- Target SQLite ---"),
+            }
+            if target_status.connected {
+                println!("  Connection: OK");
+                println!("  Tables: {}", target_status.tables.len());
+                for t in &target_status.tables {
+                    println!("    {}: {} rows", t.name, t.rows);
+                }
+            } else {
+                println!(
+                    "  Connection: FAILED - {}",
+                    target_status.error.as_deref().unwrap_or("unknown")
+                );
             }
         }
     }
@@ -574,7 +763,12 @@ fn require_stash_config(config: &Config) -> error::Result<&config::StashConfig> 
         .ok_or_else(|| error::SyncError::Config("No [stash] section in config".into()))
 }
 
-async fn run_stash(config: &Config, table: Option<String>, dry_run: bool) -> error::Result<()> {
+async fn run_stash(
+    config: &Config,
+    table: Option<String>,
+    dry_run: bool,
+    fmt: OutputFormat,
+) -> error::Result<()> {
     let stash_config = require_stash_config(config)?;
     info!("Stash mode: local -> S3 relay");
 
@@ -589,11 +783,24 @@ async fn run_stash(config: &Config, table: Option<String>, dry_run: bool) -> err
     )
     .await?;
 
-    print_summary("Stash", &results, |r| r.rows_pushed, "stash", dry_run);
+    match fmt {
+        OutputFormat::Json => {
+            let out = CommandOutput::from_sync_results("stash", &results, dry_run);
+            println!("{}", serde_json::to_string(&out).unwrap());
+        }
+        OutputFormat::Text => {
+            print_summary("Stash", &results, |r| r.rows_pushed, "stash", dry_run);
+        }
+    }
     Ok(())
 }
 
-async fn run_retrieve(config: &Config, table: Option<String>, dry_run: bool) -> error::Result<()> {
+async fn run_retrieve(
+    config: &Config,
+    table: Option<String>,
+    dry_run: bool,
+    fmt: OutputFormat,
+) -> error::Result<()> {
     let stash_config = require_stash_config(config)?;
     info!("Retrieve mode: S3 relay -> local");
 
@@ -608,6 +815,14 @@ async fn run_retrieve(config: &Config, table: Option<String>, dry_run: bool) -> 
     )
     .await?;
 
-    print_summary("Retrieve", &results, |r| r.rows_pulled, "retrieve", dry_run);
+    match fmt {
+        OutputFormat::Json => {
+            let out = CommandOutput::from_sync_results("retrieve", &results, dry_run);
+            println!("{}", serde_json::to_string(&out).unwrap());
+        }
+        OutputFormat::Text => {
+            print_summary("Retrieve", &results, |r| r.rows_pulled, "retrieve", dry_run);
+        }
+    }
     Ok(())
 }

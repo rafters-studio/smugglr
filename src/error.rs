@@ -121,6 +121,40 @@ impl SyncError {
     }
 }
 
+impl SyncError {
+    /// Map error variants to structured exit codes for agent consumption.
+    ///
+    /// - 0: success (not an error)
+    /// - 1: general/unknown error
+    /// - 2: configuration error (don't retry, fix config)
+    /// - 3: connection/network error (transient, safe to retry)
+    /// - 4: conflict error (needs human decision)
+    /// - 5: target not found (database missing, API unreachable)
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            SyncError::Config(_) | SyncError::ConfigNotFound(_) => 2,
+            SyncError::InvalidTableName { .. } | SyncError::NoPrimaryKey(_) => 2,
+            SyncError::ParamLimitExceeded { .. } => 2,
+
+            SyncError::Http(_)
+            | SyncError::RateLimited { .. }
+            | SyncError::ServerError { .. }
+            | SyncError::ConnectionTimeout
+            | SyncError::RetryExhausted { .. } => 3,
+
+            SyncError::ConcurrentWrite => 4,
+
+            SyncError::TableNotFound(_)
+            | SyncError::RelayNotFound(_)
+            | SyncError::InvalidUrl(_) => 5,
+
+            SyncError::D1Api { .. } | SyncError::BadRequest { .. } => 5,
+
+            _ => 1,
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, SyncError>;
 
 #[cfg(test)]
@@ -207,5 +241,92 @@ mod tests {
         let msg = format!("{}", err);
         assert!(msg.contains("5 attempts"));
         assert!(msg.contains("503"));
+    }
+
+    #[test]
+    fn test_exit_code_config_errors() {
+        assert_eq!(SyncError::Config("bad".into()).exit_code(), 2);
+        assert_eq!(SyncError::ConfigNotFound("x".into()).exit_code(), 2);
+        assert_eq!(
+            SyncError::InvalidTableName {
+                name: "x".into(),
+                available: "a, b".into()
+            }
+            .exit_code(),
+            2
+        );
+        assert_eq!(SyncError::NoPrimaryKey("t".into()).exit_code(), 2);
+        assert_eq!(
+            SyncError::ParamLimitExceeded {
+                table: "t".into(),
+                row_count: 1,
+                col_count: 100,
+                limit: 50
+            }
+            .exit_code(),
+            2
+        );
+    }
+
+    #[test]
+    fn test_exit_code_network_errors() {
+        assert_eq!(
+            SyncError::RateLimited {
+                retry_after: Some(30)
+            }
+            .exit_code(),
+            3
+        );
+        assert_eq!(
+            SyncError::ServerError {
+                status: 503,
+                message: "down".into()
+            }
+            .exit_code(),
+            3
+        );
+        assert_eq!(SyncError::ConnectionTimeout.exit_code(), 3);
+        assert_eq!(
+            SyncError::RetryExhausted {
+                attempts: 5,
+                last_error: "err".into()
+            }
+            .exit_code(),
+            3
+        );
+    }
+
+    #[test]
+    fn test_exit_code_conflict() {
+        assert_eq!(SyncError::ConcurrentWrite.exit_code(), 4);
+    }
+
+    #[test]
+    fn test_exit_code_not_found() {
+        assert_eq!(SyncError::TableNotFound("t".into()).exit_code(), 5);
+        assert_eq!(SyncError::RelayNotFound("r".into()).exit_code(), 5);
+        assert_eq!(SyncError::InvalidUrl("u".into()).exit_code(), 5);
+        assert_eq!(
+            SyncError::D1Api {
+                message: "err".into(),
+                code: None
+            }
+            .exit_code(),
+            5
+        );
+        assert_eq!(
+            SyncError::BadRequest {
+                status: 400,
+                message: "bad".into()
+            }
+            .exit_code(),
+            5
+        );
+    }
+
+    #[test]
+    fn test_exit_code_general() {
+        assert_eq!(SyncError::Remote("err".into()).exit_code(), 1);
+        assert_eq!(SyncError::Stash("err".into()).exit_code(), 1);
     }
 }
