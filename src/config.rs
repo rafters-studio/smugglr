@@ -23,6 +23,9 @@ pub struct Config {
 
     /// Target database configuration (sqlite or d1)
     pub target: Option<TargetConfig>,
+
+    /// LAN broadcast sync configuration
+    pub broadcast: Option<crate::broadcast::BroadcastConfig>,
 }
 
 /// Target database configuration
@@ -494,6 +497,7 @@ mod tests {
             sync: SyncConfig::default(),
             stash: None,
             target: None,
+            broadcast: None,
         }
     }
 
@@ -508,6 +512,7 @@ mod tests {
             target: Some(TargetConfig::Sqlite {
                 database: "backup.db".into(),
             }),
+            broadcast: None,
         }
     }
 
@@ -561,6 +566,7 @@ mod tests {
                 database_id: "db".into(),
                 api_token: "tok".into(),
             }),
+            broadcast: None,
         };
         let target = config.resolve_target().unwrap();
         assert!(matches!(target, ResolvedTarget::D1 { .. }));
@@ -578,6 +584,7 @@ mod tests {
             target: Some(TargetConfig::Sqlite {
                 database: "backup.db".into(),
             }),
+            broadcast: None,
         };
         let target = config.resolve_target().unwrap();
         assert!(matches!(target, ResolvedTarget::Sqlite { .. }));
@@ -593,6 +600,7 @@ mod tests {
             sync: SyncConfig::default(),
             stash: None,
             target: None,
+            broadcast: None,
         };
         assert!(config.resolve_target().is_err());
     }

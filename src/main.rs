@@ -25,7 +25,6 @@
 //! - [`batch`] - Batch operations for multi-row upserts
 
 mod batch;
-#[allow(dead_code)]
 mod broadcast;
 mod config;
 mod datasource;
@@ -155,6 +154,25 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// LAN broadcast sync with peer discovery
+    Broadcast {
+        /// Override broadcast port
+        #[arg(short = 'p', long)]
+        port: Option<u16>,
+
+        /// Sync interval in seconds
+        #[arg(short, long)]
+        interval: Option<u64>,
+
+        /// Run a single sync cycle and exit
+        #[arg(long)]
+        once: bool,
+
+        /// Show what would sync without applying
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// Print a JSON error and exit with the appropriate code.
@@ -216,10 +234,10 @@ async fn main() {
         }
     };
 
-    // Resolve target once upfront (stash/retrieve don't need it)
+    // Resolve target once upfront (stash/retrieve/broadcast don't need it)
     let config_path = cli.config.clone();
     let target = match &cli.command {
-        Commands::Stash { .. } | Commands::Retrieve { .. } => None,
+        Commands::Stash { .. } | Commands::Retrieve { .. } | Commands::Broadcast { .. } => None,
         _ => Some(config.resolve_target().unwrap_or_else(|e| {
             match fmt {
                 OutputFormat::Json => exit_json_error(command_name, &e),
@@ -254,6 +272,24 @@ async fn main() {
                 fmt,
             )
             .await
+        }
+        Commands::Broadcast {
+            port,
+            interval,
+            once,
+            dry_run,
+        } => {
+            let mut bc = config
+                .broadcast
+                .clone()
+                .unwrap_or_else(broadcast::BroadcastConfig::default);
+            if let Some(p) = port {
+                bc.port = p;
+            }
+            if let Some(i) = interval {
+                bc.interval_secs = i;
+            }
+            broadcast::run_broadcast(&config, &config_path, &bc, once, dry_run).await
         }
     };
 

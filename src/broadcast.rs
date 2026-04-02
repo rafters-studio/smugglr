@@ -57,6 +57,7 @@ pub struct BroadcastConfig {
 
     /// 256-bit pre-shared key, hex-encoded (64 hex chars).
     /// When set, all broadcast traffic is encrypted with XChaCha20-Poly1305.
+    #[allow(dead_code)] // Will be used when encryption is integrated into TCP framing
     pub secret: Option<String>,
 }
 
@@ -94,6 +95,7 @@ impl BroadcastConfig {
 
     /// Parse the hex-encoded secret into a 256-bit key.
     /// Returns None if no secret is configured.
+    #[allow(dead_code)] // Will be used when encryption is integrated into TCP framing
     pub fn encryption_key(&self) -> Result<Option<[u8; 32]>> {
         match &self.secret {
             None => Ok(None),
@@ -126,6 +128,7 @@ pub struct Peer {
     /// When we last heard from this peer
     pub last_seen: Instant,
     /// Protocol version the peer is running
+    #[allow(dead_code)]
     pub protocol_version: u8,
 }
 
@@ -180,6 +183,7 @@ impl Announcement {
 /// Encrypt a serialized packet for broadcast.
 ///
 /// Wire format: `[24-byte nonce][ciphertext + 16-byte Poly1305 tag]`
+#[allow(dead_code)] // Used by tests; will be used by TCP framing when encryption lands
 fn encrypt_packet(plaintext: &[u8], key: &[u8; 32]) -> Result<Vec<u8>> {
     let cipher = XChaCha20Poly1305::new(key.into());
 
@@ -200,6 +204,7 @@ fn encrypt_packet(plaintext: &[u8], key: &[u8; 32]) -> Result<Vec<u8>> {
 /// Decrypt a received packet.
 ///
 /// Expects wire format: `[24-byte nonce][ciphertext + 16-byte Poly1305 tag]`
+#[allow(dead_code)]
 fn decrypt_packet(data: &[u8], key: &[u8; 32]) -> Result<Vec<u8>> {
     if data.len() < ENCRYPTION_OVERHEAD {
         return Err(SyncError::Broadcast(format!(
@@ -219,6 +224,7 @@ fn decrypt_packet(data: &[u8], key: &[u8; 32]) -> Result<Vec<u8>> {
 }
 
 /// Wrap plaintext in an encryption envelope if a key is provided.
+#[allow(dead_code)]
 pub fn maybe_encrypt(plaintext: &[u8], key: &Option<[u8; 32]>) -> Result<Vec<u8>> {
     match key {
         Some(k) => encrypt_packet(plaintext, k),
@@ -227,6 +233,7 @@ pub fn maybe_encrypt(plaintext: &[u8], key: &Option<[u8; 32]>) -> Result<Vec<u8>
 }
 
 /// Unwrap a potentially encrypted packet. Returns None to signal "drop this packet".
+#[allow(dead_code)]
 pub fn maybe_decrypt(data: &[u8], key: &Option<[u8; 32]>) -> Result<Option<Vec<u8>>> {
     match key {
         Some(k) => {
@@ -396,6 +403,7 @@ impl PeerDiscovery {
     }
 
     /// Get peers that share the same database path hash (compatible for sync).
+    #[allow(dead_code)]
     pub async fn compatible_peers(&self, db_path_hash: &str) -> Vec<Peer> {
         self.peers
             .read()
@@ -436,11 +444,13 @@ impl PeerDiscovery {
     }
 
     /// Get a shared handle to the peer table for use from other tasks.
+    #[allow(dead_code)]
     pub fn peer_table(&self) -> Arc<RwLock<HashMap<String, Peer>>> {
         Arc::clone(&self.peers)
     }
 
     /// The instance ID of this discovery instance.
+    #[allow(dead_code)]
     pub fn instance_id(&self) -> &str {
         &self.instance_id
     }
@@ -498,6 +508,7 @@ pub struct DeltaPacket {
     pub deletes: Vec<String>,
 }
 
+#[allow(dead_code)]
 impl DeltaPacket {
     pub fn new(source_id: String, seq: u64, table: String) -> Self {
         Self {
@@ -628,11 +639,13 @@ impl SequenceTracker {
         current
     }
 
+    #[allow(dead_code)]
     pub fn current(&self, table: &str) -> u64 {
         self.sequences.get(table).copied().unwrap_or(0)
     }
 }
 
+#[allow(dead_code)]
 pub fn reassemble_delta(parts: &[DeltaPacket]) -> Option<DeltaPacket> {
     if parts.is_empty() {
         return None;
@@ -661,6 +674,599 @@ pub fn reassemble_delta(parts: &[DeltaPacket]) -> Option<DeltaPacket> {
     }
 
     Some(merged)
+}
+
+// ---------------------------------------------------------------------------
+// TCP sync protocol
+// ---------------------------------------------------------------------------
+
+/// A sync request sent over TCP from one peer to another.
+///
+/// Contains the requester's instance identity, the database path hash for
+/// verification, and per-table row hashes so the responder can compute
+/// what the requester is missing.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SyncRequest {
+    pub instance_id: String,
+    pub db_path_hash: String,
+    pub tables: Vec<TableSyncRequest>,
+}
+
+/// Per-table portion of a sync request.
+///
+/// `row_hashes` maps primary_key -> content_hash for every row the
+/// requester currently has. The responder diffs against its own data
+/// to determine what to send back.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TableSyncRequest {
+    pub table: String,
+    /// Map of primary_key -> content_hash for all rows the requester has
+    pub row_hashes: HashMap<String, String>,
+}
+
+/// Response to a sync request, containing deltas and want-lists.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SyncResponse {
+    pub instance_id: String,
+    /// Delta packets containing rows the requester is missing or that are newer
+    pub deltas: Vec<DeltaPacket>,
+    /// Rows the requester has that the responder wants (their PKs by table)
+    pub want_rows: Vec<TableWantRows>,
+}
+
+/// Rows the responder wants from the requester, grouped by table.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TableWantRows {
+    pub table: String,
+    pub pk_values: Vec<String>,
+}
+
+/// Write a length-prefixed JSON message to a TCP stream.
+///
+/// Wire format: [4-byte big-endian length][JSON payload]
+async fn write_framed<T: Serialize>(
+    stream: &mut tokio::net::tcp::OwnedWriteHalf,
+    msg: &T,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let payload = serde_json::to_vec(msg)
+        .map_err(|e| SyncError::Broadcast(format!("serialize frame: {}", e)))?;
+    let len = payload.len() as u32;
+    stream
+        .write_all(&len.to_be_bytes())
+        .await
+        .map_err(|e| SyncError::Broadcast(format!("write frame length: {}", e)))?;
+    stream
+        .write_all(&payload)
+        .await
+        .map_err(|e| SyncError::Broadcast(format!("write frame payload: {}", e)))?;
+    Ok(())
+}
+
+/// Read a length-prefixed JSON message from a TCP stream.
+///
+/// Wire format: [4-byte big-endian length][JSON payload]
+async fn read_framed<T: serde::de::DeserializeOwned>(
+    stream: &mut tokio::net::tcp::OwnedReadHalf,
+) -> Result<T> {
+    use tokio::io::AsyncReadExt;
+
+    let mut len_buf = [0u8; 4];
+    stream
+        .read_exact(&mut len_buf)
+        .await
+        .map_err(|e| SyncError::Broadcast(format!("read frame length: {}", e)))?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+
+    if len > 64 * 1024 * 1024 {
+        return Err(SyncError::Broadcast(format!(
+            "frame too large: {} bytes (max 64MB)",
+            len
+        )));
+    }
+
+    let mut buf = vec![0u8; len];
+    stream
+        .read_exact(&mut buf)
+        .await
+        .map_err(|e| SyncError::Broadcast(format!("read frame payload: {}", e)))?;
+
+    serde_json::from_slice(&buf)
+        .map_err(|e| SyncError::Broadcast(format!("deserialize frame: {}", e)))
+}
+
+/// Handle a single inbound TCP sync connection (server side).
+///
+/// Reads a SyncRequest, diffs against local data, and sends back a
+/// SyncResponse with delta packets for rows the requester needs.
+async fn handle_sync_connection(
+    stream: tokio::net::TcpStream,
+    config: &crate::config::Config,
+    broadcast_config: &BroadcastConfig,
+    db_path_hash: &str,
+) -> Result<()> {
+    use crate::datasource::DataSource;
+    use crate::local::LocalDb;
+
+    let peer_addr = stream
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+
+    let (mut read_half, mut write_half) = stream.into_split();
+
+    let request: SyncRequest = read_framed(&mut read_half).await?;
+    debug!(
+        "Sync request from {} (instance: {})",
+        peer_addr, request.instance_id
+    );
+
+    // Verify db_path_hash matches
+    if request.db_path_hash != db_path_hash {
+        warn!(
+            "Rejecting sync from {}: db_path_hash mismatch (theirs={}, ours={})",
+            peer_addr,
+            &request.db_path_hash[..8.min(request.db_path_hash.len())],
+            &db_path_hash[..8.min(db_path_hash.len())]
+        );
+        let response = SyncResponse {
+            instance_id: broadcast_config.resolve_instance_id(),
+            deltas: Vec::new(),
+            want_rows: Vec::new(),
+        };
+        write_framed(&mut write_half, &response).await?;
+        return Ok(());
+    }
+
+    let local = LocalDb::open(config.local_db_path())?;
+
+    let mut deltas: Vec<DeltaPacket> = Vec::new();
+    let mut want_rows: Vec<TableWantRows> = Vec::new();
+    let instance_id = broadcast_config.resolve_instance_id();
+    let mut seq_tracker = SequenceTracker::new();
+
+    for table_req in &request.tables {
+        if !config.should_sync_table(&table_req.table) {
+            debug!("Skipping excluded table: {}", table_req.table);
+            continue;
+        }
+
+        // Get our local row metadata
+        let local_meta = match local
+            .get_row_metadata(
+                &table_req.table,
+                &config.sync.timestamp_column,
+                &config.sync.exclude_columns,
+            )
+            .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(
+                    "Failed to get metadata for table {}: {}",
+                    table_req.table, e
+                );
+                continue;
+            }
+        };
+
+        // Find rows the requester is missing or has stale versions of
+        let mut missing_pks: Vec<String> = Vec::new();
+        for (pk, meta) in &local_meta {
+            match table_req.row_hashes.get(pk) {
+                None => missing_pks.push(pk.clone()),
+                Some(their_hash) => {
+                    if *their_hash != meta.content_hash {
+                        missing_pks.push(pk.clone());
+                    }
+                }
+            }
+        }
+
+        // Find rows the requester has that we don't (we want these)
+        let mut wanted_pks: Vec<String> = Vec::new();
+        for (pk, their_hash) in &table_req.row_hashes {
+            match local_meta.get(pk) {
+                None => wanted_pks.push(pk.clone()),
+                Some(our_meta) => {
+                    if *their_hash != our_meta.content_hash {
+                        // They have a different version; we already send ours above,
+                        // but also request theirs so the requester can send them back
+                        wanted_pks.push(pk.clone());
+                    }
+                }
+            }
+        }
+
+        // Fetch and pack rows we need to send
+        if !missing_pks.is_empty() {
+            let rows = local.get_rows(&table_req.table, &missing_pks).await?;
+            if !rows.is_empty() {
+                let seq = seq_tracker.next(&table_req.table);
+                let packets = split_delta(&instance_id, seq, &table_req.table, rows, Vec::new())?;
+                deltas.extend(packets);
+            }
+        }
+
+        if !wanted_pks.is_empty() {
+            want_rows.push(TableWantRows {
+                table: table_req.table.clone(),
+                pk_values: wanted_pks,
+            });
+        }
+    }
+
+    let response = SyncResponse {
+        instance_id: instance_id.clone(),
+        deltas,
+        want_rows,
+    };
+
+    let has_want_rows = !response.want_rows.is_empty();
+    write_framed(&mut write_half, &response).await?;
+    debug!("Sync response sent to {}", peer_addr);
+
+    // Read follow-up deltas the client sends in response to our want_rows
+    if has_want_rows {
+        while let Ok(Ok(delta)) = tokio::time::timeout(
+            Duration::from_secs(10),
+            read_framed::<DeltaPacket>(&mut read_half),
+        )
+        .await
+        {
+            if delta.is_empty() {
+                continue;
+            }
+            match local.upsert_rows(&delta.table, &delta.upserts).await {
+                Ok(count) => {
+                    debug!(
+                        "Applied {} follow-up rows to '{}' from {}",
+                        count, delta.table, peer_addr
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to apply follow-up delta for '{}': {}",
+                        delta.table, e
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Broadcast orchestration
+// ---------------------------------------------------------------------------
+
+/// Results from a single broadcast sync cycle.
+pub struct BroadcastResult {
+    pub peers_discovered: usize,
+    pub peers_synced: usize,
+    pub tables_synced: usize,
+    pub rows_sent: usize,
+    pub rows_received: usize,
+}
+
+/// Run a single broadcast sync cycle: discover peers, connect, exchange deltas.
+pub async fn run_broadcast_once(
+    config: &crate::config::Config,
+    broadcast_config: &BroadcastConfig,
+) -> Result<BroadcastResult> {
+    use crate::datasource::DataSource;
+    use crate::local::LocalDb;
+
+    let db_path_hash = hash_db_path(config.local_db_path());
+    let instance_id = broadcast_config.resolve_instance_id();
+
+    // Discover peers
+    let discovery = PeerDiscovery::new(broadcast_config.clone(), db_path_hash.clone()).await?;
+    let listen_duration = Duration::from_secs(broadcast_config.interval_secs.min(5));
+    let all_peers = discovery.discover_once(listen_duration).await?;
+
+    let compatible: Vec<&Peer> = all_peers
+        .iter()
+        .filter(|p| p.db_path_hash == db_path_hash)
+        .collect();
+
+    let mut result = BroadcastResult {
+        peers_discovered: compatible.len(),
+        peers_synced: 0,
+        tables_synced: 0,
+        rows_sent: 0,
+        rows_received: 0,
+    };
+
+    if compatible.is_empty() {
+        debug!("No compatible peers found");
+        return Ok(result);
+    }
+
+    info!("Found {} compatible peer(s)", compatible.len());
+
+    let local = LocalDb::open(config.local_db_path())?;
+
+    // Build our row hashes for all syncable tables
+    let all_tables = local.list_tables().await?;
+    let syncable_tables: Vec<String> = all_tables
+        .into_iter()
+        .filter(|t| config.should_sync_table(t))
+        .collect();
+
+    let mut table_requests: Vec<TableSyncRequest> = Vec::new();
+    for table in &syncable_tables {
+        let meta = local
+            .get_row_metadata(
+                table,
+                &config.sync.timestamp_column,
+                &config.sync.exclude_columns,
+            )
+            .await?;
+        let row_hashes: HashMap<String, String> = meta
+            .into_iter()
+            .map(|(pk, m)| (pk, m.content_hash))
+            .collect();
+        table_requests.push(TableSyncRequest {
+            table: table.clone(),
+            row_hashes,
+        });
+    }
+
+    let request = SyncRequest {
+        instance_id: instance_id.clone(),
+        db_path_hash: db_path_hash.clone(),
+        tables: table_requests,
+    };
+
+    // Connect to each compatible peer
+    for peer in &compatible {
+        let peer_addr = peer.addr;
+        // Use the sync_port from the peer's announcement, preserving the IP
+        let sync_addr = SocketAddr::new(peer_addr.ip(), peer.addr.port());
+
+        info!("Syncing with peer {} at {}", peer.instance_id, sync_addr);
+
+        match sync_with_peer(&local, &request, sync_addr).await {
+            Ok((rows_recv, rows_sent)) => {
+                result.peers_synced += 1;
+                result.rows_received += rows_recv;
+                result.rows_sent += rows_sent;
+                if rows_recv > 0 || rows_sent > 0 {
+                    result.tables_synced += syncable_tables.len();
+                }
+                info!(
+                    "Synced with {}: {} received, {} sent",
+                    peer.instance_id, rows_recv, rows_sent
+                );
+            }
+            Err(e) => {
+                warn!("Failed to sync with peer {}: {}", peer.instance_id, e);
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+/// Connect to a single peer via TCP, exchange sync data, and apply deltas.
+///
+/// Returns (rows_received, rows_sent).
+async fn sync_with_peer(
+    local: &crate::local::LocalDb,
+    request: &SyncRequest,
+    addr: SocketAddr,
+) -> Result<(usize, usize)> {
+    use crate::datasource::DataSource;
+
+    let connect_timeout = Duration::from_secs(10);
+    let stream = tokio::time::timeout(connect_timeout, tokio::net::TcpStream::connect(addr))
+        .await
+        .map_err(|_| SyncError::Broadcast(format!("TCP connect timeout to {}", addr)))?
+        .map_err(|e| SyncError::Broadcast(format!("TCP connect to {}: {}", addr, e)))?;
+
+    let (mut read_half, mut write_half) = stream.into_split();
+
+    // Send our sync request
+    write_framed(&mut write_half, request).await?;
+
+    // Read the response
+    let response: SyncResponse = read_framed(&mut read_half).await?;
+
+    let mut rows_received: usize = 0;
+    let mut rows_sent: usize = 0;
+
+    // Apply received deltas
+    for delta in &response.deltas {
+        if delta.is_empty() {
+            continue;
+        }
+        let count = local.upsert_rows(&delta.table, &delta.upserts).await?;
+        rows_received += count;
+        debug!(
+            "Applied {} rows to table '{}' from peer {}",
+            count, delta.table, response.instance_id
+        );
+    }
+
+    // Send rows the peer wants from us
+    for want in &response.want_rows {
+        if want.pk_values.is_empty() {
+            continue;
+        }
+        let rows = local.get_rows(&want.table, &want.pk_values).await?;
+        if !rows.is_empty() {
+            // Send these back as a follow-up delta
+            let packet = DeltaPacket {
+                version: PROTOCOL_VERSION,
+                source_id: request.instance_id.clone(),
+                seq: 0,
+                part: 0,
+                total_parts: 1,
+                table: want.table.clone(),
+                upserts: rows,
+                deletes: Vec::new(),
+            };
+            write_framed(&mut write_half, &packet).await?;
+            rows_sent += packet.upserts.len();
+        }
+    }
+
+    Ok((rows_received, rows_sent))
+}
+
+/// Resolve the PID lock file path for the broadcast daemon.
+fn broadcast_pid_lock_path(config_path: &std::path::Path) -> std::path::PathBuf {
+    if let Some(parent) = config_path.parent() {
+        if parent.as_os_str().is_empty() {
+            std::path::PathBuf::from(".smuggler-broadcast.pid")
+        } else {
+            parent.join(".smuggler-broadcast.pid")
+        }
+    } else {
+        std::path::PathBuf::from(".smuggler-broadcast.pid")
+    }
+}
+
+/// Run the broadcast daemon loop.
+///
+/// Starts a TCP sync server, discovers peers via UDP broadcast, and
+/// exchanges deltas on each interval tick. When `once` is true, runs
+/// a single cycle and exits. When `dry_run` is true, logs what would
+/// happen but does not apply deltas.
+pub async fn run_broadcast(
+    config: &crate::config::Config,
+    config_path: &std::path::Path,
+    broadcast_config: &BroadcastConfig,
+    once: bool,
+    dry_run: bool,
+) -> Result<()> {
+    use tokio::signal;
+    use tokio::time;
+
+    let pid_path = broadcast_pid_lock_path(config_path);
+    let _pid_lock = crate::watch::PidLock::acquire(&pid_path)?;
+
+    let db_path_hash = hash_db_path(config.local_db_path());
+    let instance_id = broadcast_config.resolve_instance_id();
+    let port = broadcast_config.port;
+
+    info!(
+        "Starting broadcast daemon (port: {}, interval: {}s, instance: {}, dry_run: {})",
+        port, broadcast_config.interval_secs, instance_id, dry_run
+    );
+
+    // Start TCP sync server in background
+    let tcp_config = config.clone();
+    let tcp_broadcast_config = broadcast_config.clone();
+    let tcp_db_path_hash = db_path_hash.clone();
+    let tcp_addr: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port));
+
+    let tcp_listener = tokio::net::TcpListener::bind(tcp_addr).await.map_err(|e| {
+        SyncError::Broadcast(format!(
+            "TCP bind {}:{}: {}",
+            Ipv4Addr::UNSPECIFIED,
+            port,
+            e
+        ))
+    })?;
+
+    info!("TCP sync server listening on port {}", port);
+
+    let server_handle = tokio::spawn(async move {
+        loop {
+            match tcp_listener.accept().await {
+                Ok((stream, addr)) => {
+                    debug!("Accepted TCP connection from {}", addr);
+                    if let Err(e) = handle_sync_connection(
+                        stream,
+                        &tcp_config,
+                        &tcp_broadcast_config,
+                        &tcp_db_path_hash,
+                    )
+                    .await
+                    {
+                        warn!("Error handling sync connection from {}: {}", addr, e);
+                    }
+                }
+                Err(e) => {
+                    warn!("TCP accept error: {}", e);
+                }
+            }
+        }
+    });
+
+    let interval_secs = broadcast_config.interval_secs;
+    let mut tick_count: u64 = 0;
+    let mut interval = time::interval(Duration::from_secs(interval_secs));
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                tick_count += 1;
+                info!("Broadcast tick #{}", tick_count);
+
+                if dry_run {
+                    // In dry_run mode, just discover peers and report
+                    let discovery = PeerDiscovery::new(
+                        broadcast_config.clone(),
+                        db_path_hash.clone(),
+                    ).await?;
+                    let listen_dur = Duration::from_secs(interval_secs.min(5));
+                    let peers = discovery.discover_once(listen_dur).await?;
+                    let compatible: Vec<&Peer> = peers
+                        .iter()
+                        .filter(|p| p.db_path_hash == db_path_hash)
+                        .collect();
+                    info!(
+                        "Tick #{} (dry run): {} peers discovered, {} compatible",
+                        tick_count, peers.len(), compatible.len()
+                    );
+                    for peer in &compatible {
+                        info!(
+                            "  Would sync with: {} at {}",
+                            peer.instance_id, peer.addr
+                        );
+                    }
+                } else {
+                    match run_broadcast_once(config, broadcast_config).await {
+                        Ok(result) => {
+                            if result.rows_received > 0 || result.rows_sent > 0 {
+                                info!(
+                                    "Tick #{}: {} peers synced, {} rows received, {} rows sent",
+                                    tick_count, result.peers_synced,
+                                    result.rows_received, result.rows_sent
+                                );
+                            } else {
+                                info!(
+                                    "Tick #{}: {} peers discovered, no changes",
+                                    tick_count, result.peers_discovered
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Broadcast tick #{} failed: {}", tick_count, e);
+                        }
+                    }
+                }
+
+                if once {
+                    info!("Single cycle complete, exiting");
+                    break;
+                }
+            }
+            _ = signal::ctrl_c() => {
+                info!("Received shutdown signal. Stopping broadcast daemon.");
+                break;
+            }
+        }
+    }
+
+    server_handle.abort();
+    info!("Broadcast daemon stopped after {} ticks", tick_count);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1121,5 +1727,337 @@ mod tests {
         let decrypted = decrypt_packet(&encrypted, &key).expect("decrypt");
         let decoded = DeltaPacket::from_bytes(&decrypted).expect("deserialize");
         assert_eq!(packet, decoded);
+    }
+
+    // -----------------------------------------------------------------------
+    // TCP sync integration tests
+    // -----------------------------------------------------------------------
+
+    fn test_config(db_path: &str) -> crate::config::Config {
+        crate::config::Config {
+            cloudflare_account_id: None,
+            cloudflare_api_token: None,
+            database_id: None,
+            local_db: Some(db_path.to_string()),
+            sync: crate::config::SyncConfig::default(),
+            stash: None,
+            target: Some(crate::config::TargetConfig::Sqlite {
+                database: "unused".to_string(),
+            }),
+            broadcast: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tcp_sync_bidirectional() {
+        use crate::datasource::DataSource;
+        use crate::local::LocalDb;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_a_path = dir.path().join("a.db").to_str().unwrap().to_string();
+        let db_b_path = dir.path().join("b.db").to_str().unwrap().to_string();
+
+        // Database A: has Alice and Bob
+        {
+            let conn = rusqlite::Connection::open(&db_a_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT, updated_at TEXT);
+                 INSERT INTO users VALUES ('1', 'Alice', '2026-01-01T00:00:00Z');
+                 INSERT INTO users VALUES ('2', 'Bob', '2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+        }
+
+        // Database B: has Bob and Carol
+        {
+            let conn = rusqlite::Connection::open(&db_b_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT, updated_at TEXT);
+                 INSERT INTO users VALUES ('2', 'Bob', '2026-01-01T00:00:00Z');
+                 INSERT INTO users VALUES ('3', 'Carol', '2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+        }
+
+        let _config_a = test_config(&db_a_path);
+        let config_b = test_config(&db_b_path);
+        let bc = BroadcastConfig::default();
+        let db_hash = hash_db_path(&db_a_path);
+
+        // Start TCP sync server for database B on a random port
+        let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_port = tcp_listener.local_addr().unwrap().port();
+
+        let server_config = config_b.clone();
+        let server_bc = bc.clone();
+        let server_hash = db_hash.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((stream, _)) = tcp_listener.accept().await {
+                    let _ =
+                        handle_sync_connection(stream, &server_config, &server_bc, &server_hash)
+                            .await;
+                }
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Build sync request from A's perspective
+        let local_a = LocalDb::open(&db_a_path).unwrap();
+        let meta = local_a
+            .get_row_metadata("users", "updated_at", &[])
+            .await
+            .unwrap();
+        let row_hashes: HashMap<String, String> = meta
+            .into_iter()
+            .map(|(pk, m)| (pk, m.content_hash))
+            .collect();
+
+        let request = SyncRequest {
+            instance_id: "machine-a".to_string(),
+            db_path_hash: db_hash.clone(),
+            tables: vec![TableSyncRequest {
+                table: "users".to_string(),
+                row_hashes,
+            }],
+        };
+
+        let sync_addr: SocketAddr = format!("127.0.0.1:{}", server_port).parse().unwrap();
+        let (rows_recv, rows_sent) = sync_with_peer(&local_a, &request, sync_addr).await.unwrap();
+
+        // A should have received Carol (1 row) from B
+        assert_eq!(rows_recv, 1, "A should receive 1 row (Carol) from B");
+
+        // A asked B for rows, B should have requested Alice (1 row)
+        assert_eq!(rows_sent, 1, "A should send 1 row (Alice) to B");
+
+        // Verify A now has all 3 rows
+        let count_a: i64 = {
+            let conn = rusqlite::Connection::open(&db_a_path).unwrap();
+            conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(count_a, 3, "Database A should have 3 rows after sync");
+    }
+
+    #[tokio::test]
+    async fn test_tcp_sync_respects_column_exclusion() {
+        use crate::datasource::DataSource;
+        use crate::local::LocalDb;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_a_path = dir.path().join("a.db").to_str().unwrap().to_string();
+        let db_b_path = dir.path().join("b.db").to_str().unwrap().to_string();
+
+        // Both databases have same content but different embeddings.
+        // With exclude_columns, the diff should treat them as identical.
+        {
+            let conn = rusqlite::Connection::open(&db_a_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE docs (id TEXT PRIMARY KEY, content TEXT,
+                    content_embedding BLOB, updated_at TEXT);
+                 INSERT INTO docs VALUES ('1', 'hello', X'DEADBEEF',
+                    '2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+        }
+        {
+            let conn = rusqlite::Connection::open(&db_b_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE docs (id TEXT PRIMARY KEY, content TEXT,
+                    content_embedding BLOB, updated_at TEXT);
+                 INSERT INTO docs VALUES ('1', 'hello', X'CAFEBABE',
+                    '2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+        }
+
+        let mut config_b = test_config(&db_b_path);
+        config_b.sync.exclude_columns = vec!["*_embedding".to_string()];
+        let bc = BroadcastConfig::default();
+        let db_hash = hash_db_path(&db_a_path);
+
+        // Start TCP sync server for B
+        let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_port = tcp_listener.local_addr().unwrap().port();
+        let server_config = config_b.clone();
+        let server_bc = bc.clone();
+        let server_hash = db_hash.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((stream, _)) = tcp_listener.accept().await {
+                    let _ =
+                        handle_sync_connection(stream, &server_config, &server_bc, &server_hash)
+                            .await;
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Build request from A, also excluding embeddings from hash
+        let local_a = LocalDb::open(&db_a_path).unwrap();
+        let exclude = vec!["*_embedding".to_string()];
+        let meta = local_a
+            .get_row_metadata("docs", "updated_at", &exclude)
+            .await
+            .unwrap();
+        let row_hashes: HashMap<String, String> = meta
+            .into_iter()
+            .map(|(pk, m)| (pk, m.content_hash))
+            .collect();
+
+        let request = SyncRequest {
+            instance_id: "machine-a".to_string(),
+            db_path_hash: db_hash.clone(),
+            tables: vec![TableSyncRequest {
+                table: "docs".to_string(),
+                row_hashes,
+            }],
+        };
+
+        let sync_addr: SocketAddr = format!("127.0.0.1:{}", server_port).parse().unwrap();
+        let (rows_recv, rows_sent) = sync_with_peer(&local_a, &request, sync_addr).await.unwrap();
+
+        // With embedding excluded, both see the row as identical
+        assert_eq!(
+            rows_recv, 0,
+            "No rows received (identical excluding embedding)"
+        );
+        assert_eq!(rows_sent, 0, "No rows sent (identical excluding embedding)");
+
+        // A embedding should be untouched
+        let conn_a = rusqlite::Connection::open(&db_a_path).unwrap();
+        let embedding: Vec<u8> = conn_a
+            .query_row(
+                "SELECT content_embedding FROM docs WHERE id = '1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(embedding, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[tokio::test]
+    async fn test_tcp_sync_db_hash_mismatch_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db").to_str().unwrap().to_string();
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE items (id TEXT PRIMARY KEY, name TEXT);
+                 INSERT INTO items VALUES ('1', 'test');",
+            )
+            .unwrap();
+        }
+
+        let config = test_config(&db_path);
+        let bc = BroadcastConfig::default();
+        let db_hash = hash_db_path(&db_path);
+
+        let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_port = tcp_listener.local_addr().unwrap().port();
+
+        let server_config = config.clone();
+        let server_bc = bc.clone();
+        let server_hash = db_hash.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((stream, _)) = tcp_listener.accept().await {
+                    let _ =
+                        handle_sync_connection(stream, &server_config, &server_bc, &server_hash)
+                            .await;
+                }
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Send request with wrong db_path_hash
+        let request = SyncRequest {
+            instance_id: "wrong-machine".to_string(),
+            db_path_hash: "completely_wrong_hash".to_string(),
+            tables: vec![],
+        };
+
+        let sync_addr: SocketAddr = format!("127.0.0.1:{}", server_port).parse().unwrap();
+        let local = crate::local::LocalDb::open(&db_path).unwrap();
+        let (recv, sent) = sync_with_peer(&local, &request, sync_addr).await.unwrap();
+
+        // Server should have rejected with empty response
+        assert_eq!(recv, 0);
+        assert_eq!(sent, 0);
+    }
+
+    #[tokio::test]
+    async fn test_framed_protocol_roundtrip() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (mut read, mut write) = stream.into_split();
+            let req: SyncRequest = read_framed(&mut read).await.unwrap();
+            assert_eq!(req.instance_id, "test-client");
+            assert_eq!(req.tables.len(), 1);
+
+            let resp = SyncResponse {
+                instance_id: "test-server".to_string(),
+                deltas: Vec::new(),
+                want_rows: Vec::new(),
+            };
+            write_framed(&mut write, &resp).await.unwrap();
+        });
+
+        let stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap();
+        let (mut read, mut write) = stream.into_split();
+
+        let req = SyncRequest {
+            instance_id: "test-client".to_string(),
+            db_path_hash: "abc123".to_string(),
+            tables: vec![TableSyncRequest {
+                table: "users".to_string(),
+                row_hashes: HashMap::new(),
+            }],
+        };
+        write_framed(&mut write, &req).await.unwrap();
+
+        let resp: SyncResponse = read_framed(&mut read).await.unwrap();
+        assert_eq!(resp.instance_id, "test-server");
+        assert!(resp.deltas.is_empty());
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_no_peers_graceful() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db").to_str().unwrap().to_string();
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE items (id TEXT PRIMARY KEY, name TEXT, updated_at TEXT);
+                 INSERT INTO items VALUES ('1', 'test', '2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+        }
+
+        let config = test_config(&db_path);
+        let bc = BroadcastConfig {
+            port: 0,
+            interval_secs: 1,
+            ..Default::default()
+        };
+
+        // run_broadcast_once with no peers listening should return gracefully
+        let result = run_broadcast_once(&config, &bc).await.unwrap();
+        assert_eq!(result.peers_discovered, 0);
+        assert_eq!(result.peers_synced, 0);
+        assert_eq!(result.rows_received, 0);
+        assert_eq!(result.rows_sent, 0);
     }
 }
