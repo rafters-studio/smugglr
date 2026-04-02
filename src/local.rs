@@ -106,9 +106,10 @@ impl DataSource for LocalDb {
         &self,
         table: &str,
         timestamp_column: &str,
+        exclude_columns: &[String],
     ) -> Result<HashMap<String, RowMeta>> {
         let conn = self.conn();
-        get_row_metadata_inner(&conn, table, timestamp_column)
+        get_row_metadata_inner(&conn, table, timestamp_column, exclude_columns)
     }
 
     async fn get_rows(
@@ -190,6 +191,7 @@ fn get_row_metadata_inner(
     conn: &Connection,
     table: &str,
     timestamp_column: &str,
+    exclude_columns: &[String],
 ) -> Result<HashMap<String, RowMeta>> {
     let info = table_info_inner(conn, table)?;
     let pk_cols = &info.primary_key;
@@ -208,12 +210,15 @@ fn get_row_metadata_inner(
         String::new()
     };
 
-    // For content hash, exclude timestamp columns (updated_at, created_at)
+    // For content hash, exclude timestamp columns and user-configured exclusions
     let timestamp_columns = ["updated_at", "created_at"];
     let hash_cols: Vec<_> = info
         .columns
         .iter()
-        .filter(|c| !timestamp_columns.contains(&c.name.as_str()))
+        .filter(|c| {
+            !timestamp_columns.contains(&c.name.as_str())
+                && !crate::config::column_excluded(&c.name, exclude_columns)
+        })
         .collect();
     let all_cols = hash_cols
         .iter()

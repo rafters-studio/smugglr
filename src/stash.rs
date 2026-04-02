@@ -211,7 +211,9 @@ async fn sync_table<S: DataSource, D: DataSource>(
     set_count: impl FnOnce(&mut SyncResult, usize),
 ) -> Result<SyncResult> {
     let mut result = SyncResult::new(table);
-    let diff = diff_table(source, dest, table, timestamp_column).await?;
+    // Stash operations use an empty exclusion list; column exclusion is
+    // applied by the higher-level sync engine that owns the SyncConfig.
+    let diff = diff_table(source, dest, table, timestamp_column, &[]).await?;
 
     if !diff.has_changes() {
         info!("Table {} is in sync", table);
