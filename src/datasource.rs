@@ -69,11 +69,13 @@ pub trait DataSource: Sync {
     /// Get row metadata for change detection.
     ///
     /// Returns a map of primary key value -> RowMeta containing the content
-    /// hash and optional timestamp for each row.
+    /// hash and optional timestamp for each row. Columns matching any pattern
+    /// in `exclude_columns` are omitted from the content hash.
     fn get_row_metadata(
         &self,
         table: &str,
         timestamp_column: &str,
+        exclude_columns: &[String],
     ) -> impl std::future::Future<Output = Result<HashMap<String, RowMeta>>> + Send;
 
     /// Get full row data for specific primary key values.
