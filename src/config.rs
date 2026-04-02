@@ -23,6 +23,9 @@ pub struct Config {
 
     /// Target database configuration (sqlite or d1)
     pub target: Option<TargetConfig>,
+
+    /// LAN broadcast sync configuration
+    pub broadcast: Option<crate::broadcast::BroadcastConfig>,
 }
 
 /// Target database configuration
@@ -83,6 +86,10 @@ pub struct SyncConfig {
     #[serde(default = "default_exclude_tables")]
     pub exclude_tables: Vec<String>,
 
+    /// Column name patterns to exclude from sync (glob-style: "*_embedding", "vector")
+    #[serde(default)]
+    pub exclude_columns: Vec<String>,
+
     /// Column used for timestamp-based change detection
     #[serde(default = "default_timestamp_column")]
     pub timestamp_column: String,
@@ -130,6 +137,7 @@ impl Default for SyncConfig {
         Self {
             tables: Vec::new(),
             exclude_tables: default_exclude_tables(),
+            exclude_columns: Vec::new(),
             timestamp_column: default_timestamp_column(),
             conflict_resolution: ConflictResolution::default(),
             max_retries: default_max_retries(),
@@ -139,6 +147,73 @@ impl Default for SyncConfig {
             batch_size: default_batch_size(),
             max_statement_bytes: default_max_statement_bytes(),
         }
+    }
+}
+
+impl SyncConfig {
+    /// Check if a column name should be excluded from sync.
+    ///
+    /// Supports simple glob patterns:
+    /// - `*_embedding` matches columns ending with `_embedding`
+    /// - `embedding_*` matches columns starting with `embedding_`
+    /// - `*embed*` matches columns containing `embed`
+    /// - `vector` matches the exact column name `vector`
+    #[allow(dead_code)]
+    pub fn should_exclude_column(&self, column: &str) -> bool {
+        self.exclude_columns
+            .iter()
+            .any(|pattern| column_glob_match(pattern, column))
+    }
+
+    /// Filter a list of column names, removing excluded ones.
+    #[allow(dead_code)]
+    pub fn filter_columns<'a>(&self, columns: &[&'a str]) -> Vec<&'a str> {
+        columns
+            .iter()
+            .filter(|c| !self.should_exclude_column(c))
+            .copied()
+            .collect()
+    }
+}
+
+/// Check if a column name matches any exclusion pattern in the given list.
+pub fn column_excluded(column: &str, patterns: &[String]) -> bool {
+    patterns
+        .iter()
+        .any(|pattern| column_glob_match(pattern, column))
+}
+
+/// Simple glob matching for column name patterns.
+///
+/// Supports `*` at start, end, or both. No `?` or character classes --
+/// these patterns are intentionally simple for config ergonomics.
+fn column_glob_match(pattern: &str, value: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+
+    let starts_star = pattern.starts_with('*');
+    let ends_star = pattern.ends_with('*');
+
+    match (starts_star, ends_star) {
+        (false, false) => {
+            // Exact match: "vector"
+            pattern == value
+        }
+        (true, true) if pattern.len() >= 2 => {
+            // Contains: "*embed*"
+            let inner = &pattern[1..pattern.len() - 1];
+            value.contains(inner)
+        }
+        (true, false) => {
+            // Suffix: "*_embedding"
+            value.ends_with(&pattern[1..])
+        }
+        (false, true) => {
+            // Prefix: "embedding_*"
+            value.starts_with(&pattern[..pattern.len() - 1])
+        }
+        _ => false,
     }
 }
 
@@ -210,6 +285,9 @@ pub enum ConflictResolution {
     RemoteWins,
     /// Newer timestamp wins
     NewerWins,
+    /// UUIDv7 primary key with higher embedded timestamp wins.
+    /// Falls back to NewerWins when PKs are not valid UUIDv7.
+    UuidV7Wins,
 }
 
 /// Retry configuration for D1 API calls
@@ -419,6 +497,7 @@ mod tests {
             sync: SyncConfig::default(),
             stash: None,
             target: None,
+            broadcast: None,
         }
     }
 
@@ -433,6 +512,7 @@ mod tests {
             target: Some(TargetConfig::Sqlite {
                 database: "backup.db".into(),
             }),
+            broadcast: None,
         }
     }
 
@@ -486,6 +566,7 @@ mod tests {
                 database_id: "db".into(),
                 api_token: "tok".into(),
             }),
+            broadcast: None,
         };
         let target = config.resolve_target().unwrap();
         assert!(matches!(target, ResolvedTarget::D1 { .. }));
@@ -503,6 +584,7 @@ mod tests {
             target: Some(TargetConfig::Sqlite {
                 database: "backup.db".into(),
             }),
+            broadcast: None,
         };
         let target = config.resolve_target().unwrap();
         assert!(matches!(target, ResolvedTarget::Sqlite { .. }));
@@ -518,6 +600,7 @@ mod tests {
             sync: SyncConfig::default(),
             stash: None,
             target: None,
+            broadcast: None,
         };
         assert!(config.resolve_target().is_err());
     }
@@ -670,5 +753,122 @@ local_db = "game.db"
         assert!(config.target.is_none());
         let target = config.resolve_target().unwrap();
         assert!(matches!(target, ResolvedTarget::D1 { .. }));
+    }
+
+    // -- Column exclusion tests --
+
+    #[test]
+    fn test_column_exclusion_pattern_matching() {
+        // Suffix: "*_embedding" matches "title_embedding" but not "embedding_title"
+        let sync = SyncConfig {
+            exclude_columns: vec!["*_embedding".to_string()],
+            ..Default::default()
+        };
+        assert!(sync.should_exclude_column("title_embedding"));
+        assert!(sync.should_exclude_column("content_embedding"));
+        assert!(!sync.should_exclude_column("embedding_title"));
+        assert!(!sync.should_exclude_column("title"));
+
+        // Prefix: "embedding_*" matches "embedding_title" but not "title_embedding"
+        let sync = SyncConfig {
+            exclude_columns: vec!["embedding_*".to_string()],
+            ..Default::default()
+        };
+        assert!(sync.should_exclude_column("embedding_title"));
+        assert!(sync.should_exclude_column("embedding_content"));
+        assert!(!sync.should_exclude_column("title_embedding"));
+
+        // Exact: "vector" matches "vector" but not "vector_data" or "my_vector"
+        let sync = SyncConfig {
+            exclude_columns: vec!["vector".to_string()],
+            ..Default::default()
+        };
+        assert!(sync.should_exclude_column("vector"));
+        assert!(!sync.should_exclude_column("vector_data"));
+        assert!(!sync.should_exclude_column("my_vector"));
+    }
+
+    #[test]
+    fn test_column_exclusion_contains_pattern() {
+        let sync = SyncConfig {
+            exclude_columns: vec!["*embed*".to_string()],
+            ..Default::default()
+        };
+        assert!(sync.should_exclude_column("title_embedding"));
+        assert!(sync.should_exclude_column("embedding_title"));
+        assert!(sync.should_exclude_column("embed"));
+        assert!(!sync.should_exclude_column("vector"));
+    }
+
+    #[test]
+    fn test_column_exclusion_multiple_patterns() {
+        let sync = SyncConfig {
+            exclude_columns: vec![
+                "*_embedding".to_string(),
+                "vector".to_string(),
+                "blob_*".to_string(),
+            ],
+            ..Default::default()
+        };
+        assert!(sync.should_exclude_column("title_embedding"));
+        assert!(sync.should_exclude_column("vector"));
+        assert!(sync.should_exclude_column("blob_data"));
+        assert!(!sync.should_exclude_column("title"));
+        assert!(!sync.should_exclude_column("name"));
+    }
+
+    #[test]
+    fn test_empty_exclusion_syncs_all() {
+        let sync = SyncConfig::default();
+        assert!(!sync.should_exclude_column("anything"));
+        assert!(!sync.should_exclude_column("title_embedding"));
+        assert!(!sync.should_exclude_column("vector"));
+    }
+
+    #[test]
+    fn test_column_exclusion_wildcard_all() {
+        let sync = SyncConfig {
+            exclude_columns: vec!["*".to_string()],
+            ..Default::default()
+        };
+        assert!(sync.should_exclude_column("anything"));
+    }
+
+    #[test]
+    fn test_filter_columns() {
+        let sync = SyncConfig {
+            exclude_columns: vec!["*_embedding".to_string(), "vector".to_string()],
+            ..Default::default()
+        };
+        let cols = vec!["id", "name", "title_embedding", "vector", "description"];
+        let filtered = sync.filter_columns(&cols);
+        assert_eq!(filtered, vec!["id", "name", "description"]);
+    }
+
+    #[test]
+    fn test_column_excluded_standalone() {
+        let patterns = vec!["*_embedding".to_string(), "blob_*".to_string()];
+        assert!(column_excluded("title_embedding", &patterns));
+        assert!(column_excluded("blob_data", &patterns));
+        assert!(!column_excluded("name", &patterns));
+        assert!(!column_excluded("id", &patterns));
+    }
+
+    #[test]
+    fn test_parse_toml_with_exclude_columns() {
+        let toml_str = r#"
+cloudflare_account_id = "acct"
+cloudflare_api_token = "tok"
+database_id = "db"
+local_db = "game.db"
+
+[sync]
+exclude_columns = ["*_embedding", "vector"]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.sync.exclude_columns.len(), 2);
+        assert!(config.sync.should_exclude_column("title_embedding"));
+        assert!(config.sync.should_exclude_column("vector"));
+        assert!(!config.sync.should_exclude_column("name"));
     }
 }
