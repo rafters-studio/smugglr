@@ -65,6 +65,17 @@ impl TableDiff {
                     );
                 }
             }
+            ConflictResolution::UuidV7Wins => {
+                if !self.content_differs.is_empty() {
+                    warn!(
+                        "{} row(s) in '{}' have different content but same PK (identical \
+                         UUIDv7 timestamp) -- skipped under uuid_v7_wins. \
+                         Use local_wins or remote_wins to resolve.",
+                        self.content_differs.len(),
+                        self.table
+                    );
+                }
+            }
         }
 
         rows
@@ -84,6 +95,9 @@ impl TableDiff {
                 rows.extend(self.content_differs.clone());
             }
             ConflictResolution::NewerWins => {
+                // Warning already emitted in rows_to_push
+            }
+            ConflictResolution::UuidV7Wins => {
                 // Warning already emitted in rows_to_push
             }
         }
@@ -229,4 +243,130 @@ pub async fn diff_all<A: DataSource, B: DataSource>(
     }
 
     Ok(diffs)
+}
+
+/// Extract Unix millisecond timestamp from a UUIDv7 string.
+///
+/// Returns `None` if the string is not a valid UUIDv7 (version nibble must be `7`
+/// and the string must contain exactly 32 hex digits).
+#[allow(dead_code)]
+pub(crate) fn extract_uuidv7_timestamp(uuid_str: &str) -> Option<u64> {
+    let hex_str: String = uuid_str.chars().filter(|c| *c != '-').collect();
+    if hex_str.len() != 32 {
+        return None;
+    }
+
+    // Version nibble is the 13th hex char (index 12), must be '7'
+    if hex_str.as_bytes().get(12)? != &b'7' {
+        return None;
+    }
+
+    // First 12 hex chars are the 48-bit Unix ms timestamp
+    let ts_hex = &hex_str[..12];
+    let mut ts_bytes = [0u8; 8];
+    let decoded = hex::decode(ts_hex).ok()?;
+    ts_bytes[2..8].copy_from_slice(&decoded);
+    Some(u64::from_be_bytes(ts_bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_uuidv7_timestamp_extraction() {
+        // Timestamp 0x018EC7E6_1A80 = 1713494400640 ms
+        let uuid = "018ec7e6-1a80-7000-8000-000000000000";
+        assert_eq!(extract_uuidv7_timestamp(uuid), Some(0x018e_c7e6_1a80));
+    }
+
+    #[test]
+    fn test_uuidv7_timestamp_extraction_no_hyphens() {
+        let uuid = "018ec7e61a8070008000000000000000";
+        assert_eq!(extract_uuidv7_timestamp(uuid), Some(0x018e_c7e6_1a80));
+    }
+
+    #[test]
+    fn test_uuidv7_version_detection_rejects_v4() {
+        let v4 = "550e8400-e29b-41d4-a716-446655440000";
+        assert!(extract_uuidv7_timestamp(v4).is_none());
+    }
+
+    #[test]
+    fn test_uuidv7_version_detection_accepts_v7() {
+        let v7 = "018ec7e6-1a80-7abc-8000-000000000001";
+        assert!(extract_uuidv7_timestamp(v7).is_some());
+    }
+
+    #[test]
+    fn test_non_uuid_string_returns_none() {
+        assert!(extract_uuidv7_timestamp("not-a-uuid").is_none());
+        assert!(extract_uuidv7_timestamp("").is_none());
+        assert!(extract_uuidv7_timestamp("12345").is_none());
+    }
+
+    #[test]
+    fn test_uuidv7_ordering() {
+        let earlier = "018ec7e6-1a80-7000-8000-000000000000";
+        let later = "018ec7e6-1a81-7000-8000-000000000000";
+        let ts_early = extract_uuidv7_timestamp(earlier).unwrap();
+        let ts_late = extract_uuidv7_timestamp(later).unwrap();
+        assert!(ts_late > ts_early);
+    }
+
+    #[test]
+    fn test_uuidv7_wins_push_includes_local_only_and_newer() {
+        let diff = TableDiff {
+            table: "items".to_string(),
+            local_only: vec!["018ec7e6-1a80-7000-8000-aaaaaaaaaaaa".to_string()],
+            remote_only: vec!["018ec7e6-1a81-7000-8000-bbbbbbbbbbbb".to_string()],
+            local_newer: vec!["pk3".to_string()],
+            remote_newer: vec!["pk4".to_string()],
+            content_differs: vec![],
+            identical: vec![],
+        };
+
+        let push = diff.rows_to_push(ConflictResolution::UuidV7Wins);
+        assert_eq!(push.len(), 2);
+        assert!(push.contains(&"018ec7e6-1a80-7000-8000-aaaaaaaaaaaa".to_string()));
+        assert!(push.contains(&"pk3".to_string()));
+
+        let pull = diff.rows_to_pull(ConflictResolution::UuidV7Wins);
+        assert_eq!(pull.len(), 2);
+        assert!(pull.contains(&"018ec7e6-1a81-7000-8000-bbbbbbbbbbbb".to_string()));
+        assert!(pull.contains(&"pk4".to_string()));
+    }
+
+    #[test]
+    fn test_uuidv7_wins_content_differs_skipped() {
+        let diff = TableDiff {
+            table: "items".to_string(),
+            local_only: vec![],
+            remote_only: vec![],
+            local_newer: vec![],
+            remote_newer: vec![],
+            content_differs: vec!["018ec7e6-1a80-7000-8000-aaaaaaaaaaaa".to_string()],
+            identical: vec![],
+        };
+
+        assert!(diff.rows_to_push(ConflictResolution::UuidV7Wins).is_empty());
+        assert!(diff.rows_to_pull(ConflictResolution::UuidV7Wins).is_empty());
+    }
+
+    #[test]
+    fn test_non_uuidv7_falls_back_to_newer_wins_behavior() {
+        let diff = TableDiff {
+            table: "scores".to_string(),
+            local_only: vec![],
+            remote_only: vec![],
+            local_newer: vec!["42".to_string()],
+            remote_newer: vec![],
+            content_differs: vec!["99".to_string()],
+            identical: vec![],
+        };
+
+        let push = diff.rows_to_push(ConflictResolution::UuidV7Wins);
+        assert_eq!(push, vec!["42".to_string()]);
+        assert!(diff.rows_to_pull(ConflictResolution::UuidV7Wins).is_empty());
+    }
 }
