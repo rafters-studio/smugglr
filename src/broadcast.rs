@@ -8,6 +8,9 @@
 //! handling UDP size limits by splitting large deltas into multiple parts.
 
 use crate::error::{Result, SyncError};
+use chacha20poly1305::aead::{Aead, NewAead};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -32,6 +35,9 @@ const PEER_TTL_MULTIPLIER: u64 = 3;
 /// Maximum size of a UDP announcement packet.
 const MAX_PACKET_SIZE: usize = 1024;
 
+/// Minimum encrypted packet size: 24-byte nonce + 16-byte Poly1305 tag.
+const ENCRYPTION_OVERHEAD: usize = 24 + 16;
+
 /// Configuration for LAN broadcast sync.
 #[derive(Debug, Clone, Deserialize)]
 pub struct BroadcastConfig {
@@ -45,6 +51,10 @@ pub struct BroadcastConfig {
 
     /// Instance identity (defaults to hostname)
     pub instance_id: Option<String>,
+
+    /// 256-bit pre-shared key, hex-encoded (64 hex chars).
+    /// When set, all broadcast traffic is encrypted with XChaCha20-Poly1305.
+    pub secret: Option<String>,
 }
 
 fn default_port() -> u16 {
@@ -61,6 +71,7 @@ impl Default for BroadcastConfig {
             port: DEFAULT_PORT,
             interval_secs: DEFAULT_INTERVAL_SECS,
             instance_id: None,
+            secret: None,
         }
     }
 }
@@ -76,6 +87,27 @@ impl BroadcastConfig {
     /// Peer TTL based on broadcast interval.
     pub fn peer_ttl(&self) -> Duration {
         Duration::from_secs(self.interval_secs * PEER_TTL_MULTIPLIER)
+    }
+
+    /// Parse the hex-encoded secret into a 256-bit key.
+    /// Returns None if no secret is configured.
+    pub fn encryption_key(&self) -> Result<Option<[u8; 32]>> {
+        match &self.secret {
+            None => Ok(None),
+            Some(hex_key) => {
+                let bytes = hex::decode(hex_key).map_err(|_| {
+                    SyncError::Config(
+                        "broadcast secret must be 64 hex characters (256-bit key)".to_string(),
+                    )
+                })?;
+                let key: [u8; 32] = bytes.try_into().map_err(|_| {
+                    SyncError::Config(
+                        "broadcast secret must be 64 hex characters (256-bit key)".to_string(),
+                    )
+                })?;
+                Ok(Some(key))
+            }
+        }
     }
 }
 
@@ -138,6 +170,81 @@ impl Announcement {
     }
 }
 
+/// Encrypt a serialized packet for broadcast.
+///
+/// Wire format: `[24-byte nonce][ciphertext + 16-byte Poly1305 tag]`
+fn encrypt_packet(plaintext: &[u8], key: &[u8; 32]) -> Result<Vec<u8>> {
+    let cipher = XChaCha20Poly1305::new(key.into());
+
+    let mut nonce_bytes = [0u8; 24];
+    rand::rng().fill_bytes(&mut nonce_bytes);
+    let nonce = XNonce::from_slice(&nonce_bytes);
+
+    let ciphertext = cipher
+        .encrypt(nonce, plaintext)
+        .map_err(|_| SyncError::Broadcast("encryption failed".to_string()))?;
+
+    let mut packet = Vec::with_capacity(24 + ciphertext.len());
+    packet.extend_from_slice(&nonce_bytes);
+    packet.extend_from_slice(&ciphertext);
+    Ok(packet)
+}
+
+/// Decrypt a received packet.
+///
+/// Expects wire format: `[24-byte nonce][ciphertext + 16-byte Poly1305 tag]`
+fn decrypt_packet(data: &[u8], key: &[u8; 32]) -> Result<Vec<u8>> {
+    if data.len() < ENCRYPTION_OVERHEAD {
+        return Err(SyncError::Broadcast(format!(
+            "packet too short ({} bytes, minimum {})",
+            data.len(),
+            ENCRYPTION_OVERHEAD
+        )));
+    }
+
+    let (nonce_bytes, ciphertext) = data.split_at(24);
+    let nonce = XNonce::from_slice(nonce_bytes);
+    let cipher = XChaCha20Poly1305::new(key.into());
+
+    cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|_| SyncError::Broadcast("authentication failed".to_string()))
+}
+
+/// Wrap plaintext in an encryption envelope if a key is provided.
+/// If no key, returns the plaintext as-is.
+pub fn maybe_encrypt(plaintext: &[u8], key: &Option<[u8; 32]>) -> Result<Vec<u8>> {
+    match key {
+        Some(k) => encrypt_packet(plaintext, k),
+        None => Ok(plaintext.to_vec()),
+    }
+}
+
+/// Unwrap a potentially encrypted packet.
+/// If a key is configured but the packet is too short to be encrypted, warns and drops.
+/// If no key is configured but the packet looks encrypted (not valid JSON), warns and drops.
+pub fn maybe_decrypt(data: &[u8], key: &Option<[u8; 32]>) -> Result<Option<Vec<u8>>> {
+    match key {
+        Some(k) => {
+            if data.len() < ENCRYPTION_OVERHEAD {
+                warn!(
+                    "Dropping packet: too short for encrypted mode ({} bytes)",
+                    data.len()
+                );
+                return Ok(None);
+            }
+            Ok(Some(decrypt_packet(data, k)?))
+        }
+        None => {
+            if data.first() != Some(&b'{') && data.first() != Some(&b'[') {
+                warn!("Dropping encrypted packet: no secret configured");
+                return Ok(None);
+            }
+            Ok(Some(data.to_vec()))
+        }
+    }
+}
+
 /// Manages peer discovery via UDP subnet broadcast.
 pub struct PeerDiscovery {
     config: BroadcastConfig,
@@ -184,7 +291,9 @@ impl PeerDiscovery {
 
     /// Send a broadcast announcement to all peers on the subnet.
     pub async fn announce(&self) -> Result<()> {
-        let data = self.announcement.to_bytes()?;
+        let plaintext = self.announcement.to_bytes()?;
+        let key = self.config.encryption_key()?;
+        let data = maybe_encrypt(&plaintext, &key)?;
         let broadcast_addr = SocketAddrV4::new(Ipv4Addr::BROADCAST, self.config.port);
 
         match self.socket.send_to(&data, broadcast_addr).await {
@@ -214,7 +323,13 @@ impl PeerDiscovery {
             .await
             .map_err(|e| SyncError::Broadcast(format!("recv: {}", e)))?;
 
-        let announcement = match Announcement::from_bytes(&buf[..n]) {
+        let key = self.config.encryption_key()?;
+        let plaintext = match maybe_decrypt(&buf[..n], &key)? {
+            Some(data) => data,
+            None => return Ok(None),
+        };
+
+        let announcement = match Announcement::from_bytes(&plaintext) {
             Ok(a) => a,
             Err(e) => {
                 debug!("Ignoring malformed packet from {}: {}", addr, e);
@@ -677,11 +792,13 @@ mod tests {
             port: 0, // OS-assigned port
             interval_secs: 1,
             instance_id: Some("machine-a".to_string()),
+            secret: None,
         };
         let config_b = BroadcastConfig {
             port: 0,
             interval_secs: 1,
             instance_id: Some("machine-b".to_string()),
+            secret: None,
         };
 
         let hash = hash_db_path("/test/legion.db");
@@ -718,6 +835,7 @@ mod tests {
             port: 0,
             interval_secs: 1, // 1s interval = 3s TTL
             instance_id: Some("test-host".to_string()),
+            secret: None,
         };
 
         let hash = hash_db_path("/test/db.sqlite");
@@ -938,5 +1056,155 @@ mod tests {
         assert_eq!(reassembled.upserts.len(), original_count);
         assert_eq!(reassembled.deletes, vec!["del1".to_string()]);
         assert_eq!(reassembled.seq, 7);
+    }
+
+    // -----------------------------------------------------------------------
+    // Encryption tests
+    // -----------------------------------------------------------------------
+
+    fn test_key() -> [u8; 32] {
+        let mut key = [0u8; 32];
+        for (i, byte) in key.iter_mut().enumerate() {
+            *byte = i as u8;
+        }
+        key
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_roundtrip() {
+        let key = test_key();
+        let plaintext = b"hello smuggler broadcast";
+
+        let encrypted = encrypt_packet(plaintext, &key).unwrap();
+        let decrypted = decrypt_packet(&encrypted, &key).unwrap();
+
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_wrong_key_fails_authentication() {
+        let key_a = test_key();
+        let mut key_b = test_key();
+        key_b[0] = 0xFF;
+
+        let encrypted = encrypt_packet(b"secret data", &key_a).unwrap();
+        let result = decrypt_packet(&encrypted, &key_b);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("authentication failed"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_tampered_ciphertext_fails() {
+        let key = test_key();
+        let mut encrypted = encrypt_packet(b"important data", &key).unwrap();
+
+        // Flip a byte in the ciphertext (after the 24-byte nonce)
+        encrypted[30] ^= 0xFF;
+
+        let result = decrypt_packet(&encrypted, &key);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("authentication failed"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_nonce_uniqueness() {
+        let key = test_key();
+        let plaintext = b"same plaintext twice";
+
+        let encrypted_1 = encrypt_packet(plaintext, &key).unwrap();
+        let encrypted_2 = encrypt_packet(plaintext, &key).unwrap();
+
+        // Different nonces produce different ciphertext
+        assert_ne!(encrypted_1, encrypted_2);
+
+        // Both decrypt to the same plaintext
+        assert_eq!(decrypt_packet(&encrypted_1, &key).unwrap(), plaintext);
+        assert_eq!(decrypt_packet(&encrypted_2, &key).unwrap(), plaintext);
+    }
+
+    #[test]
+    fn test_packet_too_short() {
+        let key = test_key();
+
+        // Less than ENCRYPTION_OVERHEAD (40 bytes)
+        let short = vec![0u8; 20];
+        let result = decrypt_packet(&short, &key);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("packet too short"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_maybe_encrypt_decrypt_with_key() {
+        let key = Some(test_key());
+        let plaintext = b"broadcast payload";
+
+        let encrypted = maybe_encrypt(plaintext, &key).unwrap();
+        assert_ne!(&encrypted[..], &plaintext[..]);
+
+        let decrypted = maybe_decrypt(&encrypted, &key).unwrap();
+        assert_eq!(decrypted.unwrap(), plaintext);
+    }
+
+    #[test]
+    fn test_maybe_encrypt_decrypt_without_key() {
+        let key = None;
+        let plaintext = b"{\"version\":1}";
+
+        let output = maybe_encrypt(plaintext, &key).unwrap();
+        assert_eq!(&output[..], &plaintext[..]);
+
+        let decrypted = maybe_decrypt(&output, &key).unwrap();
+        assert_eq!(decrypted.unwrap(), plaintext);
+    }
+
+    #[test]
+    fn test_maybe_decrypt_rejects_plaintext_when_key_set() {
+        let key = Some(test_key());
+        let plaintext = b"{\"version\":1}";
+
+        let result = maybe_decrypt(plaintext, &key).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_maybe_decrypt_rejects_encrypted_when_no_key() {
+        let key_for_encrypt = test_key();
+        let encrypted = encrypt_packet(b"secret", &key_for_encrypt).unwrap();
+
+        let result = maybe_decrypt(&encrypted, &None).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_encryption_key_parsing() {
+        // Valid 64-char hex
+        let config = BroadcastConfig {
+            secret: Some("a".repeat(64)),
+            ..Default::default()
+        };
+        assert!(config.encryption_key().unwrap().is_some());
+
+        // No secret
+        let config = BroadcastConfig::default();
+        assert!(config.encryption_key().unwrap().is_none());
+
+        // Invalid hex
+        let config = BroadcastConfig {
+            secret: Some("not-hex".to_string()),
+            ..Default::default()
+        };
+        assert!(config.encryption_key().is_err());
+
+        // Wrong length
+        let config = BroadcastConfig {
+            secret: Some("aa".to_string()),
+            ..Default::default()
+        };
+        assert!(config.encryption_key().is_err());
     }
 }
