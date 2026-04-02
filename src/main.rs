@@ -218,6 +218,7 @@ async fn main() {
         Commands::Stash { .. } => "stash",
         Commands::Retrieve { .. } => "retrieve",
         Commands::Watch { .. } => "watch",
+        Commands::Broadcast { .. } => "broadcast",
     };
 
     // Load config
@@ -487,7 +488,15 @@ async fn run_diff(
                 }
                 None => get_tables_to_sync(&local, &remote, config).await?,
             };
-            output_diffs(&local, &remote, &tables, &config.sync.timestamp_column, &config.sync.exclude_columns, fmt).await
+            output_diffs(
+                &local,
+                &remote,
+                &tables,
+                &config.sync.timestamp_column,
+                &config.sync.exclude_columns,
+                fmt,
+            )
+            .await
         }
         ResolvedTarget::Sqlite { database } => {
             let target_db = LocalDb::open_readonly(&database)?;
