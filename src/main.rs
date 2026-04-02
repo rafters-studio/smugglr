@@ -370,7 +370,14 @@ async fn run_diff(
                 }
                 None => get_tables_to_sync(&local, &remote, config).await?,
             };
-            print_diffs(&local, &remote, &tables, &config.sync.timestamp_column).await
+            print_diffs(
+                &local,
+                &remote,
+                &tables,
+                &config.sync.timestamp_column,
+                &config.sync.exclude_columns,
+            )
+            .await
         }
         ResolvedTarget::Sqlite { database } => {
             let target_db = LocalDb::open_readonly(&database)?;
@@ -382,7 +389,14 @@ async fn run_diff(
                 }
                 None => get_tables_to_sync(&local, &target_db, config).await?,
             };
-            print_diffs(&local, &target_db, &tables, &config.sync.timestamp_column).await
+            print_diffs(
+                &local,
+                &target_db,
+                &tables,
+                &config.sync.timestamp_column,
+                &config.sync.exclude_columns,
+            )
+            .await
         }
     }
 }
@@ -392,12 +406,13 @@ async fn print_diffs<A: DataSource, B: DataSource>(
     remote: &B,
     tables: &[String],
     timestamp_column: &str,
+    exclude_columns: &[String],
 ) -> error::Result<()> {
     println!("\n--- Differences ---");
     let mut has_any_changes = false;
 
     for table_name in tables {
-        let diff = diff_table(local, remote, table_name, timestamp_column).await?;
+        let diff = diff_table(local, remote, table_name, timestamp_column, exclude_columns).await?;
 
         if diff.has_changes() {
             has_any_changes = true;

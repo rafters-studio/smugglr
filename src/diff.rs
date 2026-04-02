@@ -146,12 +146,17 @@ pub async fn diff_table<A: DataSource, B: DataSource>(
     remote: &B,
     table: &str,
     timestamp_column: &str,
+    exclude_columns: &[String],
 ) -> Result<TableDiff> {
     info!("Computing diff for table: {}", table);
 
-    // Get metadata from both sides
-    let local_meta = local.get_row_metadata(table, timestamp_column).await?;
-    let remote_meta = remote.get_row_metadata(table, timestamp_column).await?;
+    // Get metadata from both sides (excluded columns are omitted from content hash)
+    let local_meta = local
+        .get_row_metadata(table, timestamp_column, exclude_columns)
+        .await?;
+    let remote_meta = remote
+        .get_row_metadata(table, timestamp_column, exclude_columns)
+        .await?;
 
     let local_keys: HashSet<&String> = local_meta.keys().collect();
     let remote_keys: HashSet<&String> = remote_meta.keys().collect();
@@ -220,11 +225,12 @@ pub async fn diff_all<A: DataSource, B: DataSource>(
     remote: &B,
     tables: &[String],
     timestamp_column: &str,
+    exclude_columns: &[String],
 ) -> Result<Vec<TableDiff>> {
     let mut diffs = Vec::new();
 
     for table in tables {
-        let diff = diff_table(local, remote, table, timestamp_column).await?;
+        let diff = diff_table(local, remote, table, timestamp_column, exclude_columns).await?;
         diffs.push(diff);
     }
 
