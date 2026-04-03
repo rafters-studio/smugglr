@@ -91,6 +91,9 @@ pub enum SyncError {
 
     #[error("Broadcast error: {0}")]
     Broadcast(String),
+
+    #[error("Plugin error: {0}")]
+    Plugin(String),
 }
 
 impl SyncError {
@@ -152,6 +155,8 @@ impl SyncError {
             | SyncError::InvalidUrl(_) => 5,
 
             SyncError::D1Api { .. } | SyncError::BadRequest { .. } => 5,
+
+            SyncError::Plugin(_) => 6,
 
             _ => 1,
         }
@@ -325,6 +330,12 @@ mod tests {
             .exit_code(),
             5
         );
+    }
+
+    #[test]
+    fn test_exit_code_plugin() {
+        assert_eq!(SyncError::Plugin("err".into()).exit_code(), 6);
+        assert!(!SyncError::Plugin("err".into()).is_retryable());
     }
 
     #[test]

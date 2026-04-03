@@ -2,7 +2,8 @@
 
 use crate::error::{Result, SyncError};
 use serde::Deserialize;
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use tracing::{debug, info};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -40,6 +41,16 @@ pub enum TargetConfig {
     },
     /// Local SQLite target
     Sqlite { database: String },
+    /// External plugin adapter
+    Plugin {
+        /// Plugin name (resolved from ~/.smuggler/plugins/smuggler-{name} or $PATH)
+        name: Option<String>,
+        /// Explicit path to plugin binary
+        path: Option<String>,
+        /// Plugin-specific configuration passed to initialize
+        #[serde(default)]
+        config: HashMap<String, String>,
+    },
 }
 
 /// Resolved target after merging legacy fields with [target] section
@@ -52,6 +63,11 @@ pub enum ResolvedTarget {
     },
     Sqlite {
         database: String,
+    },
+    Plugin {
+        path: PathBuf,
+        name: String,
+        config: HashMap<String, String>,
     },
 }
 
@@ -381,6 +397,36 @@ impl Config {
                 TargetConfig::Sqlite { database } => ResolvedTarget::Sqlite {
                     database: database.clone(),
                 },
+                TargetConfig::Plugin {
+                    name,
+                    path,
+                    config,
+                } => {
+                    let (resolved_path, resolved_name) = match (name, path) {
+                        (_, Some(p)) => {
+                            let pb = PathBuf::from(p);
+                            let n = pb
+                                .file_name()
+                                .map(|f| f.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| p.clone());
+                            (pb, n)
+                        }
+                        (Some(n), None) => {
+                            let pb = crate::plugin::resolve_plugin_path(n)?;
+                            (pb, n.clone())
+                        }
+                        (None, None) => {
+                            return Err(SyncError::Config(
+                                "Plugin target requires either 'name' or 'path'".into(),
+                            ));
+                        }
+                    };
+                    ResolvedTarget::Plugin {
+                        path: resolved_path,
+                        name: resolved_name,
+                        config: config.clone(),
+                    }
+                }
             });
         }
 
@@ -870,5 +916,116 @@ exclude_columns = ["*_embedding", "vector"]
         assert!(config.sync.should_exclude_column("title_embedding"));
         assert!(config.sync.should_exclude_column("vector"));
         assert!(!config.sync.should_exclude_column("name"));
+    }
+
+    #[test]
+    fn test_parse_toml_plugin_target_with_name() {
+        let toml_str = r#"
+local_db = "game.db"
+
+[target]
+type = "plugin"
+name = "turso"
+
+[target.config]
+url = "libsql://my-db.turso.io"
+auth_token = "tok123"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        match &config.target {
+            Some(TargetConfig::Plugin { name, path, config }) => {
+                assert_eq!(name.as_deref(), Some("turso"));
+                assert!(path.is_none());
+                assert_eq!(config.get("url").unwrap(), "libsql://my-db.turso.io");
+                assert_eq!(config.get("auth_token").unwrap(), "tok123");
+            }
+            _ => panic!("expected plugin target"),
+        }
+    }
+
+    #[test]
+    fn test_parse_toml_plugin_target_with_path() {
+        let toml_str = r#"
+local_db = "game.db"
+
+[target]
+type = "plugin"
+path = "/usr/local/bin/smuggler-turso"
+
+[target.config]
+url = "libsql://my-db.turso.io"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        match &config.target {
+            Some(TargetConfig::Plugin { name, path, config }) => {
+                assert!(name.is_none());
+                assert_eq!(path.as_deref(), Some("/usr/local/bin/smuggler-turso"));
+                assert_eq!(config.get("url").unwrap(), "libsql://my-db.turso.io");
+            }
+            _ => panic!("expected plugin target"),
+        }
+    }
+
+    #[test]
+    fn test_parse_toml_plugin_target_empty_config() {
+        let toml_str = r#"
+local_db = "game.db"
+
+[target]
+type = "plugin"
+path = "/usr/local/bin/smuggler-custom"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        match &config.target {
+            Some(TargetConfig::Plugin { config, .. }) => {
+                assert!(config.is_empty());
+            }
+            _ => panic!("expected plugin target"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_plugin_target_with_path() {
+        let config = Config {
+            cloudflare_account_id: None,
+            cloudflare_api_token: None,
+            database_id: None,
+            local_db: Some("test.db".into()),
+            sync: SyncConfig::default(),
+            stash: None,
+            target: Some(TargetConfig::Plugin {
+                name: None,
+                path: Some("/usr/local/bin/smuggler-turso".into()),
+                config: HashMap::new(),
+            }),
+            broadcast: None,
+        };
+        let target = config.resolve_target().unwrap();
+        match target {
+            ResolvedTarget::Plugin { path, name, .. } => {
+                assert_eq!(path, PathBuf::from("/usr/local/bin/smuggler-turso"));
+                assert_eq!(name, "smuggler-turso");
+            }
+            _ => panic!("expected plugin target"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_plugin_target_no_name_or_path() {
+        let config = Config {
+            cloudflare_account_id: None,
+            cloudflare_api_token: None,
+            database_id: None,
+            local_db: Some("test.db".into()),
+            sync: SyncConfig::default(),
+            stash: None,
+            target: Some(TargetConfig::Plugin {
+                name: None,
+                path: None,
+                config: HashMap::new(),
+            }),
+            broadcast: None,
+        };
+        assert!(config.resolve_target().is_err());
     }
 }

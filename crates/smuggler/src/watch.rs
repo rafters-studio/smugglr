@@ -12,6 +12,7 @@ use smuggler_core::daemon::{
 };
 use smuggler_core::error::Result;
 use smuggler_core::local::LocalDb;
+use smuggler_core::plugin::PluginDataSource;
 use smuggler_core::remote::D1Client;
 use smuggler_core::sync::{sync_all, NoProgress};
 use std::path::Path;
@@ -68,6 +69,13 @@ pub async fn run_watch(
                         let local = LocalDb::open(config.local_db_path())?;
                         let target_db = LocalDb::open(database)?;
                         sync_all(&local, &target_db, config, None, dry_run, &NoProgress).await
+                    }
+                    ResolvedTarget::Plugin { ref path, ref name, config: ref plugin_config } => {
+                        let local = LocalDb::open(config.local_db_path())?;
+                        match PluginDataSource::start(path, name, plugin_config).await {
+                            Ok(plugin) => sync_all(&local, &plugin, config, None, dry_run, &NoProgress).await,
+                            Err(e) => Err(e),
+                        }
                     }
                 };
 
