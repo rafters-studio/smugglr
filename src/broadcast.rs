@@ -645,6 +645,104 @@ impl SequenceTracker {
     }
 }
 
+/// Tracks seen sequence numbers per peer to detect replay attacks.
+///
+/// Uses a sliding window of 64 sequence numbers per peer. Packets with
+/// previously seen or too-old sequence numbers are rejected.
+#[derive(Debug)]
+pub struct ReplayGuard {
+    /// Per-peer sliding window of seen sequences.
+    /// Key: source_id, Value: (highest_seen_seq, bitfield of recent seqs)
+    windows: HashMap<String, (u64, u64)>,
+}
+
+impl ReplayGuard {
+    pub fn new() -> Self {
+        Self {
+            windows: HashMap::new(),
+        }
+    }
+
+    /// Remove peers not in the given active set to prevent unbounded growth.
+    pub fn prune(&mut self, active_peers: &[&str]) {
+        self.windows
+            .retain(|id, _| active_peers.contains(&id.as_str()));
+    }
+
+    /// Check whether a packet with the given source_id and seq should be accepted.
+    /// Returns `true` if accepted (not a replay), `false` if rejected.
+    pub fn check(&mut self, source_id: &str, seq: u64) -> bool {
+        // Cap source_id length and total peers to prevent DoS via crafted packets
+        if source_id.len() > 128 {
+            warn!(
+                "Replay guard: rejecting oversized source_id ({}B)",
+                source_id.len()
+            );
+            return false;
+        }
+        if !self.windows.contains_key(source_id) && self.windows.len() >= 256 {
+            warn!(
+                "Replay guard: peer limit reached, rejecting new peer '{}'",
+                source_id
+            );
+            return false;
+        }
+
+        let entry = self.windows.get_mut(source_id);
+        match entry {
+            None => {
+                self.windows.insert(source_id.to_string(), (seq, 0));
+                true
+            }
+            Some((highest, bitfield)) => {
+                if seq > *highest {
+                    let shift = seq - *highest;
+                    if shift < 64 {
+                        *bitfield = (*bitfield << shift) | (1 << (shift - 1));
+                    } else {
+                        *bitfield = 0;
+                    }
+                    *highest = seq;
+                    true
+                } else if seq == *highest {
+                    // Exact duplicate of the highest seen
+                    debug!(
+                        "Replay guard: dropping duplicate seq {} from '{}'",
+                        seq, source_id
+                    );
+                    false
+                } else if *highest - seq > 63 {
+                    // Too old -- outside the 64-seq window
+                    warn!(
+                        "Replay guard: dropping packet from '{}' with seq {} (too old, highest={})",
+                        source_id, seq, *highest
+                    );
+                    false
+                } else {
+                    let offset = *highest - seq - 1;
+                    let bit = 1u64 << offset;
+                    if *bitfield & bit != 0 {
+                        debug!(
+                            "Replay guard: dropping duplicate seq {} from '{}'",
+                            seq, source_id
+                        );
+                        false
+                    } else {
+                        *bitfield |= bit;
+                        true
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Default for ReplayGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[allow(dead_code)]
 pub fn reassemble_delta(parts: &[DeltaPacket]) -> Option<DeltaPacket> {
     if parts.is_empty() {
@@ -785,6 +883,7 @@ async fn handle_sync_connection(
     config: &crate::config::Config,
     broadcast_config: &BroadcastConfig,
     db_path_hash: &str,
+    replay_guard: &Arc<tokio::sync::Mutex<ReplayGuard>>,
 ) -> Result<()> {
     use crate::datasource::DataSource;
     use crate::local::LocalDb;
@@ -918,6 +1017,12 @@ async fn handle_sync_connection(
             if delta.is_empty() {
                 continue;
             }
+            {
+                let mut guard = replay_guard.lock().await;
+                if !guard.check(&delta.source_id, delta.seq) {
+                    continue;
+                }
+            }
             match local.upsert_rows(&delta.table, &delta.upserts).await {
                 Ok(count) => {
                     debug!(
@@ -955,6 +1060,7 @@ pub struct BroadcastResult {
 pub async fn run_broadcast_once(
     config: &crate::config::Config,
     broadcast_config: &BroadcastConfig,
+    replay_guard: &Arc<tokio::sync::Mutex<ReplayGuard>>,
 ) -> Result<BroadcastResult> {
     use crate::datasource::DataSource;
     use crate::local::LocalDb;
@@ -983,6 +1089,13 @@ pub async fn run_broadcast_once(
     if compatible.is_empty() {
         debug!("No compatible peers found");
         return Ok(result);
+    }
+
+    // Prune replay windows for peers no longer discovered
+    {
+        let active_ids: Vec<&str> = compatible.iter().map(|p| p.instance_id.as_str()).collect();
+        let mut guard = replay_guard.lock().await;
+        guard.prune(&active_ids);
     }
 
     info!("Found {} compatible peer(s)", compatible.len());
@@ -1029,7 +1142,7 @@ pub async fn run_broadcast_once(
 
         info!("Syncing with peer {} at {}", peer.instance_id, sync_addr);
 
-        match sync_with_peer(&local, &request, sync_addr).await {
+        match sync_with_peer(&local, &request, sync_addr, replay_guard).await {
             Ok((rows_recv, rows_sent)) => {
                 result.peers_synced += 1;
                 result.rows_received += rows_recv;
@@ -1058,6 +1171,7 @@ async fn sync_with_peer(
     local: &crate::local::LocalDb,
     request: &SyncRequest,
     addr: SocketAddr,
+    replay_guard: &Arc<tokio::sync::Mutex<ReplayGuard>>,
 ) -> Result<(usize, usize)> {
     use crate::datasource::DataSource;
 
@@ -1078,10 +1192,16 @@ async fn sync_with_peer(
     let mut rows_received: usize = 0;
     let mut rows_sent: usize = 0;
 
-    // Apply received deltas
+    // Apply received deltas (after replay check)
     for delta in &response.deltas {
         if delta.is_empty() {
             continue;
+        }
+        {
+            let mut guard = replay_guard.lock().await;
+            if !guard.check(&delta.source_id, delta.seq) {
+                continue;
+            }
         }
         let count = local.upsert_rows(&delta.table, &delta.upserts).await?;
         rows_received += count;
@@ -1092,17 +1212,18 @@ async fn sync_with_peer(
     }
 
     // Send rows the peer wants from us
+    let mut seq_tracker = SequenceTracker::new();
     for want in &response.want_rows {
         if want.pk_values.is_empty() {
             continue;
         }
         let rows = local.get_rows(&want.table, &want.pk_values).await?;
         if !rows.is_empty() {
-            // Send these back as a follow-up delta
+            let seq = seq_tracker.next(&want.table);
             let packet = DeltaPacket {
                 version: PROTOCOL_VERSION,
                 source_id: request.instance_id.clone(),
-                seq: 0,
+                seq,
                 part: 0,
                 total_parts: 1,
                 table: want.table.clone(),
@@ -1158,10 +1279,14 @@ pub async fn run_broadcast(
         port, broadcast_config.interval_secs, instance_id, dry_run
     );
 
+    // Shared replay guard across TCP server and sync loop
+    let replay_guard = Arc::new(tokio::sync::Mutex::new(ReplayGuard::new()));
+
     // Start TCP sync server in background
     let tcp_config = config.clone();
     let tcp_broadcast_config = broadcast_config.clone();
     let tcp_db_path_hash = db_path_hash.clone();
+    let tcp_replay_guard = replay_guard.clone();
     let tcp_addr: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port));
 
     let tcp_listener = tokio::net::TcpListener::bind(tcp_addr).await.map_err(|e| {
@@ -1185,6 +1310,7 @@ pub async fn run_broadcast(
                         &tcp_config,
                         &tcp_broadcast_config,
                         &tcp_db_path_hash,
+                        &tcp_replay_guard,
                     )
                     .await
                     {
@@ -1231,7 +1357,7 @@ pub async fn run_broadcast(
                         );
                     }
                 } else {
-                    match run_broadcast_once(config, broadcast_config).await {
+                    match run_broadcast_once(config, broadcast_config, &replay_guard).await {
                         Ok(result) => {
                             if result.rows_received > 0 || result.rows_sent > 0 {
                                 info!(
@@ -1794,9 +1920,15 @@ mod tests {
         tokio::spawn(async move {
             loop {
                 if let Ok((stream, _)) = tcp_listener.accept().await {
-                    let _ =
-                        handle_sync_connection(stream, &server_config, &server_bc, &server_hash)
-                            .await;
+                    let guard = Arc::new(tokio::sync::Mutex::new(ReplayGuard::new()));
+                    let _ = handle_sync_connection(
+                        stream,
+                        &server_config,
+                        &server_bc,
+                        &server_hash,
+                        &guard,
+                    )
+                    .await;
                 }
             }
         });
@@ -1824,7 +1956,10 @@ mod tests {
         };
 
         let sync_addr: SocketAddr = format!("127.0.0.1:{}", server_port).parse().unwrap();
-        let (rows_recv, rows_sent) = sync_with_peer(&local_a, &request, sync_addr).await.unwrap();
+        let client_guard = Arc::new(tokio::sync::Mutex::new(ReplayGuard::new()));
+        let (rows_recv, rows_sent) = sync_with_peer(&local_a, &request, sync_addr, &client_guard)
+            .await
+            .unwrap();
 
         // A should have received Carol (1 row) from B
         assert_eq!(rows_recv, 1, "A should receive 1 row (Carol) from B");
@@ -1887,9 +2022,15 @@ mod tests {
         tokio::spawn(async move {
             loop {
                 if let Ok((stream, _)) = tcp_listener.accept().await {
-                    let _ =
-                        handle_sync_connection(stream, &server_config, &server_bc, &server_hash)
-                            .await;
+                    let guard = Arc::new(tokio::sync::Mutex::new(ReplayGuard::new()));
+                    let _ = handle_sync_connection(
+                        stream,
+                        &server_config,
+                        &server_bc,
+                        &server_hash,
+                        &guard,
+                    )
+                    .await;
                 }
             }
         });
@@ -1917,7 +2058,10 @@ mod tests {
         };
 
         let sync_addr: SocketAddr = format!("127.0.0.1:{}", server_port).parse().unwrap();
-        let (rows_recv, rows_sent) = sync_with_peer(&local_a, &request, sync_addr).await.unwrap();
+        let client_guard = Arc::new(tokio::sync::Mutex::new(ReplayGuard::new()));
+        let (rows_recv, rows_sent) = sync_with_peer(&local_a, &request, sync_addr, &client_guard)
+            .await
+            .unwrap();
 
         // With embedding excluded, both see the row as identical
         assert_eq!(
@@ -1965,9 +2109,15 @@ mod tests {
         tokio::spawn(async move {
             loop {
                 if let Ok((stream, _)) = tcp_listener.accept().await {
-                    let _ =
-                        handle_sync_connection(stream, &server_config, &server_bc, &server_hash)
-                            .await;
+                    let guard = Arc::new(tokio::sync::Mutex::new(ReplayGuard::new()));
+                    let _ = handle_sync_connection(
+                        stream,
+                        &server_config,
+                        &server_bc,
+                        &server_hash,
+                        &guard,
+                    )
+                    .await;
                 }
             }
         });
@@ -1983,7 +2133,10 @@ mod tests {
 
         let sync_addr: SocketAddr = format!("127.0.0.1:{}", server_port).parse().unwrap();
         let local = crate::local::LocalDb::open(&db_path).unwrap();
-        let (recv, sent) = sync_with_peer(&local, &request, sync_addr).await.unwrap();
+        let client_guard = Arc::new(tokio::sync::Mutex::new(ReplayGuard::new()));
+        let (recv, sent) = sync_with_peer(&local, &request, sync_addr, &client_guard)
+            .await
+            .unwrap();
 
         // Server should have rejected with empty response
         assert_eq!(recv, 0);
@@ -2054,10 +2207,112 @@ mod tests {
         };
 
         // run_broadcast_once with no peers listening should return gracefully
-        let result = run_broadcast_once(&config, &bc).await.unwrap();
+        let guard = Arc::new(tokio::sync::Mutex::new(ReplayGuard::new()));
+        let result = run_broadcast_once(&config, &bc, &guard).await.unwrap();
         assert_eq!(result.peers_discovered, 0);
         assert_eq!(result.peers_synced, 0);
         assert_eq!(result.rows_received, 0);
         assert_eq!(result.rows_sent, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // ReplayGuard tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_replay_guard_accepts_new_sequence() {
+        let mut guard = ReplayGuard::new();
+        assert!(guard.check("peer-a", 5));
+    }
+
+    #[test]
+    fn test_replay_guard_rejects_duplicate() {
+        let mut guard = ReplayGuard::new();
+        assert!(guard.check("peer-a", 5));
+        assert!(!guard.check("peer-a", 5));
+    }
+
+    #[test]
+    fn test_replay_guard_sliding_window() {
+        let mut guard = ReplayGuard::new();
+        // Accept seq 100
+        assert!(guard.check("peer-a", 100));
+        // Seq 50 is too old (100 - 50 = 50 < 64, but let's use 36 which is outside)
+        // Actually 100 - 50 = 50 which is < 64, so it's within the window
+        assert!(guard.check("peer-a", 50));
+        // But seq 50 again is a duplicate
+        assert!(!guard.check("peer-a", 50));
+        // Seq 30 is within window (100 - 30 = 70 >= 64), so too old
+        assert!(!guard.check("peer-a", 30));
+        // Seq 80 is within window and not seen
+        assert!(guard.check("peer-a", 80));
+    }
+
+    #[test]
+    fn test_replay_guard_too_old_rejected() {
+        let mut guard = ReplayGuard::new();
+        assert!(guard.check("peer-a", 100));
+        // 100 - 36 = 64, which is outside the 64-seq window (> 63)
+        assert!(!guard.check("peer-a", 36));
+        // 100 - 37 = 63, exactly at boundary, within window
+        assert!(guard.check("peer-a", 37));
+    }
+
+    #[test]
+    fn test_replay_guard_independent_peers() {
+        let mut guard = ReplayGuard::new();
+        assert!(guard.check("peer-a", 5));
+        assert!(guard.check("peer-b", 5));
+        // Each peer has independent state
+        assert!(!guard.check("peer-a", 5));
+        assert!(!guard.check("peer-b", 5));
+    }
+
+    #[test]
+    fn test_replay_guard_advancing_window() {
+        let mut guard = ReplayGuard::new();
+        // Sequential acceptance
+        for seq in 0..10 {
+            assert!(guard.check("peer-a", seq));
+        }
+        // All duplicates rejected
+        for seq in 0..10 {
+            assert!(!guard.check("peer-a", seq));
+        }
+    }
+
+    #[test]
+    fn test_replay_guard_large_gap_resets_bitfield() {
+        let mut guard = ReplayGuard::new();
+        assert!(guard.check("peer-a", 0));
+        // Jump far ahead (gap >= 64 resets bitfield)
+        assert!(guard.check("peer-a", 200));
+        // Old seq 0 is too old now
+        assert!(!guard.check("peer-a", 0));
+        // But seq 200 was already seen (it's the highest)
+        assert!(!guard.check("peer-a", 200));
+        // Recent within window should work
+        assert!(guard.check("peer-a", 199));
+    }
+
+    #[test]
+    fn test_replay_guard_prune_removes_stale_peers() {
+        let mut guard = ReplayGuard::new();
+        guard.check("peer-a", 1);
+        guard.check("peer-b", 1);
+        guard.check("peer-c", 1);
+        assert_eq!(guard.windows.len(), 3);
+
+        guard.prune(&["peer-a", "peer-c"]);
+        assert_eq!(guard.windows.len(), 2);
+        assert!(guard.windows.contains_key("peer-a"));
+        assert!(!guard.windows.contains_key("peer-b"));
+        assert!(guard.windows.contains_key("peer-c"));
+    }
+
+    #[test]
+    fn test_replay_guard_default() {
+        let guard = ReplayGuard::default();
+        assert!(guard.windows.is_empty());
     }
 }
