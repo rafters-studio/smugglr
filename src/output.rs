@@ -143,6 +143,115 @@ impl CommandOutput {
     }
 }
 
+/// Structured dry-run output with per-table diff breakdown.
+///
+/// Emitted by `--dry-run --output json`. Contains the same diff data
+/// used by the actual sync so agents can use it as an approval gate.
+/// Generic over the table detail type (compact counts vs verbose PK lists).
+#[derive(Serialize)]
+pub struct DryRunOutput<T: Serialize> {
+    pub command: &'static str,
+    pub status: &'static str,
+    pub tables: Vec<T>,
+    pub total_rows_to_push: usize,
+    pub total_rows_to_pull: usize,
+    pub exit_code: i32,
+}
+
+#[derive(Serialize)]
+pub struct DryRunTableOutput {
+    pub name: String,
+    pub local_only: usize,
+    pub remote_only: usize,
+    pub local_newer: usize,
+    pub remote_newer: usize,
+    pub content_differs: usize,
+    pub identical: usize,
+    pub rows_to_push: usize,
+    pub rows_to_pull: usize,
+}
+
+#[derive(Serialize)]
+pub struct DryRunVerboseTableOutput {
+    pub name: String,
+    pub local_only: Vec<String>,
+    pub remote_only: Vec<String>,
+    pub local_newer: Vec<String>,
+    pub remote_newer: Vec<String>,
+    pub content_differs: Vec<String>,
+    pub identical: usize,
+    pub rows_to_push: usize,
+    pub rows_to_pull: usize,
+}
+
+impl<T: Serialize> DryRunOutput<T> {
+    fn build(
+        command: &'static str,
+        results: &[SyncResult],
+        map_table: impl Fn(&SyncResult) -> T,
+    ) -> Self {
+        let mut total_push = 0;
+        let mut total_pull = 0;
+        let tables: Vec<_> = results
+            .iter()
+            .map(|r| {
+                total_push += r.rows_pushed;
+                total_pull += r.rows_pulled;
+                map_table(r)
+            })
+            .collect();
+
+        Self {
+            command,
+            status: "dry_run",
+            tables,
+            total_rows_to_push: total_push,
+            total_rows_to_pull: total_pull,
+            exit_code: 0,
+        }
+    }
+}
+
+impl DryRunOutput<DryRunTableOutput> {
+    pub fn from_sync_results(command: &'static str, results: &[SyncResult]) -> Self {
+        Self::build(command, results, |r| {
+            let stats = r.diff_stats.as_ref();
+            DryRunTableOutput {
+                name: r.table.clone(),
+                local_only: stats.map(|s| s.local_only).unwrap_or(0),
+                remote_only: stats.map(|s| s.remote_only).unwrap_or(0),
+                local_newer: stats.map(|s| s.local_newer).unwrap_or(0),
+                remote_newer: stats.map(|s| s.remote_newer).unwrap_or(0),
+                content_differs: stats.map(|s| s.content_differs).unwrap_or(0),
+                identical: stats.map(|s| s.identical).unwrap_or(0),
+                rows_to_push: r.rows_pushed,
+                rows_to_pull: r.rows_pulled,
+            }
+        })
+    }
+}
+
+impl DryRunOutput<DryRunVerboseTableOutput> {
+    pub fn from_sync_results(command: &'static str, results: &[SyncResult]) -> Self {
+        Self::build(command, results, |r| {
+            let detail = r.diff_detail.as_ref();
+            DryRunVerboseTableOutput {
+                name: r.table.clone(),
+                local_only: detail.map(|d| d.local_only.clone()).unwrap_or_default(),
+                remote_only: detail.map(|d| d.remote_only.clone()).unwrap_or_default(),
+                local_newer: detail.map(|d| d.local_newer.clone()).unwrap_or_default(),
+                remote_newer: detail.map(|d| d.remote_newer.clone()).unwrap_or_default(),
+                content_differs: detail
+                    .map(|d| d.content_differs.clone())
+                    .unwrap_or_default(),
+                identical: r.diff_stats.as_ref().map(|s| s.identical).unwrap_or(0),
+                rows_to_push: r.rows_pushed,
+                rows_to_pull: r.rows_pulled,
+            }
+        })
+    }
+}
+
 impl DiffOutput {
     pub fn from_diffs(diffs: Vec<(String, TableDiff)>) -> Self {
         Self {
@@ -214,11 +323,15 @@ mod tests {
                 table: "abilities".into(),
                 rows_pushed: 42,
                 rows_pulled: 0,
+                diff_stats: None,
+                diff_detail: None,
             },
             SyncResult {
                 table: "items".into(),
                 rows_pushed: 0,
                 rows_pulled: 0,
+                diff_stats: None,
+                diff_detail: None,
             },
         ];
 
@@ -243,6 +356,8 @@ mod tests {
             table: "t".into(),
             rows_pushed: 10,
             rows_pulled: 5,
+            diff_stats: None,
+            diff_detail: None,
         }];
 
         let out = CommandOutput::from_sync_results("sync", &results, true);
@@ -278,6 +393,8 @@ mod tests {
             table: "t".into(),
             rows_pushed: 3,
             rows_pulled: 7,
+            diff_stats: None,
+            diff_detail: None,
         }];
 
         let out = WatchTickOutput::from_results(5, &results);
@@ -355,5 +472,141 @@ mod tests {
         assert_eq!(v["local"]["connected"], true);
         assert_eq!(v["local"]["tables"][0]["rows"], 100);
         assert_eq!(v["target"]["tables"][0]["rows"], 95);
+    }
+
+    #[test]
+    fn test_dry_run_output_json_structure() {
+        use crate::diff::DiffStats;
+
+        let results = vec![
+            SyncResult {
+                table: "abilities".into(),
+                rows_pushed: 8,
+                rows_pulled: 3,
+                diff_stats: Some(DiffStats {
+                    local_only: 3,
+                    remote_only: 1,
+                    local_newer: 5,
+                    remote_newer: 2,
+                    content_differs: 0,
+                    identical: 142,
+                }),
+                diff_detail: None,
+            },
+            SyncResult {
+                table: "items".into(),
+                rows_pushed: 0,
+                rows_pulled: 0,
+                diff_stats: Some(DiffStats {
+                    local_only: 0,
+                    remote_only: 0,
+                    local_newer: 0,
+                    remote_newer: 0,
+                    content_differs: 0,
+                    identical: 50,
+                }),
+                diff_detail: None,
+            },
+        ];
+
+        let out = DryRunOutput::<DryRunTableOutput>::from_sync_results("sync", &results);
+        let json = serde_json::to_string(&out).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(v["command"], "sync");
+        assert_eq!(v["status"], "dry_run");
+        assert_eq!(v["total_rows_to_push"], 8);
+        assert_eq!(v["total_rows_to_pull"], 3);
+        assert_eq!(v["exit_code"], 0);
+
+        let tables = v["tables"].as_array().unwrap();
+        assert_eq!(tables.len(), 2);
+
+        assert_eq!(tables[0]["name"], "abilities");
+        assert_eq!(tables[0]["local_only"], 3);
+        assert_eq!(tables[0]["remote_only"], 1);
+        assert_eq!(tables[0]["local_newer"], 5);
+        assert_eq!(tables[0]["remote_newer"], 2);
+        assert_eq!(tables[0]["content_differs"], 0);
+        assert_eq!(tables[0]["identical"], 142);
+        assert_eq!(tables[0]["rows_to_push"], 8);
+        assert_eq!(tables[0]["rows_to_pull"], 3);
+
+        assert_eq!(tables[1]["name"], "items");
+        assert_eq!(tables[1]["rows_to_push"], 0);
+        assert_eq!(tables[1]["rows_to_pull"], 0);
+        assert_eq!(tables[1]["identical"], 50);
+    }
+
+    #[test]
+    fn test_dry_run_no_side_effects_matches_structure() {
+        let results = vec![SyncResult {
+            table: "t".into(),
+            rows_pushed: 5,
+            rows_pulled: 2,
+            diff_stats: None,
+            diff_detail: None,
+        }];
+
+        let out = DryRunOutput::<DryRunTableOutput>::from_sync_results("push", &results);
+        let json = serde_json::to_string(&out).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(v["status"], "dry_run");
+        assert_eq!(v["total_rows_to_push"], 5);
+        assert_eq!(v["total_rows_to_pull"], 2);
+        // Without diff_stats, zeros are used for breakdown
+        assert_eq!(v["tables"][0]["local_only"], 0);
+        assert_eq!(v["tables"][0]["identical"], 0);
+    }
+
+    #[test]
+    fn test_dry_run_verbose_output_includes_pk_values() {
+        use crate::diff::DiffStats;
+        use crate::sync::DiffDetail;
+
+        let results = vec![SyncResult {
+            table: "abilities".into(),
+            rows_pushed: 3,
+            rows_pulled: 1,
+            diff_stats: Some(DiffStats {
+                local_only: 2,
+                remote_only: 1,
+                local_newer: 1,
+                remote_newer: 0,
+                content_differs: 0,
+                identical: 10,
+            }),
+            diff_detail: Some(DiffDetail {
+                local_only: vec!["pk1".into(), "pk2".into()],
+                remote_only: vec!["pk3".into()],
+                local_newer: vec!["pk4".into()],
+                remote_newer: vec![],
+                content_differs: vec![],
+            }),
+        }];
+
+        let out = DryRunOutput::<DryRunVerboseTableOutput>::from_sync_results("push", &results);
+        let json = serde_json::to_string(&out).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(v["command"], "push");
+        assert_eq!(v["status"], "dry_run");
+        assert_eq!(v["total_rows_to_push"], 3);
+        assert_eq!(v["total_rows_to_pull"], 1);
+
+        let t = &v["tables"][0];
+        assert_eq!(t["name"], "abilities");
+        assert_eq!(t["local_only"].as_array().unwrap().len(), 2);
+        assert_eq!(t["local_only"][0], "pk1");
+        assert_eq!(t["local_only"][1], "pk2");
+        assert_eq!(t["remote_only"].as_array().unwrap().len(), 1);
+        assert_eq!(t["remote_only"][0], "pk3");
+        assert_eq!(t["local_newer"].as_array().unwrap().len(), 1);
+        assert_eq!(t["remote_newer"].as_array().unwrap().len(), 0);
+        assert_eq!(t["content_differs"].as_array().unwrap().len(), 0);
+        assert_eq!(t["identical"], 10);
+        assert_eq!(t["rows_to_push"], 3);
+        assert_eq!(t["rows_to_pull"], 1);
     }
 }
