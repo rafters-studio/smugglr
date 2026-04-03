@@ -36,6 +36,8 @@ mod remote;
 mod stash;
 mod sync;
 mod table;
+#[cfg(feature = "turso")]
+mod turso;
 mod watch;
 
 use crate::config::{Config, ResolvedTarget};
@@ -366,6 +368,13 @@ async fn run_push(
             let target_db = LocalDb::open(&database)?;
             push_all(&local, &target_db, config, tables, dry_run).await?
         }
+        #[cfg(feature = "turso")]
+        ResolvedTarget::Turso { url, auth_token } => {
+            info!("Push mode: local -> Turso");
+            let remote = turso::TursoClient::connect(&url, &auth_token).await?;
+            remote.test_connection().await?;
+            push_all(&local, &remote, config, tables, dry_run).await?
+        }
     };
 
     match fmt {
@@ -412,6 +421,13 @@ async fn run_pull(
             let source_db = LocalDb::open_readonly(&database)?;
             pull_all(&local, &source_db, config, tables, dry_run).await?
         }
+        #[cfg(feature = "turso")]
+        ResolvedTarget::Turso { url, auth_token } => {
+            info!("Pull mode: Turso -> local");
+            let remote = turso::TursoClient::connect(&url, &auth_token).await?;
+            remote.test_connection().await?;
+            pull_all(&local, &remote, config, tables, dry_run).await?
+        }
     };
 
     match fmt {
@@ -457,6 +473,13 @@ async fn run_sync(
             info!("Sync mode: bidirectional (local <-> SQLite {})", database);
             let target_db = LocalDb::open(&database)?;
             sync_all(&local, &target_db, config, tables, dry_run).await?
+        }
+        #[cfg(feature = "turso")]
+        ResolvedTarget::Turso { url, auth_token } => {
+            info!("Sync mode: bidirectional (local <-> Turso)");
+            let remote = turso::TursoClient::connect(&url, &auth_token).await?;
+            remote.test_connection().await?;
+            sync_all(&local, &remote, config, tables, dry_run).await?
         }
     };
 
@@ -539,6 +562,28 @@ async fn run_diff(
             output_diffs(
                 &local,
                 &target_db,
+                &tables,
+                &config.sync.timestamp_column,
+                &config.sync.exclude_columns,
+                fmt,
+            )
+            .await
+        }
+        #[cfg(feature = "turso")]
+        ResolvedTarget::Turso { url, auth_token } => {
+            let remote = turso::TursoClient::connect(&url, &auth_token).await?;
+            remote.test_connection().await?;
+            let tables = match table {
+                Some(t) => {
+                    let schema = local.get_schema()?;
+                    let _ = schema.validate(&t)?;
+                    vec![t]
+                }
+                None => get_tables_to_sync(&local, &remote, config).await?,
+            };
+            output_diffs(
+                &local,
+                &remote,
                 &tables,
                 &config.sync.timestamp_column,
                 &config.sync.exclude_columns,
@@ -645,6 +690,8 @@ async fn run_status(
     let target_type = match &target {
         ResolvedTarget::D1 { .. } => "d1",
         ResolvedTarget::Sqlite { .. } => "sqlite",
+        #[cfg(feature = "turso")]
+        ResolvedTarget::Turso { .. } => "turso",
     };
 
     // Gather local DB info
@@ -733,6 +780,41 @@ async fn run_status(
                 tables: vec![],
             },
         },
+        #[cfg(feature = "turso")]
+        ResolvedTarget::Turso { url, auth_token } => {
+            match turso::TursoClient::connect(url, auth_token).await {
+                Ok(remote) => match remote.test_connection().await {
+                    Ok(()) => {
+                        let tables = remote.list_tables().await?;
+                        let mut table_rows = Vec::new();
+                        for table in &tables {
+                            if config.should_sync_table(table) {
+                                let count = remote.row_count(table).await?;
+                                table_rows.push(StatusTable {
+                                    name: table.clone(),
+                                    rows: count,
+                                });
+                            }
+                        }
+                        StatusDb {
+                            connected: true,
+                            error: None,
+                            tables: table_rows,
+                        }
+                    }
+                    Err(e) => StatusDb {
+                        connected: false,
+                        error: Some(e.to_string()),
+                        tables: vec![],
+                    },
+                },
+                Err(e) => StatusDb {
+                    connected: false,
+                    error: Some(e.to_string()),
+                    tables: vec![],
+                },
+            }
+        }
     };
 
     match fmt {
@@ -777,6 +859,10 @@ async fn run_status(
                 ResolvedTarget::Sqlite { database } => {
                     println!("  Target: SQLite ({})", database);
                 }
+                #[cfg(feature = "turso")]
+                ResolvedTarget::Turso { url, .. } => {
+                    println!("  Target: Turso ({})", url);
+                }
             }
 
             println!("  Timestamp column: {}", config.sync.timestamp_column);
@@ -814,6 +900,8 @@ async fn run_status(
             match &target {
                 ResolvedTarget::D1 { .. } => println!("\n--- Remote D1 ---"),
                 ResolvedTarget::Sqlite { .. } => println!("\n--- Target SQLite ---"),
+                #[cfg(feature = "turso")]
+                ResolvedTarget::Turso { .. } => println!("\n--- Target Turso ---"),
             }
             if target_status.connected {
                 println!("  Connection: OK");

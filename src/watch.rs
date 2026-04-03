@@ -262,6 +262,20 @@ pub async fn run_watch(
                         let target_db = LocalDb::open(database)?;
                         sync_all(&local, &target_db, config, None, dry_run).await
                     }
+                    #[cfg(feature = "turso")]
+                    ResolvedTarget::Turso { url, auth_token } => {
+                        let local = LocalDb::open(config.local_db_path())?;
+                        let remote = crate::turso::TursoClient::connect(url, auth_token).await?;
+                        if let Err(e) = remote.test_connection().await {
+                            warn!("Connection test failed on tick #{}: {}. Will retry next tick.", tick_count, e);
+                            if fmt == OutputFormat::Json {
+                                let out = WatchTickOutput::from_error(tick_count, &e.to_string());
+                                println!("{}", serde_json::to_string(&out).unwrap());
+                            }
+                            continue;
+                        }
+                        sync_all(&local, &remote, config, None, dry_run).await
+                    }
                 };
 
                 match result {
@@ -319,14 +333,23 @@ pub async fn run_watch(
 
 /// Check if an error is transient (should retry on next tick) vs fatal (should exit).
 fn is_transient_error(err: &SyncError) -> bool {
-    matches!(
+    if matches!(
         err,
         SyncError::RateLimited { .. }
             | SyncError::ServerError { .. }
             | SyncError::ConnectionTimeout
             | SyncError::Http(_)
             | SyncError::ConcurrentWrite
-    )
+    ) {
+        return true;
+    }
+
+    #[cfg(feature = "turso")]
+    if matches!(err, SyncError::Turso(_)) {
+        return true;
+    }
+
+    false
 }
 
 #[cfg(test)]

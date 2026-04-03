@@ -61,12 +61,19 @@ indicatif = "0.17"
 chacha20poly1305 = "0.5"
 rand = "0.9"
 
+# Turso/libSQL (optional)
+libsql = { version = "0.9", optional = true }
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Unix process checking (PID lock)
 libc = "0.2"
+
+[features]
+default = []
+turso = ["dep:libsql"]
 
 [profile.release]
 lto = true

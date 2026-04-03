@@ -91,6 +91,10 @@ pub enum SyncError {
 
     #[error("Broadcast error: {0}")]
     Broadcast(String),
+
+    #[cfg(feature = "turso")]
+    #[error("Turso error: {0}")]
+    Turso(String),
 }
 
 impl SyncError {
@@ -144,6 +148,9 @@ impl SyncError {
             | SyncError::ServerError { .. }
             | SyncError::ConnectionTimeout
             | SyncError::RetryExhausted { .. } => 3,
+
+            #[cfg(feature = "turso")]
+            SyncError::Turso(_) => 3,
 
             SyncError::ConcurrentWrite => 4,
 

@@ -40,6 +40,9 @@ pub enum TargetConfig {
     },
     /// Local SQLite target
     Sqlite { database: String },
+    /// Turso/libSQL target
+    #[cfg(feature = "turso")]
+    Turso { url: String, auth_token: String },
 }
 
 /// Resolved target after merging legacy fields with [target] section
@@ -52,6 +55,11 @@ pub enum ResolvedTarget {
     },
     Sqlite {
         database: String,
+    },
+    #[cfg(feature = "turso")]
+    Turso {
+        url: String,
+        auth_token: String,
     },
 }
 
@@ -380,6 +388,11 @@ impl Config {
                 },
                 TargetConfig::Sqlite { database } => ResolvedTarget::Sqlite {
                     database: database.clone(),
+                },
+                #[cfg(feature = "turso")]
+                TargetConfig::Turso { url, auth_token } => ResolvedTarget::Turso {
+                    url: url.clone(),
+                    auth_token: auth_token.clone(),
                 },
             });
         }
