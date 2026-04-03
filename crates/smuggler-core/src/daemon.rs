@@ -1,21 +1,12 @@
-//! Watch daemon for continuous sync
+//! Daemon utilities shared by watch and broadcast daemon loops.
 //!
-//! Runs `sync_all` on a configurable interval with a `last_sync` cursor
-//! persisted in the config file. First tick always does a full sync;
-//! subsequent ticks reuse the same engine (the cursor is informational
-//! for the user, not an optimization gate in v1).
+//! Contains PID locking, timestamp formatting, last_sync persistence,
+//! and transient error classification.
 
-use crate::config::{Config, ResolvedTarget};
 use crate::error::{Result, SyncError};
-use crate::local::LocalDb;
-use crate::output::{OutputFormat, WatchTickOutput};
-use crate::remote::D1Client;
-use crate::sync::sync_all;
 use std::fs;
 use std::path::{Path, PathBuf};
-use tokio::signal;
-use tokio::time::{self, Duration};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 /// PID lock to prevent multiple daemon instances.
 #[derive(Debug)]
@@ -73,7 +64,7 @@ impl Drop for PidLock {
 }
 
 /// Check if a process with the given PID is running.
-fn is_process_running(pid: u32) -> bool {
+pub fn is_process_running(pid: u32) -> bool {
     // On Unix, kill(pid, 0) checks existence without sending a signal
     #[cfg(unix)]
     {
@@ -127,7 +118,7 @@ pub fn update_last_sync(config_path: &Path, timestamp: &str) -> Result<()> {
 }
 
 /// Insert or update `last_sync` in a TOML string.
-fn set_last_sync_in_toml(content: &str, timestamp: &str) -> String {
+pub fn set_last_sync_in_toml(content: &str, timestamp: &str) -> String {
     let last_sync_line = format!("last_sync = \"{}\"", timestamp);
     let mut lines: Vec<String> = content.lines().map(String::from).collect();
 
@@ -175,7 +166,7 @@ fn set_last_sync_in_toml(content: &str, timestamp: &str) -> String {
 }
 
 /// Get the current UTC timestamp in ISO 8601 format.
-fn now_iso8601() -> String {
+pub fn now_iso8601() -> String {
     use std::time::SystemTime;
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -197,7 +188,7 @@ fn now_iso8601() -> String {
 }
 
 /// Convert days since Unix epoch to (year, month, day).
-fn epoch_days_to_date(days: u64) -> (u64, u64, u64) {
+pub fn epoch_days_to_date(days: u64) -> (u64, u64, u64) {
     // Algorithm from http://howardhinnant.github.io/date_algorithms.html
     let z = days + 719468;
     let era = z / 146097;
@@ -212,113 +203,8 @@ fn epoch_days_to_date(days: u64) -> (u64, u64, u64) {
     (y, m, d)
 }
 
-/// Run the watch daemon loop.
-pub async fn run_watch(
-    config: &Config,
-    config_path: &Path,
-    target: ResolvedTarget,
-    interval_secs: u64,
-    dry_run: bool,
-    fmt: OutputFormat,
-) -> Result<()> {
-    let pid_path = pid_lock_path(config_path);
-    let _pid_lock = PidLock::acquire(&pid_path)?;
-
-    info!(
-        "Starting watch daemon (interval: {}s, dry_run: {})",
-        interval_secs, dry_run
-    );
-
-    let mut tick_count: u64 = 0;
-    let mut interval = time::interval(Duration::from_secs(interval_secs));
-
-    loop {
-        tokio::select! {
-            _ = interval.tick() => {
-                tick_count += 1;
-                info!("Watch tick #{}", tick_count);
-
-                let result = match &target {
-                    ResolvedTarget::D1 { account_id, database_id, api_token } => {
-                        let local = LocalDb::open(config.local_db_path())?;
-                        let remote = D1Client::with_retry_config(
-                            account_id.clone(),
-                            database_id.clone(),
-                            api_token.clone(),
-                            config.retry_config(),
-                        );
-                        if let Err(e) = remote.test_connection().await {
-                            warn!("Connection test failed on tick #{}: {}. Will retry next tick.", tick_count, e);
-                            if fmt == OutputFormat::Json {
-                                let out = WatchTickOutput::from_error(tick_count, &e.to_string());
-                                println!("{}", serde_json::to_string(&out).unwrap());
-                            }
-                            continue;
-                        }
-                        sync_all(&local, &remote, config, None, dry_run).await
-                    }
-                    ResolvedTarget::Sqlite { database } => {
-                        let local = LocalDb::open(config.local_db_path())?;
-                        let target_db = LocalDb::open(database)?;
-                        sync_all(&local, &target_db, config, None, dry_run).await
-                    }
-                };
-
-                match result {
-                    Ok(results) => {
-                        let total_pushed: usize = results.iter().map(|r| r.rows_pushed).sum();
-                        let total_pulled: usize = results.iter().map(|r| r.rows_pulled).sum();
-
-                        if fmt == OutputFormat::Json {
-                            let out = WatchTickOutput::from_results(tick_count, &results);
-                            println!("{}", serde_json::to_string(&out).unwrap());
-                        } else if total_pushed > 0 || total_pulled > 0 {
-                            info!(
-                                "Tick #{}: {} pushed, {} pulled across {} tables",
-                                tick_count, total_pushed, total_pulled, results.len()
-                            );
-                        } else {
-                            info!("Tick #{}: no changes", tick_count);
-                        }
-
-                        if !dry_run {
-                            let ts = now_iso8601();
-                            if let Err(e) = update_last_sync(config_path, &ts) {
-                                warn!("Failed to update last_sync: {}", e);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        if is_transient_error(&e) {
-                            warn!("Transient error on tick #{}: {}. Will retry next tick.", tick_count, e);
-                            if fmt == OutputFormat::Json {
-                                let out = WatchTickOutput::from_error(tick_count, &e.to_string());
-                                println!("{}", serde_json::to_string(&out).unwrap());
-                            }
-                        } else {
-                            error!("Fatal error on tick #{}: {}", tick_count, e);
-                            if fmt == OutputFormat::Json {
-                                let out = WatchTickOutput::from_error(tick_count, &e.to_string());
-                                println!("{}", serde_json::to_string(&out).unwrap());
-                            }
-                            return Err(e);
-                        }
-                    }
-                }
-            }
-            _ = signal::ctrl_c() => {
-                info!("Received shutdown signal. Stopping watch daemon.");
-                break;
-            }
-        }
-    }
-
-    info!("Watch daemon stopped after {} ticks", tick_count);
-    Ok(())
-}
-
 /// Check if an error is transient (should retry on next tick) vs fatal (should exit).
-fn is_transient_error(err: &SyncError) -> bool {
+pub fn is_transient_error(err: &SyncError) -> bool {
     matches!(
         err,
         SyncError::RateLimited { .. }

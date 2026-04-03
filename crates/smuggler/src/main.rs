@@ -1,57 +1,70 @@
-//! # Smuggler
+//! Smuggler CLI binary.
 //!
-//! Smuggle data between SQLite and Cloudflare D1.
-//!
-//! A fast, stateless CLI tool for bidirectional synchronization between
-//! local SQLite databases and Cloudflare D1.
-//!
-//! ## Features
-//!
-//! - **True change detection** - Compares actual row content via SHA256 hashing
-//! - **Delta sync** - Only transfers rows that differ
-//! - **Bidirectional** - Push, pull, or both with configurable conflict resolution
-//! - **No state files** - Every run compares live data
-//!
-//! ## Architecture
-//!
-//! - [`config`] - Configuration loading from TOML
-//! - [`local`] - Local SQLite database operations
-//! - [`remote`] - Cloudflare D1 HTTP API client
-//! - [`diff`] - Change detection algorithm
-//! - [`sync`] - Push/pull orchestration
-//! - [`error`] - Error types
-//! - [`table`] - Table name validation
-//! - [`datasource`] - DataSource trait for abstracting database backends
-//! - [`batch`] - Batch operations for multi-row upserts
+//! This is the command-line interface for smuggler. All core sync logic
+//! lives in `smuggler_core`; this crate provides the CLI argument parsing,
+//! progress display, and human/JSON output formatting.
 
-mod batch;
 mod broadcast;
-mod config;
-mod datasource;
-mod diff;
-mod error;
-mod local;
 mod output;
-mod remote;
-mod stash;
-mod sync;
-mod table;
 mod watch;
 
-use crate::config::{Config, ResolvedTarget};
-use crate::datasource::DataSource;
-use crate::diff::diff_table;
-use crate::local::LocalDb;
-use crate::output::{
+use output::{
     CommandOutput, DiffOutput, DryRunOutput, DryRunTableOutput, DryRunVerboseTableOutput,
     ErrorOutput, OutputFormat, StatusConfig, StatusDb, StatusOutput, StatusTable,
 };
-use crate::remote::D1Client;
-use crate::sync::{get_tables_to_sync, pull_all, push_all, sync_all};
+use smuggler_core::config::{Config, ResolvedTarget};
+use smuggler_core::datasource::DataSource;
+use smuggler_core::diff::diff_table;
+use smuggler_core::error;
+use smuggler_core::local::LocalDb;
+use smuggler_core::remote::D1Client;
+use smuggler_core::sync::{
+    get_tables_to_sync, pull_all, push_all, sync_all, NoProgress, SyncProgress,
+};
+
 use clap::{Parser, Subcommand};
+use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
 use tracing::{error, info, Level};
 use tracing_subscriber::FmtSubscriber;
+
+/// CLI progress reporter using indicatif progress bars.
+struct IndicatifProgress {
+    bar: std::sync::Mutex<Option<ProgressBar>>,
+}
+
+impl IndicatifProgress {
+    fn new() -> Self {
+        Self {
+            bar: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+impl SyncProgress for IndicatifProgress {
+    fn on_transfer_start(&self, total_rows: usize, label: &str, table: &str) {
+        let pb = ProgressBar::new(total_rows as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} {msg}")
+                .expect("valid progress template"),
+        );
+        pb.set_message(format!("{} {}", label, table));
+        *self.bar.lock().expect("mutex poisoned") = Some(pb);
+    }
+
+    fn on_batch_complete(&self, rows_in_batch: usize) {
+        if let Some(ref pb) = *self.bar.lock().expect("mutex poisoned") {
+            pb.inc(rows_in_batch as u64);
+        }
+    }
+
+    fn on_transfer_finish(&self, total_rows: usize, label: &str) {
+        if let Some(ref pb) = *self.bar.lock().expect("mutex poisoned") {
+            pb.finish_with_message(format!("{} {} rows", label, total_rows));
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "smuggler")]
@@ -183,7 +196,10 @@ fn exit_json_error(command: &'static str, err: &error::SyncError) -> ! {
         error: err.to_string(),
         exit_code: err.exit_code(),
     };
-    println!("{}", serde_json::to_string(&out).unwrap());
+    println!(
+        "{}",
+        serde_json::to_string(&out).expect("ErrorOutput serialization")
+    );
     std::process::exit(err.exit_code());
 }
 
@@ -251,16 +267,42 @@ async fn main() {
     // Execute command
     let result = match cli.command {
         Commands::Push { table, dry_run } => {
-            run_push(&config, target.unwrap(), table, dry_run, fmt, cli.verbose).await
+            run_push(
+                &config,
+                target.expect("target resolved"),
+                table,
+                dry_run,
+                fmt,
+                cli.verbose,
+            )
+            .await
         }
         Commands::Pull { table, dry_run } => {
-            run_pull(&config, target.unwrap(), table, dry_run, fmt, cli.verbose).await
+            run_pull(
+                &config,
+                target.expect("target resolved"),
+                table,
+                dry_run,
+                fmt,
+                cli.verbose,
+            )
+            .await
         }
         Commands::Sync { table, dry_run } => {
-            run_sync(&config, target.unwrap(), table, dry_run, fmt, cli.verbose).await
+            run_sync(
+                &config,
+                target.expect("target resolved"),
+                table,
+                dry_run,
+                fmt,
+                cli.verbose,
+            )
+            .await
         }
-        Commands::Diff { table } => run_diff(&config, target.unwrap(), table, fmt).await,
-        Commands::Status => run_status(&config, target.unwrap(), fmt).await,
+        Commands::Diff { table } => {
+            run_diff(&config, target.expect("target resolved"), table, fmt).await
+        }
+        Commands::Status => run_status(&config, target.expect("target resolved"), fmt).await,
         Commands::Stash { table, dry_run } => {
             run_stash(&config, table, dry_run, fmt, cli.verbose).await
         }
@@ -271,7 +313,7 @@ async fn main() {
             watch::run_watch(
                 &config,
                 &config_path,
-                target.unwrap(),
+                target.expect("target resolved"),
                 interval,
                 dry_run,
                 fmt,
@@ -287,7 +329,7 @@ async fn main() {
             let mut bc = config
                 .broadcast
                 .clone()
-                .unwrap_or_else(broadcast::BroadcastConfig::default);
+                .unwrap_or_else(smuggler_core::broadcast::BroadcastConfig::default);
             if let Some(p) = port {
                 bc.port = p;
             }
@@ -307,13 +349,23 @@ async fn main() {
     }
 }
 
-fn print_dry_run_json(command: &'static str, results: &[sync::SyncResult], verbose: bool) {
+fn print_dry_run_json(
+    command: &'static str,
+    results: &[smuggler_core::sync::SyncResult],
+    verbose: bool,
+) {
     if verbose {
         let out = DryRunOutput::<DryRunVerboseTableOutput>::from_sync_results(command, results);
-        println!("{}", serde_json::to_string(&out).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string(&out).expect("DryRunOutput serialization")
+        );
     } else {
         let out = DryRunOutput::<DryRunTableOutput>::from_sync_results(command, results);
-        println!("{}", serde_json::to_string(&out).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string(&out).expect("DryRunOutput serialization")
+        );
     }
 }
 
@@ -350,6 +402,12 @@ async fn run_push(
     let local = LocalDb::open_readonly(config.local_db_path())?;
     let tables = resolve_tables(&local, table)?;
 
+    let progress: Box<dyn SyncProgress> = if fmt == OutputFormat::Text {
+        Box::new(IndicatifProgress::new())
+    } else {
+        Box::new(NoProgress)
+    };
+
     let results = match target {
         ResolvedTarget::D1 {
             account_id,
@@ -359,12 +417,20 @@ async fn run_push(
             info!("Push mode: local -> D1");
             let remote = open_d1(&account_id, &database_id, &api_token, config);
             remote.test_connection().await?;
-            push_all(&local, &remote, config, tables, dry_run).await?
+            push_all(&local, &remote, config, tables, dry_run, progress.as_ref()).await?
         }
         ResolvedTarget::Sqlite { database } => {
             info!("Push mode: local -> SQLite ({})", database);
             let target_db = LocalDb::open(&database)?;
-            push_all(&local, &target_db, config, tables, dry_run).await?
+            push_all(
+                &local,
+                &target_db,
+                config,
+                tables,
+                dry_run,
+                progress.as_ref(),
+            )
+            .await?
         }
     };
 
@@ -372,7 +438,10 @@ async fn run_push(
         OutputFormat::Json if dry_run => print_dry_run_json("push", &results, verbose),
         OutputFormat::Json => {
             let out = CommandOutput::from_sync_results("push", &results, false);
-            println!("{}", serde_json::to_string(&out).unwrap());
+            println!(
+                "{}",
+                serde_json::to_string(&out).expect("CommandOutput serialization")
+            );
         }
         OutputFormat::Text => {
             print_summary("Push", &results, |r| r.rows_pushed, "push", dry_run);
@@ -396,6 +465,12 @@ async fn run_pull(
     };
     let tables = resolve_tables(&local, table)?;
 
+    let progress: Box<dyn SyncProgress> = if fmt == OutputFormat::Text {
+        Box::new(IndicatifProgress::new())
+    } else {
+        Box::new(NoProgress)
+    };
+
     let results = match target {
         ResolvedTarget::D1 {
             account_id,
@@ -405,12 +480,20 @@ async fn run_pull(
             info!("Pull mode: D1 -> local");
             let remote = open_d1(&account_id, &database_id, &api_token, config);
             remote.test_connection().await?;
-            pull_all(&local, &remote, config, tables, dry_run).await?
+            pull_all(&local, &remote, config, tables, dry_run, progress.as_ref()).await?
         }
         ResolvedTarget::Sqlite { database } => {
             info!("Pull mode: SQLite ({}) -> local", database);
             let source_db = LocalDb::open_readonly(&database)?;
-            pull_all(&local, &source_db, config, tables, dry_run).await?
+            pull_all(
+                &local,
+                &source_db,
+                config,
+                tables,
+                dry_run,
+                progress.as_ref(),
+            )
+            .await?
         }
     };
 
@@ -418,7 +501,10 @@ async fn run_pull(
         OutputFormat::Json if dry_run => print_dry_run_json("pull", &results, verbose),
         OutputFormat::Json => {
             let out = CommandOutput::from_sync_results("pull", &results, false);
-            println!("{}", serde_json::to_string(&out).unwrap());
+            println!(
+                "{}",
+                serde_json::to_string(&out).expect("CommandOutput serialization")
+            );
         }
         OutputFormat::Text => {
             print_summary("Pull", &results, |r| r.rows_pulled, "pull", dry_run);
@@ -442,6 +528,12 @@ async fn run_sync(
     };
     let tables = resolve_tables(&local, table)?;
 
+    let progress: Box<dyn SyncProgress> = if fmt == OutputFormat::Text {
+        Box::new(IndicatifProgress::new())
+    } else {
+        Box::new(NoProgress)
+    };
+
     let results = match target {
         ResolvedTarget::D1 {
             account_id,
@@ -451,12 +543,20 @@ async fn run_sync(
             info!("Sync mode: bidirectional (local <-> D1)");
             let remote = open_d1(&account_id, &database_id, &api_token, config);
             remote.test_connection().await?;
-            sync_all(&local, &remote, config, tables, dry_run).await?
+            sync_all(&local, &remote, config, tables, dry_run, progress.as_ref()).await?
         }
         ResolvedTarget::Sqlite { database } => {
             info!("Sync mode: bidirectional (local <-> SQLite {})", database);
             let target_db = LocalDb::open(&database)?;
-            sync_all(&local, &target_db, config, tables, dry_run).await?
+            sync_all(
+                &local,
+                &target_db,
+                config,
+                tables,
+                dry_run,
+                progress.as_ref(),
+            )
+            .await?
         }
     };
 
@@ -464,7 +564,10 @@ async fn run_sync(
         OutputFormat::Json if dry_run => print_dry_run_json("sync", &results, verbose),
         OutputFormat::Json => {
             let out = CommandOutput::from_sync_results("sync", &results, false);
-            println!("{}", serde_json::to_string(&out).unwrap());
+            println!(
+                "{}",
+                serde_json::to_string(&out).expect("CommandOutput serialization")
+            );
         }
         OutputFormat::Text => {
             println!("\n--- Sync Summary ---");
@@ -566,7 +669,10 @@ async fn output_diffs<A: DataSource, B: DataSource>(
     match fmt {
         OutputFormat::Json => {
             let out = DiffOutput::from_diffs(diffs);
-            println!("{}", serde_json::to_string(&out).unwrap());
+            println!(
+                "{}",
+                serde_json::to_string(&out).expect("DiffOutput serialization")
+            );
         }
         OutputFormat::Text => {
             println!("\n--- Differences ---");
@@ -603,8 +709,8 @@ async fn output_diffs<A: DataSource, B: DataSource>(
 /// (e.g. "No changes to push").
 fn print_summary(
     heading: &str,
-    results: &[sync::SyncResult],
-    get_count: impl Fn(&sync::SyncResult) -> usize,
+    results: &[smuggler_core::sync::SyncResult],
+    get_count: impl Fn(&smuggler_core::sync::SyncResult) -> usize,
     verb: &str,
     dry_run: bool,
 ) {
@@ -751,7 +857,10 @@ async fn run_status(
                 local: local_status,
                 target: target_status,
             };
-            println!("{}", serde_json::to_string(&out).unwrap());
+            println!(
+                "{}",
+                serde_json::to_string(&out).expect("StatusOutput serialization")
+            );
         }
         OutputFormat::Text => {
             println!("--- Configuration ---");
@@ -833,7 +942,7 @@ async fn run_status(
     Ok(())
 }
 
-fn require_stash_config(config: &Config) -> error::Result<&config::StashConfig> {
+fn require_stash_config(config: &Config) -> error::Result<&smuggler_core::config::StashConfig> {
     config
         .stash
         .as_ref()
@@ -850,7 +959,7 @@ async fn run_stash(
     let stash_config = require_stash_config(config)?;
     info!("Stash mode: local -> S3 relay");
 
-    let results = stash::stash(
+    let results = smuggler_core::stash::stash(
         stash_config,
         config.local_db_path(),
         &config.sync.timestamp_column,
@@ -865,7 +974,10 @@ async fn run_stash(
         OutputFormat::Json if dry_run => print_dry_run_json("stash", &results, verbose),
         OutputFormat::Json => {
             let out = CommandOutput::from_sync_results("stash", &results, false);
-            println!("{}", serde_json::to_string(&out).unwrap());
+            println!(
+                "{}",
+                serde_json::to_string(&out).expect("CommandOutput serialization")
+            );
         }
         OutputFormat::Text => {
             print_summary("Stash", &results, |r| r.rows_pushed, "stash", dry_run);
@@ -884,7 +996,7 @@ async fn run_retrieve(
     let stash_config = require_stash_config(config)?;
     info!("Retrieve mode: S3 relay -> local");
 
-    let results = stash::retrieve(
+    let results = smuggler_core::stash::retrieve(
         stash_config,
         config.local_db_path(),
         &config.sync.timestamp_column,
@@ -899,7 +1011,10 @@ async fn run_retrieve(
         OutputFormat::Json if dry_run => print_dry_run_json("retrieve", &results, verbose),
         OutputFormat::Json => {
             let out = CommandOutput::from_sync_results("retrieve", &results, false);
-            println!("{}", serde_json::to_string(&out).unwrap());
+            println!(
+                "{}",
+                serde_json::to_string(&out).expect("CommandOutput serialization")
+            );
         }
         OutputFormat::Text => {
             print_summary("Retrieve", &results, |r| r.rows_pulled, "retrieve", dry_run);

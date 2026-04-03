@@ -30,9 +30,30 @@ impl DiffDetail {
         }
     }
 }
-use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::HashMap;
 use tracing::{info, warn};
+
+/// Trait for reporting sync progress to the UI layer.
+///
+/// The core library uses this trait instead of depending on indicatif directly,
+/// allowing CLI and non-CLI consumers to provide their own progress rendering.
+pub trait SyncProgress: Send + Sync {
+    /// Called when a row transfer begins.
+    fn on_transfer_start(&self, total_rows: usize, label: &str, table: &str);
+    /// Called after each batch of rows is transferred.
+    fn on_batch_complete(&self, rows_in_batch: usize);
+    /// Called when a row transfer finishes.
+    fn on_transfer_finish(&self, total_rows: usize, label: &str);
+}
+
+/// No-op progress reporter for headless or library usage.
+pub struct NoProgress;
+
+impl SyncProgress for NoProgress {
+    fn on_transfer_start(&self, _: usize, _: &str, _: &str) {}
+    fn on_batch_complete(&self, _: usize) {}
+    fn on_transfer_finish(&self, _: usize, _: &str) {}
+}
 
 /// Result of a sync operation
 #[derive(Debug)]
@@ -62,17 +83,6 @@ impl SyncResult {
     }
 }
 
-fn progress_bar(total: u64, message: String) -> ProgressBar {
-    let pb = ProgressBar::new(total);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} {msg}")
-            .unwrap(),
-    );
-    pb.set_message(message);
-    pb
-}
-
 /// Strip excluded columns from row data before transfer.
 ///
 /// Returns rows unchanged if `exclude_columns` is empty (fast path).
@@ -96,8 +106,10 @@ fn strip_excluded_columns(
 /// Transfer rows from one DataSource to another.
 ///
 /// Fetches rows by primary key from `source`, then upserts into `dest`
-/// in chunks (sized by `batch_config.batch_size`) with progress display.
+/// in chunks (sized by `batch_config.batch_size`) with progress reporting
+/// via the provided [`SyncProgress`] implementation.
 /// Excluded columns are stripped before upserting.
+#[allow(clippy::too_many_arguments)]
 async fn transfer_rows<Src: DataSource, Dst: DataSource>(
     source: &Src,
     dest: &Dst,
@@ -106,6 +118,7 @@ async fn transfer_rows<Src: DataSource, Dst: DataSource>(
     batch_config: &BatchConfig,
     exclude_columns: &[String],
     label: &str,
+    progress: &dyn SyncProgress,
 ) -> Result<usize> {
     let rows = source.get_rows(table, pk_values).await?;
 
@@ -116,16 +129,16 @@ async fn transfer_rows<Src: DataSource, Dst: DataSource>(
 
     let rows = strip_excluded_columns(rows, exclude_columns);
 
-    let pb = progress_bar(rows.len() as u64, format!("{} {}", label, table));
+    progress.on_transfer_start(rows.len(), label, table);
     let mut total = 0;
 
     for chunk in rows.chunks(batch_config.batch_size) {
         let count = dest.upsert_rows(table, chunk).await?;
         total += count;
-        pb.inc(chunk.len() as u64);
+        progress.on_batch_complete(chunk.len());
     }
 
-    pb.finish_with_message(format!("{} {} rows", label, total));
+    progress.on_transfer_finish(total, label);
     Ok(total)
 }
 
@@ -140,6 +153,7 @@ pub async fn push_table<Src: DataSource, Dst: DataSource>(
     batch_config: &BatchConfig,
     exclude_columns: &[String],
     dry_run: bool,
+    progress: &dyn SyncProgress,
 ) -> Result<SyncResult> {
     let mut result = SyncResult::new(table);
     let rows_to_push = diff.rows_to_push(conflict_resolution);
@@ -169,6 +183,7 @@ pub async fn push_table<Src: DataSource, Dst: DataSource>(
         batch_config,
         exclude_columns,
         "Pushing",
+        progress,
     )
     .await?;
     Ok(result)
@@ -185,6 +200,7 @@ pub async fn pull_table<Src: DataSource, Dst: DataSource>(
     batch_config: &BatchConfig,
     exclude_columns: &[String],
     dry_run: bool,
+    progress: &dyn SyncProgress,
 ) -> Result<SyncResult> {
     let mut result = SyncResult::new(table);
     let rows_to_pull = diff.rows_to_pull(conflict_resolution);
@@ -214,6 +230,7 @@ pub async fn pull_table<Src: DataSource, Dst: DataSource>(
         batch_config,
         exclude_columns,
         "Pulling",
+        progress,
     )
     .await?;
     Ok(result)
@@ -230,6 +247,7 @@ pub async fn sync_table<A: DataSource, B: DataSource>(
     batch_config: &BatchConfig,
     exclude_columns: &[String],
     dry_run: bool,
+    progress: &dyn SyncProgress,
 ) -> Result<SyncResult> {
     let diff = diff_table(a, b, table, timestamp_column, exclude_columns).await?;
     let (stats, detail) = if dry_run {
@@ -255,6 +273,7 @@ pub async fn sync_table<A: DataSource, B: DataSource>(
         batch_config,
         exclude_columns,
         dry_run,
+        progress,
     )
     .await?;
     let pull_result = pull_table(
@@ -266,6 +285,7 @@ pub async fn sync_table<A: DataSource, B: DataSource>(
         batch_config,
         exclude_columns,
         dry_run,
+        progress,
     )
     .await?;
 
@@ -336,6 +356,7 @@ pub async fn push_all<Src: DataSource, Dst: DataSource>(
     config: &Config,
     tables: Option<Vec<String>>,
     dry_run: bool,
+    progress: &dyn SyncProgress,
 ) -> Result<Vec<SyncResult>> {
     let tables_to_sync = match tables {
         Some(t) => t,
@@ -379,6 +400,7 @@ pub async fn push_all<Src: DataSource, Dst: DataSource>(
             &batch_config,
             &config.sync.exclude_columns,
             dry_run,
+            progress,
         )
         .await?;
         result.diff_stats = stats;
@@ -396,6 +418,7 @@ pub async fn pull_all<Src: DataSource, Dst: DataSource>(
     config: &Config,
     tables: Option<Vec<String>>,
     dry_run: bool,
+    progress: &dyn SyncProgress,
 ) -> Result<Vec<SyncResult>> {
     let tables_to_sync = match tables {
         Some(t) => t,
@@ -439,6 +462,7 @@ pub async fn pull_all<Src: DataSource, Dst: DataSource>(
             &batch_config,
             &config.sync.exclude_columns,
             dry_run,
+            progress,
         )
         .await?;
         result.diff_stats = stats;
@@ -456,6 +480,7 @@ pub async fn sync_all<A: DataSource, B: DataSource>(
     config: &Config,
     tables: Option<Vec<String>>,
     dry_run: bool,
+    progress: &dyn SyncProgress,
 ) -> Result<Vec<SyncResult>> {
     let tables_to_sync = match tables {
         Some(t) => t,
@@ -475,6 +500,7 @@ pub async fn sync_all<A: DataSource, B: DataSource>(
             &batch_config,
             &config.sync.exclude_columns,
             dry_run,
+            progress,
         )
         .await?;
         results.push(result);

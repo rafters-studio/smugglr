@@ -1,0 +1,49 @@
+[package]
+name = "smuggler-core"
+description = "Sync engine for smuggler -- bidirectional SQLite/D1 synchronization"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+# SQLite
+rusqlite = { version = "0.34", features = ["bundled"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Config
+toml = "0.8"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Hashing for change detection
+sha2 = "0.10"
+hex = "0.4"
+
+# Object storage (S3, R2, GCS, local filesystem)
+object_store = { version = "0.12", features = ["aws"] }
+url = "2"
+tempfile = "3"
+
+# Encryption (broadcast packets)
+chacha20poly1305 = "0.5"
+rand = "0.9"
+
+# Logging
+tracing = "0.1"
+
+# Unix process checking (PID lock)
+libc = "0.2"
