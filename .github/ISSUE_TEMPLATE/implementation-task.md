@@ -1,7 +1,7 @@
 ---
 name: Implementation Task
-about: SOLID implementation task for AI agents
-title: "Implement [Feature Name] - [Brief Description]"
+about: Implementation task for AI agents with full dev workflow
+title: "feat: [brief description]"
 labels: enhancement
 assignees: ''
 ---
@@ -10,14 +10,14 @@ assignees: ''
 
 **Single, focused objective this task achieves.**
 
-## Exact Implementation Requirements
+## Requirements
 
-### Required Struct/Trait Structure
+### Interface
 ```rust
 // Exact struct definitions, trait signatures, or API expected
 ```
 
-### Behavior Requirements
+### Behavior
 - Specific requirement 1 with clear success criteria
 - Specific requirement 2 with measurable outcome
 - Specific requirement 3 with validation method
@@ -25,92 +25,46 @@ assignees: ''
 ### Error Handling
 - What errors to return and when
 - Required error types and messages
-- Recovery strategies if applicable
 
-## Acceptance Criteria
+## Out of Scope
 
-### Functional Tests Required
-```rust
-#[test]
-fn test_expected_behavior() {
-    // Exact test cases that must pass
-    // Include setup, execution, and assertions
-    assert_eq!(result, expected_value);
-}
-
-#[test]
-#[should_panic(expected = "specific error")]
-fn test_error_case() {
-    // Error condition tests
-}
-```
-
-### Performance Requirements
-- Specific performance metrics if applicable
-- Memory usage constraints if relevant
-- Algorithmic complexity requirements if needed
-
-### Rust Requirements
-- All types must be explicit (no unnecessary inference)
-- Proper use of Result<T, E> for fallible operations
-- No `unwrap()` in production code (except where logically impossible to fail)
-- Must pass `cargo clippy -- -D warnings`
-- Must pass `cargo fmt -- --check`
-
-## What NOT to Include
-
-- Feature 1 that's out of scope (separate issue)
-- Feature 2 that's not needed yet (future consideration)
-- Complex feature that should be broken down further
+- Feature 1 (separate issue)
+- Feature 2 (future consideration)
 
 ## File Locations
 
-- Implementation: `src/<module>.rs`
+- Implementation: `crates/smuggler-core/src/module_name.rs`
 - Tests: Bottom of same file in `#[cfg(test)]` module
-- Re-export from: `src/main.rs` (if new module)
+- CLI integration: `crates/smuggler/src/main.rs`
 
-## Integration Requirements
+## Dev Workflow
 
-### Dependencies
-- Required crates (check Cargo.toml for existing deps)
-- Integration points with existing modules
+Each step is mandatory. Do not skip steps or combine them.
 
-### Module Structure
-```
-smuggler (single binary crate)
-  src/
-    main.rs        -- CLI entry point (clap)
-    config.rs      -- TOML config loading
-    datasource.rs  -- DataSource trait
-    diff.rs        -- Change detection (generic)
-    sync.rs        -- Push/pull orchestration
-    local.rs       -- Local SQLite (rusqlite)
-    remote.rs      -- Cloudflare D1 HTTP client
-    stash.rs       -- S3 relay sync
-    batch.rs       -- Upsert batching
-    table.rs       -- Table name validation
-    error.rs       -- Error types
-```
+1. **Build** -- Implement the feature. Write tests alongside code. Run `cargo test --workspace`, `cargo clippy --workspace -- -D warnings`, `cargo fmt -- --check`. All must pass.
+2. **Simplify** -- Run `/simplify` on all changed files. Accept structural improvements, flatten unnecessary abstractions, remove dead code.
+3. **Review** -- Run `/review-pr` which launches parallel review agents (code review, silent failure hunter, type design analysis). Do not create the PR yet.
+4. **Fix** -- Address every issue the review found. Re-run tests after fixes.
+5. **PR** -- Create the PR. Reference this issue number.
 
-### Usage Examples
-```rust
-// Concrete examples of how this will be used
-```
+### Rust Rules
+- No `unwrap()` in production code
+- No `unsafe` code
+- No emoji in code, comments, or documentation
+- `cargo clippy --workspace -- -D warnings` must pass
+- `cargo fmt -- --check` must pass
+- Errors use thiserror derive macros
 
-## Success Criteria
+## Done When
 
-- [ ] All functional tests pass
-- [ ] `cargo test` passes
-- [ ] `cargo clippy -- -D warnings` passes
-- [ ] `cargo fmt -- --check` passes
-- [ ] No `unsafe` code (project policy)
-- [ ] Performance requirements met
-- [ ] No emoji in code, comments, or documentation
-- [ ] Exports added to module files
+- [ ] All tests pass
+- [ ] Simplify pass completed
+- [ ] Review pass completed and issues fixed
+- [ ] PR created and linked to this issue
 
 **This issue is complete when:** [Specific, measurable completion condition]
 
-## Context & References
+## Context
 
 - Related issues: #N, #M
-- README: `README.md`
+- Design docs: link if applicable
