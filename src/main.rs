@@ -43,8 +43,8 @@ use crate::datasource::DataSource;
 use crate::diff::diff_table;
 use crate::local::LocalDb;
 use crate::output::{
-    CommandOutput, DiffOutput, ErrorOutput, OutputFormat, StatusConfig, StatusDb, StatusOutput,
-    StatusTable,
+    CommandOutput, DiffOutput, DryRunOutput, DryRunTableOutput, DryRunVerboseTableOutput,
+    ErrorOutput, OutputFormat, StatusConfig, StatusDb, StatusOutput, StatusTable,
 };
 use crate::remote::D1Client;
 use crate::sync::{get_tables_to_sync, pull_all, push_all, sync_all};
@@ -251,18 +251,22 @@ async fn main() {
     // Execute command
     let result = match cli.command {
         Commands::Push { table, dry_run } => {
-            run_push(&config, target.unwrap(), table, dry_run, fmt).await
+            run_push(&config, target.unwrap(), table, dry_run, fmt, cli.verbose).await
         }
         Commands::Pull { table, dry_run } => {
-            run_pull(&config, target.unwrap(), table, dry_run, fmt).await
+            run_pull(&config, target.unwrap(), table, dry_run, fmt, cli.verbose).await
         }
         Commands::Sync { table, dry_run } => {
-            run_sync(&config, target.unwrap(), table, dry_run, fmt).await
+            run_sync(&config, target.unwrap(), table, dry_run, fmt, cli.verbose).await
         }
         Commands::Diff { table } => run_diff(&config, target.unwrap(), table, fmt).await,
         Commands::Status => run_status(&config, target.unwrap(), fmt).await,
-        Commands::Stash { table, dry_run } => run_stash(&config, table, dry_run, fmt).await,
-        Commands::Retrieve { table, dry_run } => run_retrieve(&config, table, dry_run, fmt).await,
+        Commands::Stash { table, dry_run } => {
+            run_stash(&config, table, dry_run, fmt, cli.verbose).await
+        }
+        Commands::Retrieve { table, dry_run } => {
+            run_retrieve(&config, table, dry_run, fmt, cli.verbose).await
+        }
         Commands::Watch { interval, dry_run } => {
             watch::run_watch(
                 &config,
@@ -303,6 +307,16 @@ async fn main() {
     }
 }
 
+fn print_dry_run_json(command: &'static str, results: &[sync::SyncResult], verbose: bool) {
+    if verbose {
+        let out = DryRunOutput::<DryRunVerboseTableOutput>::from_sync_results(command, results);
+        println!("{}", serde_json::to_string(&out).unwrap());
+    } else {
+        let out = DryRunOutput::<DryRunTableOutput>::from_sync_results(command, results);
+        println!("{}", serde_json::to_string(&out).unwrap());
+    }
+}
+
 /// Open a D1Client from resolved target fields.
 fn open_d1(account_id: &str, database_id: &str, api_token: &str, config: &Config) -> D1Client {
     D1Client::with_retry_config(
@@ -331,6 +345,7 @@ async fn run_push(
     table: Option<String>,
     dry_run: bool,
     fmt: OutputFormat,
+    verbose: bool,
 ) -> error::Result<()> {
     let local = LocalDb::open_readonly(config.local_db_path())?;
     let tables = resolve_tables(&local, table)?;
@@ -354,8 +369,9 @@ async fn run_push(
     };
 
     match fmt {
+        OutputFormat::Json if dry_run => print_dry_run_json("push", &results, verbose),
         OutputFormat::Json => {
-            let out = CommandOutput::from_sync_results("push", &results, dry_run);
+            let out = CommandOutput::from_sync_results("push", &results, false);
             println!("{}", serde_json::to_string(&out).unwrap());
         }
         OutputFormat::Text => {
@@ -371,8 +387,13 @@ async fn run_pull(
     table: Option<String>,
     dry_run: bool,
     fmt: OutputFormat,
+    verbose: bool,
 ) -> error::Result<()> {
-    let local = LocalDb::open(config.local_db_path())?;
+    let local = if dry_run {
+        LocalDb::open_readonly(config.local_db_path())?
+    } else {
+        LocalDb::open(config.local_db_path())?
+    };
     let tables = resolve_tables(&local, table)?;
 
     let results = match target {
@@ -394,8 +415,9 @@ async fn run_pull(
     };
 
     match fmt {
+        OutputFormat::Json if dry_run => print_dry_run_json("pull", &results, verbose),
         OutputFormat::Json => {
-            let out = CommandOutput::from_sync_results("pull", &results, dry_run);
+            let out = CommandOutput::from_sync_results("pull", &results, false);
             println!("{}", serde_json::to_string(&out).unwrap());
         }
         OutputFormat::Text => {
@@ -411,8 +433,13 @@ async fn run_sync(
     table: Option<String>,
     dry_run: bool,
     fmt: OutputFormat,
+    verbose: bool,
 ) -> error::Result<()> {
-    let local = LocalDb::open(config.local_db_path())?;
+    let local = if dry_run {
+        LocalDb::open_readonly(config.local_db_path())?
+    } else {
+        LocalDb::open(config.local_db_path())?
+    };
     let tables = resolve_tables(&local, table)?;
 
     let results = match target {
@@ -434,8 +461,9 @@ async fn run_sync(
     };
 
     match fmt {
+        OutputFormat::Json if dry_run => print_dry_run_json("sync", &results, verbose),
         OutputFormat::Json => {
-            let out = CommandOutput::from_sync_results("sync", &results, dry_run);
+            let out = CommandOutput::from_sync_results("sync", &results, false);
             println!("{}", serde_json::to_string(&out).unwrap());
         }
         OutputFormat::Text => {
@@ -817,6 +845,7 @@ async fn run_stash(
     table: Option<String>,
     dry_run: bool,
     fmt: OutputFormat,
+    verbose: bool,
 ) -> error::Result<()> {
     let stash_config = require_stash_config(config)?;
     info!("Stash mode: local -> S3 relay");
@@ -833,8 +862,9 @@ async fn run_stash(
     .await?;
 
     match fmt {
+        OutputFormat::Json if dry_run => print_dry_run_json("stash", &results, verbose),
         OutputFormat::Json => {
-            let out = CommandOutput::from_sync_results("stash", &results, dry_run);
+            let out = CommandOutput::from_sync_results("stash", &results, false);
             println!("{}", serde_json::to_string(&out).unwrap());
         }
         OutputFormat::Text => {
@@ -849,6 +879,7 @@ async fn run_retrieve(
     table: Option<String>,
     dry_run: bool,
     fmt: OutputFormat,
+    verbose: bool,
 ) -> error::Result<()> {
     let stash_config = require_stash_config(config)?;
     info!("Retrieve mode: S3 relay -> local");
@@ -865,8 +896,9 @@ async fn run_retrieve(
     .await?;
 
     match fmt {
+        OutputFormat::Json if dry_run => print_dry_run_json("retrieve", &results, verbose),
         OutputFormat::Json => {
-            let out = CommandOutput::from_sync_results("retrieve", &results, dry_run);
+            let out = CommandOutput::from_sync_results("retrieve", &results, false);
             println!("{}", serde_json::to_string(&out).unwrap());
         }
         OutputFormat::Text => {

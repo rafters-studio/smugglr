@@ -6,8 +6,30 @@
 
 use crate::config::{column_excluded, BatchConfig, Config, ConflictResolution};
 use crate::datasource::DataSource;
-use crate::diff::{diff_table, TableDiff};
+use crate::diff::{diff_table, DiffStats, TableDiff};
 use crate::error::Result;
+
+/// Per-table primary key lists from the diff, for verbose dry-run output.
+#[derive(Debug, Clone)]
+pub struct DiffDetail {
+    pub local_only: Vec<String>,
+    pub remote_only: Vec<String>,
+    pub local_newer: Vec<String>,
+    pub remote_newer: Vec<String>,
+    pub content_differs: Vec<String>,
+}
+
+impl DiffDetail {
+    pub fn from_diff(diff: &TableDiff) -> Self {
+        Self {
+            local_only: diff.local_only.clone(),
+            remote_only: diff.remote_only.clone(),
+            local_newer: diff.local_newer.clone(),
+            remote_newer: diff.remote_newer.clone(),
+            content_differs: diff.content_differs.clone(),
+        }
+    }
+}
 use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::HashMap;
 use tracing::{info, warn};
@@ -18,6 +40,10 @@ pub struct SyncResult {
     pub table: String,
     pub rows_pushed: usize,
     pub rows_pulled: usize,
+    /// Per-table diff breakdown, populated when diff was computed.
+    pub diff_stats: Option<DiffStats>,
+    /// Per-table PK lists from diff, populated for verbose dry-run output.
+    pub diff_detail: Option<DiffDetail>,
 }
 
 impl SyncResult {
@@ -26,6 +52,8 @@ impl SyncResult {
             table: table.to_string(),
             rows_pushed: 0,
             rows_pulled: 0,
+            diff_stats: None,
+            diff_detail: None,
         }
     }
 
@@ -204,10 +232,18 @@ pub async fn sync_table<A: DataSource, B: DataSource>(
     dry_run: bool,
 ) -> Result<SyncResult> {
     let diff = diff_table(a, b, table, timestamp_column, exclude_columns).await?;
+    let (stats, detail) = if dry_run {
+        (Some(diff.stats()), Some(DiffDetail::from_diff(&diff)))
+    } else {
+        (None, None)
+    };
 
     if !diff.has_changes() {
         info!("Table {} is in sync", table);
-        return Ok(SyncResult::new(table));
+        let mut r = SyncResult::new(table);
+        r.diff_stats = stats;
+        r.diff_detail = detail;
+        return Ok(r);
     }
 
     let push_result = push_table(
@@ -237,6 +273,8 @@ pub async fn sync_table<A: DataSource, B: DataSource>(
         table: table.to_string(),
         rows_pushed: push_result.rows_pushed,
         rows_pulled: pull_result.rows_pulled,
+        diff_stats: stats,
+        diff_detail: detail,
     })
 }
 
@@ -317,13 +355,22 @@ pub async fn push_all<Src: DataSource, Dst: DataSource>(
         )
         .await?;
 
+        let (stats, detail) = if dry_run {
+            (Some(diff.stats()), Some(DiffDetail::from_diff(&diff)))
+        } else {
+            (None, None)
+        };
+
         if !diff.has_changes() {
             info!("Table {} is in sync", table);
-            results.push(SyncResult::new(table));
+            let mut r = SyncResult::new(table);
+            r.diff_stats = stats;
+            r.diff_detail = detail;
+            results.push(r);
             continue;
         }
 
-        let result = push_table(
+        let mut result = push_table(
             source,
             dest,
             table,
@@ -334,6 +381,8 @@ pub async fn push_all<Src: DataSource, Dst: DataSource>(
             dry_run,
         )
         .await?;
+        result.diff_stats = stats;
+        result.diff_detail = detail;
         results.push(result);
     }
 
@@ -366,13 +415,22 @@ pub async fn pull_all<Src: DataSource, Dst: DataSource>(
         )
         .await?;
 
+        let (stats, detail) = if dry_run {
+            (Some(diff.stats()), Some(DiffDetail::from_diff(&diff)))
+        } else {
+            (None, None)
+        };
+
         if !diff.has_changes() {
             info!("Table {} is in sync", table);
-            results.push(SyncResult::new(table));
+            let mut r = SyncResult::new(table);
+            r.diff_stats = stats;
+            r.diff_detail = detail;
+            results.push(r);
             continue;
         }
 
-        let result = pull_table(
+        let mut result = pull_table(
             local,
             remote,
             table,
@@ -383,6 +441,8 @@ pub async fn pull_all<Src: DataSource, Dst: DataSource>(
             dry_run,
         )
         .await?;
+        result.diff_stats = stats;
+        result.diff_detail = detail;
         results.push(result);
     }
 

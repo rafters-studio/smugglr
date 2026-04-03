@@ -3,8 +3,20 @@
 use crate::config::ConflictResolution;
 use crate::datasource::DataSource;
 use crate::error::Result;
+use serde::Serialize;
 use std::collections::HashSet;
 use tracing::{debug, info, warn};
+
+/// Per-table diff statistics (counts only, no PK values).
+#[derive(Debug, Clone, Serialize)]
+pub struct DiffStats {
+    pub local_only: usize,
+    pub remote_only: usize,
+    pub local_newer: usize,
+    pub remote_newer: usize,
+    pub content_differs: usize,
+    pub identical: usize,
+}
 
 /// Represents the differences between local and remote for a table
 #[derive(Debug, Default)]
@@ -121,6 +133,18 @@ impl TableDiff {
         // Rows that only exist in local but not in remote
         // This is only for full sync mode, not incremental
         vec![]
+    }
+
+    /// Compute aggregate diff statistics (counts only).
+    pub fn stats(&self) -> DiffStats {
+        DiffStats {
+            local_only: self.local_only.len(),
+            remote_only: self.remote_only.len(),
+            local_newer: self.local_newer.len(),
+            remote_newer: self.remote_newer.len(),
+            content_differs: self.content_differs.len(),
+            identical: self.identical.len(),
+        }
     }
 
     /// Summary string for display

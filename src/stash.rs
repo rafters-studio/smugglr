@@ -215,6 +215,11 @@ async fn sync_table<S: DataSource, D: DataSource>(
     // applied by the higher-level sync engine that owns the SyncConfig.
     let diff = diff_table(source, dest, table, timestamp_column, &[]).await?;
 
+    if dry_run {
+        result.diff_stats = Some(diff.stats());
+        result.diff_detail = Some(crate::sync::DiffDetail::from_diff(&diff));
+    }
+
     if !diff.has_changes() {
         info!("Table {} is in sync", table);
         return Ok(result);
