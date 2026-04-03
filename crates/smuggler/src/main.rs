@@ -894,11 +894,11 @@ async fn run_status(
             config: ref plugin_config,
         } => match PluginDataSource::start(path, name, plugin_config).await {
             Ok(plugin) => {
-                let tables = plugin.list_tables().await.unwrap_or_default();
+                let tables = plugin.list_tables().await?;
                 let mut table_rows = Vec::new();
                 for table in &tables {
                     if config.should_sync_table(table) {
-                        let count = plugin.row_count(table).await.unwrap_or(0);
+                        let count = plugin.row_count(table).await?;
                         table_rows.push(StatusTable {
                             name: table.clone(),
                             rows: count,

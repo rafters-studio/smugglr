@@ -48,6 +48,7 @@ struct PluginIo {
     stdin: BufWriter<ChildStdin>,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
+    read_buf: String,
 }
 
 #[derive(Serialize)]
@@ -128,6 +129,7 @@ impl PluginDataSource {
                 stdin: BufWriter::new(stdin),
                 stdout: BufReader::new(stdout),
                 next_id: 0,
+                read_buf: String::new(),
             }),
             plugin_name: plugin_name.to_string(),
         };
@@ -175,13 +177,14 @@ impl PluginDataSource {
             .await
             .map_err(|e| SyncError::Plugin(format!("Failed to flush plugin stdin: {}", e)))?;
 
-        let mut response_line = String::new();
-        io.stdout
-            .read_line(&mut response_line)
+        let PluginIo { ref mut stdout, ref mut read_buf, .. } = *io;
+        read_buf.clear();
+        stdout
+            .read_line(read_buf)
             .await
             .map_err(|e| SyncError::Plugin(format!("Failed to read from plugin: {}", e)))?;
 
-        if response_line.is_empty() {
+        if read_buf.is_empty() {
             return Err(SyncError::Plugin(format!(
                 "Plugin '{}' closed stdout unexpectedly",
                 self.plugin_name
@@ -189,12 +192,12 @@ impl PluginDataSource {
         }
 
         let response: RpcResponse =
-            serde_json::from_str(&response_line).map_err(|e| {
+            serde_json::from_str(read_buf).map_err(|e| {
                 SyncError::Plugin(format!(
                     "Invalid JSON-RPC response from plugin '{}': {}\nResponse: {}",
                     self.plugin_name,
                     e,
-                    response_line.trim()
+                    read_buf.trim()
                 ))
             })?;
 

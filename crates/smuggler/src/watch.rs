@@ -37,6 +37,13 @@ pub async fn run_watch(
         interval_secs, dry_run
     );
 
+    // Start plugin once before the loop to avoid respawning every tick
+    let plugin = if let ResolvedTarget::Plugin { ref path, ref name, config: ref plugin_config } = target {
+        Some(PluginDataSource::start(path, name, plugin_config).await?)
+    } else {
+        None
+    };
+
     let mut tick_count: u64 = 0;
     let mut interval = time::interval(Duration::from_secs(interval_secs));
 
@@ -70,12 +77,10 @@ pub async fn run_watch(
                         let target_db = LocalDb::open(database)?;
                         sync_all(&local, &target_db, config, None, dry_run, &NoProgress).await
                     }
-                    ResolvedTarget::Plugin { ref path, ref name, config: ref plugin_config } => {
+                    ResolvedTarget::Plugin { .. } => {
                         let local = LocalDb::open(config.local_db_path())?;
-                        match PluginDataSource::start(path, name, plugin_config).await {
-                            Ok(plugin) => sync_all(&local, &plugin, config, None, dry_run, &NoProgress).await,
-                            Err(e) => Err(e),
-                        }
+                        let plugin = plugin.as_ref().expect("plugin initialized before loop");
+                        sync_all(&local, plugin, config, None, dry_run, &NoProgress).await
                     }
                 };
 
