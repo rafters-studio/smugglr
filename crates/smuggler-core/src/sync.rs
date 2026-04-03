@@ -109,6 +109,7 @@ fn strip_excluded_columns(
 /// in chunks (sized by `batch_config.batch_size`) with progress reporting
 /// via the provided [`SyncProgress`] implementation.
 /// Excluded columns are stripped before upserting.
+#[allow(clippy::too_many_arguments)]
 async fn transfer_rows<Src: DataSource, Dst: DataSource>(
     source: &Src,
     dest: &Dst,

@@ -1,72 +1,14 @@
-[package]
-name = "smuggler"
+[workspace]
+members = ["crates/smuggler-core", "crates/smuggler"]
+resolver = "2"
+
+[workspace.package]
 version = "0.2.1"
 edition = "2021"
 rust-version = "1.75"
-description = "Smuggle data between SQLite and Cloudflare D1"
 license = "MIT"
 repository = "https://github.com/rafters-studio/smuggler"
-homepage = "https://github.com/rafters-studio/smuggler"
-documentation = "https://github.com/rafters-studio/smuggler#readme"
-readme = "README.md"
-keywords = ["cloudflare", "d1", "sqlite", "sync", "database"]
-categories = ["command-line-utilities", "database"]
 authors = ["Sean Silvius"]
-exclude = [
-    "config.toml",
-    "failed_rows.json",
-]
-
-[[bin]]
-name = "smuggler"
-path = "src/main.rs"
-
-[dependencies]
-# SQLite
-rusqlite = { version = "0.34", features = ["bundled"] }
-
-# HTTP client
-reqwest = { version = "0.12", features = ["json"] }
-
-# Async runtime
-tokio = { version = "1", features = ["full"] }
-
-# Serialization
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-
-# CLI
-clap = { version = "4", features = ["derive"] }
-
-# Config
-toml = "0.8"
-
-# Error handling
-thiserror = "2"
-anyhow = "1"
-
-# Hashing for change detection
-sha2 = "0.10"
-hex = "0.4"
-
-# Object storage (S3, R2, GCS, local filesystem)
-object_store = { version = "0.12", features = ["aws"] }
-url = "2"
-tempfile = "3"
-
-# Progress display
-indicatif = "0.17"
-
-# Encryption (broadcast packets)
-chacha20poly1305 = "0.5"
-rand = "0.9"
-
-# Logging
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# Unix process checking (PID lock)
-libc = "0.2"
 
 [profile.release]
 lto = true
