@@ -177,7 +177,11 @@ impl PluginDataSource {
             .await
             .map_err(|e| SyncError::Plugin(format!("Failed to flush plugin stdin: {}", e)))?;
 
-        let PluginIo { ref mut stdout, ref mut read_buf, .. } = *io;
+        let PluginIo {
+            ref mut stdout,
+            ref mut read_buf,
+            ..
+        } = *io;
         read_buf.clear();
         stdout
             .read_line(read_buf)
@@ -191,15 +195,14 @@ impl PluginDataSource {
             )));
         }
 
-        let response: RpcResponse =
-            serde_json::from_str(read_buf).map_err(|e| {
-                SyncError::Plugin(format!(
-                    "Invalid JSON-RPC response from plugin '{}': {}\nResponse: {}",
-                    self.plugin_name,
-                    e,
-                    read_buf.trim()
-                ))
-            })?;
+        let response: RpcResponse = serde_json::from_str(read_buf).map_err(|e| {
+            SyncError::Plugin(format!(
+                "Invalid JSON-RPC response from plugin '{}': {}\nResponse: {}",
+                self.plugin_name,
+                e,
+                read_buf.trim()
+            ))
+        })?;
 
         if response.id != id {
             return Err(SyncError::Plugin(format!(
@@ -222,9 +225,8 @@ impl PluginDataSource {
             ))
         })?;
 
-        serde_json::from_value(result).map_err(|e| {
-            SyncError::Plugin(format!("Failed to deserialize plugin response: {}", e))
-        })
+        serde_json::from_value(result)
+            .map_err(|e| SyncError::Plugin(format!("Failed to deserialize plugin response: {}", e)))
     }
 }
 
@@ -306,11 +308,7 @@ impl DataSource for PluginDataSource {
         .await
     }
 
-    async fn upsert_rows(
-        &self,
-        table: &str,
-        rows: &[HashMap<String, JsonValue>],
-    ) -> Result<usize> {
+    async fn upsert_rows(&self, table: &str, rows: &[HashMap<String, JsonValue>]) -> Result<usize> {
         self.call(
             "upsert_rows",
             serde_json::json!({
@@ -408,14 +406,14 @@ mod tests {
         let resp: RpcResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.id, 1);
         assert!(resp.error.is_none());
-        let tables: Vec<String> =
-            serde_json::from_value(resp.result.unwrap()).unwrap();
+        let tables: Vec<String> = serde_json::from_value(resp.result.unwrap()).unwrap();
         assert_eq!(tables, vec!["users", "posts"]);
     }
 
     #[test]
     fn test_rpc_error_response_deserialization() {
-        let json = r#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"table not found"},"id":2}"#;
+        let json =
+            r#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"table not found"},"id":2}"#;
         let resp: RpcResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.id, 2);
         assert!(resp.result.is_none());

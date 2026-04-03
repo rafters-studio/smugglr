@@ -964,7 +964,9 @@ async fn run_status(
                 ResolvedTarget::Sqlite { database } => {
                     println!("  Target: SQLite ({})", database);
                 }
-                ResolvedTarget::Plugin { ref name, ref path, .. } => {
+                ResolvedTarget::Plugin {
+                    ref name, ref path, ..
+                } => {
                     println!("  Target: Plugin ({})", name);
                     println!("  Plugin path: {}", path.display());
                 }

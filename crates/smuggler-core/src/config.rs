@@ -397,11 +397,7 @@ impl Config {
                 TargetConfig::Sqlite { database } => ResolvedTarget::Sqlite {
                     database: database.clone(),
                 },
-                TargetConfig::Plugin {
-                    name,
-                    path,
-                    config,
-                } => {
+                TargetConfig::Plugin { name, path, config } => {
                     let (resolved_path, resolved_name) = match (name, path) {
                         (_, Some(p)) => {
                             let pb = PathBuf::from(p);

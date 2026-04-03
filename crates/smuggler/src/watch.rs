@@ -38,7 +38,12 @@ pub async fn run_watch(
     );
 
     // Start plugin once before the loop to avoid respawning every tick
-    let plugin = if let ResolvedTarget::Plugin { ref path, ref name, config: ref plugin_config } = target {
+    let plugin = if let ResolvedTarget::Plugin {
+        ref path,
+        ref name,
+        config: ref plugin_config,
+    } = target
+    {
         Some(PluginDataSource::start(path, name, plugin_config).await?)
     } else {
         None
