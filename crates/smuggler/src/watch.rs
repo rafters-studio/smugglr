@@ -58,7 +58,7 @@ pub async fn run_watch(
                             warn!("Connection test failed on tick #{}: {}. Will retry next tick.", tick_count, e);
                             if fmt == OutputFormat::Json {
                                 let out = WatchTickOutput::from_error(tick_count, &e.to_string());
-                                println!("{}", serde_json::to_string(&out).unwrap());
+                                println!("{}", serde_json::to_string(&out).expect("WatchTickOutput is always serializable"));
                             }
                             continue;
                         }
@@ -78,7 +78,7 @@ pub async fn run_watch(
 
                         if fmt == OutputFormat::Json {
                             let out = WatchTickOutput::from_results(tick_count, &results);
-                            println!("{}", serde_json::to_string(&out).unwrap());
+                            println!("{}", serde_json::to_string(&out).expect("WatchTickOutput is always serializable"));
                         } else if total_pushed > 0 || total_pulled > 0 {
                             info!(
                                 "Tick #{}: {} pushed, {} pulled across {} tables",
@@ -100,13 +100,13 @@ pub async fn run_watch(
                             warn!("Transient error on tick #{}: {}. Will retry next tick.", tick_count, e);
                             if fmt == OutputFormat::Json {
                                 let out = WatchTickOutput::from_error(tick_count, &e.to_string());
-                                println!("{}", serde_json::to_string(&out).unwrap());
+                                println!("{}", serde_json::to_string(&out).expect("WatchTickOutput is always serializable"));
                             }
                         } else {
                             error!("Fatal error on tick #{}: {}", tick_count, e);
                             if fmt == OutputFormat::Json {
                                 let out = WatchTickOutput::from_error(tick_count, &e.to_string());
-                                println!("{}", serde_json::to_string(&out).unwrap());
+                                println!("{}", serde_json::to_string(&out).expect("WatchTickOutput is always serializable"));
                             }
                             return Err(e);
                         }

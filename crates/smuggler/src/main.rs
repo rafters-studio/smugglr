@@ -66,6 +66,14 @@ impl SyncProgress for IndicatifProgress {
     }
 }
 
+fn make_progress(fmt: OutputFormat) -> Box<dyn SyncProgress> {
+    if fmt == OutputFormat::Text {
+        Box::new(IndicatifProgress::new())
+    } else {
+        Box::new(NoProgress)
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "smuggler")]
 #[command(
@@ -402,11 +410,7 @@ async fn run_push(
     let local = LocalDb::open_readonly(config.local_db_path())?;
     let tables = resolve_tables(&local, table)?;
 
-    let progress: Box<dyn SyncProgress> = if fmt == OutputFormat::Text {
-        Box::new(IndicatifProgress::new())
-    } else {
-        Box::new(NoProgress)
-    };
+    let progress = make_progress(fmt);
 
     let results = match target {
         ResolvedTarget::D1 {
@@ -465,11 +469,7 @@ async fn run_pull(
     };
     let tables = resolve_tables(&local, table)?;
 
-    let progress: Box<dyn SyncProgress> = if fmt == OutputFormat::Text {
-        Box::new(IndicatifProgress::new())
-    } else {
-        Box::new(NoProgress)
-    };
+    let progress = make_progress(fmt);
 
     let results = match target {
         ResolvedTarget::D1 {
@@ -528,11 +528,7 @@ async fn run_sync(
     };
     let tables = resolve_tables(&local, table)?;
 
-    let progress: Box<dyn SyncProgress> = if fmt == OutputFormat::Text {
-        Box::new(IndicatifProgress::new())
-    } else {
-        Box::new(NoProgress)
-    };
+    let progress = make_progress(fmt);
 
     let results = match target {
         ResolvedTarget::D1 {

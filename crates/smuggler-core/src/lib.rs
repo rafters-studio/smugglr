@@ -23,4 +23,4 @@ pub use diff::{diff_table, DiffStats, TableDiff};
 pub use error::{Result, SyncError};
 pub use local::LocalDb;
 pub use remote::D1Client;
-pub use sync::{pull_all, push_all, sync_all, NoProgress, SyncProgress, SyncResult};
+pub use sync::{pull_all, push_all, sync_all, DiffDetail, NoProgress, SyncProgress, SyncResult};
