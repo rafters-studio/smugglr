@@ -11,6 +11,12 @@ authors.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
+[package.metadata.wasm-pack.profile.dev]
+wasm-opt = false
+
 [dependencies]
 smugglr-core = { path = "../smugglr-core", default-features = false }
 wasm-bindgen = "0.2"

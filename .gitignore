@@ -18,3 +18,4 @@ failed_rows.json
 # OS
 .DS_Store
 Thumbs.db
+/crates/smugglr-wasm/pkg/
