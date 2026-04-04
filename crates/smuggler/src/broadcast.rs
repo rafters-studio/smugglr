@@ -1,16 +1,16 @@
 //! Broadcast daemon loop (CLI layer).
 //!
 //! The engine logic (peer discovery, delta protocol, TCP sync) lives in
-//! `smugglr_core::broadcast`. This module provides the daemon loop that
+//! `smuggler_core::broadcast`. This module provides the daemon loop that
 //! ties it all together with signal handling and PID locking.
 
-use smugglr_core::broadcast::{
+use smuggler_core::broadcast::{
     broadcast_pid_lock_path, handle_sync_connection, hash_db_path, run_broadcast_once,
     BroadcastConfig, Peer, PeerDiscovery, ReplayGuard,
 };
-use smugglr_core::config::Config;
-use smugglr_core::daemon::PidLock;
-use smugglr_core::error::{Result, SyncError};
+use smuggler_core::config::Config;
+use smuggler_core::daemon::PidLock;
+use smuggler_core::error::{Result, SyncError};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::Duration;

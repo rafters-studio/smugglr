@@ -1,4 +1,4 @@
-//! smugglr-core: sync engine for bidirectional SQLite/D1 synchronization.
+//! smuggler-core: sync engine for bidirectional SQLite/D1 synchronization.
 //!
 //! This crate contains the core sync logic without any CLI dependencies.
 //! It can be used as a library by other Rust applications that need

@@ -1715,21 +1715,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
-name = "smugglr"
+name = "smuggler"
 version = "0.2.1"
 dependencies = [
  "clap",
  "indicatif",
  "serde",
  "serde_json",
- "smugglr-core",
+ "smuggler-core",
  "tokio",
  "tracing",
  "tracing-subscriber",
 ]
 
 [[package]]
-name = "smugglr-core"
+name = "smuggler-core"
 version = "0.2.1"
 dependencies = [
  "anyhow",
@@ -1752,7 +1752,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "smugglr-http-sql"
+name = "smuggler-http-sql"
 version = "0.2.1"
 dependencies = [
  "hex",
@@ -1760,12 +1760,12 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "smugglr-plugin-sdk",
+ "smuggler-plugin-sdk",
  "tokio",
 ]
 
 [[package]]
-name = "smugglr-plugin-sdk"
+name = "smuggler-plugin-sdk"
 version = "0.2.1"
 dependencies = [
  "serde",

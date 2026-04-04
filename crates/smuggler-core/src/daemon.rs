@@ -91,16 +91,16 @@ pub fn is_process_running(pid: u32) -> bool {
 
 /// Resolve the PID lock file path.
 ///
-/// Uses `~/.smugglr/smuggler.pid` or a path next to the config file.
+/// Uses `~/.smuggler/smuggler.pid` or a path next to the config file.
 pub fn pid_lock_path(config_path: &Path) -> PathBuf {
     if let Some(parent) = config_path.parent() {
         if parent.as_os_str().is_empty() {
-            PathBuf::from(".smugglr.pid")
+            PathBuf::from(".smuggler.pid")
         } else {
-            parent.join(".smugglr.pid")
+            parent.join(".smuggler.pid")
         }
     } else {
-        PathBuf::from(".smugglr.pid")
+        PathBuf::from(".smuggler.pid")
     }
 }
 
@@ -375,13 +375,13 @@ database = "backup.db""#
     #[test]
     fn test_pid_lock_path_with_config() {
         let p = pid_lock_path(Path::new("/home/user/project/config.toml"));
-        assert_eq!(p, PathBuf::from("/home/user/project/.smugglr.pid"));
+        assert_eq!(p, PathBuf::from("/home/user/project/.smuggler.pid"));
     }
 
     #[test]
     fn test_pid_lock_path_bare_filename() {
         let p = pid_lock_path(Path::new("config.toml"));
-        assert_eq!(p, PathBuf::from(".smugglr.pid"));
+        assert_eq!(p, PathBuf::from(".smuggler.pid"));
     }
 
     #[test]

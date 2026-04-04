@@ -6,15 +6,15 @@
 //! for the user, not an optimization gate in v1).
 
 use crate::output::{OutputFormat, WatchTickOutput};
-use smugglr_core::config::{Config, ResolvedTarget};
-use smugglr_core::daemon::{
+use smuggler_core::config::{Config, ResolvedTarget};
+use smuggler_core::daemon::{
     is_transient_error, now_iso8601, pid_lock_path, update_last_sync, PidLock,
 };
-use smugglr_core::error::Result;
-use smugglr_core::local::LocalDb;
-use smugglr_core::plugin::PluginDataSource;
-use smugglr_core::remote::D1Client;
-use smugglr_core::sync::{sync_all, NoProgress};
+use smuggler_core::error::Result;
+use smuggler_core::local::LocalDb;
+use smuggler_core::plugin::PluginDataSource;
+use smuggler_core::remote::D1Client;
+use smuggler_core::sync::{sync_all, NoProgress};
 use std::path::Path;
 use tokio::signal;
 use tokio::time::{self, Duration};

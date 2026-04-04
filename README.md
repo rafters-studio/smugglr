@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="smugglr.webp" alt="Smugglr" width="400">
+  <img src="smuggler.webp" alt="Smuggler" width="400">
 </p>
 
 # Smuggler
@@ -14,7 +14,7 @@ Running in production at [huttspawn.com](https://huttspawn.com) since early 2026
 
 Not 1.0 yet -- the API surface may still shift. But the core sync engine is solid and battle-tested, with LAN broadcast sync, S3 relay, and agent-friendly JSON output.
 
-There are [open issues](https://github.com/rafters-studio/smugglr/issues). We're shaving parsecs, not days.
+There are [open issues](https://github.com/rafters-studio/smuggler/issues). We're shaving parsecs, not days.
 
 ## What It Does
 
@@ -38,7 +38,7 @@ Smuggler is a universal SQLite sync engine. It started as a way to sync local de
 ### Quick install (recommended)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rafters-studio/smugglr/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/rafters-studio/smuggler/main/install.sh | bash
 ```
 
 Detects your platform, downloads the right binary, verifies the SHA256 checksum, and installs to `~/.local/bin/`. Supports Linux x64, macOS x64, and macOS ARM64. Detects Rosetta 2 and installs the native arm64 binary.
@@ -46,22 +46,22 @@ Detects your platform, downloads the right binary, verifies the SHA256 checksum,
 Install a specific version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rafters-studio/smugglr/main/install.sh | bash -s v0.1.2
+curl -fsSL https://raw.githubusercontent.com/rafters-studio/smuggler/main/install.sh | bash -s v0.1.2
 ```
 
 ### Manual download
 
 | Platform | Download |
 |----------|----------|
-| Linux x64 | [smugglr-linux-x64.tar.gz](https://github.com/rafters-studio/smugglr/releases/latest/download/smugglr-linux-x64.tar.gz) |
-| macOS x64 | [smugglr-macos-x64.tar.gz](https://github.com/rafters-studio/smugglr/releases/latest/download/smugglr-macos-x64.tar.gz) |
-| macOS ARM64 | [smugglr-macos-arm64.tar.gz](https://github.com/rafters-studio/smugglr/releases/latest/download/smugglr-macos-arm64.tar.gz) |
-| Windows x64 | [smugglr-windows-x64.zip](https://github.com/rafters-studio/smugglr/releases/latest/download/smugglr-windows-x64.zip) |
+| Linux x64 | [smuggler-linux-x64.tar.gz](https://github.com/rafters-studio/smuggler/releases/latest/download/smuggler-linux-x64.tar.gz) |
+| macOS x64 | [smuggler-macos-x64.tar.gz](https://github.com/rafters-studio/smuggler/releases/latest/download/smuggler-macos-x64.tar.gz) |
+| macOS ARM64 | [smuggler-macos-arm64.tar.gz](https://github.com/rafters-studio/smuggler/releases/latest/download/smuggler-macos-arm64.tar.gz) |
+| Windows x64 | [smuggler-windows-x64.zip](https://github.com/rafters-studio/smuggler/releases/latest/download/smuggler-windows-x64.zip) |
 
 ### From source
 
 ```bash
-cargo install --git https://github.com/rafters-studio/smugglr
+cargo install --git https://github.com/rafters-studio/smuggler
 ```
 
 Requires Rust 1.75+.
@@ -86,33 +86,33 @@ local_db = ".wrangler/state/v3/d1/miniflare-D1DatabaseObject/xxx.sqlite"
 3. Check if you can reach D1:
 
 ```bash
-smugglr status
+smuggler status
 ```
 
 4. See what's different:
 
 ```bash
-smugglr diff
+smuggler diff
 ```
 
 5. Push your local changes (point of no return):
 
 ```bash
-smugglr push
+smuggler push
 ```
 
 ## Commands
 
 ```
-smugglr status      # Can we phone home?
-smugglr diff        # What's different?
-smugglr push        # Local -> D1 (YOLO)
-smugglr pull        # D1 -> Local (safer YOLO)
-smugglr sync        # Bidirectional (push + pull in one shot)
-smugglr stash       # Local -> S3 relay (cross-machine sync)
-smugglr retrieve    # S3 relay -> Local (cross-machine sync)
-smugglr watch       # Daemon mode (sync on interval)
-smugglr broadcast   # LAN sync (peer discovery + encrypted deltas)
+smuggler status      # Can we phone home?
+smuggler diff        # What's different?
+smuggler push        # Local -> D1 (YOLO)
+smuggler pull        # D1 -> Local (safer YOLO)
+smuggler sync        # Bidirectional (push + pull in one shot)
+smuggler stash       # Local -> S3 relay (cross-machine sync)
+smuggler retrieve    # S3 relay -> Local (cross-machine sync)
+smuggler watch       # Daemon mode (sync on interval)
+smuggler broadcast   # LAN sync (peer discovery + encrypted deltas)
 ```
 
 ### Options
@@ -180,8 +180,8 @@ Machine A                    S3/R2/GCS                  Machine B
 
 Both sides are SQLite. Smuggler downloads the relay file from S3, opens it as a second `LocalDb`, and runs the same diff engine used for D1 sync. Only changed rows are transferred.
 
-- **`smugglr stash`** -- diffs local against the relay, applies changes to the relay, uploads it back to S3
-- **`smugglr retrieve`** -- downloads the relay from S3, diffs it against local, applies changes to local
+- **`smuggler stash`** -- diffs local against the relay, applies changes to the relay, uploads it back to S3
+- **`smuggler retrieve`** -- downloads the relay from S3, diffs it against local, applies changes to local
 
 On first stash, Smuggler creates the relay from scratch and initializes its schema from the local database. ETag conditional writes prevent concurrent overwrites when multiple machines stash at the same time.
 
@@ -192,7 +192,7 @@ Add a `[stash]` section to your config (independent from D1 settings):
 ```toml
 [stash]
 # S3-compatible URL to the relay file
-url = "s3://my-bucket/smugglr/relay.sqlite"
+url = "s3://my-bucket/smuggler/relay.sqlite"
 
 # AWS credentials (optional if using instance roles or env vars)
 access_key_id = "AKIA..."
@@ -213,10 +213,10 @@ Stash/retrieve pairs well with session hooks. For example, with [Legion](https:/
 
 ```bash
 # SessionStart hook
-smugglr retrieve && legion reindex
+smuggler retrieve && legion reindex
 
 # SessionStop hook
-smugglr stash
+smuggler stash
 ```
 
 ## LAN Broadcast Sync
@@ -230,7 +230,7 @@ Machine A                  LAN (port 31337)               Machine B
 
 ### How it works
 
-1. `smugglr broadcast` sends UDP announcements on port 31337
+1. `smuggler broadcast` sends UDP announcements on port 31337
 2. Peers on the same subnet discover each other automatically
 3. On discovery, peers exchange deltas over TCP (only changed rows)
 4. All traffic is encrypted with XChaCha20-Poly1305 (pre-shared key)
@@ -257,7 +257,7 @@ conflict_resolution = "uuid_v7_wins"
 
 ### Security model
 
-Designed for **known/trusted networks** (home LAN, office LAN). The pre-shared key prevents eavesdropping and tampering on the local subnet. This is not designed for hostile networks or the open internet. If you need that, run smugglr inside a WireGuard tunnel.
+Designed for **known/trusted networks** (home LAN, office LAN). The pre-shared key prevents eavesdropping and tampering on the local subnet. This is not designed for hostile networks or the open internet. If you need that, run smuggler inside a WireGuard tunnel.
 
 ## Configuration
 
@@ -325,7 +325,7 @@ Things we don't do (yet):
 - **Full-sync transactions** - Each batch is atomic, but the whole sync isn't. Re-run if interrupted.
 - **BLOB wizardry** - Binary data compared as hex strings. It works but it's not pretty.
 - **Tables without primary keys** - We need something to compare. Add a PK.
-- **Linux ARM64** - Not available yet. See [issues](https://github.com/rafters-studio/smugglr/issues) for updates.
+- **Linux ARM64** - Not available yet. See [issues](https://github.com/rafters-studio/smuggler/issues) for updates.
 
 ## Troubleshooting
 

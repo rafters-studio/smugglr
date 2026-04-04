@@ -4,7 +4,7 @@ use crate::profile::{AuthFormat, Profile};
 use reqwest::Client;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use smugglr_plugin_sdk::{ColumnInfo, PluginAdapter, PluginError, RowMeta, TableInfo};
+use smuggler_plugin_sdk::{ColumnInfo, PluginAdapter, PluginError, RowMeta, TableInfo};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -159,7 +159,7 @@ impl HttpSqlAdapter {
 
     /// Hash row content for change detection.
     ///
-    /// IMPORTANT: This must match smugglr-core local.rs hashing algorithm exactly.
+    /// IMPORTANT: This must match smuggler-core local.rs hashing algorithm exactly.
     /// local.rs hashes values only (no keys) in column definition order, using
     /// empty string for NULL. Any divergence breaks cross-source sync.
     fn content_hash(

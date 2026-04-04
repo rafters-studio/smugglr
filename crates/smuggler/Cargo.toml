@@ -1,5 +1,5 @@
 [package]
-name = "smugglr"
+name = "smuggler"
 description = "Smuggle data between SQLite and Cloudflare D1"
 version.workspace = true
 edition.workspace = true
@@ -7,8 +7,8 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-homepage = "https://github.com/rafters-studio/smugglr"
-documentation = "https://github.com/rafters-studio/smugglr#readme"
+homepage = "https://github.com/rafters-studio/smuggler"
+documentation = "https://github.com/rafters-studio/smuggler#readme"
 readme = "../../README.md"
 keywords = ["cloudflare", "d1", "sqlite", "sync", "database"]
 categories = ["command-line-utilities", "database"]
@@ -18,11 +18,11 @@ exclude = [
 ]
 
 [[bin]]
-name = "smugglr"
+name = "smuggler"
 path = "src/main.rs"
 
 [dependencies]
-smugglr-core = { path = "../smugglr-core" }
+smuggler-core = { path = "../smuggler-core" }
 
 # CLI
 clap = { version = "4", features = ["derive"] }

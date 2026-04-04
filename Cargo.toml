@@ -1,9 +1,9 @@
 [workspace]
 members = [
-    "crates/smugglr-core",
-    "crates/smugglr",
-    "crates/smugglr-plugin-sdk",
-    "plugins/smugglr-http-sql",
+    "crates/smuggler-core",
+    "crates/smuggler",
+    "crates/smuggler-plugin-sdk",
+    "plugins/smuggler-http-sql",
 ]
 resolver = "2"
 
@@ -12,7 +12,7 @@ version = "0.2.1"
 edition = "2021"
 rust-version = "1.75"
 license = "MIT"
-repository = "https://github.com/rafters-studio/smugglr"
+repository = "https://github.com/rafters-studio/smuggler"
 authors = ["Sean Silvius"]
 
 [profile.release]

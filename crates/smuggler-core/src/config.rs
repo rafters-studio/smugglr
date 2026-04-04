@@ -43,7 +43,7 @@ pub enum TargetConfig {
     Sqlite { database: String },
     /// External plugin adapter
     Plugin {
-        /// Plugin name (resolved from ~/.smugglr/plugins/smuggler-{name} or $PATH)
+        /// Plugin name (resolved from ~/.smuggler/plugins/smuggler-{name} or $PATH)
         name: Option<String>,
         /// Explicit path to plugin binary
         path: Option<String>,
@@ -946,7 +946,7 @@ local_db = "game.db"
 
 [target]
 type = "plugin"
-path = "/usr/local/bin/smugglr-turso"
+path = "/usr/local/bin/smuggler-turso"
 
 [target.config]
 url = "libsql://my-db.turso.io"
@@ -955,7 +955,7 @@ url = "libsql://my-db.turso.io"
         match &config.target {
             Some(TargetConfig::Plugin { name, path, config }) => {
                 assert!(name.is_none());
-                assert_eq!(path.as_deref(), Some("/usr/local/bin/smugglr-turso"));
+                assert_eq!(path.as_deref(), Some("/usr/local/bin/smuggler-turso"));
                 assert_eq!(config.get("url").unwrap(), "libsql://my-db.turso.io");
             }
             _ => panic!("expected plugin target"),
@@ -991,7 +991,7 @@ path = "/usr/local/bin/smuggler-custom"
             stash: None,
             target: Some(TargetConfig::Plugin {
                 name: None,
-                path: Some("/usr/local/bin/smugglr-turso".into()),
+                path: Some("/usr/local/bin/smuggler-turso".into()),
                 config: HashMap::new(),
             }),
             broadcast: None,
@@ -999,8 +999,8 @@ path = "/usr/local/bin/smuggler-custom"
         let target = config.resolve_target().unwrap();
         match target {
             ResolvedTarget::Plugin { path, name, .. } => {
-                assert_eq!(path, PathBuf::from("/usr/local/bin/smugglr-turso"));
-                assert_eq!(name, "smugglr-turso");
+                assert_eq!(path, PathBuf::from("/usr/local/bin/smuggler-turso"));
+                assert_eq!(name, "smuggler-turso");
             }
             _ => panic!("expected plugin target"),
         }
