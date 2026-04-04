@@ -358,6 +358,14 @@ impl RetryConfig {
 }
 
 impl Config {
+    /// Parse config from a TOML string without filesystem access.
+    ///
+    /// Skips local_db auto-detection and target validation.
+    /// Use this for WASM or library consumers that construct config programmatically.
+    pub fn from_toml_str(content: &str) -> Result<Self> {
+        toml::from_str(content).map_err(|e| SyncError::Config(e.to_string()))
+    }
+
     /// Load config from a TOML file
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();

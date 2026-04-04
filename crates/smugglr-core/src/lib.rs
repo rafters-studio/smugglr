@@ -12,6 +12,7 @@ pub mod config;
 pub mod datasource;
 pub mod diff;
 pub mod error;
+pub mod profile;
 pub mod sync;
 pub mod table;
 
