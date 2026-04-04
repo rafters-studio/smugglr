@@ -116,6 +116,35 @@ pub struct WatchTickOutput {
 }
 
 #[derive(Serialize)]
+pub struct SnapshotOutput {
+    pub command: &'static str,
+    pub status: &'static str,
+    pub timestamp: String,
+    pub size_bytes: u64,
+    pub tables: Vec<SnapshotTableInfo>,
+}
+
+#[derive(Serialize)]
+pub struct SnapshotTableInfo {
+    pub name: String,
+    pub row_count: usize,
+}
+
+#[derive(Serialize)]
+pub struct SnapshotListOutput {
+    pub command: &'static str,
+    pub status: &'static str,
+    pub snapshots: Vec<SnapshotListEntry>,
+}
+
+#[derive(Serialize)]
+pub struct SnapshotListEntry {
+    pub timestamp: String,
+    pub size_bytes: u64,
+    pub tables: Vec<SnapshotTableInfo>,
+}
+
+#[derive(Serialize)]
 pub struct ErrorOutput {
     pub command: &'static str,
     pub status: &'static str,

@@ -105,3 +105,16 @@ backoff_multiplier = 2.0
 # secret_access_key = "your-secret-key"
 # region = "us-east-1"
 # endpoint = "https://account-id.r2.cloudflarestorage.com"
+
+# =============================================================================
+# Snapshots
+# =============================================================================
+# Point-in-time snapshots use the same [stash] storage config above.
+# Snapshots are stored alongside the relay at <stash-path>/snapshots/<timestamp>.sqlite
+#
+# Commands:
+#   smugglr snapshot              - Create a timestamped full backup
+#   smugglr snapshots             - List available snapshots
+#   smugglr restore <timestamp>   - Restore to a specific snapshot
+#
+# All commands support --dry-run and --output json for agent consumption.

@@ -24,7 +24,7 @@ use url::Url;
 /// Supports:
 /// - `s3://bucket/key` -- Amazon S3 or S3-compatible (R2, MinIO)
 /// - `file:///absolute/path` -- Local filesystem (for testing)
-fn build_store(config: &StashConfig) -> Result<(Arc<dyn ObjectStore>, ObjectPath)> {
+pub(crate) fn build_store(config: &StashConfig) -> Result<(Arc<dyn ObjectStore>, ObjectPath)> {
     let url = Url::parse(&config.url).map_err(|e| SyncError::InvalidUrl(e.to_string()))?;
 
     match url.scheme() {
