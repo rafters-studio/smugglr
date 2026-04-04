@@ -17,6 +17,7 @@ use smuggler_core::datasource::DataSource;
 use smuggler_core::diff::diff_table;
 use smuggler_core::error;
 use smuggler_core::local::LocalDb;
+use smuggler_core::plugin::PluginDataSource;
 use smuggler_core::remote::D1Client;
 use smuggler_core::sync::{
     get_tables_to_sync, pull_all, push_all, sync_all, NoProgress, SyncProgress,
@@ -436,6 +437,15 @@ async fn run_push(
             )
             .await?
         }
+        ResolvedTarget::Plugin {
+            ref path,
+            ref name,
+            config: ref plugin_config,
+        } => {
+            info!("Push mode: local -> plugin ({})", name);
+            let plugin = PluginDataSource::start(path, name, plugin_config).await?;
+            push_all(&local, &plugin, config, tables, dry_run, progress.as_ref()).await?
+        }
     };
 
     match fmt {
@@ -495,6 +505,15 @@ async fn run_pull(
             )
             .await?
         }
+        ResolvedTarget::Plugin {
+            ref path,
+            ref name,
+            config: ref plugin_config,
+        } => {
+            info!("Pull mode: plugin ({}) -> local", name);
+            let plugin = PluginDataSource::start(path, name, plugin_config).await?;
+            pull_all(&local, &plugin, config, tables, dry_run, progress.as_ref()).await?
+        }
     };
 
     match fmt {
@@ -553,6 +572,15 @@ async fn run_sync(
                 progress.as_ref(),
             )
             .await?
+        }
+        ResolvedTarget::Plugin {
+            ref path,
+            ref name,
+            config: ref plugin_config,
+        } => {
+            info!("Sync mode: bidirectional (local <-> plugin {})", name);
+            let plugin = PluginDataSource::start(path, name, plugin_config).await?;
+            sync_all(&local, &plugin, config, tables, dry_run, progress.as_ref()).await?
         }
     };
 
@@ -638,6 +666,30 @@ async fn run_diff(
             output_diffs(
                 &local,
                 &target_db,
+                &tables,
+                &config.sync.timestamp_column,
+                &config.sync.exclude_columns,
+                fmt,
+            )
+            .await
+        }
+        ResolvedTarget::Plugin {
+            ref path,
+            ref name,
+            config: ref plugin_config,
+        } => {
+            let plugin = PluginDataSource::start(path, name, plugin_config).await?;
+            let tables = match table {
+                Some(t) => {
+                    let schema = local.get_schema()?;
+                    let _ = schema.validate(&t)?;
+                    vec![t]
+                }
+                None => get_tables_to_sync(&local, &plugin, config).await?,
+            };
+            output_diffs(
+                &local,
+                &plugin,
                 &tables,
                 &config.sync.timestamp_column,
                 &config.sync.exclude_columns,
@@ -747,6 +799,7 @@ async fn run_status(
     let target_type = match &target {
         ResolvedTarget::D1 { .. } => "d1",
         ResolvedTarget::Sqlite { .. } => "sqlite",
+        ResolvedTarget::Plugin { ref name, .. } => name.as_str(),
     };
 
     // Gather local DB info
@@ -835,6 +888,35 @@ async fn run_status(
                 tables: vec![],
             },
         },
+        ResolvedTarget::Plugin {
+            ref path,
+            ref name,
+            config: ref plugin_config,
+        } => match PluginDataSource::start(path, name, plugin_config).await {
+            Ok(plugin) => {
+                let tables = plugin.list_tables().await?;
+                let mut table_rows = Vec::new();
+                for table in &tables {
+                    if config.should_sync_table(table) {
+                        let count = plugin.row_count(table).await?;
+                        table_rows.push(StatusTable {
+                            name: table.clone(),
+                            rows: count,
+                        });
+                    }
+                }
+                StatusDb {
+                    connected: true,
+                    error: None,
+                    tables: table_rows,
+                }
+            }
+            Err(e) => StatusDb {
+                connected: false,
+                error: Some(e.to_string()),
+                tables: vec![],
+            },
+        },
     };
 
     match fmt {
@@ -882,6 +964,12 @@ async fn run_status(
                 ResolvedTarget::Sqlite { database } => {
                     println!("  Target: SQLite ({})", database);
                 }
+                ResolvedTarget::Plugin {
+                    ref name, ref path, ..
+                } => {
+                    println!("  Target: Plugin ({})", name);
+                    println!("  Plugin path: {}", path.display());
+                }
             }
 
             println!("  Timestamp column: {}", config.sync.timestamp_column);
@@ -919,6 +1007,9 @@ async fn run_status(
             match &target {
                 ResolvedTarget::D1 { .. } => println!("\n--- Remote D1 ---"),
                 ResolvedTarget::Sqlite { .. } => println!("\n--- Target SQLite ---"),
+                ResolvedTarget::Plugin { ref name, .. } => {
+                    println!("\n--- Target Plugin ({}) ---", name)
+                }
             }
             if target_status.connected {
                 println!("  Connection: OK");

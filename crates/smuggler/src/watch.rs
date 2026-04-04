@@ -12,6 +12,7 @@ use smuggler_core::daemon::{
 };
 use smuggler_core::error::Result;
 use smuggler_core::local::LocalDb;
+use smuggler_core::plugin::PluginDataSource;
 use smuggler_core::remote::D1Client;
 use smuggler_core::sync::{sync_all, NoProgress};
 use std::path::Path;
@@ -35,6 +36,18 @@ pub async fn run_watch(
         "Starting watch daemon (interval: {}s, dry_run: {})",
         interval_secs, dry_run
     );
+
+    // Start plugin once before the loop to avoid respawning every tick
+    let plugin = if let ResolvedTarget::Plugin {
+        ref path,
+        ref name,
+        config: ref plugin_config,
+    } = target
+    {
+        Some(PluginDataSource::start(path, name, plugin_config).await?)
+    } else {
+        None
+    };
 
     let mut tick_count: u64 = 0;
     let mut interval = time::interval(Duration::from_secs(interval_secs));
@@ -68,6 +81,11 @@ pub async fn run_watch(
                         let local = LocalDb::open(config.local_db_path())?;
                         let target_db = LocalDb::open(database)?;
                         sync_all(&local, &target_db, config, None, dry_run, &NoProgress).await
+                    }
+                    ResolvedTarget::Plugin { .. } => {
+                        let local = LocalDb::open(config.local_db_path())?;
+                        let plugin = plugin.as_ref().expect("plugin initialized before loop");
+                        sync_all(&local, plugin, config, None, dry_run, &NoProgress).await
                     }
                 };
 
