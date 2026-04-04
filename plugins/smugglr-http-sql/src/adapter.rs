@@ -157,13 +157,13 @@ impl HttpSqlAdapter {
             .collect()
     }
 
-    /// Calculate the maximum number of rows per batch given column count and bind param limit.
-    /// Returns `total_rows` when there is no limit (max_bind_params == 0).
-    fn max_rows_per_batch(num_columns: usize, max_bind_params: usize, total_rows: usize) -> usize {
+    /// Maximum rows per batch for a given column count and bind param limit.
+    /// Returns `None` when there is no limit (max_bind_params == 0).
+    fn max_rows_per_batch(num_columns: usize, max_bind_params: usize) -> Option<usize> {
         if max_bind_params > 0 && num_columns > 0 {
-            (max_bind_params / num_columns).max(1)
+            Some((max_bind_params / num_columns).max(1))
         } else {
-            total_rows
+            None
         }
     }
 
@@ -179,12 +179,8 @@ impl HttpSqlAdapter {
             .collect::<Vec<_>>()
             .join(", ");
 
-        let placeholders_per_row = vec!["?"; columns.len()].join(", ");
-        let all_placeholders = rows
-            .iter()
-            .map(|_| format!("({})", placeholders_per_row))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let row_placeholder = format!("({})", vec!["?"; columns.len()].join(", "));
+        let all_placeholders = vec![row_placeholder.as_str(); rows.len()].join(", ");
 
         let sql = format!(
             "INSERT OR REPLACE INTO \"{}\" ({}) VALUES {}",
@@ -434,8 +430,8 @@ impl PluginAdapter for HttpSqlAdapter {
         }
 
         let columns: Vec<String> = rows[0].keys().cloned().collect();
-        let batch_size =
-            Self::max_rows_per_batch(columns.len(), self.profile.max_bind_params, rows.len());
+        let batch_size = Self::max_rows_per_batch(columns.len(), self.profile.max_bind_params)
+            .unwrap_or(rows.len());
 
         let mut total = 0;
         for batch in rows.chunks(batch_size) {
@@ -543,30 +539,30 @@ mod tests {
 
     #[test]
     fn batch_size_no_limit() {
-        assert_eq!(HttpSqlAdapter::max_rows_per_batch(2, 0, 1000), 1000);
+        assert_eq!(HttpSqlAdapter::max_rows_per_batch(2, 0), None);
     }
 
     #[test]
     fn batch_size_d1_limit() {
         // 2 columns, 100 param limit -> 50 rows per batch
-        assert_eq!(HttpSqlAdapter::max_rows_per_batch(2, 100, 1000), 50);
+        assert_eq!(HttpSqlAdapter::max_rows_per_batch(2, 100), Some(50));
     }
 
     #[test]
     fn batch_size_wide_table() {
         // 50 columns, 100 param limit -> 2 rows per batch
-        assert_eq!(HttpSqlAdapter::max_rows_per_batch(50, 100, 1000), 2);
+        assert_eq!(HttpSqlAdapter::max_rows_per_batch(50, 100), Some(2));
     }
 
     #[test]
     fn batch_size_wider_than_limit() {
         // 150 columns, 100 param limit -> 1 row per batch (never zero)
-        assert_eq!(HttpSqlAdapter::max_rows_per_batch(150, 100, 1000), 1);
+        assert_eq!(HttpSqlAdapter::max_rows_per_batch(150, 100), Some(1));
     }
 
     #[test]
     fn batch_size_zero_columns() {
-        assert_eq!(HttpSqlAdapter::max_rows_per_batch(0, 100, 1000), 1000);
+        assert_eq!(HttpSqlAdapter::max_rows_per_batch(0, 100), None);
     }
 
     #[test]
@@ -620,7 +616,8 @@ mod tests {
             })
             .collect();
 
-        let batch_size = HttpSqlAdapter::max_rows_per_batch(columns.len(), 100, rows.len());
+        let batch_size =
+            HttpSqlAdapter::max_rows_per_batch(columns.len(), 100).unwrap_or(rows.len());
         assert_eq!(batch_size, 10);
 
         let batches: Vec<&[HashMap<String, Value>]> = rows.chunks(batch_size).collect();
