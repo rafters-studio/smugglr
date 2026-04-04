@@ -19,6 +19,7 @@ pub struct D1Client {
     database_id: String,
     api_token: String,
     retry_config: RetryConfig,
+    endpoint_url: Option<String>,
 }
 
 /// D1 query request
@@ -178,15 +179,36 @@ impl D1Client {
             database_id,
             api_token,
             retry_config,
+            endpoint_url: None,
+        }
+    }
+
+    /// Create a D1 client pointing at a custom endpoint (e.g. a DO bridge).
+    pub fn with_endpoint(
+        api_token: String,
+        endpoint_url: String,
+        retry_config: RetryConfig,
+    ) -> Self {
+        Self {
+            client: Client::new(),
+            account_id: String::new(),
+            database_id: String::new(),
+            api_token,
+            retry_config,
+            endpoint_url: Some(endpoint_url),
         }
     }
 
     /// Get the API endpoint URL
     fn endpoint(&self) -> String {
-        format!(
-            "https://api.cloudflare.com/client/v4/accounts/{}/d1/database/{}/query",
-            self.account_id, self.database_id
-        )
+        if let Some(ref url) = self.endpoint_url {
+            url.clone()
+        } else {
+            format!(
+                "https://api.cloudflare.com/client/v4/accounts/{}/d1/database/{}/query",
+                self.account_id, self.database_id
+            )
+        }
     }
 
     /// Send a SQL statement to D1 and return the parsed response (without retry).

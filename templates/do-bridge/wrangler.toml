@@ -1,0 +1,17 @@
+name = "do-bridge"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+[durable_objects]
+bindings = [
+  { name = "DO_BRIDGE", class_name = "SqliteBridge" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SqliteBridge"]
+
+[vars]
+# Set your bearer token for authentication.
+# In production, use `wrangler secret put AUTH_TOKEN` instead.
+# AUTH_TOKEN = "your-secret-token"

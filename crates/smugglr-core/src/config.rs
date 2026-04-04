@@ -34,11 +34,14 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum TargetConfig {
-    /// Cloudflare D1 target
+    /// Cloudflare D1 target (or any D1-compatible HTTP SQL endpoint)
     D1 {
         account_id: String,
         database_id: String,
         api_token: String,
+        /// Custom endpoint URL (overrides the default Cloudflare D1 API).
+        /// Use this to point at a DO bridge or other D1-compatible endpoint.
+        url: Option<String>,
     },
     /// Local SQLite target
     Sqlite { database: String },
@@ -61,6 +64,7 @@ pub enum ResolvedTarget {
         account_id: String,
         database_id: String,
         api_token: String,
+        url: Option<String>,
     },
     Sqlite {
         database: String,
@@ -390,10 +394,12 @@ impl Config {
                     account_id,
                     database_id,
                     api_token,
+                    url,
                 } => ResolvedTarget::D1 {
                     account_id: account_id.clone(),
                     database_id: database_id.clone(),
                     api_token: api_token.clone(),
+                    url: url.clone(),
                 },
                 TargetConfig::Sqlite { database } => ResolvedTarget::Sqlite {
                     database: database.clone(),
@@ -446,6 +452,7 @@ impl Config {
                 account_id: account_id.clone(),
                 database_id: database_id.clone(),
                 api_token: api_token.clone(),
+                url: None,
             }),
             _ => Err(SyncError::Config(
                 "No target configured. Add a [target] section or set cloudflare_account_id, database_id, and cloudflare_api_token.".to_string()
@@ -617,6 +624,7 @@ mod tests {
                 account_id: "acct".into(),
                 database_id: "db".into(),
                 api_token: "tok".into(),
+                url: None,
             }),
             broadcast: None,
         };
@@ -784,6 +792,7 @@ api_token = "tok789"
                 account_id,
                 database_id,
                 api_token,
+                ..
             } => {
                 assert_eq!(account_id, "acct123");
                 assert_eq!(database_id, "db456");
