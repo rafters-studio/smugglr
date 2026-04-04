@@ -71,7 +71,9 @@ pub async fn snapshot(
     let prefix = snapshots_prefix(&relay_path);
 
     let local = LocalDb::open_readonly(local_db_path)?;
-    let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+    let timestamp = chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
 
     // Gather table metadata
     let all_tables = local.list_tables().await?;
@@ -207,7 +209,10 @@ pub async fn restore(
             SyncError::Stash(format!(
                 "No snapshot found at or before {}. Earliest available: {}",
                 target_timestamp,
-                snapshots.last().map(|s| s.timestamp.as_str()).unwrap_or("none")
+                snapshots
+                    .last()
+                    .map(|s| s.timestamp.as_str())
+                    .unwrap_or("none")
             ))
         })?;
 
@@ -230,43 +235,46 @@ pub async fn restore(
     info!("Downloading snapshot from {}", snap_path);
 
     let get_result = store.get(&snap_path).await.map_err(|e| {
-        SyncError::Stash(format!("Failed to download snapshot {}: {}", entry.timestamp, e))
+        SyncError::Stash(format!(
+            "Failed to download snapshot {}: {}",
+            entry.timestamp, e
+        ))
     })?;
 
-    let bytes = get_result.bytes().await.map_err(|e| {
-        SyncError::Stash(format!("Failed to read snapshot body: {}", e))
-    })?;
+    let bytes = get_result
+        .bytes()
+        .await
+        .map_err(|e| SyncError::Stash(format!("Failed to read snapshot body: {}", e)))?;
 
     // Write to local database path (atomic via temp file + rename)
     let local_path = Path::new(local_db_path);
     let parent = local_path.parent().unwrap_or(Path::new("."));
-    let temp_path = parent.join(format!(
-        ".smugglr-restore-{}.tmp",
-        std::process::id()
-    ));
+    let temp_path = parent.join(format!(".smugglr-restore-{}.tmp", std::process::id()));
 
-    std::fs::write(&temp_path, &bytes).map_err(|e| {
-        SyncError::Stash(format!("Failed to write snapshot temp file: {}", e))
-    })?;
+    std::fs::write(&temp_path, &bytes)
+        .map_err(|e| SyncError::Stash(format!("Failed to write snapshot temp file: {}", e)))?;
 
-    // Validate the downloaded file is a valid SQLite database
-    match rusqlite::Connection::open_with_flags(
-        &temp_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    ) {
-        Ok(conn) => {
-            conn.execute_batch("SELECT 1").map_err(|e| {
-                let _ = std::fs::remove_file(&temp_path);
-                SyncError::Stash(format!("Downloaded snapshot is not a valid SQLite database: {}", e))
-            })?;
-        }
-        Err(e) => {
+    // Validate the downloaded file is a valid SQLite database.
+    // Explicitly drop the connection before rename to release file handles (Windows).
+    {
+        let conn = rusqlite::Connection::open_with_flags(
+            &temp_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|e| {
             let _ = std::fs::remove_file(&temp_path);
-            return Err(SyncError::Stash(format!(
+            SyncError::Stash(format!(
                 "Downloaded snapshot is not a valid SQLite database: {}",
                 e
-            )));
-        }
+            ))
+        })?;
+        conn.execute_batch("SELECT 1").map_err(|e| {
+            let _ = std::fs::remove_file(&temp_path);
+            SyncError::Stash(format!(
+                "Downloaded snapshot is not a valid SQLite database: {}",
+                e
+            ))
+        })?;
     }
 
     std::fs::rename(&temp_path, local_path).map_err(|e| {
@@ -429,7 +437,10 @@ mod tests {
 
         // Modify local database (simulate bad migration)
         let conn = Connection::open(&local_path).unwrap();
-        conn.execute_batch("DELETE FROM items; INSERT INTO items VALUES (99, 'corrupt', '2024-06-01');").unwrap();
+        conn.execute_batch(
+            "DELETE FROM items; INSERT INTO items VALUES (99, 'corrupt', '2024-06-01');",
+        )
+        .unwrap();
         drop(conn);
 
         // Restore
@@ -445,11 +456,9 @@ mod tests {
         assert_eq!(restore_result.timestamp, snap_result.timestamp);
 
         // Verify local has original data
-        let conn = Connection::open_with_flags(
-            &local_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .unwrap();
+        let conn =
+            Connection::open_with_flags(&local_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0))
             .unwrap();
@@ -494,11 +503,9 @@ mod tests {
         assert_eq!(result.timestamp, snap_result.timestamp);
 
         // Local should still be empty (dry run)
-        let conn = Connection::open_with_flags(
-            &local_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .unwrap();
+        let conn =
+            Connection::open_with_flags(&local_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0))
             .unwrap();
@@ -569,15 +576,17 @@ mod tests {
 
         assert_eq!(result.timestamp, snap1.timestamp);
 
-        let conn = Connection::open_with_flags(
-            &local_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .unwrap();
-        let name: String = conn
-            .query_row("SELECT name FROM items WHERE id = 1", [], |r| r.get(0))
+        {
+            let conn = Connection::open_with_flags(
+                &local_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
             .unwrap();
-        assert_eq!(name, "v1");
+            let name: String = conn
+                .query_row("SELECT name FROM items WHERE id = 1", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(name, "v1");
+        }
 
         // Restore to second snapshot
         let result = restore(
