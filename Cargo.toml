@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/smuggler-core", "crates/smuggler"]
+members = ["crates/smuggler-core", "crates/smuggler", "crates/smuggler-plugin-sdk"]
 resolver = "2"
 
 [workspace.package]
