@@ -59,14 +59,22 @@ pub async fn run_watch(
                 info!("Watch tick #{}", tick_count);
 
                 let result = match &target {
-                    ResolvedTarget::D1 { account_id, database_id, api_token } => {
+                    ResolvedTarget::D1 { account_id, database_id, api_token, ref url } => {
                         let local = LocalDb::open(config.local_db_path())?;
-                        let remote = D1Client::with_retry_config(
-                            account_id.clone(),
-                            database_id.clone(),
-                            api_token.clone(),
-                            config.retry_config(),
-                        );
+                        let remote = if let Some(endpoint) = url {
+                            D1Client::with_endpoint(
+                                api_token.clone(),
+                                endpoint.clone(),
+                                config.retry_config(),
+                            )
+                        } else {
+                            D1Client::with_retry_config(
+                                account_id.clone(),
+                                database_id.clone(),
+                                api_token.clone(),
+                                config.retry_config(),
+                            )
+                        };
                         if let Err(e) = remote.test_connection().await {
                             warn!("Connection test failed on tick #{}: {}. Will retry next tick.", tick_count, e);
                             if fmt == OutputFormat::Json {

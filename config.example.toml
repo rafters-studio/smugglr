@@ -118,3 +118,16 @@ backoff_multiplier = 2.0
 #   smugglr restore <timestamp>   - Restore to a specific snapshot
 #
 # All commands support --dry-run and --output json for agent consumption.
+
+# =============================================================================
+# Durable Objects Bridge
+# =============================================================================
+# To sync with a Cloudflare Durable Object's SQLite storage, deploy the
+# DO bridge template (templates/do-bridge/) and point at it with a custom URL:
+#
+# [target]
+# type = "d1"
+# account_id = "unused"
+# database_id = "unused"
+# api_token = "your-bridge-auth-token"
+# url = "https://do-bridge.your-subdomain.workers.dev"

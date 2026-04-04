@@ -413,13 +413,27 @@ fn print_dry_run_json(
 }
 
 /// Open a D1Client from resolved target fields.
-fn open_d1(account_id: &str, database_id: &str, api_token: &str, config: &Config) -> D1Client {
-    D1Client::with_retry_config(
-        account_id.to_string(),
-        database_id.to_string(),
-        api_token.to_string(),
-        config.retry_config(),
-    )
+fn open_d1(
+    account_id: &str,
+    database_id: &str,
+    api_token: &str,
+    url: Option<&str>,
+    config: &Config,
+) -> D1Client {
+    if let Some(endpoint) = url {
+        D1Client::with_endpoint(
+            api_token.to_string(),
+            endpoint.to_string(),
+            config.retry_config(),
+        )
+    } else {
+        D1Client::with_retry_config(
+            account_id.to_string(),
+            database_id.to_string(),
+            api_token.to_string(),
+            config.retry_config(),
+        )
+    }
 }
 
 /// Resolve table filter from CLI --table arg using local schema validation.
@@ -452,9 +466,16 @@ async fn run_push(
             account_id,
             database_id,
             api_token,
+            ref url,
         } => {
             info!("Push mode: local -> D1");
-            let remote = open_d1(&account_id, &database_id, &api_token, config);
+            let remote = open_d1(
+                &account_id,
+                &database_id,
+                &api_token,
+                url.as_deref(),
+                config,
+            );
             remote.test_connection().await?;
             push_all(&local, &remote, config, tables, dry_run, progress.as_ref()).await?
         }
@@ -520,9 +541,16 @@ async fn run_pull(
             account_id,
             database_id,
             api_token,
+            ref url,
         } => {
             info!("Pull mode: D1 -> local");
-            let remote = open_d1(&account_id, &database_id, &api_token, config);
+            let remote = open_d1(
+                &account_id,
+                &database_id,
+                &api_token,
+                url.as_deref(),
+                config,
+            );
             remote.test_connection().await?;
             pull_all(&local, &remote, config, tables, dry_run, progress.as_ref()).await?
         }
@@ -588,9 +616,16 @@ async fn run_sync(
             account_id,
             database_id,
             api_token,
+            ref url,
         } => {
             info!("Sync mode: bidirectional (local <-> D1)");
-            let remote = open_d1(&account_id, &database_id, &api_token, config);
+            let remote = open_d1(
+                &account_id,
+                &database_id,
+                &api_token,
+                url.as_deref(),
+                config,
+            );
             remote.test_connection().await?;
             sync_all(&local, &remote, config, tables, dry_run, progress.as_ref()).await?
         }
@@ -666,8 +701,15 @@ async fn run_diff(
             account_id,
             database_id,
             api_token,
+            ref url,
         } => {
-            let remote = open_d1(&account_id, &database_id, &api_token, config);
+            let remote = open_d1(
+                &account_id,
+                &database_id,
+                &api_token,
+                url.as_deref(),
+                config,
+            );
             remote.test_connection().await?;
             let tables = match table {
                 Some(t) => {
@@ -869,8 +911,9 @@ async fn run_status(
             account_id,
             database_id,
             api_token,
+            ref url,
         } => {
-            let remote = open_d1(account_id, database_id, api_token, config);
+            let remote = open_d1(account_id, database_id, api_token, url.as_deref(), config);
             match remote.test_connection().await {
                 Ok(()) => {
                     let tables = remote.list_tables().await?;
