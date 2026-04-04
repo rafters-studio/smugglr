@@ -26,6 +26,8 @@ pub mod plugin;
 #[cfg(feature = "native")]
 pub mod remote;
 #[cfg(feature = "native")]
+pub mod snapshot;
+#[cfg(feature = "native")]
 pub mod stash;
 
 pub use config::Config;

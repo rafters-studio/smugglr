@@ -10,7 +10,8 @@ mod watch;
 
 use output::{
     CommandOutput, DiffOutput, DryRunOutput, DryRunTableOutput, DryRunVerboseTableOutput,
-    ErrorOutput, OutputFormat, StatusConfig, StatusDb, StatusOutput, StatusTable,
+    ErrorOutput, OutputFormat, SnapshotListEntry, SnapshotListOutput, SnapshotOutput,
+    SnapshotTableInfo, StatusConfig, StatusDb, StatusOutput, StatusTable,
 };
 use smugglr_core::config::{Config, ResolvedTarget};
 use smugglr_core::datasource::DataSource;
@@ -177,6 +178,26 @@ enum Commands {
         dry_run: bool,
     },
 
+    /// Create a point-in-time snapshot of the local database
+    Snapshot {
+        /// Show what would be snapshotted without uploading
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// List available snapshots
+    Snapshots,
+
+    /// Restore local database from a snapshot
+    Restore {
+        /// Timestamp of snapshot to restore (exact or closest before)
+        timestamp: String,
+
+        /// Show what would be restored without applying
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// LAN broadcast sync with peer discovery
     Broadcast {
         /// Override broadcast port
@@ -242,6 +263,9 @@ async fn main() {
         Commands::Status => "status",
         Commands::Stash { .. } => "stash",
         Commands::Retrieve { .. } => "retrieve",
+        Commands::Snapshot { .. } => "snapshot",
+        Commands::Snapshots => "snapshots",
+        Commands::Restore { .. } => "restore",
         Commands::Watch { .. } => "watch",
         Commands::Broadcast { .. } => "broadcast",
     };
@@ -263,7 +287,12 @@ async fn main() {
     // Resolve target once upfront (stash/retrieve/broadcast don't need it)
     let config_path = cli.config.clone();
     let target = match &cli.command {
-        Commands::Stash { .. } | Commands::Retrieve { .. } | Commands::Broadcast { .. } => None,
+        Commands::Stash { .. }
+        | Commands::Retrieve { .. }
+        | Commands::Snapshot { .. }
+        | Commands::Snapshots
+        | Commands::Restore { .. }
+        | Commands::Broadcast { .. } => None,
         _ => Some(config.resolve_target().unwrap_or_else(|e| {
             match fmt {
                 OutputFormat::Json => exit_json_error(command_name, &e),
@@ -317,6 +346,11 @@ async fn main() {
         }
         Commands::Retrieve { table, dry_run } => {
             run_retrieve(&config, table, dry_run, fmt, cli.verbose).await
+        }
+        Commands::Snapshot { dry_run } => run_snapshot(&config, dry_run, fmt).await,
+        Commands::Snapshots => run_snapshots(&config, fmt).await,
+        Commands::Restore { timestamp, dry_run } => {
+            run_restore(&config, &timestamp, dry_run, fmt).await
         }
         Commands::Watch { interval, dry_run } => {
             watch::run_watch(
@@ -1105,6 +1139,152 @@ async fn run_retrieve(
         }
         OutputFormat::Text => {
             print_summary("Retrieve", &results, |r| r.rows_pulled, "retrieve", dry_run);
+        }
+    }
+    Ok(())
+}
+
+async fn run_snapshot(config: &Config, dry_run: bool, fmt: OutputFormat) -> error::Result<()> {
+    let stash_config = require_stash_config(config)?;
+    info!("Snapshot mode: local -> S3 relay");
+
+    let result =
+        smugglr_core::snapshot::snapshot(stash_config, config.local_db_path(), dry_run).await?;
+
+    match fmt {
+        OutputFormat::Json => {
+            let out = SnapshotOutput {
+                command: "snapshot",
+                status: if dry_run { "dry_run" } else { "ok" },
+                timestamp: result.timestamp,
+                size_bytes: result.size_bytes,
+                tables: result
+                    .tables
+                    .into_iter()
+                    .map(|t| SnapshotTableInfo {
+                        name: t.name,
+                        row_count: t.row_count,
+                    })
+                    .collect(),
+            };
+            println!(
+                "{}",
+                serde_json::to_string(&out).expect("SnapshotOutput serialization")
+            );
+        }
+        OutputFormat::Text => {
+            println!("\n--- Snapshot ---");
+            println!("  Timestamp: {}", result.timestamp);
+            println!("  Size: {} bytes", result.size_bytes);
+            for t in &result.tables {
+                println!("  {}: {} rows", t.name, t.row_count);
+            }
+            if dry_run {
+                println!("\n  (dry run - no snapshot created)");
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_snapshots(config: &Config, fmt: OutputFormat) -> error::Result<()> {
+    let stash_config = require_stash_config(config)?;
+    info!("Listing snapshots");
+
+    let entries = smugglr_core::snapshot::list_snapshots(stash_config).await?;
+
+    match fmt {
+        OutputFormat::Json => {
+            let out = SnapshotListOutput {
+                command: "snapshots",
+                status: "ok",
+                snapshots: entries
+                    .into_iter()
+                    .map(|e| SnapshotListEntry {
+                        timestamp: e.timestamp,
+                        size_bytes: e.size_bytes,
+                        tables: e
+                            .tables
+                            .into_iter()
+                            .map(|t| SnapshotTableInfo {
+                                name: t.name,
+                                row_count: t.row_count,
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            };
+            println!(
+                "{}",
+                serde_json::to_string(&out).expect("SnapshotListOutput serialization")
+            );
+        }
+        OutputFormat::Text => {
+            if entries.is_empty() {
+                println!("No snapshots available");
+            } else {
+                println!("\n--- Snapshots ---");
+                for entry in &entries {
+                    let total_rows: usize = entry.tables.iter().map(|t| t.row_count).sum();
+                    println!(
+                        "  {} ({} bytes, {} tables, {} rows)",
+                        entry.timestamp,
+                        entry.size_bytes,
+                        entry.tables.len(),
+                        total_rows
+                    );
+                }
+                println!("\n  {} snapshot(s) available", entries.len());
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_restore(
+    config: &Config,
+    timestamp: &str,
+    dry_run: bool,
+    fmt: OutputFormat,
+) -> error::Result<()> {
+    let stash_config = require_stash_config(config)?;
+    info!("Restore mode: S3 relay -> local");
+
+    let result =
+        smugglr_core::snapshot::restore(stash_config, config.local_db_path(), timestamp, dry_run)
+            .await?;
+
+    match fmt {
+        OutputFormat::Json => {
+            let out = SnapshotOutput {
+                command: "restore",
+                status: if dry_run { "dry_run" } else { "ok" },
+                timestamp: result.timestamp,
+                size_bytes: result.size_bytes,
+                tables: result
+                    .tables
+                    .into_iter()
+                    .map(|t| SnapshotTableInfo {
+                        name: t.name,
+                        row_count: t.row_count,
+                    })
+                    .collect(),
+            };
+            println!(
+                "{}",
+                serde_json::to_string(&out).expect("SnapshotOutput serialization")
+            );
+        }
+        OutputFormat::Text => {
+            println!("\n--- Restore ---");
+            println!("  Restored snapshot: {}", result.timestamp);
+            println!("  Size: {} bytes", result.size_bytes);
+            for t in &result.tables {
+                println!("  {}: {} rows", t.name, t.row_count);
+            }
+            if dry_run {
+                println!("\n  (dry run - no changes applied)");
+            }
         }
     }
     Ok(())

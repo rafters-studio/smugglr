@@ -1734,6 +1734,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "chacha20poly1305",
+ "chrono",
  "hex",
  "libc",
  "object_store",
