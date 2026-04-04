@@ -219,17 +219,19 @@ fn param_str_slice(params: &Value, key: &str) -> Result<Vec<String>, PluginError
         .ok_or_else(|| PluginError::with_code(format!("missing param: {}", key), -32602))
 }
 
-fn param_rows(params: &Value) -> Result<Vec<HashMap<String, Value>>, PluginError> {
+fn param_rows(params: &mut Value) -> Result<Vec<HashMap<String, Value>>, PluginError> {
     params
-        .get("rows")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .get_mut("rows")
+        .map(Value::take)
+        .and_then(|v| serde_json::from_value(v).ok())
         .ok_or_else(|| PluginError::with_code("missing param: rows", -32602))
 }
 
-fn param_config(params: &Value) -> Result<HashMap<String, String>, PluginError> {
+fn param_config(params: &mut Value) -> Result<HashMap<String, String>, PluginError> {
     params
-        .get("config")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .get_mut("config")
+        .map(Value::take)
+        .and_then(|v| serde_json::from_value(v).ok())
         .ok_or_else(|| PluginError::with_code("missing param: config", -32602))
 }
 
@@ -237,11 +239,11 @@ fn param_config(params: &Value) -> Result<HashMap<String, String>, PluginError> 
 
 async fn dispatch(
     adapter: &mut impl PluginAdapter,
-    req: &RpcRequest,
+    req: &mut RpcRequest,
 ) -> Result<Value, PluginError> {
     match req.method.as_str() {
         "initialize" => {
-            let config = param_config(&req.params)?;
+            let config = param_config(&mut req.params)?;
             adapter.initialize(config).await?;
             Ok(Value::Bool(true))
         }
@@ -269,7 +271,7 @@ async fn dispatch(
         }
         "upsert_rows" => {
             let table = param_str(&req.params, "table")?;
-            let rows = param_rows(&req.params)?;
+            let rows = param_rows(&mut req.params)?;
             let count = adapter.upsert_rows(&table, &rows).await?;
             Ok(serde_json::to_value(count).unwrap())
         }
@@ -293,17 +295,15 @@ pub async fn run(mut adapter: impl PluginAdapter) {
     let stdin = BufReader::new(tokio::io::stdin());
     let mut stdout = BufWriter::new(tokio::io::stdout());
     let mut lines = stdin.lines();
-    let mut read_buf = String::new();
 
     loop {
-        read_buf.clear();
         let line = match lines.next_line().await {
             Ok(Some(line)) => line,
             Ok(None) => break,
             Err(_) => break,
         };
 
-        let req: RpcRequest = match serde_json::from_str(&line) {
+        let mut req: RpcRequest = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
                 let resp = RpcResponse::err(0, -32700, format!("parse error: {}", e));
@@ -313,7 +313,7 @@ pub async fn run(mut adapter: impl PluginAdapter) {
         };
 
         let id = req.id;
-        let resp = match dispatch(&mut adapter, &req).await {
+        let resp = match dispatch(&mut adapter, &mut req).await {
             Ok(result) => RpcResponse::ok(id, result),
             Err(e) => RpcResponse::err(id, e.code, e.message),
         };
@@ -367,16 +367,16 @@ mod tests {
 
     #[test]
     fn test_param_config_extraction() {
-        let params = serde_json::json!({"config": {"url": "http://localhost", "token": "abc"}});
-        let config = param_config(&params).unwrap();
+        let mut params = serde_json::json!({"config": {"url": "http://localhost", "token": "abc"}});
+        let config = param_config(&mut params).unwrap();
         assert_eq!(config.get("url").unwrap(), "http://localhost");
         assert_eq!(config.get("token").unwrap(), "abc");
     }
 
     #[test]
     fn test_param_rows_extraction() {
-        let params = serde_json::json!({"rows": [{"id": 1, "name": "alice"}]});
-        let rows = param_rows(&params).unwrap();
+        let mut params = serde_json::json!({"rows": [{"id": 1, "name": "alice"}]});
+        let rows = param_rows(&mut params).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get("name").unwrap(), "alice");
     }
@@ -484,13 +484,13 @@ mod tests {
     #[tokio::test]
     async fn test_dispatch_list_tables() {
         let mut adapter = NoopAdapter;
-        let req = RpcRequest {
+        let mut req = RpcRequest {
             jsonrpc: "2.0".into(),
             method: "list_tables".into(),
             params: serde_json::json!({}),
             id: 1,
         };
-        let result = dispatch(&mut adapter, &req).await.unwrap();
+        let result = dispatch(&mut adapter, &mut req).await.unwrap();
         let tables: Vec<String> = serde_json::from_value(result).unwrap();
         assert_eq!(tables, vec!["test_table"]);
     }
@@ -498,26 +498,26 @@ mod tests {
     #[tokio::test]
     async fn test_dispatch_row_count() {
         let mut adapter = NoopAdapter;
-        let req = RpcRequest {
+        let mut req = RpcRequest {
             jsonrpc: "2.0".into(),
             method: "row_count".into(),
             params: serde_json::json!({"table": "users"}),
             id: 2,
         };
-        let result = dispatch(&mut adapter, &req).await.unwrap();
+        let result = dispatch(&mut adapter, &mut req).await.unwrap();
         assert_eq!(result, 42);
     }
 
     #[tokio::test]
     async fn test_dispatch_unknown_method() {
         let mut adapter = NoopAdapter;
-        let req = RpcRequest {
+        let mut req = RpcRequest {
             jsonrpc: "2.0".into(),
             method: "nonexistent".into(),
             params: serde_json::json!({}),
             id: 3,
         };
-        let err = dispatch(&mut adapter, &req).await.unwrap_err();
+        let err = dispatch(&mut adapter, &mut req).await.unwrap_err();
         assert_eq!(err.code, -32601);
         assert!(err.message.contains("nonexistent"));
     }
@@ -525,26 +525,26 @@ mod tests {
     #[tokio::test]
     async fn test_dispatch_missing_param() {
         let mut adapter = NoopAdapter;
-        let req = RpcRequest {
+        let mut req = RpcRequest {
             jsonrpc: "2.0".into(),
             method: "table_info".into(),
             params: serde_json::json!({}),
             id: 4,
         };
-        let err = dispatch(&mut adapter, &req).await.unwrap_err();
+        let err = dispatch(&mut adapter, &mut req).await.unwrap_err();
         assert_eq!(err.code, -32602);
     }
 
     #[tokio::test]
     async fn test_dispatch_initialize() {
         let mut adapter = NoopAdapter;
-        let req = RpcRequest {
+        let mut req = RpcRequest {
             jsonrpc: "2.0".into(),
             method: "initialize".into(),
             params: serde_json::json!({"config": {"key": "value"}}),
             id: 5,
         };
-        let result = dispatch(&mut adapter, &req).await.unwrap();
+        let result = dispatch(&mut adapter, &mut req).await.unwrap();
         assert_eq!(result, Value::Bool(true));
     }
 }
