@@ -5,8 +5,8 @@
 //! (JSONL format).
 
 use serde::Serialize;
-use smuggler_core::diff::TableDiff;
-use smuggler_core::sync::SyncResult;
+use smugglr_core::diff::TableDiff;
+use smugglr_core::sync::SyncResult;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
@@ -306,8 +306,8 @@ impl WatchTickOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use smuggler_core::diff::TableDiff;
-    use smuggler_core::sync::SyncResult;
+    use smugglr_core::diff::TableDiff;
+    use smugglr_core::sync::SyncResult;
 
     #[test]
     fn test_output_format_parse() {
@@ -476,7 +476,7 @@ mod tests {
 
     #[test]
     fn test_dry_run_output_json_structure() {
-        use smuggler_core::diff::DiffStats;
+        use smugglr_core::diff::DiffStats;
 
         let results = vec![
             SyncResult {
@@ -562,8 +562,8 @@ mod tests {
 
     #[test]
     fn test_dry_run_verbose_output_includes_pk_values() {
-        use smuggler_core::diff::DiffStats;
-        use smuggler_core::sync::DiffDetail;
+        use smugglr_core::diff::DiffStats;
+        use smugglr_core::sync::DiffDetail;
 
         let results = vec![SyncResult {
             table: "abilities".into(),

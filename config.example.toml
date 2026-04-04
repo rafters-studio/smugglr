@@ -91,7 +91,7 @@ backoff_multiplier = 2.0
 # Stash Settings (optional)
 # =============================================================================
 # Configure S3-compatible relay sync for cross-machine synchronization.
-# Use `smuggler stash` to upload local state and `smuggler retrieve` to download.
+# Use `smugglr stash` to upload local state and `smugglr retrieve` to download.
 #
 # Supports:
 #   s3://bucket/path    - Amazon S3
@@ -100,7 +100,7 @@ backoff_multiplier = 2.0
 #   file:///local/path  - Local filesystem (useful for testing)
 
 # [stash]
-# url = "s3://my-bucket/smuggler/relay.sqlite"
+# url = "s3://my-bucket/smugglr/relay.sqlite"
 # access_key_id = "your-access-key"
 # secret_access_key = "your-secret-key"
 # region = "us-east-1"

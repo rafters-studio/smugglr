@@ -1242,12 +1242,12 @@ async fn sync_with_peer(
 pub fn broadcast_pid_lock_path(config_path: &std::path::Path) -> std::path::PathBuf {
     if let Some(parent) = config_path.parent() {
         if parent.as_os_str().is_empty() {
-            std::path::PathBuf::from(".smuggler-broadcast.pid")
+            std::path::PathBuf::from(".smugglr-broadcast.pid")
         } else {
-            parent.join(".smuggler-broadcast.pid")
+            parent.join(".smugglr-broadcast.pid")
         }
     } else {
-        std::path::PathBuf::from(".smuggler-broadcast.pid")
+        std::path::PathBuf::from(".smugglr-broadcast.pid")
     }
 }
 

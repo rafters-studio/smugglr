@@ -328,12 +328,12 @@ impl DataSource for PluginDataSource {
 /// Resolve a plugin name to its binary path.
 ///
 /// Search order:
-/// 1. `~/.smuggler/plugins/smuggler-{name}`
+/// 1. `~/.smugglr/plugins/smuggler-{name}`
 /// 2. `smuggler-{name}` on `$PATH`
 pub fn resolve_plugin_path(name: &str) -> Result<PathBuf> {
-    let binary_name = format!("smuggler-{}", name);
+    let binary_name = format!("smugglr-{}", name);
 
-    // Check ~/.smuggler/plugins/
+    // Check ~/.smugglr/plugins/
     if let Ok(home) = std::env::var("HOME") {
         let candidate = PathBuf::from(home)
             .join(".smuggler")
@@ -350,7 +350,7 @@ pub fn resolve_plugin_path(name: &str) -> Result<PathBuf> {
     }
 
     Err(SyncError::Plugin(format!(
-        "Plugin '{}' not found. Searched: ~/.smuggler/plugins/{}, $PATH/{}",
+        "Plugin '{}' not found. Searched: ~/.smugglr/plugins/{}, $PATH/{}",
         name, binary_name, binary_name
     )))
 }
@@ -383,7 +383,7 @@ mod tests {
 
     #[test]
     fn test_find_in_path_nonexistent() {
-        assert!(find_in_path("smuggler-totally-fake-binary").is_none());
+        assert!(find_in_path("smugglr-totally-fake-binary").is_none());
     }
 
     #[test]
