@@ -30,19 +30,27 @@ pub enum AuthFormat {
 
 #[derive(Debug, Clone)]
 pub enum RequestFormat {
-    /// `{"statements": [{"q": "<sql>", "params": [...]}]}`
+    /// Turso/libSQL pipeline: `{"requests": [{"type": "execute", "stmt": {"sql": "<sql>", "args": [...]}}]}`
     Turso,
-    /// `[["<sql>", ...params]]`
+    /// rqlite: `[["<sql>", ...params]]`
     Rqlite,
-    /// `{"sql": "<sql>", "params": [...]}`
+    /// Cloudflare D1 REST: `{"sql": "<sql>", "params": [...]}`
+    D1,
+    /// Datasette: `{"sql": "<sql>", "params": {...}}`
+    Datasette,
+    /// Flat JSON: `{"sql": "<sql>", "params": [...]}`
     Generic,
 }
 
 impl Profile {
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
-            "turso" => Some(Self::turso()),
+            "turso" | "libsql" => Some(Self::turso()),
             "rqlite" => Some(Self::rqlite()),
+            "d1" | "cloudflare-d1" => Some(Self::d1()),
+            "datasette" => Some(Self::datasette()),
+            "sqlite-cloud" | "sqlitecloud" => Some(Self::sqlite_cloud()),
+            "starbasedb" | "starbase" => Some(Self::starbasedb()),
             "generic" => Some(Self::generic()),
             _ => None,
         }
@@ -75,6 +83,42 @@ impl Profile {
             request_format: RequestFormat::Rqlite,
             rows_path: vec!["results".into(), "0".into(), "values".into()],
             columns_path: vec!["results".into(), "0".into(), "columns".into()],
+        }
+    }
+
+    pub fn d1() -> Self {
+        Self {
+            auth_format: AuthFormat::Bearer,
+            request_format: RequestFormat::D1,
+            rows_path: vec!["result".into(), "0".into(), "results".into()],
+            columns_path: vec!["result".into(), "0".into(), "results".into()],
+        }
+    }
+
+    pub fn datasette() -> Self {
+        Self {
+            auth_format: AuthFormat::Bearer,
+            request_format: RequestFormat::Datasette,
+            rows_path: vec!["rows".into()],
+            columns_path: vec!["columns".into()],
+        }
+    }
+
+    pub fn sqlite_cloud() -> Self {
+        Self {
+            auth_format: AuthFormat::Bearer,
+            request_format: RequestFormat::Generic,
+            rows_path: vec!["data".into()],
+            columns_path: vec!["columns".into()],
+        }
+    }
+
+    pub fn starbasedb() -> Self {
+        Self {
+            auth_format: AuthFormat::Bearer,
+            request_format: RequestFormat::Generic,
+            rows_path: vec!["result".into()],
+            columns_path: vec!["columns".into()],
         }
     }
 
@@ -129,6 +173,16 @@ impl Profile {
                     stmt.extend(params.iter().cloned());
                     serde_json::json!([stmt])
                 }
+            }
+            RequestFormat::D1 => {
+                if params.is_empty() {
+                    serde_json::json!({"sql": sql})
+                } else {
+                    serde_json::json!({"sql": sql, "params": params})
+                }
+            }
+            RequestFormat::Datasette => {
+                serde_json::json!({"sql": sql, "_shape": "array"})
             }
             RequestFormat::Generic => {
                 if params.is_empty() {
@@ -216,9 +270,32 @@ mod tests {
     }
 
     #[test]
+    fn test_d1_request() {
+        let p = Profile::d1();
+        let body = p.build_request("SELECT 1", &[]);
+        assert_eq!(body["sql"], "SELECT 1");
+    }
+
+    #[test]
+    fn test_datasette_request() {
+        let p = Profile::datasette();
+        let body = p.build_request("SELECT 1", &[]);
+        assert_eq!(body["sql"], "SELECT 1");
+        assert_eq!(body["_shape"], "array");
+    }
+
+    #[test]
     fn test_profile_from_name() {
         assert!(Profile::from_name("turso").is_some());
+        assert!(Profile::from_name("libsql").is_some());
         assert!(Profile::from_name("rqlite").is_some());
+        assert!(Profile::from_name("d1").is_some());
+        assert!(Profile::from_name("cloudflare-d1").is_some());
+        assert!(Profile::from_name("datasette").is_some());
+        assert!(Profile::from_name("sqlite-cloud").is_some());
+        assert!(Profile::from_name("sqlitecloud").is_some());
+        assert!(Profile::from_name("starbasedb").is_some());
+        assert!(Profile::from_name("starbase").is_some());
         assert!(Profile::from_name("generic").is_some());
         assert!(Profile::from_name("unknown").is_none());
     }
