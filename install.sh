@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# install.sh: Installer for Smuggler (https://github.com/rafters-studio/smuggler)
+# install.sh: Installer for Smugglr (https://github.com/rafters-studio/smugglr)
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/rafters-studio/smuggler/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/rafters-studio/smugglr/main/install.sh | bash
 #   curl -fsSL ... | bash -s v0.2.0
-#   SMUGGLER_VERSION=v0.2.0 bash install.sh
+#   SMUGGLR_VERSION=v0.2.0 bash install.sh
 
 set -euo pipefail
 
-REPO="rafters-studio/smuggler"
+REPO="rafters-studio/smugglr"
 INSTALL_DIR="${HOME}/.local/bin"
-BINARY_NAME="smuggler"
+BINARY_NAME="smugglr"
 
 # Color support: only when stdout is a terminal.
 if [ -t 1 ]; then
@@ -97,7 +97,7 @@ detect_platform() {
   case "${os}" in
     Linux)  echo "linux" ;;
     Darwin) echo "macos" ;;
-    *)      error "Unsupported operating system: ${os}. Smuggler supports Linux and macOS." ;;
+    *)      error "Unsupported operating system: ${os}. Smugglr supports Linux and macOS." ;;
   esac
 }
 
@@ -129,7 +129,7 @@ detect_arch() {
 # Resolve the version tag to install.
 resolve_version() {
   # Priority: CLI argument, then env var, then latest release.
-  local version="${1:-${SMUGGLER_VERSION:-}}"
+  local version="${1:-${SMUGGLR_VERSION:-}}"
   if [ -n "${version}" ]; then
     # Ensure the version starts with 'v'.
     case "${version}" in
@@ -237,7 +237,7 @@ ensure_path() {
 main() {
   local version="${1:-}"
 
-  printf '%b\n\n' "${BOLD}Smuggler Installer${RESET}" >&2
+  printf '%b\n\n' "${BOLD}Smugglr Installer${RESET}" >&2
 
   local platform arch artifact_name
   platform="$(detect_platform)"
@@ -252,7 +252,7 @@ main() {
   info "Detected platform: ${platform}-${arch}"
 
   version="$(resolve_version "${version}")"
-  info "Installing Smuggler ${version}..."
+  info "Installing Smugglr ${version}..."
 
   # Create temp directory.
   TMPDIR_INSTALL="$(mktemp -d)"
@@ -286,7 +286,7 @@ main() {
   if [ -n "${installed_version}" ]; then
     success "Installed ${installed_version} to ${INSTALL_DIR}/${BINARY_NAME}"
   else
-    success "Installed Smuggler ${version} to ${INSTALL_DIR}/${BINARY_NAME}"
+    success "Installed Smugglr ${version} to ${INSTALL_DIR}/${BINARY_NAME}"
   fi
 }
 

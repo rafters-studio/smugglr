@@ -1,6 +1,6 @@
 [package]
-name = "smuggler-core"
-description = "Sync engine for smuggler -- bidirectional SQLite/D1 synchronization"
+name = "smugglr-core"
+description = "Sync engine for smugglr -- bidirectional SQLite/D1 synchronization"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

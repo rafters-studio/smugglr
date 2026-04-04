@@ -33,9 +33,9 @@ assignees: ''
 
 ## File Locations
 
-- Implementation: `crates/smuggler-core/src/module_name.rs`
+- Implementation: `crates/smugglr-core/src/module_name.rs`
 - Tests: Bottom of same file in `#[cfg(test)]` module
-- CLI integration: `crates/smuggler/src/main.rs`
+- CLI integration: `crates/smugglr/src/main.rs`
 
 ## Dev Workflow
 

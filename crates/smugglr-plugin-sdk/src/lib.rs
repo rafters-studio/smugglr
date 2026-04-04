@@ -6,8 +6,8 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use smuggler_plugin_sdk::{PluginAdapter, PluginError, run};
-//! use smuggler_plugin_sdk::{TableInfo, ColumnInfo, RowMeta};
+//! use smugglr_plugin_sdk::{PluginAdapter, PluginError, run};
+//! use smugglr_plugin_sdk::{TableInfo, ColumnInfo, RowMeta};
 //! use serde_json::Value;
 //! use std::collections::HashMap;
 //!
