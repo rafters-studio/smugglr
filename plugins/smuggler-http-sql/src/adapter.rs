@@ -49,9 +49,7 @@ impl HttpSqlAdapter {
         let mut req = client.post(&self.url).json(&body);
 
         req = match self.profile.auth_format {
-            AuthFormat::Bearer if !self.auth_token.is_empty() => {
-                req.bearer_auth(&self.auth_token)
-            }
+            AuthFormat::Bearer if !self.auth_token.is_empty() => req.bearer_auth(&self.auth_token),
             AuthFormat::Basic if !self.auth_token.is_empty() => {
                 req.basic_auth(&self.auth_token, None::<&str>)
             }
@@ -184,9 +182,7 @@ impl HttpSqlAdapter {
                     Value::Null => {} // empty string -- matches local.rs None behavior
                     Value::String(s) => hasher.update(s.as_bytes()),
                     Value::Number(n) => hasher.update(n.to_string().as_bytes()),
-                    Value::Bool(b) => {
-                        hasher.update(if *b { "1" } else { "0" }.as_bytes())
-                    }
+                    Value::Bool(b) => hasher.update(if *b { "1" } else { "0" }.as_bytes()),
                     other => hasher.update(other.to_string().as_bytes()),
                 }
             }
@@ -331,8 +327,7 @@ impl PluginAdapter for HttpSqlAdapter {
                 .get(timestamp_column)
                 .and_then(|v| v.as_str())
                 .map(String::from);
-            let hash =
-                Self::content_hash(row, &column_order, exclude_columns, timestamp_column);
+            let hash = Self::content_hash(row, &column_order, exclude_columns, timestamp_column);
 
             result.insert(
                 pk.clone(),
@@ -457,12 +452,10 @@ mod tests {
         row.insert("name".into(), Value::from("alice"));
         row.insert("embedding".into(), Value::from("big blob"));
 
-        let hash1 =
-            HttpSqlAdapter::content_hash(&row, &cols, &["embedding".into()], "updated_at");
+        let hash1 = HttpSqlAdapter::content_hash(&row, &cols, &["embedding".into()], "updated_at");
 
         row.insert("embedding".into(), Value::from("different blob"));
-        let hash2 =
-            HttpSqlAdapter::content_hash(&row, &cols, &["embedding".into()], "updated_at");
+        let hash2 = HttpSqlAdapter::content_hash(&row, &cols, &["embedding".into()], "updated_at");
 
         assert_eq!(hash1, hash2);
     }
