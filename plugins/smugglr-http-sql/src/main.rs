@@ -9,5 +9,5 @@ mod profile;
 
 #[tokio::main]
 async fn main() {
-    smuggler_plugin_sdk::run(adapter::HttpSqlAdapter::new()).await;
+    smugglr_plugin_sdk::run(adapter::HttpSqlAdapter::new()).await;
 }

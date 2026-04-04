@@ -1,7 +1,7 @@
 //! Smuggler CLI binary.
 //!
 //! This is the command-line interface for smuggler. All core sync logic
-//! lives in `smuggler_core`; this crate provides the CLI argument parsing,
+//! lives in `smugglr_core`; this crate provides the CLI argument parsing,
 //! progress display, and human/JSON output formatting.
 
 mod broadcast;
@@ -12,14 +12,14 @@ use output::{
     CommandOutput, DiffOutput, DryRunOutput, DryRunTableOutput, DryRunVerboseTableOutput,
     ErrorOutput, OutputFormat, StatusConfig, StatusDb, StatusOutput, StatusTable,
 };
-use smuggler_core::config::{Config, ResolvedTarget};
-use smuggler_core::datasource::DataSource;
-use smuggler_core::diff::diff_table;
-use smuggler_core::error;
-use smuggler_core::local::LocalDb;
-use smuggler_core::plugin::PluginDataSource;
-use smuggler_core::remote::D1Client;
-use smuggler_core::sync::{
+use smugglr_core::config::{Config, ResolvedTarget};
+use smugglr_core::datasource::DataSource;
+use smugglr_core::diff::diff_table;
+use smugglr_core::error;
+use smugglr_core::local::LocalDb;
+use smugglr_core::plugin::PluginDataSource;
+use smugglr_core::remote::D1Client;
+use smugglr_core::sync::{
     get_tables_to_sync, pull_all, push_all, sync_all, NoProgress, SyncProgress,
 };
 
@@ -76,7 +76,7 @@ fn make_progress(fmt: OutputFormat) -> Box<dyn SyncProgress> {
 }
 
 #[derive(Parser)]
-#[command(name = "smuggler")]
+#[command(name = "smugglr")]
 #[command(
     author,
     version,
@@ -338,7 +338,7 @@ async fn main() {
             let mut bc = config
                 .broadcast
                 .clone()
-                .unwrap_or_else(smuggler_core::broadcast::BroadcastConfig::default);
+                .unwrap_or_else(smugglr_core::broadcast::BroadcastConfig::default);
             if let Some(p) = port {
                 bc.port = p;
             }
@@ -360,7 +360,7 @@ async fn main() {
 
 fn print_dry_run_json(
     command: &'static str,
-    results: &[smuggler_core::sync::SyncResult],
+    results: &[smugglr_core::sync::SyncResult],
     verbose: bool,
 ) {
     if verbose {
@@ -757,8 +757,8 @@ async fn output_diffs<A: DataSource, B: DataSource>(
 /// (e.g. "No changes to push").
 fn print_summary(
     heading: &str,
-    results: &[smuggler_core::sync::SyncResult],
-    get_count: impl Fn(&smuggler_core::sync::SyncResult) -> usize,
+    results: &[smugglr_core::sync::SyncResult],
+    get_count: impl Fn(&smugglr_core::sync::SyncResult) -> usize,
     verb: &str,
     dry_run: bool,
 ) {
@@ -1029,7 +1029,7 @@ async fn run_status(
     Ok(())
 }
 
-fn require_stash_config(config: &Config) -> error::Result<&smuggler_core::config::StashConfig> {
+fn require_stash_config(config: &Config) -> error::Result<&smugglr_core::config::StashConfig> {
     config
         .stash
         .as_ref()
@@ -1046,7 +1046,7 @@ async fn run_stash(
     let stash_config = require_stash_config(config)?;
     info!("Stash mode: local -> S3 relay");
 
-    let results = smuggler_core::stash::stash(
+    let results = smugglr_core::stash::stash(
         stash_config,
         config.local_db_path(),
         &config.sync.timestamp_column,
@@ -1083,7 +1083,7 @@ async fn run_retrieve(
     let stash_config = require_stash_config(config)?;
     info!("Retrieve mode: S3 relay -> local");
 
-    let results = smuggler_core::stash::retrieve(
+    let results = smugglr_core::stash::retrieve(
         stash_config,
         config.local_db_path(),
         &config.sync.timestamp_column,
