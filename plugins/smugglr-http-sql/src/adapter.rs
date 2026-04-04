@@ -157,6 +157,52 @@ impl HttpSqlAdapter {
             .collect()
     }
 
+    /// Calculate the maximum number of rows per batch given column count and bind param limit.
+    /// Returns `total_rows` when there is no limit (max_bind_params == 0).
+    fn max_rows_per_batch(num_columns: usize, max_bind_params: usize, total_rows: usize) -> usize {
+        if max_bind_params > 0 && num_columns > 0 {
+            (max_bind_params / num_columns).max(1)
+        } else {
+            total_rows
+        }
+    }
+
+    /// Generate a multi-row INSERT OR REPLACE statement with flattened params.
+    fn generate_batch_sql(
+        table: &str,
+        columns: &[String],
+        rows: &[HashMap<String, Value>],
+    ) -> (String, Vec<Value>) {
+        let col_list = columns
+            .iter()
+            .map(|c| format!("\"{}\"", c))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let placeholders_per_row = vec!["?"; columns.len()].join(", ");
+        let all_placeholders = rows
+            .iter()
+            .map(|_| format!("({})", placeholders_per_row))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let sql = format!(
+            "INSERT OR REPLACE INTO \"{}\" ({}) VALUES {}",
+            table, col_list, all_placeholders
+        );
+
+        let params: Vec<Value> = rows
+            .iter()
+            .flat_map(|row| {
+                columns
+                    .iter()
+                    .map(|c| row.get(c).cloned().unwrap_or(Value::Null))
+            })
+            .collect();
+
+        (sql, params)
+    }
+
     /// Hash row content for change detection.
     ///
     /// IMPORTANT: This must match smugglr-core local.rs hashing algorithm exactly.
@@ -387,27 +433,26 @@ impl PluginAdapter for HttpSqlAdapter {
             return Ok(0);
         }
 
-        // Use a consistent column set from the first row to enable batching
         let columns: Vec<String> = rows[0].keys().cloned().collect();
-        let col_names: Vec<String> = columns.iter().map(|c| format!("\"{}\"", c)).collect();
-        let placeholders: Vec<String> = columns.iter().map(|_| "?".to_string()).collect();
+        let batch_size =
+            Self::max_rows_per_batch(columns.len(), self.profile.max_bind_params, rows.len());
 
-        let sql = format!(
-            "INSERT OR REPLACE INTO \"{}\" ({}) VALUES ({})",
-            table,
-            col_names.join(", "),
-            placeholders.join(", ")
-        );
+        let mut total = 0;
+        for batch in rows.chunks(batch_size) {
+            let (sql, params) = Self::generate_batch_sql(table, &columns, batch);
 
-        for row in rows {
-            let params: Vec<Value> = columns
-                .iter()
-                .map(|c| row.get(c).cloned().unwrap_or(Value::Null))
-                .collect();
-            self.execute(&sql, &params).await?;
+            self.execute(&sql, &params).await.map_err(|e| {
+                PluginError::new(format!(
+                    "batch upsert failed for table '{}' ({} rows in batch): {}",
+                    table,
+                    batch.len(),
+                    e
+                ))
+            })?;
+            total += batch.len();
         }
 
-        Ok(rows.len())
+        Ok(total)
     }
 
     async fn row_count(&self, table: &str) -> Result<usize, PluginError> {
@@ -487,5 +532,107 @@ mod tests {
         assert_eq!(maps.len(), 2);
         assert_eq!(maps[0]["name"], "alice");
         assert_eq!(maps[1]["id"], 2);
+    }
+
+    fn make_row(id: i64, name: &str) -> HashMap<String, Value> {
+        let mut row = HashMap::new();
+        row.insert("id".to_string(), Value::from(id));
+        row.insert("name".to_string(), Value::from(name));
+        row
+    }
+
+    #[test]
+    fn batch_size_no_limit() {
+        assert_eq!(HttpSqlAdapter::max_rows_per_batch(2, 0, 1000), 1000);
+    }
+
+    #[test]
+    fn batch_size_d1_limit() {
+        // 2 columns, 100 param limit -> 50 rows per batch
+        assert_eq!(HttpSqlAdapter::max_rows_per_batch(2, 100, 1000), 50);
+    }
+
+    #[test]
+    fn batch_size_wide_table() {
+        // 50 columns, 100 param limit -> 2 rows per batch
+        assert_eq!(HttpSqlAdapter::max_rows_per_batch(50, 100, 1000), 2);
+    }
+
+    #[test]
+    fn batch_size_wider_than_limit() {
+        // 150 columns, 100 param limit -> 1 row per batch (never zero)
+        assert_eq!(HttpSqlAdapter::max_rows_per_batch(150, 100, 1000), 1);
+    }
+
+    #[test]
+    fn batch_size_zero_columns() {
+        assert_eq!(HttpSqlAdapter::max_rows_per_batch(0, 100, 1000), 1000);
+    }
+
+    #[test]
+    fn generate_batch_sql_single_row() {
+        let rows = vec![make_row(1, "alice")];
+        let columns = vec!["id".to_string(), "name".to_string()];
+        let (sql, params) = HttpSqlAdapter::generate_batch_sql("users", &columns, &rows);
+
+        assert!(sql.starts_with("INSERT OR REPLACE INTO \"users\""));
+        assert!(sql.contains("(?, ?)"));
+        assert!(!sql.contains("), ("));
+        assert_eq!(params.len(), 2);
+    }
+
+    #[test]
+    fn generate_batch_sql_multi_row() {
+        let rows = vec![
+            make_row(1, "alice"),
+            make_row(2, "bob"),
+            make_row(3, "charlie"),
+        ];
+        let columns = vec!["id".to_string(), "name".to_string()];
+        let (sql, params) = HttpSqlAdapter::generate_batch_sql("users", &columns, &rows);
+
+        assert!(sql.contains("(?, ?), (?, ?), (?, ?)"));
+        assert_eq!(params.len(), 6);
+    }
+
+    #[test]
+    fn generate_batch_sql_null_for_missing_column() {
+        let mut row = HashMap::new();
+        row.insert("id".to_string(), Value::from(1));
+        // "name" is missing from this row
+        let columns = vec!["id".to_string(), "name".to_string()];
+        let (_, params) = HttpSqlAdapter::generate_batch_sql("users", &columns, &[row]);
+
+        assert_eq!(params[0], Value::from(1));
+        assert_eq!(params[1], Value::Null);
+    }
+
+    #[test]
+    fn batch_splitting_respects_param_limit() {
+        // 10 columns, 100 param limit -> max 10 rows per batch
+        let columns: Vec<String> = (0..10).map(|i| format!("col_{}", i)).collect();
+        let rows: Vec<HashMap<String, Value>> = (0..25)
+            .map(|i| {
+                columns
+                    .iter()
+                    .map(|c| (c.clone(), Value::from(i)))
+                    .collect()
+            })
+            .collect();
+
+        let batch_size = HttpSqlAdapter::max_rows_per_batch(columns.len(), 100, rows.len());
+        assert_eq!(batch_size, 10);
+
+        let batches: Vec<&[HashMap<String, Value>]> = rows.chunks(batch_size).collect();
+        assert_eq!(batches.len(), 3); // 10 + 10 + 5
+        assert_eq!(batches[0].len(), 10);
+        assert_eq!(batches[1].len(), 10);
+        assert_eq!(batches[2].len(), 5);
+
+        // Verify no batch exceeds param limit
+        for batch in &batches {
+            let (_, params) = HttpSqlAdapter::generate_batch_sql("test", &columns, batch);
+            assert!(params.len() <= 100);
+        }
     }
 }

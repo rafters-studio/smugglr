@@ -18,6 +18,8 @@ pub struct Profile {
     pub rows_path: Vec<String>,
     /// JSON path to extract column names from the response
     pub columns_path: Vec<String>,
+    /// Maximum bind parameters per query (0 = no limit)
+    pub max_bind_params: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +76,7 @@ impl Profile {
                 "result".into(),
                 "cols".into(),
             ],
+            max_bind_params: 0,
         }
     }
 
@@ -83,6 +86,7 @@ impl Profile {
             request_format: RequestFormat::Rqlite,
             rows_path: vec!["results".into(), "0".into(), "values".into()],
             columns_path: vec!["results".into(), "0".into(), "columns".into()],
+            max_bind_params: 0,
         }
     }
 
@@ -92,6 +96,7 @@ impl Profile {
             request_format: RequestFormat::D1,
             rows_path: vec!["result".into(), "0".into(), "results".into()],
             columns_path: vec!["result".into(), "0".into(), "results".into()],
+            max_bind_params: 100,
         }
     }
 
@@ -101,6 +106,7 @@ impl Profile {
             request_format: RequestFormat::Datasette,
             rows_path: vec!["rows".into()],
             columns_path: vec!["columns".into()],
+            max_bind_params: 0,
         }
     }
 
@@ -110,6 +116,7 @@ impl Profile {
             request_format: RequestFormat::Generic,
             rows_path: vec!["data".into()],
             columns_path: vec!["columns".into()],
+            max_bind_params: 0,
         }
     }
 
@@ -119,6 +126,7 @@ impl Profile {
             request_format: RequestFormat::Generic,
             rows_path: vec!["result".into()],
             columns_path: vec!["columns".into()],
+            max_bind_params: 0,
         }
     }
 
@@ -128,6 +136,7 @@ impl Profile {
             request_format: RequestFormat::Generic,
             rows_path: vec!["rows".into()],
             columns_path: vec!["columns".into()],
+            max_bind_params: 0,
         }
     }
 
