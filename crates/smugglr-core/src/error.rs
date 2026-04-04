@@ -7,12 +7,14 @@ pub enum SyncError {
     #[error("Configuration error: {0}")]
     Config(String),
 
+    #[cfg(feature = "native")]
     #[error("Local database error: {0}")]
     LocalDb(#[from] rusqlite::Error),
 
     #[error("Remote API error: {0}")]
     Remote(String),
 
+    #[cfg(feature = "native")]
     #[error("HTTP request error: {0}")]
     Http(#[from] reqwest::Error),
 
@@ -57,6 +59,7 @@ pub enum SyncError {
     #[error("Invalid table name '{name}'. Available tables: [{available}]")]
     InvalidTableName { name: String, available: String },
 
+    #[cfg(feature = "native")]
     #[error("Object store error: {0}")]
     ObjectStore(#[from] object_store::Error),
 
@@ -109,6 +112,7 @@ impl SyncError {
             SyncError::RateLimited { .. } => true,
             SyncError::ServerError { status, .. } if *status >= 500 => true,
             SyncError::ConnectionTimeout => true,
+            #[cfg(feature = "native")]
             SyncError::Http(e) => e.is_timeout() || e.is_connect(),
             _ => false,
         }
@@ -142,8 +146,9 @@ impl SyncError {
             SyncError::InvalidTableName { .. } | SyncError::NoPrimaryKey(_) => 2,
             SyncError::ParamLimitExceeded { .. } => 2,
 
-            SyncError::Http(_)
-            | SyncError::RateLimited { .. }
+            #[cfg(feature = "native")]
+            SyncError::Http(_) => 3,
+            SyncError::RateLimited { .. }
             | SyncError::ServerError { .. }
             | SyncError::ConnectionTimeout
             | SyncError::RetryExhausted { .. } => 3,

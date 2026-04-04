@@ -26,6 +26,7 @@ pub struct Config {
     pub target: Option<TargetConfig>,
 
     /// LAN broadcast sync configuration
+    #[cfg(feature = "native")]
     pub broadcast: Option<crate::broadcast::BroadcastConfig>,
 }
 
@@ -407,9 +408,18 @@ impl Config {
                                 .unwrap_or_else(|| p.clone());
                             (pb, n)
                         }
-                        (Some(n), None) => {
-                            let pb = crate::plugin::resolve_plugin_path(n)?;
-                            (pb, n.clone())
+                        (Some(_n), None) => {
+                            #[cfg(feature = "native")]
+                            {
+                                let pb = crate::plugin::resolve_plugin_path(_n)?;
+                                (pb, _n.clone())
+                            }
+                            #[cfg(not(feature = "native"))]
+                            {
+                                return Err(SyncError::Config(
+                                    "Plugin targets require the 'native' feature".into(),
+                                ));
+                            }
                         }
                         (None, None) => {
                             return Err(SyncError::Config(
