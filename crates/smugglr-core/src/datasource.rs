@@ -36,6 +36,17 @@ pub struct RowMeta {
     pub content_hash: String,
 }
 
+/// Conditional Send bound: required on native (for tokio), absent on WASM (single-threaded).
+#[cfg(not(target_arch = "wasm32"))]
+pub trait MaybeSend: Send {}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send> MaybeSend for T {}
+
+#[cfg(target_arch = "wasm32")]
+pub trait MaybeSend {}
+#[cfg(target_arch = "wasm32")]
+impl<T> MaybeSend for T {}
+
 /// Abstraction over a database that can be used as a sync source or destination.
 ///
 /// Both local SQLite databases and remote Cloudflare D1 instances implement
@@ -43,13 +54,13 @@ pub struct RowMeta {
 /// any pair of data sources.
 pub trait DataSource: Sync {
     /// List all user tables (excluding internal/system tables).
-    fn list_tables(&self) -> impl std::future::Future<Output = Result<Vec<String>>> + Send;
+    fn list_tables(&self) -> impl std::future::Future<Output = Result<Vec<String>>> + MaybeSend;
 
     /// Get schema info for a table (columns, primary keys).
     fn table_info(
         &self,
         table: &str,
-    ) -> impl std::future::Future<Output = Result<TableInfo>> + Send;
+    ) -> impl std::future::Future<Output = Result<TableInfo>> + MaybeSend;
 
     /// Check if a table has a specific column.
     ///
@@ -59,7 +70,7 @@ pub trait DataSource: Sync {
         &self,
         table: &str,
         column: &str,
-    ) -> impl std::future::Future<Output = Result<bool>> + Send {
+    ) -> impl std::future::Future<Output = Result<bool>> + MaybeSend {
         async move {
             let info = self.table_info(table).await?;
             Ok(info.columns.iter().any(|c| c.name == column))
@@ -76,22 +87,25 @@ pub trait DataSource: Sync {
         table: &str,
         timestamp_column: &str,
         exclude_columns: &[String],
-    ) -> impl std::future::Future<Output = Result<HashMap<String, RowMeta>>> + Send;
+    ) -> impl std::future::Future<Output = Result<HashMap<String, RowMeta>>> + MaybeSend;
 
     /// Get full row data for specific primary key values.
     fn get_rows(
         &self,
         table: &str,
         pk_values: &[String],
-    ) -> impl std::future::Future<Output = Result<Vec<HashMap<String, JsonValue>>>> + Send;
+    ) -> impl std::future::Future<Output = Result<Vec<HashMap<String, JsonValue>>>> + MaybeSend;
 
     /// Insert or replace rows in the table. Returns the number of rows written.
     fn upsert_rows(
         &self,
         table: &str,
         rows: &[HashMap<String, JsonValue>],
-    ) -> impl std::future::Future<Output = Result<usize>> + Send;
+    ) -> impl std::future::Future<Output = Result<usize>> + MaybeSend;
 
     /// Get the number of rows in a table.
-    fn row_count(&self, table: &str) -> impl std::future::Future<Output = Result<usize>> + Send;
+    fn row_count(
+        &self,
+        table: &str,
+    ) -> impl std::future::Future<Output = Result<usize>> + MaybeSend;
 }
