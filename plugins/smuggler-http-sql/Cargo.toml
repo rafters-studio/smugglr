@@ -1,0 +1,22 @@
+[package]
+name = "smuggler-http-sql"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "HTTP SQL adapter plugin for smuggler -- supports Turso, rqlite, SQLite Cloud, and custom endpoints"
+
+[[bin]]
+name = "smuggler-http-sql"
+path = "src/main.rs"
+
+[dependencies]
+smuggler-plugin-sdk = { path = "../../crates/smuggler-plugin-sdk" }
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
