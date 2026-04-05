@@ -1,0 +1,38 @@
+{
+  "name": "smugglr",
+  "version": "0.1.0",
+  "description": "Content-hashed delta sync for SQLite, in the browser",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build:wasm": "cd ../../crates/smugglr-wasm && wasm-pack build --target web --dev",
+    "build:ts": "tsc",
+    "build": "pnpm build:wasm && pnpm build:ts"
+  },
+  "keywords": [
+    "sqlite",
+    "sync",
+    "wasm",
+    "d1",
+    "turso",
+    "cloudflare",
+    "content-hash",
+    "delta-sync"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rafters-studio/smugglr"
+  },
+  "author": "Sean Silvius"
+}
