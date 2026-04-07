@@ -69,6 +69,14 @@ export interface DiffResult {
   tables: TableDiff[];
 }
 
+/** Options for WASM initialization */
+export interface InitOptions {
+  /** URL to the .wasm binary (overrides the default co-located path) */
+  wasmUrl?: string | URL;
+  /** Pre-imported WASM module (from `import * as wasm from "smugglr/wasm"`) */
+  wasmModule?: unknown;
+}
+
 /** Exit code semantics matching the CLI */
 export type ExitCode = 0 | 1 | 2 | 3 | 4 | 5 | 6;
 

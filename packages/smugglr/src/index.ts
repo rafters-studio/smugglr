@@ -9,6 +9,7 @@ import type {
   DiffResult,
   SyncOptions,
   EndpointConfig,
+  InitOptions,
 } from "./types.js";
 import { SmugglrError } from "./types.js";
 
@@ -18,33 +19,96 @@ export type {
   DiffResult,
   SyncOptions,
   EndpointConfig,
+  InitOptions,
 };
 export { SmugglrError };
 
-// The WASM module is loaded lazily on first Smugglr.init() call.
-let wasmReady: Promise<typeof import("../../crates/smugglr-wasm/pkg/smugglr_wasm.js")> | null =
-  null;
+// Re-export setWasm for advanced use (custom bundlers, SSR, etc.)
+export { setWasm };
 
-async function loadWasm() {
-  if (!wasmReady) {
-    wasmReady = import("../../crates/smugglr-wasm/pkg/smugglr_wasm.js").then(
-      async (mod) => {
-        await mod.default();
-        return mod;
-      }
-    );
-  }
+// WASM module state -- loaded lazily or set explicitly via setWasm().
+let wasmModule: WasmModule | null = null;
+let wasmReady: Promise<WasmModule> | null = null;
+
+// Minimal interface for the wasm-bindgen output we depend on.
+interface WasmModule {
+  default: (input?: RequestInfo | URL | BufferSource | WebAssembly.Module) => Promise<unknown>;
+  Smugglr: {
+    init(config: unknown): WasmSmugglr;
+    new (): never;
+  };
+}
+
+interface WasmSmugglr {
+  free(): void;
+  push(dry_run?: boolean | null): Promise<unknown>;
+  pull(dry_run?: boolean | null): Promise<unknown>;
+  sync(dry_run?: boolean | null): Promise<unknown>;
+  diff(): Promise<unknown>;
+  [Symbol.dispose]?: () => void;
+}
+
+/**
+ * Pre-load the WASM module before calling Smugglr.init().
+ *
+ * Useful when you want to control how/where the .wasm binary is loaded from:
+ * - Custom CDN URL
+ * - Pre-fetched ArrayBuffer
+ * - Bundler-resolved import
+ *
+ * @example
+ * ```ts
+ * import { setWasm } from "smugglr";
+ * import * as wasm from "smugglr/wasm";
+ * await setWasm(wasm);
+ * ```
+ *
+ * @example
+ * ```ts
+ * // Point to a CDN-hosted binary
+ * import { setWasm } from "smugglr";
+ * const mod = await import("smugglr/wasm");
+ * await mod.default("https://cdn.example.com/smugglr_wasm_bg.wasm");
+ * setWasm(mod);
+ * ```
+ */
+function setWasm(mod: WasmModule): void {
+  wasmModule = mod;
+  wasmReady = Promise.resolve(mod);
+}
+
+async function loadWasm(options?: InitOptions): Promise<WasmModule> {
+  if (wasmReady) return wasmReady;
+
+  wasmReady = (async () => {
+    if (wasmModule) return wasmModule;
+
+    // If the consumer passed a module directly, use it.
+    if (options?.wasmModule) {
+      const mod = options.wasmModule as WasmModule;
+      await mod.default();
+      wasmModule = mod;
+      return mod;
+    }
+
+    // Default: dynamic import of the co-located wasm-bindgen output.
+    // This path is rewritten by the build script to point at the bundled copy.
+    const mod = await import("./wasm/smugglr_wasm.js") as WasmModule;
+    const initArg = options?.wasmUrl ?? undefined;
+    await mod.default(initArg);
+    wasmModule = mod;
+    return mod;
+  })();
+
   return wasmReady;
 }
 
 /** smugglr sync client for browser and Node.js */
 export class Smugglr {
-  private inner: InstanceType<
-    Awaited<ReturnType<typeof loadWasm>>["Smugglr"]
-  >;
+  private inner: WasmSmugglr;
 
-  private constructor(inner: unknown) {
-    this.inner = inner as typeof this.inner;
+  private constructor(inner: WasmSmugglr) {
+    this.inner = inner;
   }
 
   /**
@@ -58,9 +122,17 @@ export class Smugglr {
    *   sync: { tables: ["users", "posts"], conflictResolution: "local_wins" }
    * });
    * ```
+   *
+   * @example
+   * ```ts
+   * // With custom WASM URL (e.g. from a CDN)
+   * const s = await Smugglr.init(config, {
+   *   wasmUrl: "https://cdn.example.com/smugglr_wasm_bg.wasm"
+   * });
+   * ```
    */
-  static async init(config: SmugglrConfig): Promise<Smugglr> {
-    const wasm = await loadWasm();
+  static async init(config: SmugglrConfig, options?: InitOptions): Promise<Smugglr> {
+    const wasm = await loadWasm(options);
     try {
       const inner = wasm.Smugglr.init(config);
       return new Smugglr(inner);

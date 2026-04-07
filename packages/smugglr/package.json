@@ -9,6 +9,10 @@
     ".": {
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
+    },
+    "./wasm": {
+      "import": "./dist/wasm/smugglr_wasm.js",
+      "types": "./dist/wasm/smugglr_wasm.d.ts"
     }
   },
   "files": [
@@ -16,8 +20,9 @@
   ],
   "scripts": {
     "build:wasm": "cd ../../crates/smugglr-wasm && wasm-pack build --target web --dev",
+    "build:copy-wasm": "mkdir -p dist/wasm && cp ../../crates/smugglr-wasm/pkg/smugglr_wasm.js dist/wasm/ && cp ../../crates/smugglr-wasm/pkg/smugglr_wasm.d.ts dist/wasm/ && cp ../../crates/smugglr-wasm/pkg/smugglr_wasm_bg.wasm dist/wasm/ && cp ../../crates/smugglr-wasm/pkg/smugglr_wasm_bg.wasm.d.ts dist/wasm/",
     "build:ts": "tsc",
-    "build": "pnpm build:wasm && pnpm build:ts"
+    "build": "pnpm build:wasm && pnpm build:ts && pnpm build:copy-wasm"
   },
   "keywords": [
     "sqlite",
@@ -34,5 +39,8 @@
     "type": "git",
     "url": "https://github.com/rafters-studio/smugglr"
   },
-  "author": "Sean Silvius"
+  "author": "Sean Silvius",
+  "devDependencies": {
+    "typescript": "^6.0.2"
+  }
 }
