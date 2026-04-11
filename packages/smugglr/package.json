@@ -1,0 +1,46 @@
+{
+  "name": "smugglr",
+  "version": "0.1.0",
+  "description": "Content-hashed delta sync for SQLite, in the browser",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./wasm": {
+      "import": "./dist/wasm/smugglr_wasm.js",
+      "types": "./dist/wasm/smugglr_wasm.d.ts"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build:wasm": "cd ../../crates/smugglr-wasm && wasm-pack build --target web --dev",
+    "build:copy-wasm": "mkdir -p dist/wasm && cp ../../crates/smugglr-wasm/pkg/smugglr_wasm.js dist/wasm/ && cp ../../crates/smugglr-wasm/pkg/smugglr_wasm.d.ts dist/wasm/ && cp ../../crates/smugglr-wasm/pkg/smugglr_wasm_bg.wasm dist/wasm/ && cp ../../crates/smugglr-wasm/pkg/smugglr_wasm_bg.wasm.d.ts dist/wasm/",
+    "build:ts": "tsc",
+    "build": "pnpm build:wasm && pnpm build:ts && pnpm build:copy-wasm"
+  },
+  "keywords": [
+    "sqlite",
+    "sync",
+    "wasm",
+    "d1",
+    "turso",
+    "cloudflare",
+    "content-hash",
+    "delta-sync"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rafters-studio/smugglr"
+  },
+  "author": "Sean Silvius",
+  "devDependencies": {
+    "typescript": "^6.0.2"
+  }
+}
