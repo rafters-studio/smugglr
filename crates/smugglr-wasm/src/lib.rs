@@ -21,7 +21,7 @@ mod fetch_adapter;
 use fetch_adapter::FetchDataSource;
 use smugglr_core::config::{column_excluded, ConflictResolution, SyncConfig};
 use smugglr_core::datasource::{DataSource, RowMeta};
-use smugglr_core::diff::TableDiff;
+use smugglr_core::diff::{classify_diff, TableDiff};
 use smugglr_core::profile::Profile;
 
 use serde::{Deserialize, Serialize};
@@ -48,37 +48,38 @@ impl CachedMeta {
         }
     }
 
-    /// Merge incremental results into the cache and update max_timestamp.
+    /// Observe a timestamp, advancing max_timestamp if it's larger.
+    ///
+    /// Lexicographic comparison is correct for ISO 8601 strings, which is the
+    /// documented format for `timestamp_column` values in the sync config.
+    fn observe_timestamp(&mut self, ts: &str) {
+        if self.max_timestamp.as_deref().unwrap_or("") < ts {
+            self.max_timestamp = Some(ts.to_string());
+        }
+    }
+
+    /// Merge incremental results into the cache.
     ///
     /// Rows present in `incremental` overwrite existing cache entries.
-    /// The max_timestamp is updated to the largest timestamp seen across
-    /// both the existing cache and the incremental results.
+    /// Rows absent from `incremental` are preserved (unchanged rows).
     fn merge(&mut self, incremental: HashMap<String, RowMeta>) {
         for (pk, meta) in incremental {
-            // Track the maximum timestamp across all seen rows.
             if let Some(ref ts) = meta.updated_at {
-                let current_max = self.max_timestamp.as_deref().unwrap_or("");
-                if ts.as_str() > current_max {
-                    self.max_timestamp = Some(ts.clone());
-                }
+                self.observe_timestamp(ts);
             }
             self.hashes.insert(pk, meta);
         }
     }
 
-    /// Seed the cache from a full scan result and compute max_timestamp.
+    /// Seed the cache from a full scan result.
     fn seed(&mut self, full: HashMap<String, RowMeta>) {
-        let mut max_ts: Option<String> = None;
+        self.max_timestamp = None;
         for meta in full.values() {
             if let Some(ref ts) = meta.updated_at {
-                let current_max = max_ts.as_deref().unwrap_or("");
-                if ts.as_str() > current_max {
-                    max_ts = Some(ts.clone());
-                }
+                self.observe_timestamp(ts);
             }
         }
         self.hashes = full;
-        self.max_timestamp = max_ts;
     }
 }
 
@@ -278,26 +279,27 @@ async fn transfer_rows(
     Ok(total)
 }
 
-/// Fetch row metadata for one side, using the cache when possible.
+/// Populate the cache entry for `table` on `ds`, fetching only changed rows
+/// when possible.
 ///
 /// Strategy:
-/// - If no cache entry exists: full scan via `get_row_metadata`, seeds the cache.
-/// - If a cache entry exists and the config has a timestamp column: incremental
-///   scan via `get_row_metadata_since`, merges results into the cache.
-/// - If a cache entry exists but there is no timestamp column: full scan, reseeds.
+/// - No cache entry or no timestamp column: full scan via `get_row_metadata`,
+///   seeds the cache.
+/// - Cache entry with a usable cursor: incremental scan via
+///   `get_row_metadata_since`, merges into the existing entry.
+/// - Incremental scan failure: falls back to a full scan so a stale cache
+///   never blocks sync.
 ///
-/// On incremental scan failure the function falls back to a full scan so that
-/// a stale or corrupted cache never blocks sync.
-///
-/// Returns the merged (or freshly fetched) hash map.
-async fn fetch_metadata_cached(
+/// After this call returns `Ok`, `cache` is guaranteed to contain an entry
+/// for `table`. The caller borrows the cache to access the metadata,
+/// avoiding a full clone of the hash map on the sync hot path.
+async fn ensure_cached_metadata(
     ds: &FetchDataSource,
     cache: &RefCell<HashMap<String, CachedMeta>>,
     table: &str,
     timestamp_column: &str,
     exclude_columns: &[String],
-) -> Result<HashMap<String, RowMeta>, JsValue> {
-    // Determine whether we have a warm cache entry and a usable cursor.
+) -> Result<(), JsValue> {
     let since = {
         let borrowed = cache.borrow();
         borrowed
@@ -307,27 +309,21 @@ async fn fetch_metadata_cached(
     };
 
     if let Some(ref ts) = since {
-        // Warm cache + timestamp column: try incremental fetch.
-        match ds
+        if let Ok(incremental) = ds
             .get_row_metadata_since(table, timestamp_column, exclude_columns, ts)
             .await
         {
-            Ok(incremental) => {
-                let mut borrowed = cache.borrow_mut();
-                let entry = borrowed
-                    .entry(table.to_string())
-                    .or_insert_with(CachedMeta::new);
-                entry.merge(incremental);
-                return Ok(entry.hashes.clone());
-            }
-            Err(_) => {
-                // Incremental query failed (e.g. no timestamp column on remote).
-                // Fall through to full scan below.
-            }
+            let mut borrowed = cache.borrow_mut();
+            let entry = borrowed
+                .entry(table.to_string())
+                .or_insert_with(CachedMeta::new);
+            entry.merge(incremental);
+            return Ok(());
         }
+        // Incremental query failed (e.g. schema changed, timestamp column
+        // missing on remote). Fall through to a full scan.
     }
 
-    // Cold cache or no timestamp column: full scan.
     let full = ds
         .get_row_metadata(table, timestamp_column, exclude_columns)
         .await
@@ -337,16 +333,17 @@ async fn fetch_metadata_cached(
     let entry = borrowed
         .entry(table.to_string())
         .or_insert_with(CachedMeta::new);
-    entry.seed(full.clone());
-    Ok(full)
+    entry.seed(full);
+    Ok(())
 }
 
-/// Compute the diff between source and dest for a table, using cached metadata.
+/// Compute the diff between source and dest for a table, using cached
+/// metadata. This is the incremental diff entry point for the WASM path.
 ///
-/// Mirrors the logic in `smugglr_core::diff::diff_table` but operates against
-/// the cached hash maps rather than calling `get_row_metadata` on the DataSource
-/// trait (which always does a full scan). This is the incremental diff entry point
-/// for the WASM path.
+/// Unlike `smugglr_core::diff::diff_table`, this path does not full-scan on
+/// every call: `ensure_cached_metadata` uses a per-table timestamp cursor to
+/// fetch only changed rows, and the diff classification is delegated to the
+/// shared `classify_diff` helper in core.
 async fn diff_table_cached(
     source: &FetchDataSource,
     dest: &FetchDataSource,
@@ -356,7 +353,7 @@ async fn diff_table_cached(
     timestamp_column: &str,
     exclude_columns: &[String],
 ) -> Result<TableDiff, JsValue> {
-    let source_meta = fetch_metadata_cached(
+    ensure_cached_metadata(
         source,
         source_cache,
         table,
@@ -364,48 +361,18 @@ async fn diff_table_cached(
         exclude_columns,
     )
     .await?;
-    let dest_meta =
-        fetch_metadata_cached(dest, dest_cache, table, timestamp_column, exclude_columns).await?;
+    ensure_cached_metadata(dest, dest_cache, table, timestamp_column, exclude_columns).await?;
 
-    let source_keys: HashSet<&String> = source_meta.keys().collect();
-    let dest_keys: HashSet<&String> = dest_meta.keys().collect();
+    let source_ref = source_cache.borrow();
+    let dest_ref = dest_cache.borrow();
+    let source_meta = source_ref
+        .get(table)
+        .ok_or_else(|| JsValue::from_str("source cache missing after populate"))?;
+    let dest_meta = dest_ref
+        .get(table)
+        .ok_or_else(|| JsValue::from_str("dest cache missing after populate"))?;
 
-    let mut diff = TableDiff::new(table);
-
-    for pk in source_keys.difference(&dest_keys) {
-        diff.local_only.push((*pk).clone());
-    }
-
-    for pk in dest_keys.difference(&source_keys) {
-        diff.remote_only.push((*pk).clone());
-    }
-
-    for pk in source_keys.intersection(&dest_keys) {
-        let source_row = &source_meta[*pk];
-        let dest_row = &dest_meta[*pk];
-
-        if source_row.content_hash == dest_row.content_hash {
-            diff.identical.push((*pk).clone());
-            continue;
-        }
-
-        match (&source_row.updated_at, &dest_row.updated_at) {
-            (Some(source_ts), Some(dest_ts)) => {
-                if source_ts > dest_ts {
-                    diff.local_newer.push((*pk).clone());
-                } else if dest_ts > source_ts {
-                    diff.remote_newer.push((*pk).clone());
-                } else {
-                    diff.content_differs.push((*pk).clone());
-                }
-            }
-            _ => {
-                diff.content_differs.push((*pk).clone());
-            }
-        }
-    }
-
-    Ok(diff)
+    Ok(classify_diff(&source_meta.hashes, &dest_meta.hashes, table))
 }
 
 #[wasm_bindgen]
@@ -671,8 +638,7 @@ impl Smugglr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use smugglr_core::datasource::{ColumnInfo, RowMeta, TableInfo};
-    use smugglr_core::error::Result as CoreResult;
+    use smugglr_core::datasource::RowMeta;
 
     // ---------------------------------------------------------------------------
     // CachedMeta unit tests (no network, no WASM runtime needed)
@@ -752,40 +718,30 @@ mod tests {
         assert_eq!(cache.max_timestamp.as_deref(), Some("2025-01-01"));
     }
 
-    // ---------------------------------------------------------------------------
-    // diff_table_cached logic test using a stub DataSource.
+    // `ensure_cached_metadata` and `diff_table_cached` are not exercised in host
+    // tests: the crate is gated on target_arch="wasm32" (see crate-level cfg),
+    // so FetchDataSource and the async paths only compile under wasm-pack test.
+    // The network-level fetch-count acceptance test lives in that suite.
     //
-    // We can't run the async FetchDataSource path under host-target tests because
-    // the cfg gate excludes the entire crate on non-wasm32. Instead we test the
-    // CachedMeta merge logic and `diff_table_cached` by wiring it through
-    // `fetch_metadata_cached` with a RefCell of pre-seeded CachedMeta entries,
-    // bypassing FetchDataSource entirely.
-    //
-    // For the fetch-count acceptance criterion (second call queries fewer rows),
-    // we verify it structurally: after `fetch_metadata_cached` is called with a
-    // warm cache + a non-empty `max_timestamp`, the cache branch is taken and
-    // the returned map is the *cached* map (not an empty freshly-fetched map).
-    // The network-layer fetch count test lives in the WASM integration suite
-    // which runs under wasm-pack test.
-    // ---------------------------------------------------------------------------
+    // The classification logic used by the cached path lives in
+    // `smugglr_core::diff::classify_diff`, which is unit-tested via the core
+    // integration tests. The tests below verify the WASM-local pieces: cache
+    // seeding and merging behavior, and a sanity check on the exported
+    // classification for the inputs the cached path feeds it.
 
     #[test]
     fn warm_cache_with_no_timestamp_column_stays_as_seed() {
-        // Seed cache manually as if a full scan already ran.
         let mut entry = CachedMeta::new();
         let mut full = HashMap::new();
         full.insert("pk1".into(), make_meta("pk1", None, "h1"));
         entry.seed(full);
 
-        // A warm cache entry with no timestamp means max_timestamp is None.
-        // `fetch_metadata_cached` will fall back to full scan (no incremental).
         assert!(entry.max_timestamp.is_none());
         assert_eq!(entry.hashes.len(), 1);
     }
 
     #[test]
-    fn diff_logic_local_only_remote_only() {
-        // Drive the diff classification logic directly (no async, no network).
+    fn classify_diff_local_only_remote_only() {
         let mut source_meta = HashMap::new();
         source_meta.insert("pk1".into(), make_meta("pk1", Some("2024-01-01"), "h1"));
         source_meta.insert("pk2".into(), make_meta("pk2", Some("2024-01-01"), "h2"));
@@ -794,25 +750,7 @@ mod tests {
         dest_meta.insert("pk2".into(), make_meta("pk2", Some("2024-01-01"), "h2"));
         dest_meta.insert("pk3".into(), make_meta("pk3", Some("2024-01-01"), "h3"));
 
-        let source_keys: HashSet<&String> = source_meta.keys().collect();
-        let dest_keys: HashSet<&String> = dest_meta.keys().collect();
-
-        let mut diff = TableDiff::new("test_table");
-        for pk in source_keys.difference(&dest_keys) {
-            diff.local_only.push((*pk).clone());
-        }
-        for pk in dest_keys.difference(&source_keys) {
-            diff.remote_only.push((*pk).clone());
-        }
-        for pk in source_keys.intersection(&dest_keys) {
-            let sr = &source_meta[*pk];
-            let dr = &dest_meta[*pk];
-            if sr.content_hash == dr.content_hash {
-                diff.identical.push((*pk).clone());
-            } else {
-                diff.content_differs.push((*pk).clone());
-            }
-        }
+        let diff = classify_diff(&source_meta, &dest_meta, "test_table");
 
         assert_eq!(diff.local_only, vec!["pk1".to_string()]);
         assert_eq!(diff.remote_only, vec!["pk3".to_string()]);
@@ -821,7 +759,7 @@ mod tests {
     }
 
     #[test]
-    fn diff_logic_timestamp_newer_wins() {
+    fn classify_diff_timestamp_newer_wins() {
         let mut source_meta = HashMap::new();
         source_meta.insert(
             "pk1".into(),
@@ -834,35 +772,11 @@ mod tests {
             make_meta("pk1", Some("2024-01-01"), "hash_old"),
         );
 
-        let source_keys: HashSet<&String> = source_meta.keys().collect();
-        let dest_keys: HashSet<&String> = dest_meta.keys().collect();
-        let mut diff = TableDiff::new("test_table");
-
-        for pk in source_keys.intersection(&dest_keys) {
-            let sr = &source_meta[*pk];
-            let dr = &dest_meta[*pk];
-            if sr.content_hash != dr.content_hash {
-                match (&sr.updated_at, &dr.updated_at) {
-                    (Some(sts), Some(dts)) if sts > dts => {
-                        diff.local_newer.push((*pk).clone());
-                    }
-                    (Some(sts), Some(dts)) if dts > sts => {
-                        diff.remote_newer.push((*pk).clone());
-                    }
-                    _ => {
-                        diff.content_differs.push((*pk).clone());
-                    }
-                }
-            }
-        }
+        let diff = classify_diff(&source_meta, &dest_meta, "test_table");
 
         assert_eq!(diff.local_newer, vec!["pk1".to_string()]);
         assert!(diff.remote_newer.is_empty());
     }
-
-    // ---------------------------------------------------------------------------
-    // CachedMeta invalidation test
-    // ---------------------------------------------------------------------------
 
     #[test]
     fn clear_cache_empties_all_entries() {

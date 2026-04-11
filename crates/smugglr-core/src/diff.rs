@@ -1,10 +1,10 @@
 //! Change detection between local and remote databases
 
 use crate::config::ConflictResolution;
-use crate::datasource::DataSource;
+use crate::datasource::{DataSource, RowMeta};
 use crate::error::Result;
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use tracing::{debug, info, warn};
 
 /// Per-table diff statistics (counts only, no PK values).
@@ -178,6 +178,59 @@ impl TableDiff {
     }
 }
 
+/// Classify row-level differences between two pre-fetched metadata maps.
+///
+/// Pure function with no I/O: partitions primary keys into local-only,
+/// remote-only, newer-on-each-side, content-differs, and identical buckets.
+/// Used by [`diff_table`] after fetching metadata, and by the WASM package's
+/// cached diff path which bypasses per-call full scans.
+pub fn classify_diff(
+    local_meta: &HashMap<String, RowMeta>,
+    remote_meta: &HashMap<String, RowMeta>,
+    table: &str,
+) -> TableDiff {
+    let local_keys: HashSet<&String> = local_meta.keys().collect();
+    let remote_keys: HashSet<&String> = remote_meta.keys().collect();
+
+    let mut diff = TableDiff::new(table);
+
+    for pk in local_keys.difference(&remote_keys) {
+        diff.local_only.push((*pk).clone());
+    }
+
+    for pk in remote_keys.difference(&local_keys) {
+        diff.remote_only.push((*pk).clone());
+    }
+
+    for pk in local_keys.intersection(&remote_keys) {
+        let local_row = &local_meta[*pk];
+        let remote_row = &remote_meta[*pk];
+
+        if local_row.content_hash == remote_row.content_hash {
+            diff.identical.push((*pk).clone());
+            continue;
+        }
+
+        match (&local_row.updated_at, &remote_row.updated_at) {
+            (Some(local_ts), Some(remote_ts)) => {
+                if local_ts > remote_ts {
+                    diff.local_newer.push((*pk).clone());
+                } else if remote_ts > local_ts {
+                    diff.remote_newer.push((*pk).clone());
+                } else {
+                    // Same timestamp, different content: treat as conflict.
+                    diff.content_differs.push((*pk).clone());
+                }
+            }
+            _ => {
+                diff.content_differs.push((*pk).clone());
+            }
+        }
+    }
+
+    diff
+}
+
 /// Compare two data sources for a table
 pub async fn diff_table<A: DataSource, B: DataSource>(
     local: &A,
@@ -196,50 +249,7 @@ pub async fn diff_table<A: DataSource, B: DataSource>(
         .get_row_metadata(table, timestamp_column, exclude_columns)
         .await?;
 
-    let local_keys: HashSet<&String> = local_meta.keys().collect();
-    let remote_keys: HashSet<&String> = remote_meta.keys().collect();
-
-    let mut diff = TableDiff::new(table);
-
-    // Find rows only in local
-    for pk in local_keys.difference(&remote_keys) {
-        diff.local_only.push((*pk).clone());
-    }
-
-    // Find rows only in remote
-    for pk in remote_keys.difference(&local_keys) {
-        diff.remote_only.push((*pk).clone());
-    }
-
-    // Compare rows that exist in both
-    for pk in local_keys.intersection(&remote_keys) {
-        let local_row = &local_meta[*pk];
-        let remote_row = &remote_meta[*pk];
-
-        // First check content hash - if identical, no change needed
-        if local_row.content_hash == remote_row.content_hash {
-            diff.identical.push((*pk).clone());
-            continue;
-        }
-
-        // Content differs - check timestamps if available
-        match (&local_row.updated_at, &remote_row.updated_at) {
-            (Some(local_ts), Some(remote_ts)) => {
-                if local_ts > remote_ts {
-                    diff.local_newer.push((*pk).clone());
-                } else if remote_ts > local_ts {
-                    diff.remote_newer.push((*pk).clone());
-                } else {
-                    // Same timestamp but different content - conflict
-                    diff.content_differs.push((*pk).clone());
-                }
-            }
-            _ => {
-                // No timestamps available - mark as content differs
-                diff.content_differs.push((*pk).clone());
-            }
-        }
-    }
+    let diff = classify_diff(&local_meta, &remote_meta, table);
 
     debug!(
         "Diff for {}: local_only={}, remote_only={}, local_newer={}, remote_newer={}, content_differs={}, identical={}",
