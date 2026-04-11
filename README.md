@@ -29,8 +29,8 @@ Smuggler is a universal SQLite sync engine. It started as a way to sync local de
 - **Pluggable backends** - `DataSource` trait abstracts any database backend
 - **Watch daemon** - Background sync on a configurable interval
 - **Column exclusion** - Skip embedding BLOBs and other large columns with glob patterns
-- **Automatic retries** - Exponential backoff with configurable limits for transient D1 failures
-- **Batched writes** - Respects D1's 100-parameter bind limit, splits large upserts automatically
+- **Automatic retries** - Exponential backoff with configurable limits for transient HTTP failures
+- **Batched writes** - Respects per-backend HTTP SQL parameter limits, splits large upserts automatically
 - **Table validation** - `--table` input validated against live schema before any SQL runs
 
 ## Installation
@@ -104,15 +104,18 @@ smugglr push
 ## Commands
 
 ```
-smugglr status      # Can we phone home?
-smugglr diff        # What's different?
-smugglr push        # Local -> D1 (YOLO)
-smugglr pull        # D1 -> Local (safer YOLO)
-smugglr sync        # Bidirectional (push + pull in one shot)
-smugglr stash       # Local -> S3 relay (cross-machine sync)
-smugglr retrieve    # S3 relay -> Local (cross-machine sync)
-smugglr watch       # Daemon mode (sync on interval)
-smugglr broadcast   # LAN sync (peer discovery + encrypted deltas)
+smugglr status              # Can we phone home?
+smugglr diff                # What's different?
+smugglr push                # Local -> remote (YOLO)
+smugglr pull                # Remote -> local (safer YOLO)
+smugglr sync                # Bidirectional (push + pull in one shot)
+smugglr stash               # Local -> S3 relay (cross-machine sync)
+smugglr retrieve            # S3 relay -> Local (cross-machine sync)
+smugglr watch               # Daemon mode (sync on interval)
+smugglr broadcast           # LAN sync (peer discovery + encrypted deltas)
+smugglr snapshot            # Point-in-time full backup to stash storage
+smugglr snapshots           # List available snapshots
+smugglr restore <timestamp> # Disaster recovery from a snapshot
 ```
 
 ### Options
@@ -160,11 +163,11 @@ Smuggler's sync engine is built on the `DataSource` trait, which abstracts any d
 
 ```
 DataSource (trait)
-  |-- LocalDb    (rusqlite, synchronous)
-  |-- D1Client   (reqwest HTTP, async with retries)
+  |-- LocalDb          (rusqlite, synchronous)
+  |-- PluginDataSource (runtime-loaded external adapter, stdio protocol)
 ```
 
-The diff engine (`diff_table`) and table resolution (`get_tables_to_sync`) are generic over any two `DataSource` implementations. This means the same comparison logic works whether you're syncing local-to-D1, local-to-local, or any future backend.
+The diff engine (`diff_table`) and table resolution (`get_tables_to_sync`) are generic over any two `DataSource` implementations. Every remote backend -- D1, Turso, rqlite, Datasette, SQLiteCloud, StarbaseDB -- is reached through the `smugglr-http-sql` plugin. One plugin, profile-driven: adding a new remote target is a TOML config change, not a core recompile.
 
 ## Cross-Machine Sync (Stash/Retrieve)
 
@@ -218,6 +221,27 @@ smugglr retrieve && legion reindex
 # SessionStop hook
 smugglr stash
 ```
+
+## Browser Sync (npm)
+
+The sync engine compiles to WebAssembly and ships via the `smugglr` package on npm. Browser apps can run content-hashed delta sync against any http-sql-reachable target without a server in the middle.
+
+```ts
+import { Smugglr } from "smugglr";
+
+const s = await Smugglr.init({
+  source: { url: "https://my-db.turso.io", authToken: "tok", profile: "turso" },
+  dest:   { url: "https://api.cloudflare.com/...", authToken: "cf-tok", profile: "d1" },
+  sync:   { tables: ["users", "posts"], conflictResolution: "local_wins" },
+});
+
+await s.sync();
+s.dispose();
+```
+
+The package exports `Smugglr.init(config)` and the same verbs as the CLI: `.push()`, `.pull()`, `.sync()`, `.diff()`. All return typed results. The `./wasm` subpath export is available for consumers who need to control WASM binary loading directly (CDN URL, pre-fetched buffer, bundler import).
+
+This is the current browser story: sync between two remote HTTP SQL endpoints from the browser. Local SQLite storage in the browser is a separate track, not yet shipped.
 
 ## LAN Broadcast Sync
 
@@ -344,7 +368,7 @@ Check that column order and types match. NULL vs empty string will cause hash mi
 ## Development
 
 ```bash
-cargo test                       # Run the tests (165 and counting)
+cargo test                       # Run the tests (224 and counting)
 cargo fmt                        # Format code
 cargo clippy --all-targets       # Lint (including tests)
 RUST_LOG=debug cargo run -- diff # Debug output

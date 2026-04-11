@@ -77,11 +77,7 @@ fn make_progress(fmt: OutputFormat) -> Box<dyn SyncProgress> {
 
 #[derive(Parser)]
 #[command(name = "smugglr")]
-#[command(
-    author,
-    version,
-    about = "Smuggle data between SQLite and Cloudflare D1"
-)]
+#[command(author, version, about = "Smuggle data between SQLite-shaped things")]
 struct Cli {
     /// Path to config file
     #[arg(short, long, default_value = "config.toml")]
@@ -101,7 +97,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Push local changes to D1 (local -> remote)
+    /// Push local changes to the remote target (local -> remote)
     Push {
         /// Specific table to push (default: all configured tables)
         #[arg(short, long)]
@@ -112,7 +108,7 @@ enum Commands {
         dry_run: bool,
     },
 
-    /// Pull remote changes to local (D1 -> local)
+    /// Pull changes from the remote target to local (remote -> local)
     Pull {
         /// Specific table to pull (default: all configured tables)
         #[arg(short, long)]
