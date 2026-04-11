@@ -388,9 +388,11 @@ impl Config {
             }
         }
 
-        // Validate that we have a resolvable target
-        config.resolve_target()?;
-
+        // Target resolution is deferred to command dispatch: some commands
+        // (broadcast, stash, retrieve, snapshot, restore) never touch the
+        // target and must not fail at load time if the plugin binary is
+        // missing. See crates/smugglr/src/main.rs for where target resolution
+        // actually runs.
         Ok(config)
     }
 
@@ -403,12 +405,7 @@ impl Config {
                     database_id,
                     api_token,
                     url,
-                } => ResolvedTarget::D1 {
-                    account_id: account_id.clone(),
-                    database_id: database_id.clone(),
-                    api_token: api_token.clone(),
-                    url: url.clone(),
-                },
+                } => resolve_d1_plugin_target(account_id, database_id, api_token, url.as_deref())?,
                 TargetConfig::Sqlite { database } => ResolvedTarget::Sqlite {
                     database: database.clone(),
                 },
@@ -456,12 +453,9 @@ impl Config {
             &self.database_id,
             &self.cloudflare_api_token,
         ) {
-            (Some(account_id), Some(database_id), Some(api_token)) => Ok(ResolvedTarget::D1 {
-                account_id: account_id.clone(),
-                database_id: database_id.clone(),
-                api_token: api_token.clone(),
-                url: None,
-            }),
+            (Some(account_id), Some(database_id), Some(api_token)) => {
+                resolve_d1_plugin_target(account_id, database_id, api_token, None)
+            }
             _ => Err(SyncError::Config(
                 "No target configured. Add a [target] section or set cloudflare_account_id, database_id, and cloudflare_api_token.".to_string()
             )),
@@ -495,6 +489,57 @@ impl Config {
     #[allow(dead_code)]
     pub fn retry_config(&self) -> RetryConfig {
         RetryConfig::from_sync_config(&self.sync)
+    }
+}
+
+/// Build a `ResolvedTarget::Plugin` for the http-sql plugin with a d1 profile.
+///
+/// Both the explicit `[target] type = "d1"` branch and the legacy flat-fields branch
+/// funnel through here. The `ResolvedTarget::D1` variant is preserved in the enum for
+/// issue #83 which removes it entirely; at runtime, D1 config always resolves to a plugin.
+fn resolve_d1_plugin_target(
+    account_id: &str,
+    database_id: &str,
+    api_token: &str,
+    url: Option<&str>,
+) -> Result<ResolvedTarget> {
+    let mut plugin_config = HashMap::new();
+    plugin_config.insert("profile".to_string(), "d1".to_string());
+    plugin_config.insert("account_id".to_string(), account_id.to_string());
+    plugin_config.insert("database_id".to_string(), database_id.to_string());
+    plugin_config.insert("api_token".to_string(), api_token.to_string());
+    if let Some(u) = url {
+        plugin_config.insert("url".to_string(), u.to_string());
+    }
+
+    let plugin_path = resolve_http_sql_plugin_path()?;
+
+    Ok(ResolvedTarget::Plugin {
+        path: plugin_path,
+        name: "smugglr-http-sql".to_string(),
+        config: plugin_config,
+    })
+}
+
+/// Resolve the path to the smugglr-http-sql plugin binary.
+///
+/// Under `cfg(test)` a placeholder path is returned so unit tests can assert on
+/// config synthesis without requiring the binary to be installed.
+fn resolve_http_sql_plugin_path() -> Result<PathBuf> {
+    #[cfg(test)]
+    {
+        Ok(PathBuf::from("/fake/smugglr-http-sql"))
+    }
+    #[cfg(all(not(test), feature = "native"))]
+    {
+        crate::plugin::resolve_plugin_path("http-sql")
+            .map_err(|_| SyncError::Config("d1 target requires the smugglr-http-sql plugin".into()))
+    }
+    #[cfg(all(not(test), not(feature = "native")))]
+    {
+        Err(SyncError::Config(
+            "d1 target requires the 'native' feature".into(),
+        ))
     }
 }
 
@@ -583,6 +628,33 @@ mod tests {
         }
     }
 
+    /// Assert that `target` is a `ResolvedTarget::Plugin` pointing at the
+    /// http-sql plugin with a synthesized d1 profile config. Used by every
+    /// test that exercises the D1-to-plugin routing in `resolve_target`.
+    fn assert_d1_plugin(
+        target: &ResolvedTarget,
+        account_id: &str,
+        database_id: &str,
+        api_token: &str,
+        url: Option<&str>,
+    ) {
+        let ResolvedTarget::Plugin { name, config, .. } = target else {
+            panic!("expected plugin target, got {:?}", target);
+        };
+        assert_eq!(name, "smugglr-http-sql");
+        assert_eq!(config.get("profile").map(String::as_str), Some("d1"));
+        assert_eq!(
+            config.get("account_id").map(String::as_str),
+            Some(account_id)
+        );
+        assert_eq!(
+            config.get("database_id").map(String::as_str),
+            Some(database_id)
+        );
+        assert_eq!(config.get("api_token").map(String::as_str), Some(api_token));
+        assert_eq!(config.get("url").map(String::as_str), url);
+    }
+
     #[test]
     fn test_default_excludes() {
         let config = test_config_d1();
@@ -606,7 +678,7 @@ mod tests {
     fn test_resolve_target_legacy_d1() {
         let config = test_config_d1();
         let target = config.resolve_target().unwrap();
-        assert!(matches!(target, ResolvedTarget::D1 { .. }));
+        assert_d1_plugin(&target, "test_acct", "test_db", "test_token", None);
     }
 
     #[test]
@@ -637,7 +709,38 @@ mod tests {
             broadcast: None,
         };
         let target = config.resolve_target().unwrap();
-        assert!(matches!(target, ResolvedTarget::D1 { .. }));
+        assert_d1_plugin(&target, "acct", "db", "tok", None);
+    }
+
+    #[test]
+    fn test_resolve_target_d1_with_url() {
+        // Covers the `if let Some(u) = url` branch in resolve_d1_plugin_target.
+        // A D1 config with an explicit url (e.g. for a self-hosted HTTP bridge
+        // via the Durable Objects template) must round-trip through the plugin
+        // config map so the http-sql adapter can pick it up.
+        let config = Config {
+            cloudflare_account_id: None,
+            cloudflare_api_token: None,
+            database_id: None,
+            local_db: Some("test.db".into()),
+            sync: SyncConfig::default(),
+            stash: None,
+            target: Some(TargetConfig::D1 {
+                account_id: "acct".into(),
+                database_id: "db".into(),
+                api_token: "tok".into(),
+                url: Some("https://bridge.example.com".into()),
+            }),
+            broadcast: None,
+        };
+        let target = config.resolve_target().unwrap();
+        assert_d1_plugin(
+            &target,
+            "acct",
+            "db",
+            "tok",
+            Some("https://bridge.example.com"),
+        );
     }
 
     #[test]
@@ -795,19 +898,7 @@ api_token = "tok789"
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         let target = config.resolve_target().unwrap();
-        match target {
-            ResolvedTarget::D1 {
-                account_id,
-                database_id,
-                api_token,
-                ..
-            } => {
-                assert_eq!(account_id, "acct123");
-                assert_eq!(database_id, "db456");
-                assert_eq!(api_token, "tok789");
-            }
-            _ => panic!("expected d1"),
-        }
+        assert_d1_plugin(&target, "acct123", "db456", "tok789", None);
     }
 
     #[test]
@@ -821,7 +912,7 @@ local_db = "game.db"
         let config: Config = toml::from_str(toml_str).unwrap();
         assert!(config.target.is_none());
         let target = config.resolve_target().unwrap();
-        assert!(matches!(target, ResolvedTarget::D1 { .. }));
+        assert_d1_plugin(&target, "acct", "db", "tok", None);
     }
 
     // -- Column exclusion tests --
