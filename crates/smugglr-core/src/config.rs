@@ -713,6 +713,37 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_target_d1_with_url() {
+        // Covers the `if let Some(u) = url` branch in resolve_d1_plugin_target.
+        // A D1 config with an explicit url (e.g. for a self-hosted HTTP bridge
+        // via the Durable Objects template) must round-trip through the plugin
+        // config map so the http-sql adapter can pick it up.
+        let config = Config {
+            cloudflare_account_id: None,
+            cloudflare_api_token: None,
+            database_id: None,
+            local_db: Some("test.db".into()),
+            sync: SyncConfig::default(),
+            stash: None,
+            target: Some(TargetConfig::D1 {
+                account_id: "acct".into(),
+                database_id: "db".into(),
+                api_token: "tok".into(),
+                url: Some("https://bridge.example.com".into()),
+            }),
+            broadcast: None,
+        };
+        let target = config.resolve_target().unwrap();
+        assert_d1_plugin(
+            &target,
+            "acct",
+            "db",
+            "tok",
+            Some("https://bridge.example.com"),
+        );
+    }
+
+    #[test]
     fn test_resolve_target_explicit_overrides_legacy() {
         let config = Config {
             cloudflare_account_id: Some("old_acct".into()),
