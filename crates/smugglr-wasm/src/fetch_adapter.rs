@@ -223,6 +223,74 @@ impl FetchDataSource {
         hex::encode(hasher.finalize())
     }
 
+    /// Query row metadata for rows with `timestamp_column > since_timestamp`.
+    ///
+    /// Used by the incremental diff path to fetch only changed rows instead of
+    /// the full table. Falls back to `get_row_metadata` if since_timestamp is None.
+    pub async fn get_row_metadata_since(
+        &self,
+        table: &str,
+        timestamp_column: &str,
+        exclude_columns: &[String],
+        since_timestamp: &str,
+    ) -> Result<HashMap<String, RowMeta>> {
+        let info = self.cached_table_info(table).await?;
+        if info.primary_key.is_empty() {
+            return Err(SyncError::Config(format!(
+                "no primary key for table: {}",
+                table
+            )));
+        }
+
+        let pk_expr = if info.primary_key.len() == 1 {
+            format!("CAST(\"{}\" AS TEXT)", info.primary_key[0])
+        } else {
+            let parts: Vec<String> = info
+                .primary_key
+                .iter()
+                .map(|k| format!("CAST(\"{}\" AS TEXT)", k))
+                .collect();
+            parts.join(" || '|' || ")
+        };
+
+        let column_order: Vec<String> = info.columns.iter().map(|c| c.name.clone()).collect();
+
+        let sql = format!(
+            "SELECT *, {} AS __pk FROM \"{}\" WHERE \"{}\" > ?",
+            pk_expr, table, timestamp_column
+        );
+        let params = vec![Value::String(since_timestamp.to_string())];
+        let response = self.execute(&sql, &params).await?;
+        let columns = self.extract_columns(&response)?;
+        let rows = self.extract_rows(&response, &columns)?;
+        let maps = self.rows_to_maps(&columns, &rows);
+
+        let mut result = HashMap::new();
+        for row in &maps {
+            let pk = row
+                .get("__pk")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let updated_at = row
+                .get(timestamp_column)
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let hash = Self::content_hash(row, &column_order, exclude_columns, timestamp_column);
+
+            result.insert(
+                pk.clone(),
+                RowMeta {
+                    pk_value: pk,
+                    updated_at,
+                    content_hash: hash,
+                },
+            );
+        }
+
+        Ok(result)
+    }
+
     async fn cached_table_info(&self, table: &str) -> Result<TableInfo> {
         if let Some(info) = self.table_info_cache.lock().unwrap().get(table) {
             return Ok(info.clone());
