@@ -20,12 +20,68 @@ mod fetch_adapter;
 
 use fetch_adapter::FetchDataSource;
 use smugglr_core::config::{column_excluded, ConflictResolution, SyncConfig};
-use smugglr_core::datasource::DataSource;
-use smugglr_core::diff::diff_table;
+use smugglr_core::datasource::{DataSource, RowMeta};
+use smugglr_core::diff::{classify_diff, TableDiff};
 use smugglr_core::profile::Profile;
 
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use wasm_bindgen::prelude::*;
+
+/// Per-table cached row metadata used for incremental diff.
+///
+/// After each full or incremental scan, the Smugglr instance stores the
+/// complete hash map for each table alongside the maximum timestamp seen.
+/// On subsequent calls, only rows newer than `max_timestamp` are fetched,
+/// and the result is merged into the cached map before diffing.
+struct CachedMeta {
+    hashes: HashMap<String, RowMeta>,
+    max_timestamp: Option<String>,
+}
+
+impl CachedMeta {
+    fn new() -> Self {
+        Self {
+            hashes: HashMap::new(),
+            max_timestamp: None,
+        }
+    }
+
+    /// Observe a timestamp, advancing max_timestamp if it's larger.
+    ///
+    /// Lexicographic comparison is correct for ISO 8601 strings, which is the
+    /// documented format for `timestamp_column` values in the sync config.
+    fn observe_timestamp(&mut self, ts: &str) {
+        if self.max_timestamp.as_deref().unwrap_or("") < ts {
+            self.max_timestamp = Some(ts.to_string());
+        }
+    }
+
+    /// Merge incremental results into the cache.
+    ///
+    /// Rows present in `incremental` overwrite existing cache entries.
+    /// Rows absent from `incremental` are preserved (unchanged rows).
+    fn merge(&mut self, incremental: HashMap<String, RowMeta>) {
+        for (pk, meta) in incremental {
+            if let Some(ref ts) = meta.updated_at {
+                self.observe_timestamp(ts);
+            }
+            self.hashes.insert(pk, meta);
+        }
+    }
+
+    /// Seed the cache from a full scan result.
+    fn seed(&mut self, full: HashMap<String, RowMeta>) {
+        self.max_timestamp = None;
+        for meta in full.values() {
+            if let Some(ref ts) = meta.updated_at {
+                self.observe_timestamp(ts);
+            }
+        }
+        self.hashes = full;
+    }
+}
 
 #[derive(Deserialize)]
 struct JsEndpointConfig {
@@ -144,13 +200,13 @@ async fn get_sync_tables(
     dest: &FetchDataSource,
     sync_config: &SyncConfig,
 ) -> Result<Vec<String>, JsValue> {
-    let source_tables: std::collections::HashSet<String> = source
+    let source_tables: HashSet<String> = source
         .list_tables()
         .await
         .map_err(|e| JsValue::from_str(&e.to_string()))?
         .into_iter()
         .collect();
-    let dest_tables: std::collections::HashSet<String> = dest
+    let dest_tables: HashSet<String> = dest
         .list_tables()
         .await
         .map_err(|e| JsValue::from_str(&e.to_string()))?
@@ -179,9 +235,9 @@ async fn get_sync_tables(
 
 /// Strip excluded columns from row data before transfer.
 fn strip_excluded(
-    rows: Vec<std::collections::HashMap<String, serde_json::Value>>,
+    rows: Vec<HashMap<String, serde_json::Value>>,
     exclude: &[String],
-) -> Vec<std::collections::HashMap<String, serde_json::Value>> {
+) -> Vec<HashMap<String, serde_json::Value>> {
     if exclude.is_empty() {
         return rows;
     }
@@ -223,16 +279,120 @@ async fn transfer_rows(
     Ok(total)
 }
 
+/// Populate the cache entry for `table` on `ds`, fetching only changed rows
+/// when possible.
+///
+/// Strategy:
+/// - No cache entry or no timestamp column: full scan via `get_row_metadata`,
+///   seeds the cache.
+/// - Cache entry with a usable cursor: incremental scan via
+///   `get_row_metadata_since`, merges into the existing entry.
+/// - Incremental scan failure: falls back to a full scan so a stale cache
+///   never blocks sync.
+///
+/// After this call returns `Ok`, `cache` is guaranteed to contain an entry
+/// for `table`. The caller borrows the cache to access the metadata,
+/// avoiding a full clone of the hash map on the sync hot path.
+async fn ensure_cached_metadata(
+    ds: &FetchDataSource,
+    cache: &RefCell<HashMap<String, CachedMeta>>,
+    table: &str,
+    timestamp_column: &str,
+    exclude_columns: &[String],
+) -> Result<(), JsValue> {
+    let since = {
+        let borrowed = cache.borrow();
+        borrowed
+            .get(table)
+            .and_then(|c| c.max_timestamp.clone())
+            .filter(|_| !timestamp_column.is_empty())
+    };
+
+    if let Some(ref ts) = since {
+        if let Ok(incremental) = ds
+            .get_row_metadata_since(table, timestamp_column, exclude_columns, ts)
+            .await
+        {
+            let mut borrowed = cache.borrow_mut();
+            let entry = borrowed
+                .entry(table.to_string())
+                .or_insert_with(CachedMeta::new);
+            entry.merge(incremental);
+            return Ok(());
+        }
+        // Incremental query failed (e.g. schema changed, timestamp column
+        // missing on remote). Fall through to a full scan.
+    }
+
+    let full = ds
+        .get_row_metadata(table, timestamp_column, exclude_columns)
+        .await
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    let mut borrowed = cache.borrow_mut();
+    let entry = borrowed
+        .entry(table.to_string())
+        .or_insert_with(CachedMeta::new);
+    entry.seed(full);
+    Ok(())
+}
+
+/// Compute the diff between source and dest for a table, using cached
+/// metadata. This is the incremental diff entry point for the WASM path.
+///
+/// Unlike `smugglr_core::diff::diff_table`, this path does not full-scan on
+/// every call: `ensure_cached_metadata` uses a per-table timestamp cursor to
+/// fetch only changed rows, and the diff classification is delegated to the
+/// shared `classify_diff` helper in core.
+async fn diff_table_cached(
+    source: &FetchDataSource,
+    dest: &FetchDataSource,
+    source_cache: &RefCell<HashMap<String, CachedMeta>>,
+    dest_cache: &RefCell<HashMap<String, CachedMeta>>,
+    table: &str,
+    timestamp_column: &str,
+    exclude_columns: &[String],
+) -> Result<TableDiff, JsValue> {
+    ensure_cached_metadata(
+        source,
+        source_cache,
+        table,
+        timestamp_column,
+        exclude_columns,
+    )
+    .await?;
+    ensure_cached_metadata(dest, dest_cache, table, timestamp_column, exclude_columns).await?;
+
+    let source_ref = source_cache.borrow();
+    let dest_ref = dest_cache.borrow();
+    let source_meta = source_ref
+        .get(table)
+        .ok_or_else(|| JsValue::from_str("source cache missing after populate"))?;
+    let dest_meta = dest_ref
+        .get(table)
+        .ok_or_else(|| JsValue::from_str("dest cache missing after populate"))?;
+
+    Ok(classify_diff(&source_meta.hashes, &dest_meta.hashes, table))
+}
+
 #[wasm_bindgen]
 pub struct Smugglr {
     sync_config: SyncConfig,
     source: FetchDataSource,
     dest: FetchDataSource,
+    /// Per-table metadata cache for the source endpoint.
+    source_cache: RefCell<HashMap<String, CachedMeta>>,
+    /// Per-table metadata cache for the dest endpoint.
+    dest_cache: RefCell<HashMap<String, CachedMeta>>,
 }
 
 #[wasm_bindgen]
 impl Smugglr {
     /// Initialize smugglr with source and destination endpoints.
+    ///
+    /// Each call to `init` returns a new Smugglr instance with empty caches.
+    /// Passing a different endpoint config automatically invalidates the old
+    /// caches because the old instance is discarded.
     #[wasm_bindgen]
     pub fn init(config_js: JsValue) -> Result<Smugglr, JsValue> {
         let js_config: JsSmugglrConfig = serde_wasm_bindgen::from_value(config_js)
@@ -246,7 +406,21 @@ impl Smugglr {
             sync_config,
             source,
             dest,
+            source_cache: RefCell::new(HashMap::new()),
+            dest_cache: RefCell::new(HashMap::new()),
         })
+    }
+
+    /// Clear all cached row metadata for both endpoints.
+    ///
+    /// The next call to push/pull/sync/diff will perform a full scan on both
+    /// sides before resuming incremental mode. Use this when you know the
+    /// remote schema or data has changed in a way the incremental path cannot
+    /// detect (e.g. mass deletes, schema migration).
+    #[wasm_bindgen(js_name = clearCache)]
+    pub fn clear_cache(&self) {
+        self.source_cache.borrow_mut().clear();
+        self.dest_cache.borrow_mut().clear();
     }
 
     /// Push source rows to destination.
@@ -259,15 +433,16 @@ impl Smugglr {
 
         let mut results = Vec::new();
         for table in &tables {
-            let diff = diff_table(
+            let diff = diff_table_cached(
                 &self.source,
                 &self.dest,
+                &self.source_cache,
+                &self.dest_cache,
                 table,
                 &self.sync_config.timestamp_column,
                 &self.sync_config.exclude_columns,
             )
-            .await
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            .await?;
 
             let to_push = diff.rows_to_push(conflict);
             let pushed = if dry_run || to_push.is_empty() {
@@ -310,15 +485,16 @@ impl Smugglr {
 
         let mut results = Vec::new();
         for table in &tables {
-            let diff = diff_table(
+            let diff = diff_table_cached(
                 &self.source,
                 &self.dest,
+                &self.source_cache,
+                &self.dest_cache,
                 table,
                 &self.sync_config.timestamp_column,
                 &self.sync_config.exclude_columns,
             )
-            .await
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            .await?;
 
             let to_pull = diff.rows_to_pull(conflict);
             let pulled = if dry_run || to_pull.is_empty() {
@@ -361,15 +537,16 @@ impl Smugglr {
 
         let mut results = Vec::new();
         for table in &tables {
-            let diff = diff_table(
+            let diff = diff_table_cached(
                 &self.source,
                 &self.dest,
+                &self.source_cache,
+                &self.dest_cache,
                 table,
                 &self.sync_config.timestamp_column,
                 &self.sync_config.exclude_columns,
             )
-            .await
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            .await?;
 
             let to_push = diff.rows_to_push(conflict);
             let to_pull = diff.rows_to_pull(conflict);
@@ -425,15 +602,16 @@ impl Smugglr {
 
         let mut table_diffs = Vec::new();
         for table in &tables {
-            let diff = diff_table(
+            let diff = diff_table_cached(
                 &self.source,
                 &self.dest,
+                &self.source_cache,
+                &self.dest_cache,
                 table,
                 &self.sync_config.timestamp_column,
                 &self.sync_config.exclude_columns,
             )
-            .await
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            .await?;
 
             let stats = diff.stats();
             table_diffs.push(JsTableDiff {
@@ -454,5 +632,194 @@ impl Smugglr {
         };
         serde_wasm_bindgen::to_value(&output)
             .map_err(|e| JsValue::from_str(&format!("serialization failed: {}", e)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smugglr_core::datasource::RowMeta;
+
+    // ---------------------------------------------------------------------------
+    // CachedMeta unit tests (no network, no WASM runtime needed)
+    // ---------------------------------------------------------------------------
+
+    fn make_meta(pk: &str, ts: Option<&str>, hash: &str) -> RowMeta {
+        RowMeta {
+            pk_value: pk.to_string(),
+            updated_at: ts.map(String::from),
+            content_hash: hash.to_string(),
+        }
+    }
+
+    #[test]
+    fn cached_meta_seed_computes_max_timestamp() {
+        let mut cache = CachedMeta::new();
+        let mut full = HashMap::new();
+        full.insert("pk1".into(), make_meta("pk1", Some("2024-01-01"), "hash1"));
+        full.insert("pk2".into(), make_meta("pk2", Some("2024-06-15"), "hash2"));
+        full.insert("pk3".into(), make_meta("pk3", Some("2024-03-20"), "hash3"));
+        cache.seed(full);
+
+        assert_eq!(cache.max_timestamp.as_deref(), Some("2024-06-15"));
+        assert_eq!(cache.hashes.len(), 3);
+    }
+
+    #[test]
+    fn cached_meta_seed_with_no_timestamps_leaves_max_timestamp_none() {
+        let mut cache = CachedMeta::new();
+        let mut full = HashMap::new();
+        full.insert("pk1".into(), make_meta("pk1", None, "hash1"));
+        cache.seed(full);
+
+        assert!(cache.max_timestamp.is_none());
+        assert_eq!(cache.hashes.len(), 1);
+    }
+
+    #[test]
+    fn cached_meta_merge_updates_existing_rows() {
+        let mut cache = CachedMeta::new();
+        let mut full = HashMap::new();
+        full.insert(
+            "pk1".into(),
+            make_meta("pk1", Some("2024-01-01"), "old_hash"),
+        );
+        full.insert("pk2".into(), make_meta("pk2", Some("2024-01-01"), "hash2"));
+        cache.seed(full);
+
+        // pk1 changes, pk3 appears
+        let mut incremental = HashMap::new();
+        incremental.insert(
+            "pk1".into(),
+            make_meta("pk1", Some("2024-06-15"), "new_hash"),
+        );
+        incremental.insert("pk3".into(), make_meta("pk3", Some("2024-07-01"), "hash3"));
+        cache.merge(incremental);
+
+        assert_eq!(cache.hashes.len(), 3);
+        assert_eq!(
+            cache.hashes["pk1"].content_hash, "new_hash",
+            "existing row should be overwritten"
+        );
+        assert_eq!(cache.max_timestamp.as_deref(), Some("2024-07-01"));
+    }
+
+    #[test]
+    fn cached_meta_merge_advances_max_timestamp() {
+        let mut cache = CachedMeta::new();
+        let mut full = HashMap::new();
+        full.insert("pk1".into(), make_meta("pk1", Some("2024-01-01"), "h1"));
+        cache.seed(full);
+
+        let mut inc = HashMap::new();
+        inc.insert("pk2".into(), make_meta("pk2", Some("2025-01-01"), "h2"));
+        cache.merge(inc);
+
+        assert_eq!(cache.max_timestamp.as_deref(), Some("2025-01-01"));
+    }
+
+    // `ensure_cached_metadata` and `diff_table_cached` are not exercised in host
+    // tests: the crate is gated on target_arch="wasm32" (see crate-level cfg),
+    // so FetchDataSource and the async paths only compile under wasm-pack test.
+    // The network-level fetch-count acceptance test lives in that suite.
+    //
+    // The classification logic used by the cached path lives in
+    // `smugglr_core::diff::classify_diff`, which is unit-tested via the core
+    // integration tests. The tests below verify the WASM-local pieces: cache
+    // seeding and merging behavior, and a sanity check on the exported
+    // classification for the inputs the cached path feeds it.
+
+    #[test]
+    fn warm_cache_with_no_timestamp_column_stays_as_seed() {
+        let mut entry = CachedMeta::new();
+        let mut full = HashMap::new();
+        full.insert("pk1".into(), make_meta("pk1", None, "h1"));
+        entry.seed(full);
+
+        assert!(entry.max_timestamp.is_none());
+        assert_eq!(entry.hashes.len(), 1);
+    }
+
+    #[test]
+    fn classify_diff_local_only_remote_only() {
+        let mut source_meta = HashMap::new();
+        source_meta.insert("pk1".into(), make_meta("pk1", Some("2024-01-01"), "h1"));
+        source_meta.insert("pk2".into(), make_meta("pk2", Some("2024-01-01"), "h2"));
+
+        let mut dest_meta = HashMap::new();
+        dest_meta.insert("pk2".into(), make_meta("pk2", Some("2024-01-01"), "h2"));
+        dest_meta.insert("pk3".into(), make_meta("pk3", Some("2024-01-01"), "h3"));
+
+        let diff = classify_diff(&source_meta, &dest_meta, "test_table");
+
+        assert_eq!(diff.local_only, vec!["pk1".to_string()]);
+        assert_eq!(diff.remote_only, vec!["pk3".to_string()]);
+        assert_eq!(diff.identical, vec!["pk2".to_string()]);
+        assert!(diff.content_differs.is_empty());
+    }
+
+    #[test]
+    fn classify_diff_timestamp_newer_wins() {
+        let mut source_meta = HashMap::new();
+        source_meta.insert(
+            "pk1".into(),
+            make_meta("pk1", Some("2024-06-01"), "hash_new"),
+        );
+
+        let mut dest_meta = HashMap::new();
+        dest_meta.insert(
+            "pk1".into(),
+            make_meta("pk1", Some("2024-01-01"), "hash_old"),
+        );
+
+        let diff = classify_diff(&source_meta, &dest_meta, "test_table");
+
+        assert_eq!(diff.local_newer, vec!["pk1".to_string()]);
+        assert!(diff.remote_newer.is_empty());
+    }
+
+    #[test]
+    fn clear_cache_empties_all_entries() {
+        // Simulate what Smugglr::clear_cache does on the RefCells.
+        let cache: RefCell<HashMap<String, CachedMeta>> = RefCell::new(HashMap::new());
+        {
+            let mut entry = CachedMeta::new();
+            let mut full = HashMap::new();
+            full.insert("pk1".into(), make_meta("pk1", Some("2024-01-01"), "h1"));
+            entry.seed(full);
+            cache.borrow_mut().insert("users".into(), entry);
+        }
+        assert_eq!(cache.borrow().len(), 1);
+
+        cache.borrow_mut().clear();
+        assert_eq!(cache.borrow().len(), 0);
+    }
+
+    #[test]
+    fn incremental_merge_does_not_lose_rows_absent_from_incremental() {
+        // Rows not returned by the incremental query (unchanged) stay in cache.
+        let mut cache = CachedMeta::new();
+        let mut full = HashMap::new();
+        // 5 rows in initial full scan
+        for i in 1..=5u32 {
+            full.insert(
+                format!("pk{}", i),
+                make_meta(&format!("pk{}", i), Some("2024-01-01"), &format!("h{}", i)),
+            );
+        }
+        cache.seed(full);
+        assert_eq!(cache.hashes.len(), 5);
+
+        // Only pk6 is new in the incremental scan (pk1..5 are unchanged and absent)
+        let mut incremental = HashMap::new();
+        incremental.insert("pk6".into(), make_meta("pk6", Some("2024-06-01"), "h6"));
+        cache.merge(incremental);
+
+        assert_eq!(
+            cache.hashes.len(),
+            6,
+            "merge must preserve rows absent from incremental result"
+        );
+        assert_eq!(cache.max_timestamp.as_deref(), Some("2024-06-01"));
     }
 }
