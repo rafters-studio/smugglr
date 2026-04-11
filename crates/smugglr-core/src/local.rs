@@ -28,6 +28,14 @@ impl LocalDb {
 
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
 
+        let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+        if mode != "wal" {
+            tracing::warn!(
+                journal_mode = %mode,
+                "WAL mode unavailable (network filesystem?). Concurrent write access may deadlock."
+            );
+        }
+
         Ok(Self {
             conn: Mutex::new(conn),
         })
