@@ -4,8 +4,10 @@
 //! replication. Use as a library from Rust or compile to WASM for browser use.
 //!
 //! The `native` feature (default) enables platform-specific backends:
-//! LocalDb (rusqlite), D1Client, PluginDataSource, broadcast, stash, daemon.
-//! Without it, only the diff/sync engine and trait definitions are available.
+//! LocalDb (rusqlite), PluginDataSource, broadcast, stash, daemon. Remote
+//! adapters like D1, turso, or rqlite live in the http-sql plugin and are
+//! reached through `PluginDataSource`. Without `native`, only the diff/sync
+//! engine and trait definitions are available.
 
 pub mod batch;
 pub mod config;
@@ -25,8 +27,6 @@ pub mod local;
 #[cfg(feature = "native")]
 pub mod plugin;
 #[cfg(feature = "native")]
-pub mod remote;
-#[cfg(feature = "native")]
 pub mod snapshot;
 #[cfg(feature = "native")]
 pub mod stash;
@@ -41,5 +41,3 @@ pub use sync::{pull_all, push_all, sync_all, DiffDetail, NoProgress, SyncProgres
 pub use local::LocalDb;
 #[cfg(feature = "native")]
 pub use plugin::PluginDataSource;
-#[cfg(feature = "native")]
-pub use remote::D1Client;

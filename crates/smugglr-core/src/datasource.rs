@@ -1,8 +1,9 @@
 //! DataSource trait for abstracting database backends
 //!
-//! This module defines the [`DataSource`] trait that both [`LocalDb`](crate::local::LocalDb)
-//! and [`D1Client`](crate::remote::D1Client) implement, allowing the diff and sync engines
-//! to work with any pair of data sources.
+//! This module defines the [`DataSource`] trait that [`LocalDb`](crate::local::LocalDb)
+//! and [`PluginDataSource`](crate::plugin::PluginDataSource) implement, allowing the diff
+//! and sync engines to work with any pair of data sources. Remote backends (D1, turso,
+//! rqlite, datasette, sqlitecloud, starbasedb) are reached via the http-sql plugin.
 
 use crate::error::Result;
 use serde_json::Value as JsonValue;

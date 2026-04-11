@@ -19,7 +19,6 @@ use smugglr_core::diff::diff_table;
 use smugglr_core::error;
 use smugglr_core::local::LocalDb;
 use smugglr_core::plugin::PluginDataSource;
-use smugglr_core::remote::D1Client;
 use smugglr_core::sync::{
     get_tables_to_sync, pull_all, push_all, sync_all, NoProgress, SyncProgress,
 };
@@ -412,30 +411,6 @@ fn print_dry_run_json(
     }
 }
 
-/// Open a D1Client from resolved target fields.
-fn open_d1(
-    account_id: &str,
-    database_id: &str,
-    api_token: &str,
-    url: Option<&str>,
-    config: &Config,
-) -> D1Client {
-    if let Some(endpoint) = url {
-        D1Client::with_endpoint(
-            api_token.to_string(),
-            endpoint.to_string(),
-            config.retry_config(),
-        )
-    } else {
-        D1Client::with_retry_config(
-            account_id.to_string(),
-            database_id.to_string(),
-            api_token.to_string(),
-            config.retry_config(),
-        )
-    }
-}
-
 /// Resolve table filter from CLI --table arg using local schema validation.
 fn resolve_tables(local: &LocalDb, table: Option<String>) -> error::Result<Option<Vec<String>>> {
     match table {
@@ -462,23 +437,6 @@ async fn run_push(
     let progress = make_progress(fmt);
 
     let results = match target {
-        ResolvedTarget::D1 {
-            account_id,
-            database_id,
-            api_token,
-            ref url,
-        } => {
-            info!("Push mode: local -> D1");
-            let remote = open_d1(
-                &account_id,
-                &database_id,
-                &api_token,
-                url.as_deref(),
-                config,
-            );
-            remote.test_connection().await?;
-            push_all(&local, &remote, config, tables, dry_run, progress.as_ref()).await?
-        }
         ResolvedTarget::Sqlite { database } => {
             info!("Push mode: local -> SQLite ({})", database);
             let target_db = LocalDb::open(&database)?;
@@ -537,23 +495,6 @@ async fn run_pull(
     let progress = make_progress(fmt);
 
     let results = match target {
-        ResolvedTarget::D1 {
-            account_id,
-            database_id,
-            api_token,
-            ref url,
-        } => {
-            info!("Pull mode: D1 -> local");
-            let remote = open_d1(
-                &account_id,
-                &database_id,
-                &api_token,
-                url.as_deref(),
-                config,
-            );
-            remote.test_connection().await?;
-            pull_all(&local, &remote, config, tables, dry_run, progress.as_ref()).await?
-        }
         ResolvedTarget::Sqlite { database } => {
             info!("Pull mode: SQLite ({}) -> local", database);
             let source_db = LocalDb::open_readonly(&database)?;
@@ -612,23 +553,6 @@ async fn run_sync(
     let progress = make_progress(fmt);
 
     let results = match target {
-        ResolvedTarget::D1 {
-            account_id,
-            database_id,
-            api_token,
-            ref url,
-        } => {
-            info!("Sync mode: bidirectional (local <-> D1)");
-            let remote = open_d1(
-                &account_id,
-                &database_id,
-                &api_token,
-                url.as_deref(),
-                config,
-            );
-            remote.test_connection().await?;
-            sync_all(&local, &remote, config, tables, dry_run, progress.as_ref()).await?
-        }
         ResolvedTarget::Sqlite { database } => {
             info!("Sync mode: bidirectional (local <-> SQLite {})", database);
             let target_db = LocalDb::open(&database)?;
@@ -697,38 +621,6 @@ async fn run_diff(
     let local = LocalDb::open_readonly(config.local_db_path())?;
 
     match target {
-        ResolvedTarget::D1 {
-            account_id,
-            database_id,
-            api_token,
-            ref url,
-        } => {
-            let remote = open_d1(
-                &account_id,
-                &database_id,
-                &api_token,
-                url.as_deref(),
-                config,
-            );
-            remote.test_connection().await?;
-            let tables = match table {
-                Some(t) => {
-                    let schema = local.get_schema()?;
-                    let _ = schema.validate(&t)?;
-                    vec![t]
-                }
-                None => get_tables_to_sync(&local, &remote, config).await?,
-            };
-            output_diffs(
-                &local,
-                &remote,
-                &tables,
-                &config.sync.timestamp_column,
-                &config.sync.exclude_columns,
-                fmt,
-            )
-            .await
-        }
         ResolvedTarget::Sqlite { database } => {
             let target_db = LocalDb::open_readonly(&database)?;
             let tables = match table {
@@ -873,7 +765,6 @@ async fn run_status(
     fmt: OutputFormat,
 ) -> error::Result<()> {
     let target_type = match &target {
-        ResolvedTarget::D1 { .. } => "d1",
         ResolvedTarget::Sqlite { .. } => "sqlite",
         ResolvedTarget::Plugin { ref name, .. } => name.as_str(),
     };
@@ -907,39 +798,6 @@ async fn run_status(
 
     // Gather target info
     let target_status = match &target {
-        ResolvedTarget::D1 {
-            account_id,
-            database_id,
-            api_token,
-            ref url,
-        } => {
-            let remote = open_d1(account_id, database_id, api_token, url.as_deref(), config);
-            match remote.test_connection().await {
-                Ok(()) => {
-                    let tables = remote.list_tables().await?;
-                    let mut table_rows = Vec::new();
-                    for table in &tables {
-                        if config.should_sync_table(table) {
-                            let count = remote.row_count(table).await?;
-                            table_rows.push(StatusTable {
-                                name: table.clone(),
-                                rows: count,
-                            });
-                        }
-                    }
-                    StatusDb {
-                        connected: true,
-                        error: None,
-                        tables: table_rows,
-                    }
-                }
-                Err(e) => StatusDb {
-                    connected: false,
-                    error: Some(e.to_string()),
-                    tables: vec![],
-                },
-            }
-        }
         ResolvedTarget::Sqlite { database } => match LocalDb::open_readonly(database) {
             Ok(target_db) => {
                 let tables = target_db.list_tables().await?;
@@ -1023,21 +881,6 @@ async fn run_status(
             println!("  Local DB: {}", config.local_db_path());
 
             match &target {
-                ResolvedTarget::D1 {
-                    account_id,
-                    database_id,
-                    ..
-                } => {
-                    println!("  Target: D1");
-                    println!(
-                        "  Account ID: {}...",
-                        &account_id[..8.min(account_id.len())]
-                    );
-                    println!(
-                        "  Database ID: {}...",
-                        &database_id[..8.min(database_id.len())]
-                    );
-                }
                 ResolvedTarget::Sqlite { database } => {
                     println!("  Target: SQLite ({})", database);
                 }
@@ -1082,7 +925,6 @@ async fn run_status(
 
             // Target
             match &target {
-                ResolvedTarget::D1 { .. } => println!("\n--- Remote D1 ---"),
                 ResolvedTarget::Sqlite { .. } => println!("\n--- Target SQLite ---"),
                 ResolvedTarget::Plugin { ref name, .. } => {
                     println!("\n--- Target Plugin ({}) ---", name)

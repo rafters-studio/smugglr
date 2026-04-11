@@ -57,15 +57,13 @@ pub enum TargetConfig {
     },
 }
 
-/// Resolved target after merging legacy fields with [target] section
+/// Resolved target after merging legacy fields with [target] section.
+///
+/// D1 config (both `[target] type = "d1"` and the legacy flat fields) resolves
+/// to `Plugin` with a synthesized http-sql profile. The CLI and watch loop only
+/// ever see `Sqlite` or `Plugin`; there is no dedicated D1 variant.
 #[derive(Debug, Clone)]
 pub enum ResolvedTarget {
-    D1 {
-        account_id: String,
-        database_id: String,
-        api_token: String,
-        url: Option<String>,
-    },
     Sqlite {
         database: String,
     },
@@ -495,8 +493,7 @@ impl Config {
 /// Build a `ResolvedTarget::Plugin` for the http-sql plugin with a d1 profile.
 ///
 /// Both the explicit `[target] type = "d1"` branch and the legacy flat-fields branch
-/// funnel through here. The `ResolvedTarget::D1` variant is preserved in the enum for
-/// issue #83 which removes it entirely; at runtime, D1 config always resolves to a plugin.
+/// funnel through here -- D1 is just another http-sql profile at runtime.
 fn resolve_d1_plugin_target(
     account_id: &str,
     database_id: &str,

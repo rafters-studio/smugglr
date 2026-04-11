@@ -13,7 +13,6 @@ use smugglr_core::daemon::{
 use smugglr_core::error::Result;
 use smugglr_core::local::LocalDb;
 use smugglr_core::plugin::PluginDataSource;
-use smugglr_core::remote::D1Client;
 use smugglr_core::sync::{sync_all, NoProgress};
 use std::path::Path;
 use tokio::signal;
@@ -59,32 +58,6 @@ pub async fn run_watch(
                 info!("Watch tick #{}", tick_count);
 
                 let result = match &target {
-                    ResolvedTarget::D1 { account_id, database_id, api_token, ref url } => {
-                        let local = LocalDb::open(config.local_db_path())?;
-                        let remote = if let Some(endpoint) = url {
-                            D1Client::with_endpoint(
-                                api_token.clone(),
-                                endpoint.clone(),
-                                config.retry_config(),
-                            )
-                        } else {
-                            D1Client::with_retry_config(
-                                account_id.clone(),
-                                database_id.clone(),
-                                api_token.clone(),
-                                config.retry_config(),
-                            )
-                        };
-                        if let Err(e) = remote.test_connection().await {
-                            warn!("Connection test failed on tick #{}: {}. Will retry next tick.", tick_count, e);
-                            if fmt == OutputFormat::Json {
-                                let out = WatchTickOutput::from_error(tick_count, &e.to_string());
-                                println!("{}", serde_json::to_string(&out).expect("WatchTickOutput is always serializable"));
-                            }
-                            continue;
-                        }
-                        sync_all(&local, &remote, config, None, dry_run, &NoProgress).await
-                    }
                     ResolvedTarget::Sqlite { database } => {
                         let local = LocalDb::open(config.local_db_path())?;
                         let target_db = LocalDb::open(database)?;
