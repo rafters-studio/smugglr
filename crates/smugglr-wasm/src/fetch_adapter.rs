@@ -193,6 +193,58 @@ impl FetchDataSource {
             .collect()
     }
 
+    /// Build a SQLite expression that casts primary key columns to TEXT.
+    ///
+    /// For single-column PKs this is `CAST("col" AS TEXT)`. For composite PKs
+    /// the parts are joined with `|` to produce a stable string form matching
+    /// the rest of smugglr's primary key encoding.
+    fn build_pk_text_expr(primary_key: &[String]) -> String {
+        if primary_key.len() == 1 {
+            format!("CAST(\"{}\" AS TEXT)", primary_key[0])
+        } else {
+            primary_key
+                .iter()
+                .map(|k| format!("CAST(\"{}\" AS TEXT)", k))
+                .collect::<Vec<_>>()
+                .join(" || '|' || ")
+        }
+    }
+
+    /// Convert result rows (each with a synthetic `__pk` column) into RowMeta
+    /// entries keyed by primary key. Used by both full-scan and incremental
+    /// metadata fetches.
+    fn row_maps_to_metadata(
+        maps: &[HashMap<String, Value>],
+        column_order: &[String],
+        timestamp_column: &str,
+        exclude_columns: &[String],
+    ) -> HashMap<String, RowMeta> {
+        let mut result = HashMap::with_capacity(maps.len());
+        for row in maps {
+            let pk = row
+                .get("__pk")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let updated_at = row
+                .get(timestamp_column)
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let content_hash =
+                Self::content_hash(row, column_order, exclude_columns, timestamp_column);
+
+            result.insert(
+                pk.clone(),
+                RowMeta {
+                    pk_value: pk,
+                    updated_at,
+                    content_hash,
+                },
+            );
+        }
+        result
+    }
+
     /// Content hash matching smugglr-core local.rs algorithm exactly.
     fn content_hash(
         row: &HashMap<String, Value>,
@@ -226,7 +278,7 @@ impl FetchDataSource {
     /// Query row metadata for rows with `timestamp_column > since_timestamp`.
     ///
     /// Used by the incremental diff path to fetch only changed rows instead of
-    /// the full table. Falls back to `get_row_metadata` if since_timestamp is None.
+    /// the full table.
     pub async fn get_row_metadata_since(
         &self,
         table: &str,
@@ -242,19 +294,8 @@ impl FetchDataSource {
             )));
         }
 
-        let pk_expr = if info.primary_key.len() == 1 {
-            format!("CAST(\"{}\" AS TEXT)", info.primary_key[0])
-        } else {
-            let parts: Vec<String> = info
-                .primary_key
-                .iter()
-                .map(|k| format!("CAST(\"{}\" AS TEXT)", k))
-                .collect();
-            parts.join(" || '|' || ")
-        };
-
+        let pk_expr = Self::build_pk_text_expr(&info.primary_key);
         let column_order: Vec<String> = info.columns.iter().map(|c| c.name.clone()).collect();
-
         let sql = format!(
             "SELECT *, {} AS __pk FROM \"{}\" WHERE \"{}\" > ?",
             pk_expr, table, timestamp_column
@@ -265,30 +306,12 @@ impl FetchDataSource {
         let rows = self.extract_rows(&response, &columns)?;
         let maps = self.rows_to_maps(&columns, &rows);
 
-        let mut result = HashMap::new();
-        for row in &maps {
-            let pk = row
-                .get("__pk")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let updated_at = row
-                .get(timestamp_column)
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            let hash = Self::content_hash(row, &column_order, exclude_columns, timestamp_column);
-
-            result.insert(
-                pk.clone(),
-                RowMeta {
-                    pk_value: pk,
-                    updated_at,
-                    content_hash: hash,
-                },
-            );
-        }
-
-        Ok(result)
+        Ok(Self::row_maps_to_metadata(
+            &maps,
+            &column_order,
+            timestamp_column,
+            exclude_columns,
+        ))
     }
 
     async fn cached_table_info(&self, table: &str) -> Result<TableInfo> {
@@ -425,49 +448,20 @@ impl DataSource for FetchDataSource {
             )));
         }
 
-        let pk_expr = if info.primary_key.len() == 1 {
-            format!("CAST(\"{}\" AS TEXT)", info.primary_key[0])
-        } else {
-            let parts: Vec<String> = info
-                .primary_key
-                .iter()
-                .map(|k| format!("CAST(\"{}\" AS TEXT)", k))
-                .collect();
-            parts.join(" || '|' || ")
-        };
-
+        let pk_expr = Self::build_pk_text_expr(&info.primary_key);
         let column_order: Vec<String> = info.columns.iter().map(|c| c.name.clone()).collect();
-
         let sql = format!("SELECT *, {} AS __pk FROM \"{}\"", pk_expr, table);
         let response = self.execute(&sql, &[]).await?;
         let columns = self.extract_columns(&response)?;
         let rows = self.extract_rows(&response, &columns)?;
         let maps = self.rows_to_maps(&columns, &rows);
 
-        let mut result = HashMap::new();
-        for row in &maps {
-            let pk = row
-                .get("__pk")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let updated_at = row
-                .get(timestamp_column)
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            let hash = Self::content_hash(row, &column_order, exclude_columns, timestamp_column);
-
-            result.insert(
-                pk.clone(),
-                RowMeta {
-                    pk_value: pk,
-                    updated_at,
-                    content_hash: hash,
-                },
-            );
-        }
-
-        Ok(result)
+        Ok(Self::row_maps_to_metadata(
+            &maps,
+            &column_order,
+            timestamp_column,
+            exclude_columns,
+        ))
     }
 
     async fn get_rows(
@@ -480,16 +474,7 @@ impl DataSource for FetchDataSource {
         }
 
         let info = self.cached_table_info(table).await?;
-        let pk_expr = if info.primary_key.len() == 1 {
-            format!("CAST(\"{}\" AS TEXT)", info.primary_key[0])
-        } else {
-            let parts: Vec<String> = info
-                .primary_key
-                .iter()
-                .map(|k| format!("CAST(\"{}\" AS TEXT)", k))
-                .collect();
-            parts.join(" || '|' || ")
-        };
+        let pk_expr = Self::build_pk_text_expr(&info.primary_key);
 
         let placeholders: Vec<String> = pk_values.iter().map(|_| "?".to_string()).collect();
         let params: Vec<Value> = pk_values.iter().map(|v| Value::String(v.clone())).collect();
