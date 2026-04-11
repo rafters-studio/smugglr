@@ -77,11 +77,7 @@ fn make_progress(fmt: OutputFormat) -> Box<dyn SyncProgress> {
 
 #[derive(Parser)]
 #[command(name = "smugglr")]
-#[command(
-    author,
-    version,
-    about = "Smuggle data between SQLite-shaped things"
-)]
+#[command(author, version, about = "Smuggle data between SQLite-shaped things")]
 struct Cli {
     /// Path to config file
     #[arg(short, long, default_value = "config.toml")]
