@@ -7,6 +7,14 @@
 //! requires Send futures for tokio) and drives the diff engine directly against
 //! FetchDataSource. The diff algorithm, conflict resolution, and batch planning
 //! are all from smugglr-core.
+//!
+//! Compilation gate: this crate requires `target_arch = "wasm32"`. FetchDataSource
+//! uses `!Send` types (JsFuture, Rc, RefCell) which are incompatible with the
+//! `Send` futures that smugglr-core's DataSource trait requires on multi-threaded
+//! targets. Under `wasm32-unknown-unknown` the single-threaded target relaxes
+//! `Send` bounds and the crate builds cleanly. See issue #93 for details.
+
+#![cfg(target_arch = "wasm32")]
 
 mod fetch_adapter;
 
