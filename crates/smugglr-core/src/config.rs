@@ -388,9 +388,11 @@ impl Config {
             }
         }
 
-        // Validate that we have a resolvable target
-        config.resolve_target()?;
-
+        // Target resolution is deferred to command dispatch: some commands
+        // (broadcast, stash, retrieve, snapshot, restore) never touch the
+        // target and must not fail at load time if the plugin binary is
+        // missing. See crates/smugglr/src/main.rs for where target resolution
+        // actually runs.
         Ok(config)
     }
 
@@ -523,25 +525,22 @@ fn resolve_d1_plugin_target(
 ///
 /// Under `cfg(test)` a placeholder path is returned so unit tests can assert on
 /// config synthesis without requiring the binary to be installed.
-#[cfg(test)]
 fn resolve_http_sql_plugin_path() -> Result<PathBuf> {
-    Ok(PathBuf::from("/fake/smugglr-http-sql"))
-}
-
-#[cfg(all(not(test), feature = "native"))]
-fn resolve_http_sql_plugin_path() -> Result<PathBuf> {
-    crate::plugin::resolve_plugin_path("http-sql").map_err(|_| {
-        SyncError::Config(
-            "D1 target requires the smugglr-http-sql plugin. Install it with: cargo install smugglr-http-sql".into(),
-        )
-    })
-}
-
-#[cfg(all(not(test), not(feature = "native")))]
-fn resolve_http_sql_plugin_path() -> Result<PathBuf> {
-    Err(SyncError::Config(
-        "D1 target requires the 'native' feature".into(),
-    ))
+    #[cfg(test)]
+    {
+        Ok(PathBuf::from("/fake/smugglr-http-sql"))
+    }
+    #[cfg(all(not(test), feature = "native"))]
+    {
+        crate::plugin::resolve_plugin_path("http-sql")
+            .map_err(|_| SyncError::Config("d1 target requires the smugglr-http-sql plugin".into()))
+    }
+    #[cfg(all(not(test), not(feature = "native")))]
+    {
+        Err(SyncError::Config(
+            "d1 target requires the 'native' feature".into(),
+        ))
+    }
 }
 
 /// Auto-detect the local D1 database from wrangler's state directory
@@ -629,6 +628,33 @@ mod tests {
         }
     }
 
+    /// Assert that `target` is a `ResolvedTarget::Plugin` pointing at the
+    /// http-sql plugin with a synthesized d1 profile config. Used by every
+    /// test that exercises the D1-to-plugin routing in `resolve_target`.
+    fn assert_d1_plugin(
+        target: &ResolvedTarget,
+        account_id: &str,
+        database_id: &str,
+        api_token: &str,
+        url: Option<&str>,
+    ) {
+        let ResolvedTarget::Plugin { name, config, .. } = target else {
+            panic!("expected plugin target, got {:?}", target);
+        };
+        assert_eq!(name, "smugglr-http-sql");
+        assert_eq!(config.get("profile").map(String::as_str), Some("d1"));
+        assert_eq!(
+            config.get("account_id").map(String::as_str),
+            Some(account_id)
+        );
+        assert_eq!(
+            config.get("database_id").map(String::as_str),
+            Some(database_id)
+        );
+        assert_eq!(config.get("api_token").map(String::as_str), Some(api_token));
+        assert_eq!(config.get("url").map(String::as_str), url);
+    }
+
     #[test]
     fn test_default_excludes() {
         let config = test_config_d1();
@@ -652,26 +678,7 @@ mod tests {
     fn test_resolve_target_legacy_d1() {
         let config = test_config_d1();
         let target = config.resolve_target().unwrap();
-        match target {
-            ResolvedTarget::Plugin { name, config, .. } => {
-                assert_eq!(name, "smugglr-http-sql");
-                assert_eq!(config.get("profile").map(String::as_str), Some("d1"));
-                assert_eq!(
-                    config.get("account_id").map(String::as_str),
-                    Some("test_acct")
-                );
-                assert_eq!(
-                    config.get("database_id").map(String::as_str),
-                    Some("test_db")
-                );
-                assert_eq!(
-                    config.get("api_token").map(String::as_str),
-                    Some("test_token")
-                );
-                assert!(config.get("url").is_none());
-            }
-            _ => panic!("expected plugin target for legacy d1 config"),
-        }
+        assert_d1_plugin(&target, "test_acct", "test_db", "test_token", None);
     }
 
     #[test]
@@ -702,17 +709,7 @@ mod tests {
             broadcast: None,
         };
         let target = config.resolve_target().unwrap();
-        match target {
-            ResolvedTarget::Plugin { name, config, .. } => {
-                assert_eq!(name, "smugglr-http-sql");
-                assert_eq!(config.get("profile").map(String::as_str), Some("d1"));
-                assert_eq!(config.get("account_id").map(String::as_str), Some("acct"));
-                assert_eq!(config.get("database_id").map(String::as_str), Some("db"));
-                assert_eq!(config.get("api_token").map(String::as_str), Some("tok"));
-                assert!(config.get("url").is_none());
-            }
-            _ => panic!("expected plugin target for explicit d1 config"),
-        }
+        assert_d1_plugin(&target, "acct", "db", "tok", None);
     }
 
     #[test]
@@ -870,19 +867,7 @@ api_token = "tok789"
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         let target = config.resolve_target().unwrap();
-        match target {
-            ResolvedTarget::Plugin { name, config, .. } => {
-                assert_eq!(name, "smugglr-http-sql");
-                assert_eq!(config.get("profile").map(String::as_str), Some("d1"));
-                assert_eq!(
-                    config.get("account_id").map(String::as_str),
-                    Some("acct123")
-                );
-                assert_eq!(config.get("database_id").map(String::as_str), Some("db456"));
-                assert_eq!(config.get("api_token").map(String::as_str), Some("tok789"));
-            }
-            _ => panic!("expected plugin target for d1 toml config"),
-        }
+        assert_d1_plugin(&target, "acct123", "db456", "tok789", None);
     }
 
     #[test]
@@ -896,16 +881,7 @@ local_db = "game.db"
         let config: Config = toml::from_str(toml_str).unwrap();
         assert!(config.target.is_none());
         let target = config.resolve_target().unwrap();
-        match target {
-            ResolvedTarget::Plugin { name, config, .. } => {
-                assert_eq!(name, "smugglr-http-sql");
-                assert_eq!(config.get("profile").map(String::as_str), Some("d1"));
-                assert_eq!(config.get("account_id").map(String::as_str), Some("acct"));
-                assert_eq!(config.get("api_token").map(String::as_str), Some("tok"));
-                assert_eq!(config.get("database_id").map(String::as_str), Some("db"));
-            }
-            _ => panic!("expected plugin target for legacy d1 toml config"),
-        }
+        assert_d1_plugin(&target, "acct", "db", "tok", None);
     }
 
     // -- Column exclusion tests --
