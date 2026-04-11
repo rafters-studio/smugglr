@@ -50,9 +50,10 @@ impl<T> MaybeSend for T {}
 
 /// Abstraction over a database that can be used as a sync source or destination.
 ///
-/// Both local SQLite databases and remote Cloudflare D1 instances implement
-/// this trait, allowing the diff and sync engines to work generically with
-/// any pair of data sources.
+/// `LocalDb` and `PluginDataSource` implement this trait, letting the diff
+/// and sync engines work generically with any pair of data sources. Remote
+/// backends (D1, Turso, rqlite, Datasette, SQLiteCloud, StarbaseDB) are
+/// reached through the http-sql plugin via `PluginDataSource`.
 pub trait DataSource: Sync {
     /// List all user tables (excluding internal/system tables).
     fn list_tables(&self) -> impl std::future::Future<Output = Result<Vec<String>>> + MaybeSend;
