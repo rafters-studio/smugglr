@@ -23,9 +23,6 @@ export type {
 };
 export { SmugglrError };
 
-// Re-export setWasm for advanced use (custom bundlers, SSR, etc.)
-export { setWasm };
-
 // WASM module state -- loaded lazily or set explicitly via setWasm().
 let wasmModule: WasmModule | null = null;
 let wasmReady: Promise<WasmModule> | null = null;
@@ -72,7 +69,7 @@ interface WasmSmugglr {
  * setWasm(mod);
  * ```
  */
-function setWasm(mod: WasmModule): void {
+export function setWasm(mod: WasmModule): void {
   wasmModule = mod;
   wasmReady = Promise.resolve(mod);
 }
@@ -81,8 +78,6 @@ async function loadWasm(options?: InitOptions): Promise<WasmModule> {
   if (wasmReady) return wasmReady;
 
   wasmReady = (async () => {
-    if (wasmModule) return wasmModule;
-
     // If the consumer passed a module directly, use it.
     if (options?.wasmModule) {
       const mod = options.wasmModule as WasmModule;
@@ -94,8 +89,7 @@ async function loadWasm(options?: InitOptions): Promise<WasmModule> {
     // Default: dynamic import of the co-located wasm-bindgen output.
     // This path is rewritten by the build script to point at the bundled copy.
     const mod = await import("./wasm/smugglr_wasm.js") as WasmModule;
-    const initArg = options?.wasmUrl ?? undefined;
-    await mod.default(initArg);
+    await mod.default(options?.wasmUrl);
     wasmModule = mod;
     return mod;
   })();

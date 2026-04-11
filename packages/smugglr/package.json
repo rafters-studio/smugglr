@@ -7,12 +7,12 @@
   "types": "dist/index.d.ts",
   "exports": {
     ".": {
-      "import": "./dist/index.js",
-      "types": "./dist/index.d.ts"
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
     },
     "./wasm": {
-      "import": "./dist/wasm/smugglr_wasm.js",
-      "types": "./dist/wasm/smugglr_wasm.d.ts"
+      "types": "./dist/wasm/smugglr_wasm.d.ts",
+      "import": "./dist/wasm/smugglr_wasm.js"
     }
   },
   "files": [
