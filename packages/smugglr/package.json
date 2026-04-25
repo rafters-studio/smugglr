@@ -1,6 +1,6 @@
 {
   "name": "smugglr",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Content-hashed delta sync for SQLite, in the browser",
   "type": "module",
   "main": "dist/index.js",
