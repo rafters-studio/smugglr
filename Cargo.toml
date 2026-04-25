@@ -15,11 +15,13 @@ default-members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 rust-version = "1.75"
 license = "MIT"
 repository = "https://github.com/rafters-studio/smugglr"
+homepage = "https://smugglr.dev"
+documentation = "https://smugglr.dev/docs"
 authors = ["Sean Silvius"]
 
 [profile.release]

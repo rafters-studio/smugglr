@@ -1727,7 +1727,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "smugglr"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "clap",
  "indicatif",
@@ -1741,7 +1741,7 @@ dependencies = [
 
 [[package]]
 name = "smugglr-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "chacha20poly1305",
@@ -1765,7 +1765,7 @@ dependencies = [
 
 [[package]]
 name = "smugglr-http-sql"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "hex",
  "reqwest",
@@ -1779,7 +1779,7 @@ dependencies = [
 
 [[package]]
 name = "smugglr-plugin-sdk"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1788,7 +1788,7 @@ dependencies = [
 
 [[package]]
 name = "smugglr-wasm"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "hex",
  "js-sys",
