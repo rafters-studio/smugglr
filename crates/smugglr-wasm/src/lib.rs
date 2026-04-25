@@ -17,11 +17,14 @@
 #![cfg(target_arch = "wasm32")]
 
 mod fetch_adapter;
+mod local_adapter;
 
 use fetch_adapter::FetchDataSource;
+use local_adapter::LocalSqlDataSource;
 use smugglr_core::config::{column_excluded, ConflictResolution, SyncConfig};
-use smugglr_core::datasource::{DataSource, RowMeta};
+use smugglr_core::datasource::{DataSource, RowMeta, TableInfo};
 use smugglr_core::diff::{classify_diff, TableDiff};
+use smugglr_core::error::Result as SmugglrResult;
 use smugglr_core::profile::Profile;
 
 use serde::{Deserialize, Serialize};
@@ -83,8 +86,104 @@ impl CachedMeta {
     }
 }
 
+/// Either a remote HTTP SQL endpoint or a local SQLite executor.
+///
+/// Both implement `DataSource`; lib.rs holds an `AnyDataSource` for source
+/// and dest and dispatches at the trait surface so the diff/sync paths
+/// don't care which side is local vs remote.
+pub(crate) enum AnyDataSource {
+    Fetch(FetchDataSource),
+    Local(LocalSqlDataSource),
+}
+
+impl AnyDataSource {
+    /// Incremental row metadata query, delegated to the underlying adapter.
+    /// Mirrors the inherent method on each adapter.
+    pub async fn get_row_metadata_since(
+        &self,
+        table: &str,
+        timestamp_column: &str,
+        exclude_columns: &[String],
+        since_timestamp: &str,
+    ) -> SmugglrResult<HashMap<String, RowMeta>> {
+        match self {
+            Self::Fetch(d) => {
+                d.get_row_metadata_since(table, timestamp_column, exclude_columns, since_timestamp)
+                    .await
+            }
+            Self::Local(d) => {
+                d.get_row_metadata_since(table, timestamp_column, exclude_columns, since_timestamp)
+                    .await
+            }
+        }
+    }
+}
+
+impl DataSource for AnyDataSource {
+    async fn list_tables(&self) -> SmugglrResult<Vec<String>> {
+        match self {
+            Self::Fetch(d) => d.list_tables().await,
+            Self::Local(d) => d.list_tables().await,
+        }
+    }
+
+    async fn table_info(&self, table: &str) -> SmugglrResult<TableInfo> {
+        match self {
+            Self::Fetch(d) => d.table_info(table).await,
+            Self::Local(d) => d.table_info(table).await,
+        }
+    }
+
+    async fn get_row_metadata(
+        &self,
+        table: &str,
+        timestamp_column: &str,
+        exclude_columns: &[String],
+    ) -> SmugglrResult<HashMap<String, RowMeta>> {
+        match self {
+            Self::Fetch(d) => {
+                d.get_row_metadata(table, timestamp_column, exclude_columns)
+                    .await
+            }
+            Self::Local(d) => {
+                d.get_row_metadata(table, timestamp_column, exclude_columns)
+                    .await
+            }
+        }
+    }
+
+    async fn get_rows(
+        &self,
+        table: &str,
+        pk_values: &[String],
+    ) -> SmugglrResult<Vec<HashMap<String, serde_json::Value>>> {
+        match self {
+            Self::Fetch(d) => d.get_rows(table, pk_values).await,
+            Self::Local(d) => d.get_rows(table, pk_values).await,
+        }
+    }
+
+    async fn upsert_rows(
+        &self,
+        table: &str,
+        rows: &[HashMap<String, serde_json::Value>],
+    ) -> SmugglrResult<usize> {
+        match self {
+            Self::Fetch(d) => d.upsert_rows(table, rows).await,
+            Self::Local(d) => d.upsert_rows(table, rows).await,
+        }
+    }
+
+    async fn row_count(&self, table: &str) -> SmugglrResult<usize> {
+        match self {
+            Self::Fetch(d) => d.row_count(table).await,
+            Self::Local(d) => d.row_count(table).await,
+        }
+    }
+}
+
 #[derive(Deserialize)]
-struct JsEndpointConfig {
+struct JsHttpEndpoint {
     url: String,
     #[serde(default, alias = "authToken")]
     auth_token: String,
@@ -94,14 +193,6 @@ struct JsEndpointConfig {
 
 fn default_profile() -> String {
     "generic".to_string()
-}
-
-#[derive(Deserialize)]
-struct JsSmugglrConfig {
-    source: JsEndpointConfig,
-    dest: JsEndpointConfig,
-    #[serde(default)]
-    sync: JsSyncConfig,
 }
 
 #[derive(Deserialize, Default)]
@@ -183,21 +274,43 @@ fn build_sync_config(js: &JsSyncConfig) -> SyncConfig {
     sync
 }
 
-fn build_datasource(endpoint: &JsEndpointConfig) -> Result<FetchDataSource, JsValue> {
-    let profile = Profile::from_name(&endpoint.profile)
-        .ok_or_else(|| JsValue::from_str(&format!("unknown profile: {}", endpoint.profile)))?;
-    Ok(FetchDataSource::new(
-        endpoint.url.clone(),
-        endpoint.auth_token.clone(),
-        profile,
-    ))
+/// Dispatch endpoint config -> adapter.
+///
+/// Local endpoint shape: `{ type: "local", executor: SqlExecutor }` where
+/// the executor is any JS object with a `run(sql, params): Promise<{columns, rows}>` method.
+/// Anything else is treated as a remote HTTP endpoint and parsed as `JsHttpEndpoint`.
+fn build_datasource(endpoint_js: &JsValue) -> Result<AnyDataSource, JsValue> {
+    let kind = js_sys::Reflect::get(endpoint_js, &JsValue::from_str("type"))
+        .ok()
+        .and_then(|v| v.as_string());
+
+    if kind.as_deref() == Some("local") {
+        let executor = js_sys::Reflect::get(endpoint_js, &JsValue::from_str("executor"))
+            .map_err(|e| JsValue::from_str(&format!("local endpoint missing executor: {:?}", e)))?;
+        if executor.is_undefined() || executor.is_null() {
+            return Err(JsValue::from_str(
+                "local endpoint missing executor: must be an object with a run(sql, params) method",
+            ));
+        }
+        Ok(AnyDataSource::Local(LocalSqlDataSource::new(executor)))
+    } else {
+        let http: JsHttpEndpoint = serde_wasm_bindgen::from_value(endpoint_js.clone())
+            .map_err(|e| JsValue::from_str(&format!("invalid endpoint config: {}", e)))?;
+        let profile = Profile::from_name(&http.profile)
+            .ok_or_else(|| JsValue::from_str(&format!("unknown profile: {}", http.profile)))?;
+        Ok(AnyDataSource::Fetch(FetchDataSource::new(
+            http.url,
+            http.auth_token,
+            profile,
+        )))
+    }
 }
 
 /// Get tables to sync by finding the intersection of both sides,
 /// filtering by config, and requiring a primary key.
 async fn get_sync_tables(
-    source: &FetchDataSource,
-    dest: &FetchDataSource,
+    source: &AnyDataSource,
+    dest: &AnyDataSource,
     sync_config: &SyncConfig,
 ) -> Result<Vec<String>, JsValue> {
     let source_tables: HashSet<String> = source
@@ -252,8 +365,8 @@ fn strip_excluded(
 
 /// Transfer rows from source to dest in batches.
 async fn transfer_rows(
-    source: &FetchDataSource,
-    dest: &FetchDataSource,
+    source: &AnyDataSource,
+    dest: &AnyDataSource,
     table: &str,
     pk_values: &[String],
     batch_size: usize,
@@ -294,7 +407,7 @@ async fn transfer_rows(
 /// for `table`. The caller borrows the cache to access the metadata,
 /// avoiding a full clone of the hash map on the sync hot path.
 async fn ensure_cached_metadata(
-    ds: &FetchDataSource,
+    ds: &AnyDataSource,
     cache: &RefCell<HashMap<String, CachedMeta>>,
     table: &str,
     timestamp_column: &str,
@@ -345,8 +458,8 @@ async fn ensure_cached_metadata(
 /// fetch only changed rows, and the diff classification is delegated to the
 /// shared `classify_diff` helper in core.
 async fn diff_table_cached(
-    source: &FetchDataSource,
-    dest: &FetchDataSource,
+    source: &AnyDataSource,
+    dest: &AnyDataSource,
     source_cache: &RefCell<HashMap<String, CachedMeta>>,
     dest_cache: &RefCell<HashMap<String, CachedMeta>>,
     table: &str,
@@ -378,8 +491,8 @@ async fn diff_table_cached(
 #[wasm_bindgen]
 pub struct Smugglr {
     sync_config: SyncConfig,
-    source: FetchDataSource,
-    dest: FetchDataSource,
+    source: AnyDataSource,
+    dest: AnyDataSource,
     /// Per-table metadata cache for the source endpoint.
     source_cache: RefCell<HashMap<String, CachedMeta>>,
     /// Per-table metadata cache for the dest endpoint.
@@ -395,12 +508,23 @@ impl Smugglr {
     /// caches because the old instance is discarded.
     #[wasm_bindgen]
     pub fn init(config_js: JsValue) -> Result<Smugglr, JsValue> {
-        let js_config: JsSmugglrConfig = serde_wasm_bindgen::from_value(config_js)
-            .map_err(|e| JsValue::from_str(&format!("invalid config: {}", e)))?;
+        let source_js = js_sys::Reflect::get(&config_js, &JsValue::from_str("source"))
+            .map_err(|e| JsValue::from_str(&format!("config.source missing: {:?}", e)))?;
+        let dest_js = js_sys::Reflect::get(&config_js, &JsValue::from_str("dest"))
+            .map_err(|e| JsValue::from_str(&format!("config.dest missing: {:?}", e)))?;
+        let sync_js = js_sys::Reflect::get(&config_js, &JsValue::from_str("sync"))
+            .unwrap_or(JsValue::UNDEFINED);
 
-        let sync_config = build_sync_config(&js_config.sync);
-        let source = build_datasource(&js_config.source)?;
-        let dest = build_datasource(&js_config.dest)?;
+        let js_sync: JsSyncConfig = if sync_js.is_undefined() || sync_js.is_null() {
+            JsSyncConfig::default()
+        } else {
+            serde_wasm_bindgen::from_value(sync_js)
+                .map_err(|e| JsValue::from_str(&format!("invalid sync config: {}", e)))?
+        };
+
+        let sync_config = build_sync_config(&js_sync);
+        let source = build_datasource(&source_js)?;
+        let dest = build_datasource(&dest_js)?;
 
         Ok(Smugglr {
             sync_config,
