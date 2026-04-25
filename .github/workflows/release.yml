@@ -155,6 +155,7 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
+          cache-dependency-path: packages/smugglr/pnpm-lock.yaml
           registry-url: https://registry.npmjs.org
 
       - name: Install deps
