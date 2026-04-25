@@ -16,7 +16,9 @@ use web_sys::{Request, RequestInit, RequestMode, Response};
 
 pub struct FetchDataSource {
     url: String,
-    auth_token: String,
+    // Interior-mutable so `Smugglr.updateAuth(...)` can swap the token at
+    // runtime without touching the table_info_cache or the source endpoint.
+    auth_token: std::sync::Mutex<String>,
     profile: Profile,
     table_info_cache: std::sync::Mutex<HashMap<String, TableInfo>>,
 }
@@ -25,10 +27,16 @@ impl FetchDataSource {
     pub fn new(url: String, auth_token: String, profile: Profile) -> Self {
         Self {
             url,
-            auth_token,
+            auth_token: std::sync::Mutex::new(auth_token),
             profile,
             table_info_cache: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Replace the auth token. Subsequent requests use the new value.
+    /// Safe to call mid-flight; no in-flight request is mutated.
+    pub fn set_auth_token(&self, token: String) {
+        *self.auth_token.lock().unwrap() = token;
     }
 
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<Value> {
@@ -49,18 +57,19 @@ impl FetchDataSource {
             .set("Content-Type", "application/json")
             .map_err(|e| SyncError::Remote(format!("failed to set header: {:?}", e)))?;
 
-        if !self.auth_token.is_empty() {
+        let token = self.auth_token.lock().unwrap().clone();
+        if !token.is_empty() {
             match self.profile.auth_format {
                 AuthFormat::Bearer => {
                     headers
-                        .set("Authorization", &format!("Bearer {}", self.auth_token))
+                        .set("Authorization", &format!("Bearer {}", token))
                         .map_err(|e| {
                             SyncError::Remote(format!("failed to set auth header: {:?}", e))
                         })?;
                 }
                 AuthFormat::Basic => {
                     headers
-                        .set("Authorization", &format!("Basic {}", self.auth_token))
+                        .set("Authorization", &format!("Basic {}", token))
                         .map_err(|e| {
                             SyncError::Remote(format!("failed to set auth header: {:?}", e))
                         })?;

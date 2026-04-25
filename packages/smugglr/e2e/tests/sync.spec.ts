@@ -15,7 +15,7 @@ interface RemoteRow {
 interface MockState {
   tableExists: boolean;
   rows: Map<string, RemoteRow>;
-  requests: Array<{ sql: string; params: unknown[] }>;
+  requests: Array<{ sql: string; params: unknown[]; auth: string | null }>;
 }
 
 function freshState(): MockState {
@@ -42,7 +42,8 @@ function installMockTarget(page: Page, state: MockState, host = "https://mock.sm
     };
     const sql = body.sql.trim();
     const params = body.params ?? [];
-    state.requests.push({ sql, params });
+    const auth = route.request().headerValue("authorization");
+    state.requests.push({ sql, params, auth: await auth });
 
     const lower = sql.toLowerCase();
 
@@ -268,5 +269,44 @@ test.describe("smugglr OPFS e2e", () => {
       window.e2e.runSql("PRAGMA table_info('users')"),
     )) as { rows: unknown[][] };
     expect(schema.rows.length).toBe(3);
+  });
+
+  test("updateAuth: token swap is reflected in subsequent request headers", async ({ page }) => {
+    const state = freshState();
+    await installMockTarget(page, state);
+
+    await page.evaluate(() =>
+      window.e2e.runSql(
+        "CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, name TEXT, updated_at INTEGER)",
+      ),
+    );
+    await page.evaluate(() =>
+      window.e2e.runSql(
+        "INSERT INTO users (id, name, updated_at) VALUES (?, ?, ?)",
+        ["u1", "ada", 100],
+      ),
+    );
+
+    await page.evaluate(() =>
+      window.e2e.syncWithAuthSwap({
+        destUrl: "https://mock.smugglr.test",
+        initialToken: "anonymous-token",
+        newToken: "account-token",
+        tables: ["users"],
+      }),
+    );
+
+    // Group requests by which token they carried.
+    const withInitial = state.requests.filter((r) => r.auth === "Bearer anonymous-token");
+    const withNew = state.requests.filter((r) => r.auth === "Bearer account-token");
+
+    expect(withInitial.length).toBeGreaterThan(0);
+    expect(withNew.length).toBeGreaterThan(0);
+
+    // Verify temporal ordering: every request with the new token came after
+    // every request with the initial one.
+    const lastInitialIdx = state.requests.findLastIndex((r) => r.auth === "Bearer anonymous-token");
+    const firstNewIdx = state.requests.findIndex((r) => r.auth === "Bearer account-token");
+    expect(firstNewIdx).toBeGreaterThan(lastInitialIdx);
   });
 });

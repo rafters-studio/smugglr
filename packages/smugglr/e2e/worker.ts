@@ -92,6 +92,27 @@ async function eraseLocal(opts: { destUrl: string; tables: string[] }) {
   return result;
 }
 
+async function syncWithAuthSwap(opts: {
+  destUrl: string;
+  initialToken: string;
+  newToken: string;
+  tables: string[];
+}) {
+  if (!sqlite3 || db === null) throw new Error("init() first");
+  const s = await Smugglr.init({
+    source: { type: "local", executor: createWaSqliteExecutor(sqlite3, db) },
+    dest: { url: opts.destUrl, authToken: opts.initialToken, profile: "generic" },
+    sync: { tables: opts.tables },
+  });
+
+  const r1 = await s.push();
+  s.updateAuth(opts.newToken);
+  const r2 = await s.push();
+
+  s.dispose();
+  return { firstPush: r1, secondPush: r2 };
+}
+
 async function reset() {
   if (sqlite3 && db !== null) {
     sqlite3.close(db);
@@ -105,7 +126,7 @@ async function reset() {
 
 interface RpcCall {
   id: number;
-  op: "init" | "runSql" | "sync" | "eraseLocal" | "reset";
+  op: "init" | "runSql" | "sync" | "eraseLocal" | "syncWithAuthSwap" | "reset";
   args: unknown[];
 }
 
@@ -118,6 +139,7 @@ self.addEventListener("message", async (ev: MessageEvent<RpcCall>) => {
       case "runSql": result = await runSql(args[0] as string, (args[1] as unknown[]) ?? []); break;
       case "sync": result = await sync(args[0] as Parameters<typeof sync>[0]); break;
       case "eraseLocal": result = await eraseLocal(args[0] as Parameters<typeof eraseLocal>[0]); break;
+      case "syncWithAuthSwap": result = await syncWithAuthSwap(args[0] as Parameters<typeof syncWithAuthSwap>[0]); break;
       case "reset": result = await reset(); break;
     }
     (self as unknown as Worker).postMessage({ id, ok: true, result });

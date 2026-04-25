@@ -7,6 +7,7 @@ declare global {
       runSql(sql: string, params?: unknown[]): Promise<unknown>;
       sync(opts: unknown): Promise<unknown>;
       eraseLocal(opts: unknown): Promise<unknown>;
+      syncWithAuthSwap(opts: unknown): Promise<unknown>;
       reset(): Promise<unknown>;
     };
   }
@@ -40,6 +41,7 @@ window.e2e = {
   runSql: (sql, params = []) => call("runSql", [sql, params]),
   sync: (opts) => call("sync", [opts]),
   eraseLocal: (opts) => call("eraseLocal", [opts]),
+  syncWithAuthSwap: (opts) => call("syncWithAuthSwap", [opts]),
   reset: () => call("reset", []),
 };
 
