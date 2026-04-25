@@ -1,0 +1,21 @@
+# cli-lan-broadcast example config.
+#
+# Copy to config.toml on each machine; the encryption_key MUST be identical
+# across peers. Generate one with: openssl rand -hex 32
+
+local_db = "./shared.sqlite"
+
+[sync]
+tables = []
+exclude_tables = ["sqlite_sequence"]
+timestamp_column = "updated_at"
+# UUIDv7 PKs encode creation time, so newer writes win without clock sync.
+conflict_resolution = "uuid_v7_wins"
+
+[broadcast]
+# Hex-encoded 256-bit key. Identical on every peer.
+encryption_key = "REPLACE_WITH_OUTPUT_OF_openssl_rand_-hex_32"
+# Default UDP port for peer announcements.
+port = 47291
+# Skip large columns (embeddings, blobs) from broadcast payloads.
+exclude_columns = ["*_embedding", "vector"]

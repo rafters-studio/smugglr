@@ -1,0 +1,14 @@
+[package]
+name = "smugglr-example-tokio-service"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+smugglr-core = { version = "0.3", path = "../../../crates/smugglr-core" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"

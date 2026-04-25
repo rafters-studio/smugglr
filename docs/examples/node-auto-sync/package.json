@@ -1,0 +1,12 @@
+{
+  "name": "smugglr-example-node-auto-sync",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node --env-file=.env auto-sync.mjs"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.0.0",
+    "smugglr": "^0.3.3"
+  }
+}
