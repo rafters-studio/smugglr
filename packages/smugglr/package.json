@@ -28,7 +28,9 @@
     "build:wasm:dev": "cd ../../crates/smugglr-wasm && wasm-pack build --target web --dev",
     "build:copy-wasm": "mkdir -p dist/wasm && cp ../../crates/smugglr-wasm/pkg/smugglr_wasm.js dist/wasm/ && cp ../../crates/smugglr-wasm/pkg/smugglr_wasm.d.ts dist/wasm/ && cp ../../crates/smugglr-wasm/pkg/smugglr_wasm_bg.wasm dist/wasm/ && cp ../../crates/smugglr-wasm/pkg/smugglr_wasm_bg.wasm.d.ts dist/wasm/",
     "build:ts": "tsc",
-    "build": "pnpm build:wasm && pnpm build:ts && pnpm build:copy-wasm"
+    "build": "pnpm build:wasm && pnpm build:ts && pnpm build:copy-wasm",
+    "test:e2e": "playwright test",
+    "test:e2e:install": "playwright install --with-deps chromium"
   },
   "keywords": [
     "sqlite",
@@ -47,6 +49,10 @@
   },
   "author": "Sean Silvius",
   "devDependencies": {
-    "typescript": "^6.0.2"
+    "@playwright/test": "^1.59.1",
+    "@types/node": "^24.0.0",
+    "typescript": "^6.0.2",
+    "vite": "^8.0.10",
+    "wa-sqlite": "^1.0.0"
   }
 }

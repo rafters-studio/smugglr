@@ -43,16 +43,18 @@ await s.sync();
 
 Sync a real SQLite database in the browser (via [wa-sqlite](https://github.com/rhashimoto/wa-sqlite) on OPFS) to any HTTP SQL backend:
 
+> OPFS sync access handles are worker-only in WebKit and Firefox. Run wa-sqlite + smugglr inside a Web Worker for cross-browser compatibility (Chromium allows main-thread use, but worker context is the spec-portable choice).
+
 ```ts
 import SQLiteAsyncESMFactory from "wa-sqlite/dist/wa-sqlite-async.mjs";
 import * as SQLite from "wa-sqlite";
-import { OPFSCoopSyncVFS } from "wa-sqlite/src/examples/OPFSCoopSyncVFS.js";
+import { OriginPrivateFileSystemVFS } from "wa-sqlite/src/examples/OriginPrivateFileSystemVFS.js";
 import { Smugglr, createWaSqliteExecutor } from "smugglr";
 
-// One-time wa-sqlite + OPFS setup
+// One-time wa-sqlite + OPFS setup (run inside a Web Worker)
 const module = await SQLiteAsyncESMFactory();
 const sqlite3 = SQLite.Factory(module);
-const vfs = await OPFSCoopSyncVFS.create("opfs", module);
+const vfs = new OriginPrivateFileSystemVFS();
 sqlite3.vfs_register(vfs, true);
 const db = await sqlite3.open_v2(
   "app.db",
@@ -84,6 +86,28 @@ await wasm.default("https://cdn.example.com/smugglr_wasm_bg.wasm");
 setWasm(wasm);
 
 const s = await Smugglr.init(config);
+```
+
+## Bundle size
+
+| Module                                         | Compressed (gzip) |
+| ---------------------------------------------- | ----------------- |
+| `smugglr` (TS wrapper)                         | ~2 KB             |
+| `smugglr/wasm` glue (`smugglr_wasm.js`)        | ~8 KB             |
+| `smugglr_wasm_bg.wasm` (sync engine)           | ~110 KB           |
+| `wa-sqlite-async.wasm` (peer, OPFS path only)  | ~410 KB           |
+| `wa-sqlite-async.mjs` glue (peer)              | ~15 KB            |
+
+`wa-sqlite` is only required for the local OPFS path. HTTP-only sync (e.g. Turso → D1) ships without it. Smugglr declares `wa-sqlite` as a peer dependency rather than bundling it, so consumers control the version and the bundler can tree-shake it out when only HTTP endpoints are configured.
+
+## End-to-end tests
+
+A Playwright suite under `e2e/` exercises the full local-OPFS path against a mocked HTTP target. Run with:
+
+```sh
+pnpm install
+pnpm test:e2e:install   # one-time: download chromium
+pnpm test:e2e
 ```
 
 ## License

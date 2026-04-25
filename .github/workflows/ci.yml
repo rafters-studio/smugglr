@@ -58,3 +58,42 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test
+
+  e2e-smugglr-npm:
+    name: E2E (smugglr npm + OPFS)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: packages/smugglr/pnpm-lock.yaml
+      - name: Install deps
+        working-directory: packages/smugglr
+        run: pnpm install --frozen-lockfile
+      - name: Build smugglr
+        working-directory: packages/smugglr
+        run: pnpm build
+      - name: Install Playwright browsers
+        working-directory: packages/smugglr
+        run: pnpm test:e2e:install
+      - name: Run e2e
+        working-directory: packages/smugglr
+        run: pnpm test:e2e
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: packages/smugglr/playwright-report
+          retention-days: 7
