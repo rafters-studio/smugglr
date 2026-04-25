@@ -100,6 +100,26 @@ export interface DiffResult {
   tables: TableDiff[];
 }
 
+/** Event payload for the `table-changed` event. */
+export interface TableChangedEvent {
+  /** Name of the table whose local rows were modified. */
+  table: string;
+  /** Primary keys of rows that were inserted or updated. */
+  changedPks: string[];
+  /** Primary keys of rows that were removed. Reserved -- always empty until delete propagation lands. */
+  removedPks: string[];
+  /** Which operation produced the change. */
+  source: "pull" | "sync";
+}
+
+/** Subscribable events emitted by a Smugglr instance. */
+export type SmugglrEventMap = {
+  "table-changed": TableChangedEvent;
+};
+
+/** Function returned by `Smugglr.on(...)`; call it to remove the listener. */
+export type Unsubscribe = () => void;
+
 /** Options for WASM initialization */
 export interface InitOptions {
   /** URL to the .wasm binary (overrides the default co-located path) */

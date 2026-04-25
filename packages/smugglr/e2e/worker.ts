@@ -39,6 +39,10 @@ async function sync(opts: {
   tables: string[];
   conflict?: "local_wins" | "remote_wins" | "newer_wins" | "uuid_v7_wins";
   direction?: "push" | "pull" | "sync";
+  /** When set, subscribes to "table-changed" before sync and returns captured events. */
+  captureEvents?: boolean;
+  /** When set, also test that the unsubscribe function silences subsequent events. */
+  testUnsubscribe?: boolean;
 }) {
   if (!sqlite3 || db === null) throw new Error("init() first");
   const s = await Smugglr.init({
@@ -49,12 +53,31 @@ async function sync(opts: {
       conflictResolution: opts.conflict ?? "newer_wins",
     },
   });
+
+  const events: unknown[] = [];
+  let unsub: (() => void) | null = null;
+  if (opts.captureEvents) {
+    unsub = s.on("table-changed", (e) => events.push(e));
+  }
+
   const dir = opts.direction ?? "sync";
   const result = dir === "push" ? await s.push()
     : dir === "pull" ? await s.pull()
     : await s.sync();
+
+  let postUnsubEvents: unknown[] = [];
+  if (opts.testUnsubscribe && unsub) {
+    unsub();
+    const after: unknown[] = [];
+    s.on("table-changed", (e) => after.push(e));
+    // Trigger a no-op pull -- since the rows already match, no event should fire.
+    await s.pull();
+    postUnsubEvents = after;
+  }
+
   s.dispose();
-  return result;
+  if (!opts.captureEvents) return result;
+  return { result, events, postUnsubEvents };
 }
 
 async function reset() {

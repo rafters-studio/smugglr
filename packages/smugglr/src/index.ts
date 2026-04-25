@@ -13,6 +13,9 @@ import type {
   LocalEndpointConfig,
   SqlExecutor,
   InitOptions,
+  TableChangedEvent,
+  SmugglrEventMap,
+  Unsubscribe,
 } from "./types.js";
 import { SmugglrError } from "./types.js";
 
@@ -26,6 +29,9 @@ export type {
   LocalEndpointConfig,
   SqlExecutor,
   InitOptions,
+  TableChangedEvent,
+  SmugglrEventMap,
+  Unsubscribe,
 };
 export { SmugglrError };
 export { createWaSqliteExecutor } from "./opfs.js";
@@ -50,6 +56,7 @@ interface WasmSmugglr {
   pull(dry_run?: boolean | null): Promise<unknown>;
   sync(dry_run?: boolean | null): Promise<unknown>;
   diff(): Promise<unknown>;
+  on(event: string, callback: (e: unknown) => void): () => void;
   [Symbol.dispose]?: () => void;
 }
 
@@ -189,6 +196,30 @@ export class Smugglr {
     } catch (e) {
       throw parseError(e);
     }
+  }
+
+  /**
+   * Subscribe to events emitted by this Smugglr instance.
+   *
+   * The `table-changed` event fires once per affected table after a `pull`
+   * or `sync` completes the local write. The handler receives a
+   * {@link TableChangedEvent}. Returns an unsubscribe function.
+   *
+   * @example
+   * ```ts
+   * const unsub = s.on("table-changed", (e) => {
+   *   console.log(`${e.table} changed`, e.changedPks, "via", e.source);
+   * });
+   * await s.sync();
+   * unsub();
+   * ```
+   */
+  on<K extends keyof SmugglrEventMap>(
+    event: K,
+    handler: (e: SmugglrEventMap[K]) => void,
+  ): Unsubscribe {
+    const wrapped = (raw: unknown) => handler(raw as SmugglrEventMap[K]);
+    return this.inner.on(event, wrapped);
   }
 
   /** Release WASM resources. Called automatically if using `using` syntax. */

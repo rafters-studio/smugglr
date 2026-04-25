@@ -189,4 +189,42 @@ test.describe("smugglr OPFS e2e", () => {
 
     expect(local.rows).toEqual([["r1", "remote-only", 500]]);
   });
+
+  test("on('table-changed'): fires once per pulled table with the right pks", async ({ page }) => {
+    const state = freshState();
+    state.rows.set("r1", { id: "r1", name: "alpha", updated_at: 100 });
+    state.rows.set("r2", { id: "r2", name: "beta", updated_at: 200 });
+    await installMockTarget(page, state);
+
+    await page.evaluate(() =>
+      window.e2e.runSql(
+        "CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, name TEXT, updated_at INTEGER)",
+      ),
+    );
+
+    const out = (await page.evaluate(() =>
+      window.e2e.sync({
+        destUrl: "https://mock.smugglr.test",
+        tables: ["users"],
+        direction: "pull",
+        captureEvents: true,
+        testUnsubscribe: true,
+      }),
+    )) as {
+      result: { command: string; status: string };
+      events: Array<{ table: string; changedPks: string[]; removedPks: string[]; source: string }>;
+      postUnsubEvents: unknown[];
+    };
+
+    expect(out.result).toMatchObject({ command: "pull", status: "ok" });
+    expect(out.events).toHaveLength(1);
+    expect(out.events[0].table).toBe("users");
+    expect(out.events[0].source).toBe("pull");
+    expect(out.events[0].removedPks).toEqual([]);
+    expect(out.events[0].changedPks.sort()).toEqual(["r1", "r2"]);
+
+    // Unsubscribed listener should be silent; second listener that registered
+    // after unsubscribe sees zero events because the second pull had no diff.
+    expect(out.postUnsubEvents).toEqual([]);
+  });
 });

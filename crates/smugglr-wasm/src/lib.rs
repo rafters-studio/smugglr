@@ -30,7 +30,35 @@ use smugglr_core::profile::Profile;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsCast;
+
+/// Build the `TableChangedEvent` JS object for a single table.
+fn build_table_changed_event(
+    table: &str,
+    changed_pks: &[String],
+    origin: &str,
+) -> Result<JsValue, JsValue> {
+    let obj = js_sys::Object::new();
+    js_sys::Reflect::set(&obj, &JsValue::from_str("table"), &JsValue::from_str(table))?;
+    let arr = js_sys::Array::new();
+    for pk in changed_pks {
+        arr.push(&JsValue::from_str(pk));
+    }
+    js_sys::Reflect::set(&obj, &JsValue::from_str("changedPks"), &arr)?;
+    js_sys::Reflect::set(
+        &obj,
+        &JsValue::from_str("removedPks"),
+        &js_sys::Array::new(),
+    )?;
+    js_sys::Reflect::set(
+        &obj,
+        &JsValue::from_str("source"),
+        &JsValue::from_str(origin),
+    )?;
+    Ok(obj.into())
+}
 
 /// Per-table cached row metadata used for incremental diff.
 ///
@@ -497,6 +525,10 @@ pub struct Smugglr {
     source_cache: RefCell<HashMap<String, CachedMeta>>,
     /// Per-table metadata cache for the dest endpoint.
     dest_cache: RefCell<HashMap<String, CachedMeta>>,
+    /// Registered `table-changed` listeners. Each entry is (id, callback);
+    /// the id lets the JS-side unsubscribe closure remove its own slot.
+    listeners: RefCell<Vec<(u64, js_sys::Function)>>,
+    next_listener_id: RefCell<u64>,
 }
 
 #[wasm_bindgen]
@@ -532,7 +564,77 @@ impl Smugglr {
             dest,
             source_cache: RefCell::new(HashMap::new()),
             dest_cache: RefCell::new(HashMap::new()),
+            listeners: RefCell::new(Vec::new()),
+            next_listener_id: RefCell::new(0),
         })
+    }
+
+    /// Subscribe to events emitted by this instance.
+    ///
+    /// Currently the only supported event is `"table-changed"`, which fires
+    /// once per affected table after a `pull` or `sync` operation completes
+    /// the local write. The handler receives a `TableChangedEvent`:
+    ///
+    /// ```ts
+    /// interface TableChangedEvent {
+    ///   table: string;
+    ///   changedPks: string[];
+    ///   removedPks: string[];   // reserved; always [] until delete propagation lands
+    ///   source: 'pull' | 'sync';
+    /// }
+    /// ```
+    ///
+    /// Returns an unsubscribe function. Calling it removes the listener;
+    /// subsequent invocations are no-ops.
+    #[wasm_bindgen]
+    pub fn on(&self, event: &str, callback: js_sys::Function) -> Result<js_sys::Function, JsValue> {
+        if event != "table-changed" {
+            return Err(JsValue::from_str(&format!(
+                "unknown event '{}': only 'table-changed' is supported",
+                event
+            )));
+        }
+        let id = {
+            let mut next = self.next_listener_id.borrow_mut();
+            let v = *next;
+            *next = next.wrapping_add(1);
+            v
+        };
+        self.listeners.borrow_mut().push((id, callback));
+
+        // Build the unsubscribe closure. We reach back into the same Smugglr
+        // via a raw pointer because wasm-bindgen cannot capture `&self` into
+        // a JS-callable closure with a non-'static lifetime. This is safe in
+        // single-threaded WASM as long as the Smugglr instance outlives the
+        // unsubscribe call -- which it must, since the JS-side wrapper holds
+        // it and dispose() consumes it explicitly.
+        let self_ptr: *const Smugglr = self;
+        let cb = Closure::wrap(Box::new(move || {
+            // Safety: see comment above.
+            let s = unsafe { &*self_ptr };
+            s.listeners.borrow_mut().retain(|(other, _)| *other != id);
+        }) as Box<dyn Fn()>);
+        let func: js_sys::Function = cb.as_ref().unchecked_ref::<js_sys::Function>().clone();
+        cb.forget();
+        Ok(func)
+    }
+
+    fn emit_table_changed(&self, table: &str, changed_pks: &[String], origin: &str) {
+        if changed_pks.is_empty() {
+            return;
+        }
+        let listeners = self.listeners.borrow().clone();
+        if listeners.is_empty() {
+            return;
+        }
+        let event = match build_table_changed_event(table, changed_pks, origin) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let this = JsValue::NULL;
+        for (_id, cb) in listeners.iter() {
+            let _ = cb.call1(&this, &event);
+        }
     }
 
     /// Clear all cached row metadata for both endpoints.
@@ -624,7 +726,7 @@ impl Smugglr {
             let pulled = if dry_run || to_pull.is_empty() {
                 to_pull.len()
             } else {
-                transfer_rows(
+                let n = transfer_rows(
                     &self.dest,
                     &self.source,
                     table,
@@ -632,7 +734,11 @@ impl Smugglr {
                     batch_size,
                     &self.sync_config.exclude_columns,
                 )
-                .await?
+                .await?;
+                if n > 0 {
+                    self.emit_table_changed(table, &to_pull, "pull");
+                }
+                n
             };
 
             results.push(JsTableResult {
@@ -692,7 +798,7 @@ impl Smugglr {
             let pulled = if dry_run || to_pull.is_empty() {
                 to_pull.len()
             } else {
-                transfer_rows(
+                let n = transfer_rows(
                     &self.dest,
                     &self.source,
                     table,
@@ -700,7 +806,11 @@ impl Smugglr {
                     batch_size,
                     &self.sync_config.exclude_columns,
                 )
-                .await?
+                .await?;
+                if n > 0 {
+                    self.emit_table_changed(table, &to_pull, "sync");
+                }
+                n
             };
 
             results.push(JsTableResult {
