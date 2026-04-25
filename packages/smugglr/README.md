@@ -88,6 +88,25 @@ setWasm(wasm);
 const s = await Smugglr.init(config);
 ```
 
+## Reactive events
+
+Subscribe to `table-changed` to react to sync writes without polling. Fires once per affected table after `pull` or `sync` completes the local write; `push` and `diff` never emit.
+
+```ts
+const unsub = s.on("table-changed", (e) => {
+  // e.table          -- which table was modified
+  // e.changedPks     -- primary keys of inserted/updated rows
+  // e.removedPks     -- reserved; always [] until delete propagation lands
+  // e.source         -- "pull" | "sync"
+  console.log(`${e.table} +${e.changedPks.length} via ${e.source}`);
+});
+
+await s.sync();
+unsub(); // remove this listener
+```
+
+This is the primitive the framework binding plugins (`@smugglr/zustand`, `@smugglr/nanostores`, etc.) are built on.
+
 ## Bundle size
 
 | Module                                         | Compressed (gzip) |
