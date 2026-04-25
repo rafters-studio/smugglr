@@ -374,6 +374,21 @@ cargo clippy --all-targets       # Lint (including tests)
 RUST_LOG=debug cargo run -- diff # Debug output
 ```
 
+## Examples
+
+Runnable examples covering CLI, Node, Rust, and browser use cases live in [`docs/examples/`](docs/examples/). Each subdir has its own README, prerequisites, and source.
+
+| Surface | Example | What it shows |
+| ------- | ------- | ------------- |
+| CLI     | [cli-d1-sync](docs/examples/cli-d1-sync) | `smugglr push/pull/sync` against Cloudflare D1. |
+| CLI     | [cli-lan-broadcast](docs/examples/cli-lan-broadcast) | Two laptops auto-syncing via UDP on the same subnet. |
+| Node    | [node-server-to-d1](docs/examples/node-server-to-d1) | `Smugglr.init({source: local, dest: D1}).push()` from Node. |
+| Node    | [node-auto-sync](docs/examples/node-auto-sync) | Long-running sync loop with backoff and graceful shutdown. |
+| Rust    | [rust-tokio-service](docs/examples/rust-tokio-service) | Embedded sync inside a tokio service. |
+| Rust    | [rust-custom-datasource](docs/examples/rust-custom-datasource) | Implement `DataSource` against an in-memory store. |
+| Browser | [browser-opfs-turso](docs/examples/browser-opfs-turso) | wa-sqlite + OPFS, syncing to Turso. |
+| Browser | [browser-idb-turso](docs/examples/browser-idb-turso) | Same demo backed by IndexedDB instead of OPFS. |
+
 ## Related Projects
 
 Part of the [rafters-studio](https://github.com/rafters-studio) ecosystem. Built for [huttspawn.com](https://huttspawn.com) and the broader rafters portfolio.

@@ -1,0 +1,28 @@
+# cli-d1-sync example config.
+#
+# Copy this file to config.toml and replace the placeholders.
+# The API token is read from the SMUGGLR_D1_TOKEN environment variable, so
+# this file is safe to commit.
+
+cloudflare_account_id = "your-32-char-account-id"
+cloudflare_api_token = "${SMUGGLR_D1_TOKEN}"
+database_id = "your-d1-database-uuid"
+
+local_db = "./app.sqlite"
+
+[sync]
+
+# Sync everything except smugglr/wrangler bookkeeping tables.
+tables = []
+exclude_tables = [
+    "sqlite_sequence",
+    "_cf_KV",
+    "_cf_METADATA",
+    "d1_migrations",
+]
+
+# Most schemas keep an updated_at column; smugglr uses it as a tiebreaker.
+timestamp_column = "updated_at"
+
+# Local edits win over D1 -- typical dev -> prod workflow.
+conflict_resolution = "local_wins"
