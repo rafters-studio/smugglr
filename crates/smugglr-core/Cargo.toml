@@ -6,7 +6,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 authors.workspace = true
+readme = "../../README.md"
+keywords = ["sqlite", "sync", "replication", "delta", "content-hash"]
+categories = ["database", "wasm"]
 
 [features]
 default = ["native"]

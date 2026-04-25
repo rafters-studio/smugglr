@@ -5,8 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 authors.workspace = true
 description = "HTTP SQL adapter plugin for smugglr -- supports Turso, rqlite, SQLite Cloud, and custom endpoints"
+readme = "../../README.md"
+keywords = ["smugglr", "plugin", "turso", "rqlite", "d1"]
+categories = ["database"]
 
 [[bin]]
 name = "smugglr-http-sql"

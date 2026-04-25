@@ -1,16 +1,16 @@
 [package]
 name = "smugglr"
-description = "Smuggle data between SQLite and Cloudflare D1"
+description = "Content-hashed delta sync for SQLite -- push, pull, and bidirectional sync to any pluggable target"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 authors.workspace = true
-homepage = "https://github.com/rafters-studio/smugglr"
-documentation = "https://github.com/rafters-studio/smugglr#readme"
 readme = "../../README.md"
-keywords = ["cloudflare", "d1", "sqlite", "sync", "database"]
+keywords = ["sqlite", "sync", "replication", "delta", "cli"]
 categories = ["command-line-utilities", "database"]
 exclude = [
     "config.toml",

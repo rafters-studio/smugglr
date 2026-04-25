@@ -5,8 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 authors.workspace = true
 description = "SDK for building smugglr adapter plugins"
+readme = "../../README.md"
+keywords = ["smugglr", "plugin", "sqlite", "sync", "sdk"]
+categories = ["database", "development-tools"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
