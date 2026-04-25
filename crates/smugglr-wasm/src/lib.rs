@@ -649,6 +649,60 @@ impl Smugglr {
         self.dest_cache.borrow_mut().clear();
     }
 
+    /// Erase local state. Issues `DELETE FROM <table>` against the local
+    /// SQLite database for every configured sync table, then clears the
+    /// in-memory metadata caches. The schema and any non-synced tables are
+    /// untouched.
+    ///
+    /// The dest endpoint is not touched -- server-side erasure is the app's
+    /// concern, typically through its auth/account system.
+    ///
+    /// At least one of source / dest must be a local executor; calling this
+    /// on a HTTP-only configuration is a no-op (with a returned warning).
+    #[wasm_bindgen(js_name = eraseLocal)]
+    pub async fn erase_local(&self) -> Result<JsValue, JsValue> {
+        let local = match (&self.source, &self.dest) {
+            (AnyDataSource::Local(d), _) => d,
+            (_, AnyDataSource::Local(d)) => d,
+            _ => {
+                return Err(JsValue::from_str(
+                    "eraseLocal: neither source nor dest is a local executor",
+                ));
+            }
+        };
+
+        let tables = if !self.sync_config.tables.is_empty() {
+            self.sync_config.tables.clone()
+        } else {
+            local
+                .list_tables()
+                .await
+                .map_err(|e| JsValue::from_str(&format!("eraseLocal: list_tables failed: {}", e)))?
+        };
+
+        let mut erased = Vec::new();
+        for table in &tables {
+            if self.sync_config.exclude_tables.iter().any(|t| t == table) {
+                continue;
+            }
+            local.delete_all_rows(table).await.map_err(|e| {
+                JsValue::from_str(&format!("eraseLocal: delete from {} failed: {}", table, e))
+            })?;
+            erased.push(table.clone());
+        }
+
+        self.source_cache.borrow_mut().clear();
+        self.dest_cache.borrow_mut().clear();
+
+        let arr = js_sys::Array::new();
+        for t in &erased {
+            arr.push(&JsValue::from_str(t));
+        }
+        let obj = js_sys::Object::new();
+        js_sys::Reflect::set(&obj, &JsValue::from_str("erasedTables"), &arr)?;
+        Ok(obj.into())
+    }
+
     /// Push source rows to destination.
     #[wasm_bindgen]
     pub async fn push(&self, dry_run: Option<bool>) -> Result<JsValue, JsValue> {

@@ -107,6 +107,15 @@ unsub(); // remove this listener
 
 This is the primitive the framework binding plugins (`@smugglr/zustand`, `@smugglr/nanostores`, etc.) are built on.
 
+## GDPR / right-to-erasure
+
+`eraseLocal()` empties every configured sync table on the local SQLite database and clears smugglr's in-memory caches. Schema and any non-synced tables are untouched; the dest endpoint is not contacted (server-side erasure is the app's concern, typically via its auth/account system).
+
+```ts
+const result = await s.eraseLocal();
+// { erasedTables: ["users", "posts"] }
+```
+
 ## Bundle size
 
 | Module                                         | Compressed (gzip) |
