@@ -9,6 +9,9 @@ import type {
   DiffResult,
   SyncOptions,
   EndpointConfig,
+  HttpEndpointConfig,
+  LocalEndpointConfig,
+  SqlExecutor,
   InitOptions,
 } from "./types.js";
 import { SmugglrError } from "./types.js";
@@ -19,9 +22,14 @@ export type {
   DiffResult,
   SyncOptions,
   EndpointConfig,
+  HttpEndpointConfig,
+  LocalEndpointConfig,
+  SqlExecutor,
   InitOptions,
 };
 export { SmugglrError };
+export { createWaSqliteExecutor } from "./opfs.js";
+export type { WaSqlite3 } from "./opfs.js";
 
 // WASM module state -- loaded lazily or set explicitly via setWasm().
 let wasmModule: WasmModule | null = null;

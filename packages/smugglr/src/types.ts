@@ -1,8 +1,8 @@
 // smugglr npm package type definitions
 // These provide typed interfaces over the raw wasm-bindgen output.
 
-/** HTTP SQL endpoint configuration */
-export interface EndpointConfig {
+/** HTTP SQL endpoint -- syncs against any HTTP SQL backend (D1, Turso, rqlite, etc.). */
+export interface HttpEndpointConfig {
   /** Full URL to the HTTP SQL endpoint */
   url: string;
   /** Authentication token (Bearer for most profiles, Basic for rqlite) */
@@ -10,6 +10,37 @@ export interface EndpointConfig {
   /** Profile name: d1, turso, rqlite, datasette, sqlitecloud, starbasedb, generic */
   profile?: string;
 }
+
+/**
+ * Local SQLite executor contract.
+ *
+ * Any SQLite runtime can plug in -- wa-sqlite + OPFS (browser), better-sqlite3
+ * (Node), official sqlite-wasm, sql.js, or a future runtime. Smugglr is
+ * SQLite-runtime-agnostic; consumers provide an executor that satisfies this
+ * shape and the diff/sync engine speaks SQL strings against it.
+ *
+ * Result shape:
+ * - `columns`: column names in declaration order
+ * - `rows`: each row is an array of values aligned with `columns`
+ *
+ * Implementations should bind `params` positionally (`?` placeholders).
+ */
+export interface SqlExecutor {
+  run(sql: string, params: unknown[]): Promise<{
+    columns: string[];
+    rows: unknown[][];
+  }>;
+}
+
+/** Local SQLite endpoint -- syncs against an in-process SQLite database. */
+export interface LocalEndpointConfig {
+  type: "local";
+  /** SQL executor wrapping a SQLite runtime (wa-sqlite/OPFS, better-sqlite3, etc.). */
+  executor: SqlExecutor;
+}
+
+/** Either side of a sync may be a remote HTTP endpoint or a local SQLite database. */
+export type EndpointConfig = HttpEndpointConfig | LocalEndpointConfig;
 
 /** Sync behavior configuration */
 export interface SyncOptions {
