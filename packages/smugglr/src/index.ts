@@ -58,6 +58,8 @@ interface WasmSmugglr {
   diff(): Promise<unknown>;
   on(event: string, callback: (e: unknown) => void): () => void;
   eraseLocal(): Promise<unknown>;
+  updateAuth(authToken: string): void;
+  updateDest(dest: unknown): void;
   [Symbol.dispose]?: () => void;
 }
 
@@ -236,6 +238,43 @@ export class Smugglr {
   async eraseLocal(): Promise<{ erasedTables: string[] }> {
     try {
       return (await this.inner.eraseLocal()) as { erasedTables: string[] };
+    } catch (e) {
+      throw parseError(e);
+    }
+  }
+
+  /**
+   * Replace the dest auth token without re-initializing.
+   * The dest URL, profile, and metadata cache are unchanged; the next
+   * request just uses the new token. Use this for token rotation.
+   *
+   * Errors if the dest is not an HTTP endpoint.
+   *
+   * **Do not call while a sync future is pending.** Await any in-flight
+   * push/pull/sync first.
+   */
+  updateAuth(authToken: string): void {
+    try {
+      this.inner.updateAuth(authToken);
+    } catch (e) {
+      throw parseError(e);
+    }
+  }
+
+  /**
+   * Replace the entire dest endpoint. Accepts the same shape as the
+   * `dest` field of `Smugglr.init({...})`. Clears the dest metadata
+   * cache so the next sync re-scans against the new endpoint; the
+   * source cache (and local OPFS data) survive.
+   *
+   * Use this for the anonymous-to-account upgrade flow: start with an
+   * anonymous ingress dest, swap to the account-bound dest after sign-in.
+   *
+   * **Do not call while a sync future is pending.** Await first.
+   */
+  updateDest(dest: EndpointConfig): void {
+    try {
+      this.inner.updateDest(dest);
     } catch (e) {
       throw parseError(e);
     }

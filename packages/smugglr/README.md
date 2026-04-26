@@ -116,6 +116,26 @@ const result = await s.eraseLocal();
 // { erasedTables: ["users", "posts"] }
 ```
 
+## Auth rotation and dest swapping
+
+`updateAuth(token)` rotates the dest auth token without re-initializing the WASM module or losing the metadata cache. `updateDest(dest)` replaces the entire dest endpoint -- URL, profile, token -- and clears only the dest cache (source cache survives).
+
+```ts
+// Token rotation
+s.updateAuth(newToken);
+await s.sync(); // uses newToken
+
+// Anonymous -> account upgrade
+s.updateDest({
+  url: "https://api.acme.com/sync",
+  authToken: accountToken,
+  profile: "generic",
+});
+await s.sync(); // first sync against the new dest re-scans then pushes
+```
+
+> **Do not call while a sync future is pending.** Await any in-flight push/pull/sync first; the implementation borrows the dest across awaits and a concurrent mutation will panic.
+
 ## Bundle size
 
 | Module                                         | Compressed (gzip) |

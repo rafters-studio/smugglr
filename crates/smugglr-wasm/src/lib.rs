@@ -520,7 +520,11 @@ async fn diff_table_cached(
 pub struct Smugglr {
     sync_config: SyncConfig,
     source: AnyDataSource,
-    dest: AnyDataSource,
+    // Interior-mutable so `updateDest()` can swap the entire endpoint and
+    // `updateAuth()` can reach into the underlying FetchDataSource. The
+    // borrow is held across awaits inside push/pull/sync; do not call
+    // updateAuth/updateDest while a sync future is pending.
+    dest: RefCell<AnyDataSource>,
     /// Per-table metadata cache for the source endpoint.
     source_cache: RefCell<HashMap<String, CachedMeta>>,
     /// Per-table metadata cache for the dest endpoint.
@@ -561,7 +565,7 @@ impl Smugglr {
         Ok(Smugglr {
             sync_config,
             source,
-            dest,
+            dest: RefCell::new(dest),
             source_cache: RefCell::new(HashMap::new()),
             dest_cache: RefCell::new(HashMap::new()),
             listeners: RefCell::new(Vec::new()),
@@ -658,17 +662,19 @@ impl Smugglr {
     /// concern, typically through its auth/account system.
     ///
     /// At least one of source / dest must be a local executor; calling this
-    /// on a HTTP-only configuration is a no-op (with a returned warning).
+    /// on a HTTP-only configuration errors out.
+    #[allow(clippy::await_holding_refcell_ref)]
     #[wasm_bindgen(js_name = eraseLocal)]
     pub async fn erase_local(&self) -> Result<JsValue, JsValue> {
-        let local = match (&self.source, &self.dest) {
-            (AnyDataSource::Local(d), _) => d,
-            (_, AnyDataSource::Local(d)) => d,
-            _ => {
-                return Err(JsValue::from_str(
-                    "eraseLocal: neither source nor dest is a local executor",
-                ));
-            }
+        let dest = self.dest.borrow();
+        let local = if let AnyDataSource::Local(d) = &self.source {
+            d
+        } else if let AnyDataSource::Local(d) = &*dest {
+            d
+        } else {
+            return Err(JsValue::from_str(
+                "eraseLocal: neither source nor dest is a local executor",
+            ));
         };
 
         let tables = if !self.sync_config.tables.is_empty() {
@@ -691,6 +697,7 @@ impl Smugglr {
             erased.push(table.clone());
         }
 
+        drop(dest);
         self.source_cache.borrow_mut().clear();
         self.dest_cache.borrow_mut().clear();
 
@@ -703,11 +710,56 @@ impl Smugglr {
         Ok(obj.into())
     }
 
+    /// Replace the dest auth token. The dest URL, profile, and metadata
+    /// cache are unchanged -- the next request just uses the new token.
+    /// Errors if the dest is not an HTTP endpoint.
+    ///
+    /// **Do not call while a sync future is pending.** Await any in-flight
+    /// push/pull/sync first; the implementation borrows the dest across
+    /// awaits and a concurrent mutation will panic.
+    #[wasm_bindgen(js_name = updateAuth)]
+    pub fn update_auth(&self, auth_token: String) -> Result<(), JsValue> {
+        let dest = self.dest.borrow();
+        match &*dest {
+            AnyDataSource::Fetch(d) => {
+                d.set_auth_token(auth_token);
+                Ok(())
+            }
+            AnyDataSource::Local(_) => Err(JsValue::from_str(
+                "updateAuth: dest is a local executor, not an HTTP endpoint",
+            )),
+        }
+    }
+
+    /// Replace the entire dest endpoint. Accepts the same shape as the
+    /// `dest` field of `Smugglr.init({...})`. Clears the dest metadata
+    /// cache so the next sync re-scans against the new endpoint; the
+    /// source cache is untouched.
+    ///
+    /// Use this for the anonymous -> account-upgrade flow: start with
+    /// an anonymous ingress dest, swap to the account-bound dest after
+    /// the user signs in. Local OPFS data and the source cache survive.
+    ///
+    /// **Do not call while a sync future is pending.** Same caveat as
+    /// `updateAuth` -- await first.
+    #[wasm_bindgen(js_name = updateDest)]
+    pub fn update_dest(&self, dest_js: JsValue) -> Result<(), JsValue> {
+        let new_dest = build_datasource(&dest_js)?;
+        *self.dest.borrow_mut() = new_dest;
+        self.dest_cache.borrow_mut().clear();
+        Ok(())
+    }
+
     /// Push source rows to destination.
+    // RefCell borrow held across await is safe here: WASM is single-threaded
+    // and `updateAuth` / `updateDest` are documented as not safe to call
+    // concurrently with sync futures. See struct docstring on `dest`.
+    #[allow(clippy::await_holding_refcell_ref)]
     #[wasm_bindgen]
     pub async fn push(&self, dry_run: Option<bool>) -> Result<JsValue, JsValue> {
+        let dest = self.dest.borrow();
         let dry_run = dry_run.unwrap_or(false);
-        let tables = get_sync_tables(&self.source, &self.dest, &self.sync_config).await?;
+        let tables = get_sync_tables(&self.source, &dest, &self.sync_config).await?;
         let conflict = self.sync_config.conflict_resolution;
         let batch_size = self.sync_config.batch_size;
 
@@ -715,7 +767,7 @@ impl Smugglr {
         for table in &tables {
             let diff = diff_table_cached(
                 &self.source,
-                &self.dest,
+                &dest,
                 &self.source_cache,
                 &self.dest_cache,
                 table,
@@ -730,7 +782,7 @@ impl Smugglr {
             } else {
                 transfer_rows(
                     &self.source,
-                    &self.dest,
+                    &dest,
                     table,
                     &to_push,
                     batch_size,
@@ -756,10 +808,12 @@ impl Smugglr {
     }
 
     /// Pull destination rows to source.
+    #[allow(clippy::await_holding_refcell_ref)]
     #[wasm_bindgen]
     pub async fn pull(&self, dry_run: Option<bool>) -> Result<JsValue, JsValue> {
+        let dest = self.dest.borrow();
         let dry_run = dry_run.unwrap_or(false);
-        let tables = get_sync_tables(&self.source, &self.dest, &self.sync_config).await?;
+        let tables = get_sync_tables(&self.source, &dest, &self.sync_config).await?;
         let conflict = self.sync_config.conflict_resolution;
         let batch_size = self.sync_config.batch_size;
 
@@ -767,7 +821,7 @@ impl Smugglr {
         for table in &tables {
             let diff = diff_table_cached(
                 &self.source,
-                &self.dest,
+                &dest,
                 &self.source_cache,
                 &self.dest_cache,
                 table,
@@ -781,7 +835,7 @@ impl Smugglr {
                 to_pull.len()
             } else {
                 let n = transfer_rows(
-                    &self.dest,
+                    &dest,
                     &self.source,
                     table,
                     &to_pull,
@@ -812,10 +866,12 @@ impl Smugglr {
     }
 
     /// Bidirectional sync.
+    #[allow(clippy::await_holding_refcell_ref)]
     #[wasm_bindgen]
     pub async fn sync(&self, dry_run: Option<bool>) -> Result<JsValue, JsValue> {
+        let dest = self.dest.borrow();
         let dry_run = dry_run.unwrap_or(false);
-        let tables = get_sync_tables(&self.source, &self.dest, &self.sync_config).await?;
+        let tables = get_sync_tables(&self.source, &dest, &self.sync_config).await?;
         let conflict = self.sync_config.conflict_resolution;
         let batch_size = self.sync_config.batch_size;
 
@@ -823,7 +879,7 @@ impl Smugglr {
         for table in &tables {
             let diff = diff_table_cached(
                 &self.source,
-                &self.dest,
+                &dest,
                 &self.source_cache,
                 &self.dest_cache,
                 table,
@@ -840,7 +896,7 @@ impl Smugglr {
             } else {
                 transfer_rows(
                     &self.source,
-                    &self.dest,
+                    &dest,
                     table,
                     &to_push,
                     batch_size,
@@ -853,7 +909,7 @@ impl Smugglr {
                 to_pull.len()
             } else {
                 let n = transfer_rows(
-                    &self.dest,
+                    &dest,
                     &self.source,
                     table,
                     &to_pull,
@@ -884,15 +940,17 @@ impl Smugglr {
     }
 
     /// Read-only diff between source and destination.
+    #[allow(clippy::await_holding_refcell_ref)]
     #[wasm_bindgen]
     pub async fn diff(&self) -> Result<JsValue, JsValue> {
-        let tables = get_sync_tables(&self.source, &self.dest, &self.sync_config).await?;
+        let dest = self.dest.borrow();
+        let tables = get_sync_tables(&self.source, &dest, &self.sync_config).await?;
 
         let mut table_diffs = Vec::new();
         for table in &tables {
             let diff = diff_table_cached(
                 &self.source,
-                &self.dest,
+                &dest,
                 &self.source_cache,
                 &self.dest_cache,
                 table,
