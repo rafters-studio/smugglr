@@ -62,8 +62,13 @@ export interface SyncOptions {
 export interface SmugglrConfig {
   /** Source endpoint (data is read from here for push, written to here for pull) */
   source: EndpointConfig;
-  /** Destination endpoint (data is written to here for push, read from here for pull) */
-  dest: EndpointConfig;
+  /**
+   * Destination endpoint. Optional -- omit it to run in anonymous-first mode
+   * (no network, push/pull/sync error, diff degrades to a local-only inventory).
+   * Use this when the user hasn't signed up yet; attach a dest later via
+   * `updateDest()`.
+   */
+  dest?: EndpointConfig;
   /** Sync behavior options */
   sync?: SyncOptions;
 }
