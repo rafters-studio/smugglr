@@ -57,6 +57,7 @@ interface WasmSmugglr {
   sync(dry_run?: boolean | null): Promise<unknown>;
   diff(): Promise<unknown>;
   on(event: string, callback: (e: unknown) => void): () => void;
+  eraseLocal(): Promise<unknown>;
   [Symbol.dispose]?: () => void;
 }
 
@@ -220,6 +221,24 @@ export class Smugglr {
   ): Unsubscribe {
     const wrapped = (raw: unknown) => handler(raw as SmugglrEventMap[K]);
     return this.inner.on(event, wrapped);
+  }
+
+  /**
+   * Erase local state. Issues `DELETE FROM <table>` against the local
+   * SQLite database for every configured sync table, then clears the
+   * in-memory metadata caches. Schema and any non-synced tables stay put.
+   *
+   * The dest endpoint is not touched -- server-side erasure is the app's
+   * concern. Use this for GDPR right-to-erasure on the client side.
+   *
+   * Returns the list of tables that were erased.
+   */
+  async eraseLocal(): Promise<{ erasedTables: string[] }> {
+    try {
+      return (await this.inner.eraseLocal()) as { erasedTables: string[] };
+    } catch (e) {
+      throw parseError(e);
+    }
   }
 
   /** Release WASM resources. Called automatically if using `using` syntax. */

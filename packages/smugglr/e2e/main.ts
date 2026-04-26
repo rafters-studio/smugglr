@@ -6,6 +6,7 @@ declare global {
       init(dbPath: string): Promise<unknown>;
       runSql(sql: string, params?: unknown[]): Promise<unknown>;
       sync(opts: unknown): Promise<unknown>;
+      eraseLocal(opts: unknown): Promise<unknown>;
       reset(): Promise<unknown>;
     };
   }
@@ -38,6 +39,7 @@ window.e2e = {
   init: (dbPath) => call("init", [dbPath]),
   runSql: (sql, params = []) => call("runSql", [sql, params]),
   sync: (opts) => call("sync", [opts]),
+  eraseLocal: (opts) => call("eraseLocal", [opts]),
   reset: () => call("reset", []),
 };
 

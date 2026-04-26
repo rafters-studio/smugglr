@@ -227,4 +227,46 @@ test.describe("smugglr OPFS e2e", () => {
     // after unsubscribe sees zero events because the second pull had no diff.
     expect(out.postUnsubEvents).toEqual([]);
   });
+
+  test("eraseLocal: empties configured tables but leaves the schema", async ({ page }) => {
+    const state = freshState();
+    await installMockTarget(page, state);
+
+    await page.evaluate(() =>
+      window.e2e.runSql(
+        "CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, name TEXT, updated_at INTEGER)",
+      ),
+    );
+    await page.evaluate(() =>
+      window.e2e.runSql(
+        "INSERT INTO users (id, name, updated_at) VALUES (?, ?, ?), (?, ?, ?)",
+        ["u1", "ada", 100, "u2", "lin", 200],
+      ),
+    );
+
+    const before = (await page.evaluate(() =>
+      window.e2e.runSql("SELECT COUNT(*) FROM users"),
+    )) as { rows: unknown[][] };
+    expect(before.rows[0][0]).toBe(2);
+
+    const result = (await page.evaluate(() =>
+      window.e2e.eraseLocal({
+        destUrl: "https://mock.smugglr.test",
+        tables: ["users"],
+      }),
+    )) as { erasedTables: string[] };
+
+    expect(result.erasedTables).toEqual(["users"]);
+
+    const after = (await page.evaluate(() =>
+      window.e2e.runSql("SELECT COUNT(*) FROM users"),
+    )) as { rows: unknown[][] };
+    expect(after.rows[0][0]).toBe(0);
+
+    // Schema must still be queryable -- no DROP, just DELETE.
+    const schema = (await page.evaluate(() =>
+      window.e2e.runSql("PRAGMA table_info('users')"),
+    )) as { rows: unknown[][] };
+    expect(schema.rows.length).toBe(3);
+  });
 });

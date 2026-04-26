@@ -80,6 +80,18 @@ async function sync(opts: {
   return { result, events, postUnsubEvents };
 }
 
+async function eraseLocal(opts: { destUrl: string; tables: string[] }) {
+  if (!sqlite3 || db === null) throw new Error("init() first");
+  const s = await Smugglr.init({
+    source: { type: "local", executor: createWaSqliteExecutor(sqlite3, db) },
+    dest: { url: opts.destUrl, profile: "generic" },
+    sync: { tables: opts.tables },
+  });
+  const result = await s.eraseLocal();
+  s.dispose();
+  return result;
+}
+
 async function reset() {
   if (sqlite3 && db !== null) {
     sqlite3.close(db);
@@ -93,7 +105,7 @@ async function reset() {
 
 interface RpcCall {
   id: number;
-  op: "init" | "runSql" | "sync" | "reset";
+  op: "init" | "runSql" | "sync" | "eraseLocal" | "reset";
   args: unknown[];
 }
 
@@ -105,6 +117,7 @@ self.addEventListener("message", async (ev: MessageEvent<RpcCall>) => {
       case "init": result = await init(args[0] as string); break;
       case "runSql": result = await runSql(args[0] as string, (args[1] as unknown[]) ?? []); break;
       case "sync": result = await sync(args[0] as Parameters<typeof sync>[0]); break;
+      case "eraseLocal": result = await eraseLocal(args[0] as Parameters<typeof eraseLocal>[0]); break;
       case "reset": result = await reset(); break;
     }
     (self as unknown as Worker).postMessage({ id, ok: true, result });

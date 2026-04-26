@@ -36,6 +36,14 @@ impl LocalSqlDataSource {
         }
     }
 
+    /// Issue `DELETE FROM "<table>"`, leaving the schema in place.
+    /// Used by `Smugglr.eraseLocal()` for GDPR-style local wipes.
+    pub(crate) async fn delete_all_rows(&self, table: &str) -> Result<()> {
+        let sql = format!("DELETE FROM \"{}\"", table);
+        self.run(&sql, &[]).await?;
+        Ok(())
+    }
+
     async fn run(&self, sql: &str, params: &[Value]) -> Result<RunResult> {
         let run_fn = js_sys::Reflect::get(&self.executor, &JsValue::from_str("run"))
             .map_err(|e| SyncError::Remote(format!("executor.run missing: {:?}", e)))?
