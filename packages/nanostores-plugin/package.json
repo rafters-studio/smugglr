@@ -1,0 +1,43 @@
+{
+  "name": "@smugglr/nanostores",
+  "version": "0.1.0",
+  "description": "Nanostores adapter that auto-persists atoms and maps to a smugglr-managed SQLite table.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run"
+  },
+  "homepage": "https://smugglr.dev",
+  "bugs": {
+    "url": "https://github.com/rafters-studio/smugglr/issues"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rafters-studio/smugglr"
+  },
+  "author": "Sean Silvius",
+  "peerDependencies": {
+    "nanostores": "^1.0.0",
+    "smugglr": "^0.3.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "nanostores": "^1.3.0",
+    "smugglr": "link:../smugglr",
+    "typescript": "^6.0.2",
+    "vitest": "^3.0.0"
+  }
+}
