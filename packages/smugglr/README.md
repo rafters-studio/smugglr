@@ -116,6 +116,23 @@ const result = await s.eraseLocal();
 // { erasedTables: ["users", "posts"] }
 ```
 
+## Anonymous-first
+
+Omit `dest` to run smugglr with no network at all -- nothing leaves the device. Useful for the "let users try the app before signing up" flow.
+
+```ts
+const s = await Smugglr.init({
+  source: { type: "local", executor },
+  // no dest
+  sync: { tables: ["todos"] },
+});
+
+await s.diff();   // works -- shows local rows as `localOnly`
+await s.push();   // throws SmugglrError("push: no dest configured")
+```
+
+Attach a dest later via `updateDest()` (see below). Local OPFS data and the source cache survive the upgrade.
+
 ## Auth rotation and dest swapping
 
 `updateAuth(token)` rotates the dest auth token without re-initializing the WASM module or losing the metadata cache. `updateDest(dest)` replaces the entire dest endpoint -- URL, profile, token -- and clears only the dest cache (source cache survives).

@@ -309,4 +309,32 @@ test.describe("smugglr OPFS e2e", () => {
     const firstNewIdx = state.requests.findIndex((r) => r.auth === "Bearer account-token");
     expect(firstNewIdx).toBeGreaterThan(lastInitialIdx);
   });
+
+  test("anonymous-first: no dest -> diff works locally, push errors clearly", async ({ page }) => {
+    await page.evaluate(() =>
+      window.e2e.runSql(
+        "CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, name TEXT, updated_at INTEGER)",
+      ),
+    );
+    await page.evaluate(() =>
+      window.e2e.runSql(
+        "INSERT INTO users (id, name, updated_at) VALUES (?, ?, ?), (?, ?, ?)",
+        ["u1", "ada", 100, "u2", "lin", 200],
+      ),
+    );
+
+    const out = (await page.evaluate(() => window.e2e.anonymousMode())) as {
+      diff: { command: string; status: string; tables: Array<{ name: string; localOnly: number }> };
+      pushError: string | null;
+    };
+
+    expect(out.diff.command).toBe("diff");
+    expect(out.diff.status).toBe("ok");
+    const users = out.diff.tables.find((t) => t.name === "users");
+    expect(users).toBeDefined();
+    expect(users!.localOnly).toBe(2);
+
+    expect(out.pushError).not.toBeNull();
+    expect(out.pushError).toContain("no dest configured");
+  });
 });

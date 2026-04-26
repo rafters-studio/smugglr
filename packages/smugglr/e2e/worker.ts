@@ -113,6 +113,25 @@ async function syncWithAuthSwap(opts: {
   return { firstPush: r1, secondPush: r2 };
 }
 
+async function anonymousMode() {
+  if (!sqlite3 || db === null) throw new Error("init() first");
+  const s = await Smugglr.init({
+    source: { type: "local", executor: createWaSqliteExecutor(sqlite3, db) },
+    sync: { tables: ["users"] },
+  });
+
+  const diff = await s.diff();
+  let pushError: string | null = null;
+  try {
+    await s.push();
+  } catch (e) {
+    pushError = e instanceof Error ? e.message : String(e);
+  }
+
+  s.dispose();
+  return { diff, pushError };
+}
+
 async function reset() {
   if (sqlite3 && db !== null) {
     sqlite3.close(db);
@@ -126,7 +145,7 @@ async function reset() {
 
 interface RpcCall {
   id: number;
-  op: "init" | "runSql" | "sync" | "eraseLocal" | "syncWithAuthSwap" | "reset";
+  op: "init" | "runSql" | "sync" | "eraseLocal" | "syncWithAuthSwap" | "anonymousMode" | "reset";
   args: unknown[];
 }
 
@@ -140,6 +159,7 @@ self.addEventListener("message", async (ev: MessageEvent<RpcCall>) => {
       case "sync": result = await sync(args[0] as Parameters<typeof sync>[0]); break;
       case "eraseLocal": result = await eraseLocal(args[0] as Parameters<typeof eraseLocal>[0]); break;
       case "syncWithAuthSwap": result = await syncWithAuthSwap(args[0] as Parameters<typeof syncWithAuthSwap>[0]); break;
+      case "anonymousMode": result = await anonymousMode(); break;
       case "reset": result = await reset(); break;
     }
     (self as unknown as Worker).postMessage({ id, ok: true, result });

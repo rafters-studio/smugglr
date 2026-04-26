@@ -242,6 +242,7 @@ struct JsSyncResult {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct JsTableResult {
     name: String,
     #[serde(skip_serializing_if = "is_zero")]
@@ -262,6 +263,7 @@ struct JsDiffResult {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct JsTableDiff {
     name: String,
     local_only: usize,
@@ -524,7 +526,12 @@ pub struct Smugglr {
     // `updateAuth()` can reach into the underlying FetchDataSource. The
     // borrow is held across awaits inside push/pull/sync; do not call
     // updateAuth/updateDest while a sync future is pending.
-    dest: RefCell<AnyDataSource>,
+    //
+    // `None` means "anonymous-first" -- the instance was constructed with
+    // no dest. push/pull/sync return a clear error in that state; diff
+    // degrades to a local-only inventory. Attach a dest later via
+    // `updateDest()`.
+    dest: RefCell<Option<AnyDataSource>>,
     /// Per-table metadata cache for the source endpoint.
     source_cache: RefCell<HashMap<String, CachedMeta>>,
     /// Per-table metadata cache for the dest endpoint.
@@ -546,8 +553,9 @@ impl Smugglr {
     pub fn init(config_js: JsValue) -> Result<Smugglr, JsValue> {
         let source_js = js_sys::Reflect::get(&config_js, &JsValue::from_str("source"))
             .map_err(|e| JsValue::from_str(&format!("config.source missing: {:?}", e)))?;
+        // dest is optional -- "anonymous-first" mode runs entirely locally.
         let dest_js = js_sys::Reflect::get(&config_js, &JsValue::from_str("dest"))
-            .map_err(|e| JsValue::from_str(&format!("config.dest missing: {:?}", e)))?;
+            .unwrap_or(JsValue::UNDEFINED);
         let sync_js = js_sys::Reflect::get(&config_js, &JsValue::from_str("sync"))
             .unwrap_or(JsValue::UNDEFINED);
 
@@ -560,7 +568,11 @@ impl Smugglr {
 
         let sync_config = build_sync_config(&js_sync);
         let source = build_datasource(&source_js)?;
-        let dest = build_datasource(&dest_js)?;
+        let dest = if dest_js.is_undefined() || dest_js.is_null() {
+            None
+        } else {
+            Some(build_datasource(&dest_js)?)
+        };
 
         Ok(Smugglr {
             sync_config,
@@ -669,7 +681,7 @@ impl Smugglr {
         let dest = self.dest.borrow();
         let local = if let AnyDataSource::Local(d) = &self.source {
             d
-        } else if let AnyDataSource::Local(d) = &*dest {
+        } else if let Some(AnyDataSource::Local(d)) = &*dest {
             d
         } else {
             return Err(JsValue::from_str(
@@ -720,13 +732,16 @@ impl Smugglr {
     #[wasm_bindgen(js_name = updateAuth)]
     pub fn update_auth(&self, auth_token: String) -> Result<(), JsValue> {
         let dest = self.dest.borrow();
-        match &*dest {
-            AnyDataSource::Fetch(d) => {
+        match dest.as_ref() {
+            Some(AnyDataSource::Fetch(d)) => {
                 d.set_auth_token(auth_token);
                 Ok(())
             }
-            AnyDataSource::Local(_) => Err(JsValue::from_str(
+            Some(AnyDataSource::Local(_)) => Err(JsValue::from_str(
                 "updateAuth: dest is a local executor, not an HTTP endpoint",
+            )),
+            None => Err(JsValue::from_str(
+                "updateAuth: no dest configured. Call updateDest() first to attach an endpoint.",
             )),
         }
     }
@@ -745,7 +760,7 @@ impl Smugglr {
     #[wasm_bindgen(js_name = updateDest)]
     pub fn update_dest(&self, dest_js: JsValue) -> Result<(), JsValue> {
         let new_dest = build_datasource(&dest_js)?;
-        *self.dest.borrow_mut() = new_dest;
+        *self.dest.borrow_mut() = Some(new_dest);
         self.dest_cache.borrow_mut().clear();
         Ok(())
     }
@@ -757,7 +772,12 @@ impl Smugglr {
     #[allow(clippy::await_holding_refcell_ref)]
     #[wasm_bindgen]
     pub async fn push(&self, dry_run: Option<bool>) -> Result<JsValue, JsValue> {
-        let dest = self.dest.borrow();
+        let dest_ref = self.dest.borrow();
+        let dest = dest_ref.as_ref().ok_or_else(|| {
+            JsValue::from_str(
+                "push: no dest configured. Pass `dest` to Smugglr.init() to enable network sync.",
+            )
+        })?;
         let dry_run = dry_run.unwrap_or(false);
         let tables = get_sync_tables(&self.source, &dest, &self.sync_config).await?;
         let conflict = self.sync_config.conflict_resolution;
@@ -811,7 +831,12 @@ impl Smugglr {
     #[allow(clippy::await_holding_refcell_ref)]
     #[wasm_bindgen]
     pub async fn pull(&self, dry_run: Option<bool>) -> Result<JsValue, JsValue> {
-        let dest = self.dest.borrow();
+        let dest_ref = self.dest.borrow();
+        let dest = dest_ref.as_ref().ok_or_else(|| {
+            JsValue::from_str(
+                "pull: no dest configured. Pass `dest` to Smugglr.init() to enable network sync.",
+            )
+        })?;
         let dry_run = dry_run.unwrap_or(false);
         let tables = get_sync_tables(&self.source, &dest, &self.sync_config).await?;
         let conflict = self.sync_config.conflict_resolution;
@@ -869,7 +894,12 @@ impl Smugglr {
     #[allow(clippy::await_holding_refcell_ref)]
     #[wasm_bindgen]
     pub async fn sync(&self, dry_run: Option<bool>) -> Result<JsValue, JsValue> {
-        let dest = self.dest.borrow();
+        let dest_ref = self.dest.borrow();
+        let dest = dest_ref.as_ref().ok_or_else(|| {
+            JsValue::from_str(
+                "sync: no dest configured. Pass `dest` to Smugglr.init() to enable network sync.",
+            )
+        })?;
         let dry_run = dry_run.unwrap_or(false);
         let tables = get_sync_tables(&self.source, &dest, &self.sync_config).await?;
         let conflict = self.sync_config.conflict_resolution;
@@ -943,14 +973,56 @@ impl Smugglr {
     #[allow(clippy::await_holding_refcell_ref)]
     #[wasm_bindgen]
     pub async fn diff(&self) -> Result<JsValue, JsValue> {
-        let dest = self.dest.borrow();
-        let tables = get_sync_tables(&self.source, &dest, &self.sync_config).await?;
+        let dest_ref = self.dest.borrow();
+
+        // Local-only mode: enumerate source tables and report row counts as
+        // `local_only`. No network is touched.
+        let Some(dest) = dest_ref.as_ref() else {
+            let local_tables = self
+                .source
+                .list_tables()
+                .await
+                .map_err(|e| JsValue::from_str(&format!("list_tables failed: {}", e)))?;
+            let mut table_diffs = Vec::new();
+            for table in local_tables {
+                if !self.sync_config.tables.is_empty() && !self.sync_config.tables.contains(&table)
+                {
+                    continue;
+                }
+                if self.sync_config.exclude_tables.iter().any(|t| t == &table) {
+                    continue;
+                }
+                let n = self
+                    .source
+                    .row_count(&table)
+                    .await
+                    .map_err(|e| JsValue::from_str(&format!("row_count failed: {}", e)))?;
+                table_diffs.push(JsTableDiff {
+                    name: table,
+                    local_only: n,
+                    remote_only: 0,
+                    local_newer: 0,
+                    remote_newer: 0,
+                    content_differs: 0,
+                    identical: 0,
+                });
+            }
+            let output = JsDiffResult {
+                command: "diff".into(),
+                status: "ok".into(),
+                tables: table_diffs,
+            };
+            return serde_wasm_bindgen::to_value(&output)
+                .map_err(|e| JsValue::from_str(&format!("serialization failed: {}", e)));
+        };
+
+        let tables = get_sync_tables(&self.source, dest, &self.sync_config).await?;
 
         let mut table_diffs = Vec::new();
         for table in &tables {
             let diff = diff_table_cached(
                 &self.source,
-                &dest,
+                dest,
                 &self.source_cache,
                 &self.dest_cache,
                 table,
