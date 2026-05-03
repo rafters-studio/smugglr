@@ -16,8 +16,11 @@ import type {
   TableChangedEvent,
   SmugglrEventMap,
   Unsubscribe,
+  AutoSyncConfig,
+  AutoSyncBackoff,
 } from "./types.js";
 import { SmugglrError } from "./types.js";
+import { startAutoSync, type AutoSyncRuntime } from "./autoSync.js";
 
 export type {
   SmugglrConfig,
@@ -32,6 +35,8 @@ export type {
   TableChangedEvent,
   SmugglrEventMap,
   Unsubscribe,
+  AutoSyncConfig,
+  AutoSyncBackoff,
 };
 export { SmugglrError };
 export { createWaSqliteExecutor } from "./opfs.js";
@@ -118,6 +123,7 @@ async function loadWasm(options?: InitOptions): Promise<WasmModule> {
 /** smugglr sync client for browser and Node.js */
 export class Smugglr {
   private inner: WasmSmugglr;
+  private auto: AutoSyncRuntime | null = null;
 
   private constructor(inner: WasmSmugglr) {
     this.inner = inner;
@@ -145,12 +151,24 @@ export class Smugglr {
    */
   static async init(config: SmugglrConfig, options?: InitOptions): Promise<Smugglr> {
     const wasm = await loadWasm(options);
+    let inner: WasmSmugglr;
     try {
-      const inner = wasm.Smugglr.init(config);
-      return new Smugglr(inner);
+      inner = wasm.Smugglr.init(config);
     } catch (e) {
       throw new SmugglrError(String(e), 2);
     }
+    const instance = new Smugglr(inner);
+    if (config.autoSync) {
+      instance.auto = startAutoSync({
+        target: instance,
+        config: config.autoSync,
+        source: config.source,
+        dest: config.dest,
+        sync: config.sync,
+      });
+      await instance.auto.ready;
+    }
+    return instance;
   }
 
   /**
@@ -280,8 +298,19 @@ export class Smugglr {
     }
   }
 
+  /**
+   * Cancel the auto-sync loop started by `Smugglr.init({ autoSync: ... })`.
+   * Removes the `online` listener and aborts any pending retry timer. Idempotent;
+   * safe to call when no auto-sync is active.
+   */
+  stopAutoSync(): void {
+    this.auto?.stop();
+    this.auto = null;
+  }
+
   /** Release WASM resources. Called automatically if using `using` syntax. */
   dispose(): void {
+    this.stopAutoSync();
     this.inner.free();
   }
 

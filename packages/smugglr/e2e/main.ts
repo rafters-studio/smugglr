@@ -9,6 +9,7 @@ declare global {
       eraseLocal(opts: unknown): Promise<unknown>;
       syncWithAuthSwap(opts: unknown): Promise<unknown>;
       anonymousMode(): Promise<unknown>;
+      autoSync(opts: unknown): Promise<unknown>;
       reset(): Promise<unknown>;
     };
   }
@@ -44,6 +45,7 @@ window.e2e = {
   eraseLocal: (opts) => call("eraseLocal", [opts]),
   syncWithAuthSwap: (opts) => call("syncWithAuthSwap", [opts]),
   anonymousMode: () => call("anonymousMode", []),
+  autoSync: (opts) => call("autoSync", [opts]),
   reset: () => call("reset", []),
 };
 
