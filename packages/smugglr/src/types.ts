@@ -76,8 +76,8 @@ export interface SmugglrConfig {
    * and sync-on-reconnect when the browser comes back online. Has no effect
    * when `dest` is not configured -- there is nothing to sync against.
    *
-   * Only meaningful in browser environments (relies on `navigator.locks`,
-   * `navigator.storage`, and the `online` event). In Node it is a no-op.
+   * Only meaningful in browser environments (relies on `navigator.locks`
+   * and the `online` event). In Node it is a no-op.
    */
   autoSync?: AutoSyncConfig;
 }
