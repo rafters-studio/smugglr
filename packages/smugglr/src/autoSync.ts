@@ -1,8 +1,8 @@
 // Auto-sync runtime: empty-state hydration on init + sync-on-reconnect.
 //
-// Browser-only. Bails (returns a no-op handle) when navigator.locks,
-// navigator.storage, or globalThis.addEventListener are absent so Node
-// consumers can pass `autoSync: {...}` without branching.
+// Browser-only. Bails (returns a no-op handle) when navigator.locks or
+// globalThis.addEventListener are absent so Node consumers can pass
+// `autoSync: {...}` without branching.
 
 import type {
   AutoSyncBackoff,
@@ -24,16 +24,12 @@ export interface AutoSyncRuntime {
   ready: Promise<void>;
 }
 
-interface SidecarState {
-  lastSyncAt: number | null;
-}
-
-const DEFAULT_SIDECAR = ".smugglr/auto-sync.json";
 const DEFAULT_BACKOFF: Required<AutoSyncBackoff> = {
   initialMs: 1000,
   maxMs: 300_000,
   jitter: true,
 };
+const ONLINE_DEBOUNCE_MS = 250;
 
 export function startAutoSync(opts: {
   target: AutoSyncTarget;
@@ -42,42 +38,42 @@ export function startAutoSync(opts: {
   dest: EndpointConfig | undefined;
   sync: SyncOptions | undefined;
 }): AutoSyncRuntime {
-  // No dest: nothing to sync against. Spec says no-op.
   if (!opts.dest) return noopRuntime();
 
-  // Need a browser-ish env (online events, locks, storage). Otherwise no-op.
   const g = globalThis as unknown as {
     addEventListener?: (ev: string, cb: () => void) => void;
     removeEventListener?: (ev: string, cb: () => void) => void;
     navigator?: {
       locks?: { request: (name: string, cb: () => Promise<void>) => Promise<void> };
-      storage?: { getDirectory: () => Promise<FileSystemDirectoryHandle> };
     };
   };
-  if (!g.addEventListener || !g.navigator?.locks || !g.navigator?.storage) {
+  if (!g.addEventListener || !g.navigator?.locks) {
     return noopRuntime();
   }
 
   const onInit = opts.config.onInit ?? "hydrate-if-empty";
   const onReconnect = opts.config.onReconnect ?? true;
   const backoff = { ...DEFAULT_BACKOFF, ...(opts.config.backoff ?? {}) };
-  const sidecarPath = opts.config.sidecarPath ?? DEFAULT_SIDECAR;
   const lockName = opts.config.lockName ?? defaultLockName(opts.dest);
-
-  const sidecar = createSidecar(sidecarPath, g.navigator.storage);
   const locks = g.navigator.locks;
 
   let stopped = false;
   let attempt = 0;
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
-  const onlineHandler = () => { void runWithRetry("sync"); };
+  let onlineDebounce: ReturnType<typeof setTimeout> | null = null;
+  const onlineHandler = () => {
+    if (onlineDebounce !== null) clearTimeout(onlineDebounce);
+    onlineDebounce = setTimeout(() => {
+      onlineDebounce = null;
+      void runWithRetry("sync");
+    }, ONLINE_DEBOUNCE_MS);
+  };
 
   async function runOnce(kind: "pull" | "sync"): Promise<void> {
     await locks.request(lockName, async () => {
       if (stopped) return;
       if (kind === "pull") await opts.target.pull();
       else await opts.target.sync();
-      await sidecar.write({ lastSyncAt: Date.now() });
       attempt = 0;
     });
   }
@@ -99,7 +95,6 @@ export function startAutoSync(opts: {
       await runWithRetry("pull");
       return;
     }
-    // hydrate-if-empty: only pull when every configured table has zero rows.
     const empty = await isLocalEmpty(opts.source, opts.sync?.tables);
     if (empty) await runWithRetry("pull");
   })();
@@ -111,6 +106,7 @@ export function startAutoSync(opts: {
     stop() {
       stopped = true;
       if (retryTimer !== null) clearTimeout(retryTimer);
+      if (onlineDebounce !== null) clearTimeout(onlineDebounce);
       if (onReconnect) g.removeEventListener?.("online", onlineHandler);
     },
   };
@@ -121,8 +117,12 @@ function noopRuntime(): AutoSyncRuntime {
 }
 
 function defaultLockName(dest: EndpointConfig): string {
-  if ("type" in dest && dest.type === "local") return "smugglr:auto:local";
-  return `smugglr:auto:${(dest as { url: string }).url}`;
+  if (isLocal(dest)) return "smugglr:auto:local";
+  return `smugglr:auto:${dest.url}`;
+}
+
+function isLocal(endpoint: EndpointConfig): endpoint is Extract<EndpointConfig, { type: "local" }> {
+  return "type" in endpoint && endpoint.type === "local";
 }
 
 function nextDelay(backoff: Required<AutoSyncBackoff>, attempt: number): number {
@@ -134,9 +134,7 @@ async function isLocalEmpty(
   source: EndpointConfig,
   tables: string[] | undefined,
 ): Promise<boolean> {
-  // Only meaningful for local sources. HTTP source -> caller is doing
-  // server-to-server sync, which has no "empty local" semantic.
-  if (!("type" in source) || source.type !== "local") return false;
+  if (!isLocal(source)) return false;
   if (!tables || tables.length === 0) return false;
 
   const exec: SqlExecutor = source.executor;
@@ -157,30 +155,4 @@ function quoteIdent(name: string): string {
     throw new Error(`autoSync: refusing unsafe table identifier "${name}"`);
   }
   return `"${name}"`;
-}
-
-interface Sidecar {
-  write(state: SidecarState): Promise<void>;
-}
-
-function createSidecar(
-  path: string,
-  storage: { getDirectory: () => Promise<FileSystemDirectoryHandle> },
-): Sidecar {
-  const segments = path.split("/").filter(Boolean);
-  const fileName = segments.pop();
-  if (!fileName) throw new Error(`autoSync: invalid sidecarPath "${path}"`);
-
-  return {
-    async write(state) {
-      let dir = await storage.getDirectory();
-      for (const seg of segments) {
-        dir = await dir.getDirectoryHandle(seg, { create: true });
-      }
-      const handle = await dir.getFileHandle(fileName, { create: true });
-      const writable = await handle.createWritable();
-      await writable.write(JSON.stringify(state));
-      await writable.close();
-    },
-  };
 }

@@ -97,13 +97,6 @@ export interface AutoSyncConfig {
   /** Exponential backoff for retries after a failed auto-sync. */
   backoff?: AutoSyncBackoff;
   /**
-   * OPFS path for the cursor sidecar. Defaults to `.smugglr/auto-sync.json`.
-   * The sidecar holds the last successful sync timestamp so repeat init calls
-   * can skip the empty-state pull when local is already populated and a
-   * recent sync is on record.
-   */
-  sidecarPath?: string;
-  /**
    * Web Lock name. Defaults to `smugglr:auto:<dest>`. Multi-tab sync uses this
    * lock so only the lead tab runs the sync; other tabs wait.
    */

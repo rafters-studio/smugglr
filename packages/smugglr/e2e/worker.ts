@@ -150,10 +150,9 @@ async function autoSync(opts: {
   });
 
   if (opts.triggerOnline) {
-    // Dispatch synthetic `online`, then yield long enough for the lock-bound
-    // sync to flush. 250 ms is generous for a single mocked round-trip.
+    // online -> 250ms debounce -> lock + mocked round-trip. 750ms covers all three.
     self.dispatchEvent(new Event("online"));
-    await new Promise((r) => setTimeout(r, 250));
+    await new Promise((r) => setTimeout(r, 750));
   }
 
   const local = await createWaSqliteExecutor(sqlite3, db).run(
