@@ -132,6 +132,39 @@ async function anonymousMode() {
   return { diff, pushError };
 }
 
+// Runs Smugglr.init with autoSync configured, optionally fires a synthetic
+// `online` event, and returns the captured row count + the request fingerprint
+// the mock saw (so the test can assert "did a pull actually happen").
+async function autoSync(opts: {
+  destUrl: string;
+  tables: string[];
+  onInit?: "hydrate-if-empty" | "always" | "never";
+  triggerOnline?: boolean;
+}) {
+  if (!sqlite3 || db === null) throw new Error("init() first");
+  const s = await Smugglr.init({
+    source: { type: "local", executor: createWaSqliteExecutor(sqlite3, db) },
+    dest: { url: opts.destUrl, profile: "generic" },
+    sync: { tables: opts.tables },
+    autoSync: { onInit: opts.onInit ?? "hydrate-if-empty", onReconnect: true },
+  });
+
+  if (opts.triggerOnline) {
+    // online -> 250ms debounce -> lock + mocked round-trip. 750ms covers all three.
+    self.dispatchEvent(new Event("online"));
+    await new Promise((r) => setTimeout(r, 750));
+  }
+
+  const local = await createWaSqliteExecutor(sqlite3, db).run(
+    `SELECT id, name, updated_at FROM ${opts.tables[0]} ORDER BY id`,
+    [],
+  );
+
+  s.stopAutoSync();
+  s.dispose();
+  return { local };
+}
+
 async function reset() {
   if (sqlite3 && db !== null) {
     sqlite3.close(db);
@@ -145,7 +178,7 @@ async function reset() {
 
 interface RpcCall {
   id: number;
-  op: "init" | "runSql" | "sync" | "eraseLocal" | "syncWithAuthSwap" | "anonymousMode" | "reset";
+  op: "init" | "runSql" | "sync" | "eraseLocal" | "syncWithAuthSwap" | "anonymousMode" | "autoSync" | "reset";
   args: unknown[];
 }
 
@@ -160,6 +193,7 @@ self.addEventListener("message", async (ev: MessageEvent<RpcCall>) => {
       case "eraseLocal": result = await eraseLocal(args[0] as Parameters<typeof eraseLocal>[0]); break;
       case "syncWithAuthSwap": result = await syncWithAuthSwap(args[0] as Parameters<typeof syncWithAuthSwap>[0]); break;
       case "anonymousMode": result = await anonymousMode(); break;
+      case "autoSync": result = await autoSync(args[0] as Parameters<typeof autoSync>[0]); break;
       case "reset": result = await reset(); break;
     }
     (self as unknown as Worker).postMessage({ id, ok: true, result });

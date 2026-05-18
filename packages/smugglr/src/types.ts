@@ -71,6 +71,46 @@ export interface SmugglrConfig {
   dest?: EndpointConfig;
   /** Sync behavior options */
   sync?: SyncOptions;
+  /**
+   * Hands-off sync triggers. Opt-in. Drives empty-state hydration on init
+   * and sync-on-reconnect when the browser comes back online. Has no effect
+   * when `dest` is not configured -- there is nothing to sync against.
+   *
+   * Only meaningful in browser environments (relies on `navigator.locks`
+   * and the `online` event). In Node it is a no-op.
+   */
+  autoSync?: AutoSyncConfig;
+}
+
+/** When/how the auto-sync loop triggers a sync. */
+export interface AutoSyncConfig {
+  /**
+   * Behavior on Smugglr.init():
+   * - `"hydrate-if-empty"` (default): pull from dest only when every configured
+   *   sync table has zero rows. Cheap startup cost when local already has data.
+   * - `"always"`: pull on every init. Useful when staleness matters more than cost.
+   * - `"never"`: skip the init-time pull. Reconnect/online still fires.
+   */
+  onInit?: "hydrate-if-empty" | "always" | "never";
+  /** Run `.sync()` whenever the browser fires an `online` event. Default: true. */
+  onReconnect?: boolean;
+  /** Exponential backoff for retries after a failed auto-sync. */
+  backoff?: AutoSyncBackoff;
+  /**
+   * Web Lock name. Defaults to `smugglr:auto:<dest>`. Multi-tab sync uses this
+   * lock so only the lead tab runs the sync; other tabs wait.
+   */
+  lockName?: string;
+}
+
+/** Exponential backoff with jitter for auto-sync retries. */
+export interface AutoSyncBackoff {
+  /** First retry delay. Default: 1000 ms. */
+  initialMs?: number;
+  /** Cap on retry delay. Default: 300_000 ms (5 min). */
+  maxMs?: number;
+  /** Add 0..delay random jitter to each retry. Default: true. */
+  jitter?: boolean;
 }
 
 /** Per-table sync result */
