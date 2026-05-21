@@ -1,0 +1,17 @@
+name = "smugglr-tenant-fence"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+
+# Bind the shared D1 database. Create it first with:
+#   npx wrangler d1 create smugglr_demo
+# then paste the returned database_id below.
+[[d1_databases]]
+binding = "DB"
+database_name = "smugglr_demo"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+
+# Demo-only token -> tenant_id map. In production this is a JWT verification
+# step or a lookup against a secrets table. Plain vars keep the example small.
+[vars]
+TENANT_TOKEN_ALICE = "alice-dev-token"
+TENANT_TOKEN_BOB = "bob-dev-token"

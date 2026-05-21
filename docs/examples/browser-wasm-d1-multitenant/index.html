@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>smugglr WASM + D1 multi-tenant</title>
+  </head>
+  <body>
+    <h1>smugglr browser-WASM <span id="tenant-label"></span> &rarr; D1</h1>
+    <p>Each browser is its own SQLite database. D1 is shared, partitioned by tenant_id. The Cloudflare Worker is the fence.</p>
+    <p>Open this page in a second tab with a different <code>?tenant=</code> query param to see isolation.</p>
+    <button id="add">Add note</button>
+    <button id="sync">Sync</button>
+    <button id="list">List local rows</button>
+    <button id="reset">Reset local</button>
+    <pre id="log"></pre>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>
