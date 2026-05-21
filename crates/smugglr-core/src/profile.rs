@@ -42,6 +42,9 @@ pub enum RequestFormat {
     Datasette,
     /// Flat JSON: `{"sql": "<sql>", "params": [...]}`
     Generic,
+    /// http-sql v0.1 spec: `{"sql": "<sql>", "params": [...]}`
+    /// See <https://github.com/rafters-studio/http-sql>.
+    HttpSql,
 }
 
 impl Profile {
@@ -54,6 +57,7 @@ impl Profile {
             "sqlite-cloud" | "sqlitecloud" => Some(Self::sqlite_cloud()),
             "starbasedb" | "starbase" => Some(Self::starbasedb()),
             "generic" => Some(Self::generic()),
+            "http-sql" | "httpsql" => Some(Self::http_sql()),
             _ => None,
         }
     }
@@ -140,6 +144,18 @@ impl Profile {
         }
     }
 
+    /// Profile for any server conforming to the http-sql v0.1 spec.
+    /// See <https://github.com/rafters-studio/http-sql>.
+    pub fn http_sql() -> Self {
+        Self {
+            auth_format: AuthFormat::Bearer,
+            request_format: RequestFormat::HttpSql,
+            rows_path: vec!["rows".into()],
+            columns_path: vec!["columns".into()],
+            max_bind_params: 0,
+        }
+    }
+
     /// Build the request body for a SQL query.
     pub fn build_request(&self, sql: &str, params: &[Value]) -> Value {
         match self.request_format {
@@ -194,6 +210,13 @@ impl Profile {
                 serde_json::json!({"sql": sql, "_shape": "array"})
             }
             RequestFormat::Generic => {
+                if params.is_empty() {
+                    serde_json::json!({"sql": sql})
+                } else {
+                    serde_json::json!({"sql": sql, "params": params})
+                }
+            }
+            RequestFormat::HttpSql => {
                 if params.is_empty() {
                     serde_json::json!({"sql": sql})
                 } else {
@@ -306,6 +329,36 @@ mod tests {
         assert!(Profile::from_name("starbasedb").is_some());
         assert!(Profile::from_name("starbase").is_some());
         assert!(Profile::from_name("generic").is_some());
+        assert!(Profile::from_name("http-sql").is_some());
+        assert!(Profile::from_name("httpsql").is_some());
         assert!(Profile::from_name("unknown").is_none());
+    }
+
+    #[test]
+    fn test_http_sql_request_no_params() {
+        let p = Profile::http_sql();
+        let body = p.build_request("SELECT 1", &[]);
+        assert_eq!(body["sql"], "SELECT 1");
+        assert!(body.get("params").is_none());
+    }
+
+    #[test]
+    fn test_http_sql_request_with_params() {
+        let p = Profile::http_sql();
+        let body = p.build_request(
+            "SELECT * FROM notes WHERE id = ?",
+            &[Value::String("42".into())],
+        );
+        assert_eq!(body["sql"], "SELECT * FROM notes WHERE id = ?");
+        assert_eq!(body["params"][0], "42");
+    }
+
+    #[test]
+    fn test_http_sql_response_paths() {
+        // The v0.1 success envelope is {"columns": [...], "rows": [...], ...}
+        // at the top level. Verify the profile points there.
+        let p = Profile::http_sql();
+        assert_eq!(p.rows_path, vec!["rows".to_string()]);
+        assert_eq!(p.columns_path, vec!["columns".to_string()]);
     }
 }
