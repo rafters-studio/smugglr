@@ -412,7 +412,7 @@ fn resolve_tables(local: &LocalDb, table: Option<String>) -> error::Result<Optio
     match table {
         Some(t) => {
             let schema = local.get_schema()?;
-            let _ = schema.validate(&t)?;
+            schema.validate(&t)?;
             Ok(Some(vec![t]))
         }
         None => Ok(None),
@@ -622,7 +622,7 @@ async fn run_diff(
             let tables = match table {
                 Some(t) => {
                     let schema = local.get_schema()?;
-                    let _ = schema.validate(&t)?;
+                    schema.validate(&t)?;
                     vec![t]
                 }
                 None => get_tables_to_sync(&local, &target_db, config).await?,
@@ -646,7 +646,7 @@ async fn run_diff(
             let tables = match table {
                 Some(t) => {
                     let schema = local.get_schema()?;
-                    let _ = schema.validate(&t)?;
+                    schema.validate(&t)?;
                     vec![t]
                 }
                 None => get_tables_to_sync(&local, &plugin, config).await?,
