@@ -120,7 +120,7 @@ pub struct SyncConfig {
     /// Retry policy for transient failures. Flattened into the `[sync]` table,
     /// so the TOML keys stay `max_retries`, `initial_retry_delay_ms`,
     /// `max_retry_delay_ms`, and `backoff_multiplier`. These are the raw
-    /// (unvalidated) values; [`RetryConfig::from_sync_config`] applies the caps.
+    /// (unvalidated) values; [`RetryConfig::clamped`] applies the caps.
     #[serde(flatten)]
     pub retry: RetryConfig,
 
@@ -225,7 +225,7 @@ impl BatchConfig {
         Self {
             batch_size: sync.batch_size,
             max_statement_bytes: sync.max_statement_bytes,
-            retry: RetryConfig::from_sync_config(sync),
+            retry: RetryConfig::clamped(&sync.retry),
         }
     }
 }
@@ -309,16 +309,16 @@ impl Default for RetryConfig {
 }
 
 impl RetryConfig {
-    /// Create RetryConfig from SyncConfig settings.
+    /// Build a validated RetryConfig from a raw one.
     ///
     /// Validates that backoff_multiplier >= 1.0 (clamps invalid values).
-    pub fn from_sync_config(sync: &SyncConfig) -> Self {
+    pub fn clamped(raw: &RetryConfig) -> Self {
         Self {
-            max_retries: sync.retry.max_retries.min(100), // cap at reasonable max
-            initial_delay_ms: sync.retry.initial_delay_ms,
-            max_delay_ms: sync.retry.max_delay_ms,
+            max_retries: raw.max_retries.min(100), // cap at reasonable max
+            initial_delay_ms: raw.initial_delay_ms,
+            max_delay_ms: raw.max_delay_ms,
             // Ensure multiplier is at least 1.0 to avoid zero/negative delays
-            backoff_multiplier: sync.retry.backoff_multiplier.max(1.0),
+            backoff_multiplier: raw.backoff_multiplier.max(1.0),
         }
     }
 
@@ -854,7 +854,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let retry = RetryConfig::from_sync_config(&sync);
+        let retry = RetryConfig::clamped(&sync.retry);
         assert_eq!(retry.backoff_multiplier, 1.0);
     }
 
@@ -867,7 +867,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let retry = RetryConfig::from_sync_config(&sync);
+        let retry = RetryConfig::clamped(&sync.retry);
         assert_eq!(retry.max_retries, 100);
     }
 
@@ -882,7 +882,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let retry = RetryConfig::from_sync_config(&sync);
+        let retry = RetryConfig::clamped(&sync.retry);
         assert_eq!(retry.max_retries, 3);
         assert_eq!(retry.initial_delay_ms, 500);
         assert_eq!(retry.max_delay_ms, 30000);
