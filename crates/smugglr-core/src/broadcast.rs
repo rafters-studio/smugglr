@@ -563,13 +563,22 @@ impl DeltaPacket {
     }
 }
 
+/// Split a delta into datagram-sized parts.
+///
+/// `reserve` is wire-envelope headroom (bytes) the caller will add AFTER this
+/// returns -- e.g. the multicast `Msg` JSON wrapper plus the XChaCha20 nonce+tag.
+/// Each part's bare serialized size is kept at or below `SAFE_PACKET_SIZE -
+/// reserve`, so the sealed datagram stays within the safe MTU. Pass 0 if the
+/// part goes on the wire as-is.
 pub fn split_delta(
     source_id: &str,
     seq: u64,
     table: &str,
     upserts: Vec<HashMap<String, serde_json::Value>>,
     deletes: Vec<String>,
+    reserve: usize,
 ) -> Result<Vec<DeltaPacket>> {
+    let limit = SAFE_PACKET_SIZE.saturating_sub(reserve);
     let mut base = DeltaPacket {
         version: PROTOCOL_VERSION,
         source_id: source_id.to_string(),
@@ -587,7 +596,7 @@ pub fn split_delta(
 
     base.upserts = upserts.clone();
     let serialized = base.to_bytes()?;
-    if serialized.len() <= SAFE_PACKET_SIZE {
+    if serialized.len() <= limit {
         return Ok(vec![base]);
     }
 
@@ -607,7 +616,7 @@ pub fn split_delta(
         current.upserts.push(row);
 
         let size = current.to_bytes()?.len();
-        if size > SAFE_PACKET_SIZE && current.upserts.len() > 1 {
+        if size > limit && current.upserts.len() > 1 {
             let overflow = current.upserts.pop().unwrap();
             packets.push(current);
 
@@ -915,7 +924,7 @@ mod tests {
         let upserts = vec![make_row("1", "Alice"), make_row("2", "Bob")];
         let deletes = vec!["3".to_string()];
         let packets =
-            split_delta("machine-a", 1, "users", upserts.clone(), deletes.clone()).unwrap();
+            split_delta("machine-a", 1, "users", upserts.clone(), deletes.clone(), 0).unwrap();
         assert_eq!(packets.len(), 1);
         assert_eq!(packets[0].upserts.len(), 2);
         assert_eq!(packets[0].deletes.len(), 1);
@@ -938,7 +947,7 @@ mod tests {
             })
             .collect();
 
-        let packets = split_delta("machine-a", 5, "big_table", upserts, vec![]).unwrap();
+        let packets = split_delta("machine-a", 5, "big_table", upserts, vec![], 0).unwrap();
         assert!(packets.len() > 1, "should split into multiple packets");
 
         for p in &packets {
@@ -964,7 +973,7 @@ mod tests {
 
     #[test]
     fn test_split_delta_empty() {
-        let packets = split_delta("machine-a", 0, "empty_table", vec![], vec![]).unwrap();
+        let packets = split_delta("machine-a", 0, "empty_table", vec![], vec![], 0).unwrap();
         assert_eq!(packets.len(), 1);
         assert!(packets[0].is_empty());
     }
