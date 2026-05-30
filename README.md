@@ -23,7 +23,7 @@ Smuggler is a universal SQLite sync engine. It started as a way to sync local de
 - **Content hashing** - SHA256 comparison of actual row data, not just timestamps
 - **Delta sync** - Only moves rows that changed
 - **Bidirectional** - Push, pull, or both with configurable conflict resolution
-- **LAN broadcast sync** - UDP peer discovery + encrypted delta exchange between machines on the same subnet
+- **LAN broadcast sync** - masterless UDP multicast: every node broadcasts a content-hash digest, peers pull what they're missing, no coordinator -- two or two hundred nodes converge
 - **Agent-friendly** - `--output json` across all commands, structured exit codes for programmatic callers
 - **No state files** - Fresh comparison every run, no stale state to haunt you
 - **Pluggable backends** - `DataSource` trait abstracts any database backend
@@ -245,20 +245,22 @@ This is the current browser story: sync between two remote HTTP SQL endpoints fr
 
 ## LAN Broadcast Sync
 
-Smuggler can keep SQLite databases in sync across machines on the same LAN. No relay server, no cloud dependency -- just encrypted UDP broadcast for peer discovery and TCP for delta exchange.
+Smuggler keeps SQLite databases in sync across machines on the same LAN with no relay, no cloud, and no coordinator. Every node runs the identical loop -- masterless UDP multicast gossip -- so two or two hundred nodes converge automatically. Membership is key possession: hold the shared key, you're on the network.
 
 ```
-Machine A                  LAN (port 31337)               Machine B
-  legion.db  --broadcast-->  [encrypted deltas]  <--broadcast--  legion.db
+Machine A           multicast group 239.255.43.21 (encrypted)          Machine B
+  legion.db  <---- content-hash digest / pull / row, all multicast ---->  legion.db
 ```
 
 ### How it works
 
-1. `smugglr broadcast` sends UDP announcements on port 31337
-2. Peers on the same subnet discover each other automatically
-3. On discovery, peers exchange deltas over TCP (only changed rows)
-4. All traffic is encrypted with XChaCha20-Poly1305 (pre-shared key)
-5. UUIDv7 primary keys prevent insert collisions across machines
+1. `smugglr broadcast` joins the multicast group and, each interval, multicasts a `primary_key -> content_hash` digest of every synced table -- the heartbeat.
+2. A node that hears a digest covering rows it lacks (or hashes differently) multicasts a request for exactly those rows.
+3. Whoever holds them multicasts the rows; every listener applies idempotently, so one answer converges the whole group. Last-received-wins on divergence -- UUIDv7 keys make concurrent divergence rare, no CRDTs.
+4. Late joiners and partition rejoins converge through the same heartbeat -- no special case.
+5. All traffic is XChaCha20-Poly1305 encrypted with the pre-shared key. Lost packets are safe: applying a row twice is a no-op and the next heartbeat re-reconciles.
+
+This is masterless and peer-symmetric -- no primary, no leader, and no TCP between LAN peers. (Cross-process and cross-subnet sync, where multicast can't reach, use the separate TCP framing path.)
 
 ### Broadcast configuration
 

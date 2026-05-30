@@ -25,6 +25,8 @@ pub mod daemon;
 #[cfg(feature = "native")]
 pub mod local;
 #[cfg(feature = "native")]
+pub mod multicast;
+#[cfg(feature = "native")]
 pub mod plugin;
 #[cfg(feature = "native")]
 pub mod snapshot;
