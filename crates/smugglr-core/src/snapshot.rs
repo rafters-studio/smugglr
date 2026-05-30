@@ -15,7 +15,9 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tracing::{debug, info};
 
-/// Metadata stored alongside each snapshot.
+/// A snapshot's metadata: the sidecar stored alongside each snapshot, and the
+/// value returned by `snapshot`, `restore`, and `list_snapshots` (the JSON shape
+/// is identical in all three roles).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotMeta {
     pub timestamp: String,
@@ -27,22 +29,6 @@ pub struct SnapshotMeta {
 pub struct SnapshotTableMeta {
     pub name: String,
     pub row_count: usize,
-}
-
-/// Result of a snapshot operation.
-#[derive(Debug, Clone, Serialize)]
-pub struct SnapshotResult {
-    pub timestamp: String,
-    pub size_bytes: u64,
-    pub tables: Vec<SnapshotTableMeta>,
-}
-
-/// An entry in the snapshot list.
-#[derive(Debug, Clone, Serialize)]
-pub struct SnapshotEntry {
-    pub timestamp: String,
-    pub size_bytes: u64,
-    pub tables: Vec<SnapshotTableMeta>,
 }
 
 /// Derive the snapshots prefix from the stash config URL.
@@ -66,7 +52,7 @@ pub async fn snapshot(
     config: &StashConfig,
     local_db_path: &str,
     dry_run: bool,
-) -> Result<SnapshotResult> {
+) -> Result<SnapshotMeta> {
     let (store, relay_path) = build_store(config)?;
     let prefix = snapshots_prefix(&relay_path);
 
@@ -92,7 +78,7 @@ pub async fn snapshot(
 
     if dry_run {
         debug!("Dry run -- skipping upload");
-        return Ok(SnapshotResult {
+        return Ok(SnapshotMeta {
             timestamp,
             size_bytes,
             tables,
@@ -109,28 +95,27 @@ pub async fn snapshot(
 
     // Upload metadata sidecar
     let meta = SnapshotMeta {
-        timestamp: timestamp.clone(),
+        timestamp,
         size_bytes,
-        tables: tables.clone(),
+        tables,
     };
     let meta_json = serde_json::to_vec(&meta)?;
-    let meta_path = ObjectPath::from(format!("{}/{}.meta.json", prefix, timestamp));
+    let meta_path = ObjectPath::from(format!("{}/{}.meta.json", prefix, meta.timestamp));
     store
         .put(&meta_path, PutPayload::from(meta_json))
         .await
         .map_err(|e| SyncError::Stash(format!("Failed to upload snapshot metadata: {}", e)))?;
 
-    info!("Snapshot created: {} ({} bytes)", timestamp, size_bytes);
+    info!(
+        "Snapshot created: {} ({} bytes)",
+        meta.timestamp, meta.size_bytes
+    );
 
-    Ok(SnapshotResult {
-        timestamp,
-        size_bytes,
-        tables,
-    })
+    Ok(meta)
 }
 
 /// List available snapshots from the relay store.
-pub async fn list_snapshots(config: &StashConfig) -> Result<Vec<SnapshotEntry>> {
+pub async fn list_snapshots(config: &StashConfig) -> Result<Vec<SnapshotMeta>> {
     let (store, relay_path) = build_store(config)?;
     let prefix = snapshots_prefix(&relay_path);
 
@@ -155,11 +140,7 @@ pub async fn list_snapshots(config: &StashConfig) -> Result<Vec<SnapshotEntry>> 
                 })?;
                 match serde_json::from_slice::<SnapshotMeta>(&bytes) {
                     Ok(meta) => {
-                        entries.push(SnapshotEntry {
-                            timestamp: meta.timestamp,
-                            size_bytes: meta.size_bytes,
-                            tables: meta.tables,
-                        });
+                        entries.push(meta);
                     }
                     Err(e) => {
                         debug!("Skipping malformed metadata at {}: {}", path_str, e);
@@ -185,7 +166,7 @@ pub async fn restore(
     local_db_path: &str,
     target_timestamp: &str,
     dry_run: bool,
-) -> Result<SnapshotResult> {
+) -> Result<SnapshotMeta> {
     let (store, relay_path) = build_store(config)?;
     let prefix = snapshots_prefix(&relay_path);
 
@@ -216,11 +197,7 @@ pub async fn restore(
             ))
         })?;
 
-    let result = SnapshotResult {
-        timestamp: entry.timestamp.clone(),
-        size_bytes: entry.size_bytes,
-        tables: entry.tables.clone(),
-    };
+    let result = entry.clone();
 
     if dry_run {
         info!(
