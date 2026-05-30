@@ -355,13 +355,109 @@ impl RetryConfig {
     }
 }
 
+/// Parse `content` as TOML, then expand `${VAR}` references inside string
+/// *values only*, returning the typed `Config`.
+///
+/// Expansion happens AFTER structural parse, on the parsed `toml::Value` tree --
+/// never on raw text. This is deliberate and load-bearing for a secrets path:
+/// a substituted value (a token) can therefore never inject TOML structure, and
+/// no `toml` parser ever sees expanded secret text, so a malformed secret cannot
+/// echo into a parse error (which would leak it to logs/stderr). The only parse
+/// runs on the user's literal config (placeholders, not secrets).
+fn parse_with_env(content: &str) -> Result<Config> {
+    let mut value: toml::Value =
+        toml::from_str(content).map_err(|e| SyncError::Config(e.to_string()))?;
+    expand_value(&mut value)?;
+    value
+        .try_into()
+        .map_err(|e| SyncError::Config(e.to_string()))
+}
+
+/// Recursively expand `${VAR}` in every string leaf of a parsed TOML tree.
+fn expand_value(value: &mut toml::Value) -> Result<()> {
+    match value {
+        toml::Value::String(s) => *s = expand_env_vars(s)?,
+        toml::Value::Array(items) => {
+            for item in items {
+                expand_value(item)?;
+            }
+        }
+        toml::Value::Table(table) => {
+            for (_, v) in table.iter_mut() {
+                expand_value(v)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Expand `${VAR}` / `${VAR:-default}` references in a single string value
+/// against the process environment. `$$` is a literal `$`. An unset var with no
+/// default is a hard error naming the variable -- never a silent empty
+/// substitution (which would send a blank credential).
+fn expand_env_vars(input: &str) -> Result<String> {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '$' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('$') => {
+                chars.next();
+                out.push('$'); // $$ -> literal $
+            }
+            Some('{') => {
+                chars.next(); // consume '{'
+                let mut spec = String::new();
+                let mut closed = false;
+                for ch in chars.by_ref() {
+                    if ch == '}' {
+                        closed = true;
+                        break;
+                    }
+                    spec.push(ch);
+                }
+                if !closed {
+                    return Err(SyncError::Config(
+                        "unterminated ${...} reference in config".to_string(),
+                    ));
+                }
+                let (name, default) = match spec.split_once(":-") {
+                    Some((n, d)) => (n.trim(), Some(d)),
+                    None => (spec.trim(), None),
+                };
+                if name.is_empty() {
+                    return Err(SyncError::Config(
+                        "empty ${} reference in config".to_string(),
+                    ));
+                }
+                match std::env::var(name) {
+                    Ok(v) => out.push_str(&v),
+                    Err(_) => match default {
+                        Some(d) => out.push_str(d),
+                        None => return Err(SyncError::ConfigEnvVar(name.to_string())),
+                    },
+                }
+            }
+            // A lone '$' not starting an escape or reference is preserved.
+            _ => out.push('$'),
+        }
+    }
+    Ok(out)
+}
+
 impl Config {
     /// Parse config from a TOML string without filesystem access.
     ///
     /// Skips local_db auto-detection and target validation.
     /// Use this for WASM or library consumers that construct config programmatically.
+    /// `${VAR}` references inside string values are expanded from the environment
+    /// (see [`parse_with_env`]).
     pub fn from_toml_str(content: &str) -> Result<Self> {
-        toml::from_str(content).map_err(|e| SyncError::Config(e.to_string()))
+        parse_with_env(content)
     }
 
     /// Load config from a TOML file
@@ -372,8 +468,7 @@ impl Config {
         }
 
         let content = std::fs::read_to_string(path)?;
-        let mut config: Config =
-            toml::from_str(&content).map_err(|e| SyncError::Config(e.to_string()))?;
+        let mut config: Config = parse_with_env(&content)?;
 
         // Auto-detect local_db if not specified
         if config.local_db.is_none() {
@@ -1138,5 +1233,59 @@ path = "/usr/local/bin/smuggler-custom"
             broadcast: None,
         };
         assert!(config.resolve_target().is_err());
+    }
+
+    #[test]
+    fn env_expand_substitutes_set_var() {
+        std::env::set_var("SMUGGLR_TEST_ENV_TOKEN", "s3cr3t");
+        let cfg = Config::from_toml_str(
+            "local_db = \"x.db\"\ncloudflare_api_token = \"${SMUGGLR_TEST_ENV_TOKEN}\"",
+        )
+        .unwrap();
+        assert_eq!(cfg.cloudflare_api_token.as_deref(), Some("s3cr3t"));
+        std::env::remove_var("SMUGGLR_TEST_ENV_TOKEN");
+    }
+
+    #[test]
+    fn env_expand_uses_default_when_unset() {
+        let out = expand_env_vars("${SMUGGLR_TEST_ENV_UNSET_X:-fallback}").unwrap();
+        assert_eq!(out, "fallback");
+    }
+
+    #[test]
+    fn env_expand_unset_no_default_errors_with_exit_2() {
+        let err = expand_env_vars("${SMUGGLR_TEST_ENV_DEFINITELY_UNSET_Y}").unwrap_err();
+        assert!(
+            matches!(err, SyncError::ConfigEnvVar(ref v) if v == "SMUGGLR_TEST_ENV_DEFINITELY_UNSET_Y")
+        );
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn env_expand_double_dollar_is_literal() {
+        assert_eq!(expand_env_vars("$${HOME}/x").unwrap(), "${HOME}/x");
+    }
+
+    #[test]
+    fn env_expand_lone_dollar_preserved() {
+        assert_eq!(expand_env_vars("costs $5 total").unwrap(), "costs $5 total");
+    }
+
+    #[test]
+    fn env_expand_value_with_toml_metachars_is_safe() {
+        // Expansion happens post-parse on string values, so a secret containing
+        // a quote/newline is inserted verbatim -- it cannot inject TOML structure
+        // and never reaches a parser (so a malformed secret can't leak via a
+        // parse error). The value must round-trip exactly.
+        let nasty = "ab\"c\ninjected = \"x";
+        std::env::set_var("SMUGGLR_TEST_ENV_NASTY", nasty);
+        let cfg = Config::from_toml_str(
+            "local_db = \"x.db\"\ncloudflare_api_token = \"${SMUGGLR_TEST_ENV_NASTY}\"",
+        )
+        .unwrap();
+        assert_eq!(cfg.cloudflare_api_token.as_deref(), Some(nasty));
+        // No `injected` key leaked into the config as structure.
+        assert!(cfg.database_id.is_none());
+        std::env::remove_var("SMUGGLR_TEST_ENV_NASTY");
     }
 }

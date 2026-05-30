@@ -7,6 +7,9 @@ pub enum SyncError {
     #[error("Configuration error: {0}")]
     Config(String),
 
+    #[error("Config references unset environment variable ${{{0}}}")]
+    ConfigEnvVar(String),
+
     #[cfg(feature = "native")]
     #[error("Local database error: {0}")]
     LocalDb(#[from] rusqlite::Error),
@@ -143,6 +146,7 @@ impl SyncError {
     pub fn exit_code(&self) -> i32 {
         match self {
             SyncError::Config(_) | SyncError::ConfigNotFound(_) => 2,
+            SyncError::ConfigEnvVar(_) => 2,
             SyncError::InvalidTableName { .. } | SyncError::NoPrimaryKey(_) => 2,
             SyncError::ParamLimitExceeded { .. } => 2,
 
