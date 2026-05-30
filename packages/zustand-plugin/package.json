@@ -30,7 +30,7 @@
   },
   "author": "Sean Silvius",
   "peerDependencies": {
-    "smugglr": "^0.3.3",
+    "smugglr": "^0.4.0",
     "zustand": "^4.0.0 || ^5.0.0"
   },
   "devDependencies": {

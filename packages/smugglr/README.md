@@ -116,6 +116,30 @@ const result = await s.eraseLocal();
 // { erasedTables: ["users", "posts"] }
 ```
 
+## Auto-sync
+
+Opt in to hands-off triggers: pull from dest when the local database is empty on init, and re-sync whenever the browser fires `online`.
+
+```ts
+const s = await Smugglr.init({
+  source: { type: "local", executor },
+  dest:   { url, authToken, profile: "turso" },
+  sync:   { tables: ["users", "posts"] },
+  autoSync: {
+    onInit: "hydrate-if-empty", // default; or "always" | "never"
+    onReconnect: true,          // default; runs sync() on `online` events
+    backoff: { initialMs: 1000, maxMs: 300_000, jitter: true },
+  },
+});
+
+await s.ready; // optional: wait for the init-phase trigger to finish
+s.stopAutoSync(); // cancel the loop
+```
+
+Multi-tab safe: a Web Lock (`smugglr:auto:<dest>` by default, overridable via `lockName`) ensures only the lead tab runs the sync. Other tabs wait. Failures back off exponentially with jitter, capped at 5 min. No retry ceiling -- the loop survives indefinite outages.
+
+No-op in Node (relies on `navigator.locks` and the `online` event); pass the config unconditionally and it falls through silently.
+
 ## Anonymous-first
 
 Omit `dest` to run smugglr with no network at all -- nothing leaves the device. Useful for the "let users try the app before signing up" flow.
