@@ -16,6 +16,7 @@
 
 #![cfg(target_arch = "wasm32")]
 
+mod adapter_common;
 mod fetch_adapter;
 mod local_adapter;
 
@@ -779,7 +780,7 @@ impl Smugglr {
             )
         })?;
         let dry_run = dry_run.unwrap_or(false);
-        let tables = get_sync_tables(&self.source, &dest, &self.sync_config).await?;
+        let tables = get_sync_tables(&self.source, dest, &self.sync_config).await?;
         let conflict = self.sync_config.conflict_resolution;
         let batch_size = self.sync_config.batch_size;
 
@@ -787,7 +788,7 @@ impl Smugglr {
         for table in &tables {
             let diff = diff_table_cached(
                 &self.source,
-                &dest,
+                dest,
                 &self.source_cache,
                 &self.dest_cache,
                 table,
@@ -802,7 +803,7 @@ impl Smugglr {
             } else {
                 transfer_rows(
                     &self.source,
-                    &dest,
+                    dest,
                     table,
                     &to_push,
                     batch_size,
@@ -838,7 +839,7 @@ impl Smugglr {
             )
         })?;
         let dry_run = dry_run.unwrap_or(false);
-        let tables = get_sync_tables(&self.source, &dest, &self.sync_config).await?;
+        let tables = get_sync_tables(&self.source, dest, &self.sync_config).await?;
         let conflict = self.sync_config.conflict_resolution;
         let batch_size = self.sync_config.batch_size;
 
@@ -846,7 +847,7 @@ impl Smugglr {
         for table in &tables {
             let diff = diff_table_cached(
                 &self.source,
-                &dest,
+                dest,
                 &self.source_cache,
                 &self.dest_cache,
                 table,
@@ -860,7 +861,7 @@ impl Smugglr {
                 to_pull.len()
             } else {
                 let n = transfer_rows(
-                    &dest,
+                    dest,
                     &self.source,
                     table,
                     &to_pull,
@@ -901,7 +902,7 @@ impl Smugglr {
             )
         })?;
         let dry_run = dry_run.unwrap_or(false);
-        let tables = get_sync_tables(&self.source, &dest, &self.sync_config).await?;
+        let tables = get_sync_tables(&self.source, dest, &self.sync_config).await?;
         let conflict = self.sync_config.conflict_resolution;
         let batch_size = self.sync_config.batch_size;
 
@@ -909,7 +910,7 @@ impl Smugglr {
         for table in &tables {
             let diff = diff_table_cached(
                 &self.source,
-                &dest,
+                dest,
                 &self.source_cache,
                 &self.dest_cache,
                 table,
@@ -926,7 +927,7 @@ impl Smugglr {
             } else {
                 transfer_rows(
                     &self.source,
-                    &dest,
+                    dest,
                     table,
                     &to_push,
                     batch_size,
@@ -939,7 +940,7 @@ impl Smugglr {
                 to_pull.len()
             } else {
                 let n = transfer_rows(
-                    &dest,
+                    dest,
                     &self.source,
                     table,
                     &to_pull,
