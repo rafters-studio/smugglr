@@ -325,17 +325,18 @@ impl DataSource for PluginDataSource {
     }
 }
 
+/// Directory under `$HOME` where smugglr looks for plugin binaries.
+///
+/// Single source of truth so the path we search and the path we name in errors
+/// cannot drift apart -- that drift was bug #140 (the join said `.smuggler`
+/// while the error message said `.smugglr`).
+const PLUGIN_HOME_SUBDIR: &str = ".smugglr/plugins";
+
 /// Resolve a plugin name to its binary path.
 ///
 /// Search order:
 /// 1. `~/.smugglr/plugins/smugglr-{name}`
 /// 2. `smugglr-{name}` on `$PATH`
-/// Directory under `$HOME` where smugglr looks for plugin binaries. Single
-/// source of truth so the path we search and the path we name in errors cannot
-/// drift apart (that drift was bug #140: the join said `.smuggler`, the message
-/// said `.smugglr`).
-const PLUGIN_HOME_SUBDIR: &str = ".smugglr/plugins";
-
 pub fn resolve_plugin_path(name: &str) -> Result<PathBuf> {
     let binary_name = format!("smugglr-{}", name);
 
