@@ -1,62 +1,12 @@
-//! Table name validation for SQL injection prevention
+//! Table name validation for SQL injection prevention.
 //!
-//! This module provides the [`ValidatedTableName`] newtype which ensures
-//! table names are validated against an allowlist before use in SQL queries.
+//! [`TableSchema::validate`] checks a table name against an allowlist of names
+//! read from the live database schema and rejects anything not present. Callers
+//! validate before interpolating a table name into SQL, so injection via the
+//! table identifier is prevented by the allowlist check.
 
 use crate::error::{Result, SyncError};
 use std::collections::HashSet;
-
-/// A table name that has been validated against the database schema.
-///
-/// This type can only be constructed via [`ValidatedTableName::new`] or
-/// [`TableSchema::validate`], ensuring all table names used in SQL queries
-/// have been verified to exist in the database.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ValidatedTableName(String);
-
-impl ValidatedTableName {
-    /// Create a new validated table name.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SyncError::InvalidTableName`] if the name is not in the allowlist.
-    pub fn new(name: &str, allowed_tables: &HashSet<String>) -> Result<Self> {
-        if allowed_tables.contains(name) {
-            Ok(Self(name.to_string()))
-        } else {
-            let mut available: Vec<_> = allowed_tables.iter().cloned().collect();
-            available.sort();
-            Err(SyncError::InvalidTableName {
-                name: name.to_string(),
-                available: available.join(", "),
-            })
-        }
-    }
-
-    /// Get the table name as a string slice.
-    #[allow(dead_code)]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    /// Consume the validated name and return the inner string.
-    #[allow(dead_code)]
-    pub fn into_string(self) -> String {
-        self.0
-    }
-}
-
-impl std::fmt::Display for ValidatedTableName {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl AsRef<str> for ValidatedTableName {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
 
 /// Schema information used for table name validation.
 ///
@@ -78,9 +28,17 @@ impl TableSchema {
     ///
     /// # Errors
     ///
-    /// Returns [`SyncError::InvalidTableName`] if the table doesn't exist.
-    pub fn validate(&self, name: &str) -> Result<ValidatedTableName> {
-        ValidatedTableName::new(name, &self.tables)
+    /// Returns [`SyncError::InvalidTableName`] if the name is not in the allowlist.
+    pub fn validate(&self, name: &str) -> Result<()> {
+        if self.tables.contains(name) {
+            return Ok(());
+        }
+        let mut available: Vec<_> = self.tables.iter().cloned().collect();
+        available.sort();
+        Err(SyncError::InvalidTableName {
+            name: name.to_string(),
+            available: available.join(", "),
+        })
     }
 }
 
@@ -99,8 +57,7 @@ mod tests {
     #[test]
     fn validate_existing_table() {
         let schema = test_schema();
-        let validated = schema.validate("users").unwrap();
-        assert_eq!(validated.as_str(), "users");
+        assert!(schema.validate("users").is_ok());
     }
 
     #[test]
@@ -148,29 +105,6 @@ mod tests {
     fn empty_schema() {
         let schema = TableSchema::new(Vec::<String>::new());
         assert!(schema.validate("anything").is_err());
-    }
-
-    #[test]
-    fn validated_name_display() {
-        let schema = test_schema();
-        let validated = schema.validate("users").unwrap();
-        assert_eq!(format!("{}", validated), "users");
-    }
-
-    #[test]
-    fn validated_name_into_string() {
-        let schema = test_schema();
-        let validated = schema.validate("users").unwrap();
-        let s: String = validated.into_string();
-        assert_eq!(s, "users");
-    }
-
-    #[test]
-    fn validated_name_as_ref() {
-        let schema = test_schema();
-        let validated = schema.validate("users").unwrap();
-        let s: &str = validated.as_ref();
-        assert_eq!(s, "users");
     }
 
     #[test]
