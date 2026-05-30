@@ -199,24 +199,13 @@ impl Profile {
                     serde_json::json!([stmt])
                 }
             }
-            RequestFormat::D1 => {
-                if params.is_empty() {
-                    serde_json::json!({"sql": sql})
-                } else {
-                    serde_json::json!({"sql": sql, "params": params})
-                }
-            }
             RequestFormat::Datasette => {
                 serde_json::json!({"sql": sql, "_shape": "array"})
             }
-            RequestFormat::Generic => {
-                if params.is_empty() {
-                    serde_json::json!({"sql": sql})
-                } else {
-                    serde_json::json!({"sql": sql, "params": params})
-                }
-            }
-            RequestFormat::HttpSql => {
+            // D1, Generic, and http-sql all use the flat `{"sql", "params"}` body.
+            // Kept as separate variants because they are independent vendor
+            // contracts that may diverge; only the shared body is merged here.
+            RequestFormat::D1 | RequestFormat::Generic | RequestFormat::HttpSql => {
                 if params.is_empty() {
                     serde_json::json!({"sql": sql})
                 } else {
