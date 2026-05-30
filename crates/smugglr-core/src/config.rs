@@ -243,6 +243,8 @@ pub struct BatchConfig {
     pub batch_size: usize,
     /// Maximum bytes per SQL statement
     pub max_statement_bytes: usize,
+    /// Retry policy for transient write failures
+    pub retry: RetryConfig,
 }
 
 impl Default for BatchConfig {
@@ -250,17 +252,18 @@ impl Default for BatchConfig {
         Self {
             batch_size: default_batch_size(),
             max_statement_bytes: default_max_statement_bytes(),
+            retry: RetryConfig::default(),
         }
     }
 }
 
 impl BatchConfig {
     /// Create BatchConfig from SyncConfig
-    #[allow(dead_code)]
     pub fn from_sync_config(sync: &SyncConfig) -> Self {
         Self {
             batch_size: sync.batch_size,
             max_statement_bytes: sync.max_statement_bytes,
+            retry: RetryConfig::from_sync_config(sync),
         }
     }
 }
@@ -310,7 +313,7 @@ pub enum ConflictResolution {
 }
 
 /// Retry configuration for D1 API calls
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct RetryConfig {
     /// Maximum number of retry attempts
     pub max_retries: u32,

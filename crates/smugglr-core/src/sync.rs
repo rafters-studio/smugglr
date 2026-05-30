@@ -4,7 +4,7 @@
 //! any pair of data sources (local<->local, local<->D1, local<->S3, etc.)
 //! to sync using the same diff-and-apply engine.
 
-use crate::config::{column_excluded, BatchConfig, Config, ConflictResolution};
+use crate::config::{column_excluded, BatchConfig, Config, ConflictResolution, RetryConfig};
 use crate::datasource::DataSource;
 use crate::diff::{diff_table, DiffStats, TableDiff};
 use crate::error::Result;
@@ -103,8 +103,67 @@ fn strip_excluded_columns(
         .collect()
 }
 
-/// Transfer rows from one DataSource to another.
-///
+/// Delay (ms) before the next retry: the server's Retry-After if present (capped
+/// by `max_delay_ms` so a misbehaving server can't make us sleep unboundedly),
+/// otherwise the computed exponential backoff for `attempt`.
+#[cfg(feature = "native")]
+fn retry_delay_ms(err: &crate::error::SyncError, attempt: u32, retry: &RetryConfig) -> u64 {
+    err.retry_after_ms()
+        .map(|ms| ms.min(retry.max_delay_ms))
+        .unwrap_or_else(|| retry.delay_for_attempt(attempt))
+}
+
+/// Upsert one chunk into `dest`, retrying transient failures with exponential
+/// backoff. Permanent errors fail fast; transient errors (see
+/// [`crate::error::SyncError::is_retryable`]) retry up to `retry.max_retries`;
+/// exhaustion returns `RetryExhausted` (exit 3).
+#[cfg(feature = "native")]
+async fn upsert_with_retry<Dst: DataSource>(
+    dest: &Dst,
+    table: &str,
+    chunk: &[HashMap<String, serde_json::Value>],
+    retry: &RetryConfig,
+) -> Result<usize> {
+    use crate::error::SyncError;
+    let mut attempt: u32 = 0;
+    loop {
+        match dest.upsert_rows(table, chunk).await {
+            Ok(n) => return Ok(n),
+            Err(e) if e.is_retryable() && attempt < retry.max_retries => {
+                let delay = retry_delay_ms(&e, attempt, retry);
+                warn!(
+                    "Upsert to '{}' failed (attempt {}), retrying in {}ms: {}",
+                    table,
+                    attempt + 1,
+                    delay,
+                    e
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                attempt += 1;
+            }
+            Err(e) if e.is_retryable() => {
+                return Err(SyncError::RetryExhausted {
+                    attempts: attempt,
+                    last_error: e.to_string(),
+                });
+            }
+            Err(e) => return Err(e), // permanent -> fast fail
+        }
+    }
+}
+
+/// On WASM the engine upserts directly: retry/backoff for the browser is the JS
+/// autoSync layer's job, and there is no tokio timer in the wasm build.
+#[cfg(not(feature = "native"))]
+async fn upsert_with_retry<Dst: DataSource>(
+    dest: &Dst,
+    table: &str,
+    chunk: &[HashMap<String, serde_json::Value>],
+    _retry: &RetryConfig,
+) -> Result<usize> {
+    dest.upsert_rows(table, chunk).await
+}
+
 /// Fetches rows by primary key from `source`, then upserts into `dest`
 /// in chunks (sized by `batch_config.batch_size`) with progress reporting
 /// via the provided [`SyncProgress`] implementation.
@@ -133,7 +192,7 @@ async fn transfer_rows<Src: DataSource, Dst: DataSource>(
     let mut total = 0;
 
     for chunk in rows.chunks(batch_config.batch_size) {
-        let count = dest.upsert_rows(table, chunk).await?;
+        let count = upsert_with_retry(dest, table, chunk, &batch_config.retry).await?;
         total += count;
         progress.on_batch_complete(chunk.len());
     }
@@ -570,5 +629,155 @@ mod tests {
         assert_eq!(stripped[0].len(), 2);
         assert!(stripped[0].contains_key("id"));
         assert!(stripped[0].contains_key("title"));
+    }
+
+    // Retry/backoff is the native write path; the wasm variant passes through.
+    #[cfg(feature = "native")]
+    mod retry {
+        use super::super::upsert_with_retry;
+        use crate::config::RetryConfig;
+        use crate::datasource::{DataSource, RowMeta, TableInfo};
+        use crate::error::{Result, SyncError};
+        use serde_json::{json, Value};
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        /// A dest whose `upsert_rows` fails `fails_before_success` times with a
+        /// transient (retryable) error, then succeeds -- or, if `permanent`,
+        /// always returns a non-retryable error. Counts calls.
+        struct FlakyDest {
+            fails_before_success: u32,
+            permanent: bool,
+            calls: AtomicU32,
+        }
+
+        impl DataSource for FlakyDest {
+            async fn list_tables(&self) -> Result<Vec<String>> {
+                Ok(vec![])
+            }
+            async fn table_info(&self, _t: &str) -> Result<TableInfo> {
+                Err(SyncError::TableNotFound("unused".into()))
+            }
+            async fn get_row_metadata(
+                &self,
+                _t: &str,
+                _ts: &str,
+                _ex: &[String],
+            ) -> Result<HashMap<String, RowMeta>> {
+                Ok(HashMap::new())
+            }
+            async fn get_rows(
+                &self,
+                _t: &str,
+                _pks: &[String],
+            ) -> Result<Vec<HashMap<String, Value>>> {
+                Ok(vec![])
+            }
+            async fn upsert_rows(
+                &self,
+                _t: &str,
+                rows: &[HashMap<String, Value>],
+            ) -> Result<usize> {
+                let n = rows.len();
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                if self.permanent {
+                    return Err(SyncError::BadRequest {
+                        status: 400,
+                        message: "bad sql".into(),
+                    });
+                }
+                if call < self.fails_before_success {
+                    return Err(SyncError::ServerError {
+                        status: 503,
+                        message: "unavailable".into(),
+                    });
+                }
+                Ok(n)
+            }
+            async fn row_count(&self, _t: &str) -> Result<usize> {
+                Ok(0)
+            }
+        }
+
+        fn fast_retry(max_retries: u32) -> RetryConfig {
+            RetryConfig {
+                max_retries,
+                initial_delay_ms: 1,
+                max_delay_ms: 5,
+                backoff_multiplier: 2.0,
+            }
+        }
+
+        fn one_chunk() -> Vec<HashMap<String, Value>> {
+            vec![HashMap::from([("id".to_string(), json!("1"))])]
+        }
+
+        #[tokio::test]
+        async fn retries_transient_then_succeeds() {
+            let dest = FlakyDest {
+                fails_before_success: 2,
+                permanent: false,
+                calls: AtomicU32::new(0),
+            };
+            let n = upsert_with_retry(&dest, "t", &one_chunk(), &fast_retry(5))
+                .await
+                .unwrap();
+            assert_eq!(n, 1);
+            assert_eq!(
+                dest.calls.load(Ordering::SeqCst),
+                3,
+                "2 failures + 1 success"
+            );
+        }
+
+        #[tokio::test]
+        async fn exhaustion_returns_retry_exhausted_exit_3() {
+            let dest = FlakyDest {
+                fails_before_success: 100,
+                permanent: false,
+                calls: AtomicU32::new(0),
+            };
+            let err = upsert_with_retry(&dest, "t", &one_chunk(), &fast_retry(2))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, SyncError::RetryExhausted { attempts: 2, .. }));
+            assert_eq!(err.exit_code(), 3);
+            assert_eq!(dest.calls.load(Ordering::SeqCst), 3, "initial + 2 retries");
+        }
+
+        #[test]
+        fn retry_after_is_capped_by_max_delay() {
+            use super::super::retry_delay_ms;
+            let retry = fast_retry(5); // max_delay_ms = 5
+                                       // A hostile/buggy server asking for a 24h Retry-After is capped.
+            let rl = SyncError::RateLimited {
+                retry_after: Some(86_400),
+            };
+            assert_eq!(retry_delay_ms(&rl, 0, &retry), 5);
+            // Without a server hint, computed backoff is used (delay_for_attempt(0)).
+            let se = SyncError::ServerError {
+                status: 503,
+                message: "x".into(),
+            };
+            assert_eq!(retry_delay_ms(&se, 0, &retry), retry.delay_for_attempt(0));
+        }
+
+        #[tokio::test]
+        async fn permanent_error_fails_fast_no_retry() {
+            let dest = FlakyDest {
+                fails_before_success: 0,
+                permanent: true,
+                calls: AtomicU32::new(0),
+            };
+            let err = upsert_with_retry(&dest, "t", &one_chunk(), &fast_retry(5))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, SyncError::BadRequest { .. }));
+            assert_eq!(
+                dest.calls.load(Ordering::SeqCst),
+                1,
+                "no retry on permanent error"
+            );
+        }
     }
 }
