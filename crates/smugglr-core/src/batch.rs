@@ -207,6 +207,7 @@ mod tests {
         let config = BatchConfig {
             batch_size: 3,
             max_statement_bytes: 100_000,
+            ..Default::default()
         };
 
         let batches = batch_rows(&rows, &columns, &config);
@@ -235,6 +236,7 @@ mod tests {
         let config = BatchConfig {
             batch_size: 100, // would allow 100, but param limit caps at 10
             max_statement_bytes: 100_000,
+            ..Default::default()
         };
 
         let batches = batch_rows(&rows, &columns, &config);
@@ -268,6 +270,7 @@ mod tests {
         let config = BatchConfig {
             batch_size: 100,
             max_statement_bytes: 100_000,
+            ..Default::default()
         };
 
         let batches = batch_rows(&rows, &columns, &config);
@@ -297,6 +300,7 @@ mod tests {
         let config = BatchConfig {
             batch_size: 100,
             max_statement_bytes: 100_000,
+            ..Default::default()
         };
 
         let batches = batch_rows(&rows, &columns, &config);
@@ -326,6 +330,7 @@ mod tests {
         let config = BatchConfig {
             batch_size: 100,
             max_statement_bytes: 2500, // Force multiple batches due to size
+            ..Default::default()
         };
 
         let batches = batch_rows(&rows, &columns, &config);
@@ -403,6 +408,7 @@ mod tests {
         let config = BatchConfig {
             batch_size: 100,
             max_statement_bytes: 1000, // Deliberately small
+            ..Default::default()
         };
 
         let batches = batch_rows(&rows, &columns, &config);
