@@ -8,32 +8,28 @@ use serde::Serialize;
 use smugglr_core::diff::TableDiff;
 use smugglr_core::sync::SyncResult;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[clap(rename_all = "lower")]
 pub enum OutputFormat {
     Text,
     Json,
 }
 
-impl std::str::FromStr for OutputFormat {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "text" => Ok(Self::Text),
-            "json" => Ok(Self::Json),
-            _ => Err(format!(
-                "invalid output format '{}', expected 'text' or 'json'",
-                s
-            )),
-        }
-    }
+/// Machine-readable status carried by every JSON output.
+///
+/// Serializes to exactly "ok" / "error" / "dry_run" -- a public wire contract.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Status {
+    Ok,
+    Error,
+    DryRun,
 }
 
 #[derive(Serialize)]
 pub struct CommandOutput {
     pub command: &'static str,
-    pub status: &'static str,
-    pub dry_run: bool,
+    pub status: Status,
     pub tables: Vec<TableOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -55,25 +51,35 @@ fn is_zero(n: &usize) -> bool {
 #[derive(Serialize)]
 pub struct DiffOutput {
     pub command: &'static str,
-    pub status: &'static str,
+    pub status: Status,
     pub tables: Vec<TableDiffOutput>,
 }
 
+/// The five per-table primary-key lists shared by diff and verbose dry-run output.
+///
+/// Embedded via `#[serde(flatten)]` so the keys appear inline at the parent level,
+/// keeping the wire byte-identical with the previously-duplicated fields.
 #[derive(Serialize)]
-pub struct TableDiffOutput {
-    pub name: String,
+pub struct DiffBreakdown {
     pub local_only: Vec<String>,
     pub remote_only: Vec<String>,
     pub local_newer: Vec<String>,
     pub remote_newer: Vec<String>,
     pub content_differs: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct TableDiffOutput {
+    pub name: String,
+    #[serde(flatten)]
+    pub breakdown: DiffBreakdown,
     pub identical_count: usize,
 }
 
 #[derive(Serialize)]
 pub struct StatusOutput {
     pub command: &'static str,
-    pub status: &'static str,
+    pub status: Status,
     pub config: StatusConfig,
     pub local: StatusDb,
     pub target: StatusDb,
@@ -109,7 +115,7 @@ pub struct StatusTable {
 pub struct WatchTickOutput {
     pub command: &'static str,
     pub tick: u64,
-    pub status: &'static str,
+    pub status: Status,
     pub tables: Vec<TableOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -118,7 +124,7 @@ pub struct WatchTickOutput {
 #[derive(Serialize)]
 pub struct SnapshotOutput {
     pub command: &'static str,
-    pub status: &'static str,
+    pub status: Status,
     pub timestamp: String,
     pub size_bytes: u64,
     pub tables: Vec<SnapshotTableInfo>,
@@ -133,7 +139,7 @@ pub struct SnapshotTableInfo {
 #[derive(Serialize)]
 pub struct SnapshotListOutput {
     pub command: &'static str,
-    pub status: &'static str,
+    pub status: Status,
     pub snapshots: Vec<SnapshotListEntry>,
 }
 
@@ -147,17 +153,16 @@ pub struct SnapshotListEntry {
 #[derive(Serialize)]
 pub struct ErrorOutput {
     pub command: &'static str,
-    pub status: &'static str,
+    pub status: Status,
     pub error: String,
     pub exit_code: i32,
 }
 
 impl CommandOutput {
-    pub fn from_sync_results(command: &'static str, results: &[SyncResult], dry_run: bool) -> Self {
+    pub fn from_sync_results(command: &'static str, results: &[SyncResult]) -> Self {
         Self {
             command,
-            status: "ok",
-            dry_run,
+            status: Status::Ok,
             tables: results
                 .iter()
                 .filter(|r| r.has_changes())
@@ -180,7 +185,7 @@ impl CommandOutput {
 #[derive(Serialize)]
 pub struct DryRunOutput<T: Serialize> {
     pub command: &'static str,
-    pub status: &'static str,
+    pub status: Status,
     pub tables: Vec<T>,
     pub total_rows_to_push: usize,
     pub total_rows_to_pull: usize,
@@ -203,11 +208,8 @@ pub struct DryRunTableOutput {
 #[derive(Serialize)]
 pub struct DryRunVerboseTableOutput {
     pub name: String,
-    pub local_only: Vec<String>,
-    pub remote_only: Vec<String>,
-    pub local_newer: Vec<String>,
-    pub remote_newer: Vec<String>,
-    pub content_differs: Vec<String>,
+    #[serde(flatten)]
+    pub breakdown: DiffBreakdown,
     pub identical: usize,
     pub rows_to_push: usize,
     pub rows_to_pull: usize,
@@ -232,7 +234,7 @@ impl<T: Serialize> DryRunOutput<T> {
 
         Self {
             command,
-            status: "dry_run",
+            status: Status::DryRun,
             tables,
             total_rows_to_push: total_push,
             total_rows_to_pull: total_pull,
@@ -266,13 +268,15 @@ impl DryRunOutput<DryRunVerboseTableOutput> {
             let detail = r.diff_detail.as_ref();
             DryRunVerboseTableOutput {
                 name: r.table.clone(),
-                local_only: detail.map(|d| d.local_only.clone()).unwrap_or_default(),
-                remote_only: detail.map(|d| d.remote_only.clone()).unwrap_or_default(),
-                local_newer: detail.map(|d| d.local_newer.clone()).unwrap_or_default(),
-                remote_newer: detail.map(|d| d.remote_newer.clone()).unwrap_or_default(),
-                content_differs: detail
-                    .map(|d| d.content_differs.clone())
-                    .unwrap_or_default(),
+                breakdown: DiffBreakdown {
+                    local_only: detail.map(|d| d.local_only.clone()).unwrap_or_default(),
+                    remote_only: detail.map(|d| d.remote_only.clone()).unwrap_or_default(),
+                    local_newer: detail.map(|d| d.local_newer.clone()).unwrap_or_default(),
+                    remote_newer: detail.map(|d| d.remote_newer.clone()).unwrap_or_default(),
+                    content_differs: detail
+                        .map(|d| d.content_differs.clone())
+                        .unwrap_or_default(),
+                },
                 identical: r.diff_stats.as_ref().map(|s| s.identical).unwrap_or(0),
                 rows_to_push: r.rows_pushed,
                 rows_to_pull: r.rows_pulled,
@@ -285,17 +289,19 @@ impl DiffOutput {
     pub fn from_diffs(diffs: Vec<(String, TableDiff)>) -> Self {
         Self {
             command: "diff",
-            status: "ok",
+            status: Status::Ok,
             tables: diffs
                 .into_iter()
                 .map(|(name, d)| TableDiffOutput {
                     name,
                     identical_count: d.identical.len(),
-                    local_only: d.local_only,
-                    remote_only: d.remote_only,
-                    local_newer: d.local_newer,
-                    remote_newer: d.remote_newer,
-                    content_differs: d.content_differs,
+                    breakdown: DiffBreakdown {
+                        local_only: d.local_only,
+                        remote_only: d.remote_only,
+                        local_newer: d.local_newer,
+                        remote_newer: d.remote_newer,
+                        content_differs: d.content_differs,
+                    },
                 })
                 .collect(),
         }
@@ -307,7 +313,7 @@ impl WatchTickOutput {
         Self {
             command: "watch",
             tick,
-            status: "ok",
+            status: Status::Ok,
             tables: results
                 .iter()
                 .filter(|r| r.has_changes())
@@ -325,7 +331,7 @@ impl WatchTickOutput {
         Self {
             command: "watch",
             tick,
-            status: "error",
+            status: Status::Error,
             tables: vec![],
             error: Some(err.to_string()),
         }
@@ -340,9 +346,16 @@ mod tests {
 
     #[test]
     fn test_output_format_parse() {
-        assert_eq!("text".parse::<OutputFormat>().unwrap(), OutputFormat::Text);
-        assert_eq!("json".parse::<OutputFormat>().unwrap(), OutputFormat::Json);
-        assert!("xml".parse::<OutputFormat>().is_err());
+        use clap::ValueEnum;
+        assert_eq!(
+            OutputFormat::from_str("text", true).unwrap(),
+            OutputFormat::Text
+        );
+        assert_eq!(
+            OutputFormat::from_str("json", true).unwrap(),
+            OutputFormat::Json
+        );
+        assert!(OutputFormat::from_str("xml", true).is_err());
     }
 
     #[test]
@@ -364,38 +377,18 @@ mod tests {
             },
         ];
 
-        let out = CommandOutput::from_sync_results("push", &results, false);
+        let out = CommandOutput::from_sync_results("push", &results);
         let json = serde_json::to_string(&out).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
 
         assert_eq!(v["command"], "push");
         assert_eq!(v["status"], "ok");
-        assert_eq!(v["dry_run"], false);
         // Only abilities should appear (items had 0 changes)
         assert_eq!(v["tables"].as_array().unwrap().len(), 1);
         assert_eq!(v["tables"][0]["name"], "abilities");
         assert_eq!(v["tables"][0]["rows_pushed"], 42);
         // error should be absent (skip_serializing_if)
         assert!(v.get("error").is_none());
-    }
-
-    #[test]
-    fn test_command_output_dry_run() {
-        let results = vec![SyncResult {
-            table: "t".into(),
-            rows_pushed: 10,
-            rows_pulled: 5,
-            diff_stats: None,
-            diff_detail: None,
-        }];
-
-        let out = CommandOutput::from_sync_results("sync", &results, true);
-        let json = serde_json::to_string(&out).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(v["dry_run"], true);
-        assert_eq!(v["tables"][0]["rows_pushed"], 10);
-        assert_eq!(v["tables"][0]["rows_pulled"], 5);
     }
 
     #[test]
@@ -451,7 +444,7 @@ mod tests {
     fn test_error_output_json() {
         let out = ErrorOutput {
             command: "push",
-            status: "error",
+            status: Status::Error,
             error: "Config file not found".into(),
             exit_code: 2,
         };
@@ -467,7 +460,7 @@ mod tests {
     fn test_status_output_json() {
         let out = StatusOutput {
             command: "status",
-            status: "ok",
+            status: Status::Ok,
             config: StatusConfig {
                 local_db: "game.db".into(),
                 target_type: "sqlite".into(),
@@ -637,5 +630,343 @@ mod tests {
         assert_eq!(t["identical"], 10);
         assert_eq!(t["rows_to_push"], 3);
         assert_eq!(t["rows_to_pull"], 1);
+    }
+
+    // ---- Golden wire tests ----
+    //
+    // These capture the FULL serialized shape of every output struct via
+    // `serde_json::to_value` compared against a `json!` literal. Any field
+    // add/remove/rename breaks them. `serde_json::Value` map comparison is
+    // order-insensitive, so they guard keys+values, not field order.
+
+    use serde_json::json;
+
+    #[test]
+    fn golden_command_output() {
+        let results = vec![
+            SyncResult {
+                table: "abilities".into(),
+                rows_pushed: 42,
+                rows_pulled: 0,
+                diff_stats: None,
+                diff_detail: None,
+            },
+            SyncResult {
+                table: "items".into(),
+                rows_pushed: 0,
+                rows_pulled: 0,
+                diff_stats: None,
+                diff_detail: None,
+            },
+        ];
+        let out = CommandOutput::from_sync_results("push", &results);
+        assert_eq!(
+            serde_json::to_value(&out).unwrap(),
+            json!({
+                "command": "push",
+                "status": "ok",
+                "tables": [
+                    { "name": "abilities", "rows_pushed": 42 }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn golden_command_output_no_changed_table() {
+        let results = vec![SyncResult {
+            table: "items".into(),
+            rows_pushed: 0,
+            rows_pulled: 0,
+            diff_stats: None,
+            diff_detail: None,
+        }];
+        let out = CommandOutput::from_sync_results("pull", &results);
+        assert_eq!(
+            serde_json::to_value(&out).unwrap(),
+            json!({
+                "command": "pull",
+                "status": "ok",
+                "tables": []
+            })
+        );
+    }
+
+    #[test]
+    fn golden_diff_output() {
+        let mut diff = TableDiff::new("abilities");
+        diff.local_only = vec!["pk1".into(), "pk2".into()];
+        diff.remote_only = vec!["pk3".into()];
+        diff.local_newer = vec!["pk4".into()];
+        diff.remote_newer = vec!["pk5".into()];
+        diff.content_differs = vec!["pk6".into()];
+        diff.identical = vec!["pk7".into(), "pk8".into()];
+
+        let out = DiffOutput::from_diffs(vec![("abilities".into(), diff)]);
+        assert_eq!(
+            serde_json::to_value(&out).unwrap(),
+            json!({
+                "command": "diff",
+                "status": "ok",
+                "tables": [{
+                    "name": "abilities",
+                    "local_only": ["pk1", "pk2"],
+                    "remote_only": ["pk3"],
+                    "local_newer": ["pk4"],
+                    "remote_newer": ["pk5"],
+                    "content_differs": ["pk6"],
+                    "identical_count": 2
+                }]
+            })
+        );
+    }
+
+    #[test]
+    fn golden_status_output() {
+        let out = StatusOutput {
+            command: "status",
+            status: Status::Ok,
+            config: StatusConfig {
+                local_db: "game.db".into(),
+                target_type: "sqlite".into(),
+                timestamp_column: "updated_at".into(),
+                conflict_resolution: "NewerWins".into(),
+                tables: vec!["abilities".into(), "items".into()],
+                exclude_tables: vec!["_migrations".into()],
+            },
+            local: StatusDb {
+                connected: true,
+                error: None,
+                tables: vec![StatusTable {
+                    name: "abilities".into(),
+                    rows: 100,
+                }],
+            },
+            target: StatusDb {
+                connected: false,
+                error: Some("connection refused".into()),
+                tables: vec![],
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&out).unwrap(),
+            json!({
+                "command": "status",
+                "status": "ok",
+                "config": {
+                    "local_db": "game.db",
+                    "target_type": "sqlite",
+                    "timestamp_column": "updated_at",
+                    "conflict_resolution": "NewerWins",
+                    "tables": ["abilities", "items"],
+                    "exclude_tables": ["_migrations"]
+                },
+                "local": {
+                    "connected": true,
+                    "tables": [{ "name": "abilities", "rows": 100 }]
+                },
+                "target": {
+                    "connected": false,
+                    "error": "connection refused",
+                    "tables": []
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn golden_watch_tick_output() {
+        let results = vec![SyncResult {
+            table: "t".into(),
+            rows_pushed: 3,
+            rows_pulled: 7,
+            diff_stats: None,
+            diff_detail: None,
+        }];
+        let out = WatchTickOutput::from_results(5, &results);
+        assert_eq!(
+            serde_json::to_value(&out).unwrap(),
+            json!({
+                "command": "watch",
+                "tick": 5,
+                "status": "ok",
+                "tables": [{ "name": "t", "rows_pushed": 3, "rows_pulled": 7 }]
+            })
+        );
+    }
+
+    #[test]
+    fn golden_watch_tick_error_output() {
+        let out = WatchTickOutput::from_error(3, "connection timeout");
+        assert_eq!(
+            serde_json::to_value(&out).unwrap(),
+            json!({
+                "command": "watch",
+                "tick": 3,
+                "status": "error",
+                "tables": [],
+                "error": "connection timeout"
+            })
+        );
+    }
+
+    #[test]
+    fn golden_snapshot_output() {
+        let out = SnapshotOutput {
+            command: "snapshot",
+            status: Status::Ok,
+            timestamp: "2026-05-30T00:00:00Z".into(),
+            size_bytes: 4096,
+            tables: vec![SnapshotTableInfo {
+                name: "abilities".into(),
+                row_count: 100,
+            }],
+        };
+        assert_eq!(
+            serde_json::to_value(&out).unwrap(),
+            json!({
+                "command": "snapshot",
+                "status": "ok",
+                "timestamp": "2026-05-30T00:00:00Z",
+                "size_bytes": 4096,
+                "tables": [{ "name": "abilities", "row_count": 100 }]
+            })
+        );
+    }
+
+    #[test]
+    fn golden_snapshot_list_output() {
+        let out = SnapshotListOutput {
+            command: "snapshots",
+            status: Status::Ok,
+            snapshots: vec![SnapshotListEntry {
+                timestamp: "2026-05-30T00:00:00Z".into(),
+                size_bytes: 4096,
+                tables: vec![SnapshotTableInfo {
+                    name: "abilities".into(),
+                    row_count: 100,
+                }],
+            }],
+        };
+        assert_eq!(
+            serde_json::to_value(&out).unwrap(),
+            json!({
+                "command": "snapshots",
+                "status": "ok",
+                "snapshots": [{
+                    "timestamp": "2026-05-30T00:00:00Z",
+                    "size_bytes": 4096,
+                    "tables": [{ "name": "abilities", "row_count": 100 }]
+                }]
+            })
+        );
+    }
+
+    #[test]
+    fn golden_error_output() {
+        let out = ErrorOutput {
+            command: "push",
+            status: Status::Error,
+            error: "Config file not found".into(),
+            exit_code: 2,
+        };
+        assert_eq!(
+            serde_json::to_value(&out).unwrap(),
+            json!({
+                "command": "push",
+                "status": "error",
+                "error": "Config file not found",
+                "exit_code": 2
+            })
+        );
+    }
+
+    #[test]
+    fn golden_dry_run_output_compact() {
+        use smugglr_core::diff::DiffStats;
+        let results = vec![SyncResult {
+            table: "abilities".into(),
+            rows_pushed: 8,
+            rows_pulled: 3,
+            diff_stats: Some(DiffStats {
+                local_only: 3,
+                remote_only: 1,
+                local_newer: 5,
+                remote_newer: 2,
+                content_differs: 0,
+                identical: 142,
+            }),
+            diff_detail: None,
+        }];
+        let out = DryRunOutput::<DryRunTableOutput>::from_sync_results("sync", &results);
+        assert_eq!(
+            serde_json::to_value(&out).unwrap(),
+            json!({
+                "command": "sync",
+                "status": "dry_run",
+                "tables": [{
+                    "name": "abilities",
+                    "local_only": 3,
+                    "remote_only": 1,
+                    "local_newer": 5,
+                    "remote_newer": 2,
+                    "content_differs": 0,
+                    "identical": 142,
+                    "rows_to_push": 8,
+                    "rows_to_pull": 3
+                }],
+                "total_rows_to_push": 8,
+                "total_rows_to_pull": 3,
+                "exit_code": 0
+            })
+        );
+    }
+
+    #[test]
+    fn golden_dry_run_output_verbose() {
+        use smugglr_core::diff::DiffStats;
+        use smugglr_core::sync::DiffDetail;
+        let results = vec![SyncResult {
+            table: "abilities".into(),
+            rows_pushed: 3,
+            rows_pulled: 1,
+            diff_stats: Some(DiffStats {
+                local_only: 2,
+                remote_only: 1,
+                local_newer: 1,
+                remote_newer: 0,
+                content_differs: 0,
+                identical: 10,
+            }),
+            diff_detail: Some(DiffDetail {
+                local_only: vec!["pk1".into(), "pk2".into()],
+                remote_only: vec!["pk3".into()],
+                local_newer: vec!["pk4".into()],
+                remote_newer: vec![],
+                content_differs: vec![],
+            }),
+        }];
+        let out = DryRunOutput::<DryRunVerboseTableOutput>::from_sync_results("push", &results);
+        assert_eq!(
+            serde_json::to_value(&out).unwrap(),
+            json!({
+                "command": "push",
+                "status": "dry_run",
+                "tables": [{
+                    "name": "abilities",
+                    "local_only": ["pk1", "pk2"],
+                    "remote_only": ["pk3"],
+                    "local_newer": ["pk4"],
+                    "remote_newer": [],
+                    "content_differs": [],
+                    "identical": 10,
+                    "rows_to_push": 3,
+                    "rows_to_pull": 1
+                }],
+                "total_rows_to_push": 3,
+                "total_rows_to_pull": 1,
+                "exit_code": 0
+            })
+        );
     }
 }
