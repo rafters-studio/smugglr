@@ -29,6 +29,7 @@ End-to-end examples covering the main ways people reach for smugglr. Each exampl
 | ------- | ------------- |
 | [browser-opfs-turso](./browser-opfs-turso) | wa-sqlite + `OriginPrivateFileSystemVFS` (OPFS), syncing to Turso. The local-first golden path. |
 | [browser-idb-turso](./browser-idb-turso) | `IDBBatchAtomicVFS` (IndexedDB) variant. Compatibility for older Safari and embedded webviews. |
+| [browser-wasm-d1-multitenant](./browser-wasm-d1-multitenant) | Many browsers, each its own SQLite, syncing into one shared D1 partitioned by `tenant_id`. Includes a Cloudflare Worker that authenticates, scopes reads, and validates writes. |
 
 ## Notes on running these
 
