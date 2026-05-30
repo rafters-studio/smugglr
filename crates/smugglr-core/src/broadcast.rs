@@ -25,10 +25,15 @@ use tracing::{debug, info, warn};
 
 /// Protocol version for UDP packets. Bump on breaking wire changes.
 ///
-/// v2 introduced the masterless multicast gossip envelope (`multicast::Msg`:
-/// `Digest`/`Want`/`Delta`). v1 nodes (which only spoke bare `Announcement`)
-/// version-skip a v2 node and vice versa -- there is no cross-version sync.
-pub(crate) const PROTOCOL_VERSION: u8 = 2;
+/// - v2 introduced the masterless multicast gossip envelope (`multicast::Msg`:
+///   `Digest`/`Want`/`Delta`).
+/// - v3 removed the `db_path_hash` field from that envelope: membership is the
+///   shared key + group, never the database's file path. v2 and v3 envelopes are
+///   incompatible, so the version is bumped (v2 was never released).
+///
+/// Nodes on different versions version-skip each other -- there is no
+/// cross-version sync.
+pub(crate) const PROTOCOL_VERSION: u8 = 3;
 
 /// Default UDP port for broadcast discovery.
 pub const DEFAULT_PORT: u16 = 31337;

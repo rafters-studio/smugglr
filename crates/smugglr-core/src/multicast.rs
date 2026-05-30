@@ -408,9 +408,15 @@ impl Gossip {
         config: &Config,
     ) -> Result<(GossipEvent, Vec<Body>)> {
         let none = Vec::new();
-        let plain = match maybe_decrypt(datagram, &self.key)? {
-            Some(p) => p,
-            None => return Ok((GossipEvent::Ignored(IgnoreReason::Undecryptable), none)),
+        // A datagram we cannot turn into plaintext is not ours: a foreign key
+        // (AEAD auth failure), a runt packet, or noise. Drop it as a clean,
+        // counted Ignored -- never an error -- so a different-keyed cluster
+        // sharing the LAN is silent, not a stream of recv-error logs.
+        let plain = match maybe_decrypt(datagram, &self.key) {
+            Ok(Some(p)) => p,
+            Ok(None) | Err(_) => {
+                return Ok((GossipEvent::Ignored(IgnoreReason::Undecryptable), none))
+            }
         };
         let msg = match Msg::from_bytes(&plain) {
             Ok(m) => m,
@@ -674,6 +680,17 @@ mod tests {
         a_path: &str,
         b_path: &str,
     ) -> (Gossip, Config, LocalDb, Gossip, Config, LocalDb) {
+        two_nodes_keyed(a_path, b_path, None, None).await
+    }
+
+    /// Like `two_nodes` but with explicit per-node encryption keys (hex), so
+    /// tests can exercise the sealed wire and cross-key isolation.
+    async fn two_nodes_keyed(
+        a_path: &str,
+        b_path: &str,
+        key_a: Option<&str>,
+        key_b: Option<&str>,
+    ) -> (Gossip, Config, LocalDb, Gossip, Config, LocalDb) {
         let a_cfg = cfg(a_path);
         let b_cfg = cfg(b_path);
         let a_local = LocalDb::open(a_path).unwrap();
@@ -681,10 +698,12 @@ mod tests {
 
         let bc_a = BroadcastConfig {
             instance_id: Some("node-a".into()),
+            secret: key_a.map(String::from),
             ..Default::default()
         };
         let bc_b = BroadcastConfig {
             instance_id: Some("node-b".into()),
+            secret: key_b.map(String::from),
             ..Default::default()
         };
 
@@ -786,6 +805,68 @@ mod tests {
             Some("Alice2"),
             "divergent row resolves last-received-wins"
         );
+    }
+
+    // Convergence over the ENCRYPTED wire: the same shared key on both nodes.
+    // Proves seal-on-A / decrypt-on-B round-trips real XChaCha20-Poly1305
+    // ciphertext -- the production path. The keyless convergence test above
+    // exercises only the plaintext passthrough.
+    #[tokio::test]
+    async fn keyed_convergence() {
+        let key = "ab".repeat(32); // 64 hex chars -> valid 256-bit key
+        let dir = tempfile::tempdir().unwrap();
+        let a_path = dir.path().join("a.db").to_str().unwrap().to_string();
+        let b_path = dir.path().join("b.db").to_str().unwrap().to_string();
+        seed(&a_path, &[("1", "Alice"), ("2", "Bob")]);
+        seed(&b_path, &[]);
+        let (a, a_cfg, a_local, b, b_cfg, b_local) =
+            two_nodes_keyed(&a_path, &b_path, Some(&key), Some(&key)).await;
+
+        let digest = only(a.digest_bodies(&a_local, &a_cfg).await.unwrap());
+        let (ev, out) = route(&a, digest, &b, &b_local, &b_cfg).await;
+        assert!(
+            matches!(ev, GossipEvent::Digest { wanted: 2, .. }),
+            "got {ev:?}"
+        );
+        let (ev, out) = route(&b, only(out), &a, &a_local, &a_cfg).await;
+        assert!(
+            matches!(ev, GossipEvent::Served { rows: 2, .. }),
+            "got {ev:?}"
+        );
+        let (ev, _) = route(&a, only(out), &b, &b_local, &b_cfg).await;
+        assert!(
+            matches!(ev, GossipEvent::Applied { rows: 2, .. }),
+            "got {ev:?}"
+        );
+        assert_eq!(count(&b_path), 2, "encrypted convergence");
+        assert_eq!(name_of(&b_path, "1").as_deref(), Some("Alice"));
+    }
+
+    // Cross-key isolation -- the only isolation mechanism after db_path_hash was
+    // removed, so it is load-bearing. A datagram sealed with key K1 is dropped
+    // CLEANLY (Ignored(Undecryptable), never an error) by a node holding K2, and
+    // that node's data is untouched. If `handle` ever let the decrypt error
+    // propagate instead, `route`'s unwrap would panic here.
+    #[tokio::test]
+    async fn wrong_key_datagram_is_dropped() {
+        let k1 = "ab".repeat(32);
+        let k2 = "cd".repeat(32);
+        let dir = tempfile::tempdir().unwrap();
+        let a_path = dir.path().join("a.db").to_str().unwrap().to_string();
+        let b_path = dir.path().join("b.db").to_str().unwrap().to_string();
+        seed(&a_path, &[("1", "Alice")]);
+        seed(&b_path, &[]);
+        let (a, a_cfg, a_local, b, b_cfg, b_local) =
+            two_nodes_keyed(&a_path, &b_path, Some(&k1), Some(&k2)).await;
+
+        let digest = only(a.digest_bodies(&a_local, &a_cfg).await.unwrap());
+        let (ev, out) = route(&a, digest, &b, &b_local, &b_cfg).await;
+        assert!(
+            matches!(ev, GossipEvent::Ignored(IgnoreReason::Undecryptable)),
+            "foreign-key datagram must drop cleanly, got {ev:?}"
+        );
+        assert!(out.is_empty());
+        assert_eq!(count(&b_path), 0, "foreign-key node must not converge");
     }
 
     // Live multicast smoke test: proves bind/join/send/recv over a real socket.
