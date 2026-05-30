@@ -169,32 +169,6 @@ impl Default for SyncConfig {
     }
 }
 
-impl SyncConfig {
-    /// Check if a column name should be excluded from sync.
-    ///
-    /// Supports simple glob patterns:
-    /// - `*_embedding` matches columns ending with `_embedding`
-    /// - `embedding_*` matches columns starting with `embedding_`
-    /// - `*embed*` matches columns containing `embed`
-    /// - `vector` matches the exact column name `vector`
-    #[allow(dead_code)]
-    pub fn should_exclude_column(&self, column: &str) -> bool {
-        self.exclude_columns
-            .iter()
-            .any(|pattern| column_glob_match(pattern, column))
-    }
-
-    /// Filter a list of column names, removing excluded ones.
-    #[allow(dead_code)]
-    pub fn filter_columns<'a>(&self, columns: &[&'a str]) -> Vec<&'a str> {
-        columns
-            .iter()
-            .filter(|c| !self.should_exclude_column(c))
-            .copied()
-            .collect()
-    }
-}
-
 /// Check if a column name matches any exclusion pattern in the given list.
 pub fn column_excluded(column: &str, patterns: &[String]) -> bool {
     patterns
@@ -336,7 +310,6 @@ impl Default for RetryConfig {
     }
 }
 
-#[allow(dead_code)]
 impl RetryConfig {
     /// Create RetryConfig from SyncConfig settings.
     ///
@@ -579,12 +552,6 @@ impl Config {
 
         // Otherwise sync all non-excluded tables
         true
-    }
-
-    /// Get retry configuration from sync settings
-    #[allow(dead_code)]
-    pub fn retry_config(&self) -> RetryConfig {
-        RetryConfig::from_sync_config(&self.sync)
     }
 }
 
@@ -949,17 +916,6 @@ mod tests {
     }
 
     #[test]
-    fn test_config_retry_config() {
-        let mut config = test_config_d1();
-        config.sync.max_retries = 10;
-        config.sync.initial_retry_delay_ms = 500;
-
-        let retry = config.retry_config();
-        assert_eq!(retry.max_retries, 10);
-        assert_eq!(retry.initial_delay_ms, 500);
-    }
-
-    #[test]
     fn test_parse_toml_sqlite_target() {
         let toml_str = r#"
 local_db = "game.db"
@@ -1013,94 +969,6 @@ local_db = "game.db"
     // -- Column exclusion tests --
 
     #[test]
-    fn test_column_exclusion_pattern_matching() {
-        // Suffix: "*_embedding" matches "title_embedding" but not "embedding_title"
-        let sync = SyncConfig {
-            exclude_columns: vec!["*_embedding".to_string()],
-            ..Default::default()
-        };
-        assert!(sync.should_exclude_column("title_embedding"));
-        assert!(sync.should_exclude_column("content_embedding"));
-        assert!(!sync.should_exclude_column("embedding_title"));
-        assert!(!sync.should_exclude_column("title"));
-
-        // Prefix: "embedding_*" matches "embedding_title" but not "title_embedding"
-        let sync = SyncConfig {
-            exclude_columns: vec!["embedding_*".to_string()],
-            ..Default::default()
-        };
-        assert!(sync.should_exclude_column("embedding_title"));
-        assert!(sync.should_exclude_column("embedding_content"));
-        assert!(!sync.should_exclude_column("title_embedding"));
-
-        // Exact: "vector" matches "vector" but not "vector_data" or "my_vector"
-        let sync = SyncConfig {
-            exclude_columns: vec!["vector".to_string()],
-            ..Default::default()
-        };
-        assert!(sync.should_exclude_column("vector"));
-        assert!(!sync.should_exclude_column("vector_data"));
-        assert!(!sync.should_exclude_column("my_vector"));
-    }
-
-    #[test]
-    fn test_column_exclusion_contains_pattern() {
-        let sync = SyncConfig {
-            exclude_columns: vec!["*embed*".to_string()],
-            ..Default::default()
-        };
-        assert!(sync.should_exclude_column("title_embedding"));
-        assert!(sync.should_exclude_column("embedding_title"));
-        assert!(sync.should_exclude_column("embed"));
-        assert!(!sync.should_exclude_column("vector"));
-    }
-
-    #[test]
-    fn test_column_exclusion_multiple_patterns() {
-        let sync = SyncConfig {
-            exclude_columns: vec![
-                "*_embedding".to_string(),
-                "vector".to_string(),
-                "blob_*".to_string(),
-            ],
-            ..Default::default()
-        };
-        assert!(sync.should_exclude_column("title_embedding"));
-        assert!(sync.should_exclude_column("vector"));
-        assert!(sync.should_exclude_column("blob_data"));
-        assert!(!sync.should_exclude_column("title"));
-        assert!(!sync.should_exclude_column("name"));
-    }
-
-    #[test]
-    fn test_empty_exclusion_syncs_all() {
-        let sync = SyncConfig::default();
-        assert!(!sync.should_exclude_column("anything"));
-        assert!(!sync.should_exclude_column("title_embedding"));
-        assert!(!sync.should_exclude_column("vector"));
-    }
-
-    #[test]
-    fn test_column_exclusion_wildcard_all() {
-        let sync = SyncConfig {
-            exclude_columns: vec!["*".to_string()],
-            ..Default::default()
-        };
-        assert!(sync.should_exclude_column("anything"));
-    }
-
-    #[test]
-    fn test_filter_columns() {
-        let sync = SyncConfig {
-            exclude_columns: vec!["*_embedding".to_string(), "vector".to_string()],
-            ..Default::default()
-        };
-        let cols = vec!["id", "name", "title_embedding", "vector", "description"];
-        let filtered = sync.filter_columns(&cols);
-        assert_eq!(filtered, vec!["id", "name", "description"]);
-    }
-
-    #[test]
     fn test_column_excluded_standalone() {
         let patterns = vec!["*_embedding".to_string(), "blob_*".to_string()];
         assert!(column_excluded("title_embedding", &patterns));
@@ -1122,9 +990,10 @@ exclude_columns = ["*_embedding", "vector"]
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.sync.exclude_columns.len(), 2);
-        assert!(config.sync.should_exclude_column("title_embedding"));
-        assert!(config.sync.should_exclude_column("vector"));
-        assert!(!config.sync.should_exclude_column("name"));
+        let patterns = &config.sync.exclude_columns;
+        assert!(column_excluded("title_embedding", patterns));
+        assert!(column_excluded("vector", patterns));
+        assert!(!column_excluded("name", patterns));
     }
 
     #[test]

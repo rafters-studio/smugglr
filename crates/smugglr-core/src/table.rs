@@ -82,36 +82,6 @@ impl TableSchema {
     pub fn validate(&self, name: &str) -> Result<ValidatedTableName> {
         ValidatedTableName::new(name, &self.tables)
     }
-
-    /// Check if a table name exists in the schema.
-    #[allow(dead_code)]
-    pub fn contains(&self, name: &str) -> bool {
-        self.tables.contains(name)
-    }
-
-    /// Get the number of tables in the schema.
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
-        self.tables.len()
-    }
-
-    /// Check if the schema is empty.
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.tables.is_empty()
-    }
-
-    /// Get an iterator over all table names.
-    #[allow(dead_code)]
-    pub fn iter(&self) -> impl Iterator<Item = &String> {
-        self.tables.iter()
-    }
-
-    /// Get the underlying set of table names (for ValidatedTableName::new).
-    #[allow(dead_code)]
-    pub fn tables(&self) -> &HashSet<String> {
-        &self.tables
-    }
 }
 
 #[cfg(test)]
@@ -175,25 +145,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_contains() {
-        let schema = test_schema();
-        assert!(schema.contains("users"));
-        assert!(schema.contains("posts"));
-        assert!(!schema.contains("nonexistent"));
-    }
-
-    #[test]
-    fn schema_len() {
-        let schema = test_schema();
-        assert_eq!(schema.len(), 3);
-        assert!(!schema.is_empty());
-    }
-
-    #[test]
     fn empty_schema() {
         let schema = TableSchema::new(Vec::<String>::new());
-        assert!(schema.is_empty());
-        assert_eq!(schema.len(), 0);
         assert!(schema.validate("anything").is_err());
     }
 

@@ -12,7 +12,7 @@ use std::collections::HashMap;
 /// Table schema information
 #[derive(Debug, Clone)]
 pub struct TableInfo {
-    #[allow(dead_code)]
+    /// Exists for wire/serialization parity with the plugin's `WireTableInfo`.
     pub name: String,
     pub columns: Vec<ColumnInfo>,
     pub primary_key: Vec<String>,
@@ -31,7 +31,7 @@ pub struct ColumnInfo {
 /// A row with its primary key and optional timestamp
 #[derive(Debug, Clone)]
 pub struct RowMeta {
-    #[allow(dead_code)]
+    /// Exists for wire/serialization parity with the plugin's `WireRowMeta`.
     pub pk_value: String,
     pub updated_at: Option<String>,
     pub content_hash: String,
@@ -63,21 +63,6 @@ pub trait DataSource: Sync {
         &self,
         table: &str,
     ) -> impl std::future::Future<Output = Result<TableInfo>> + MaybeSend;
-
-    /// Check if a table has a specific column.
-    ///
-    /// Default implementation delegates to `table_info`.
-    #[allow(dead_code)]
-    fn has_column(
-        &self,
-        table: &str,
-        column: &str,
-    ) -> impl std::future::Future<Output = Result<bool>> + MaybeSend {
-        async move {
-            let info = self.table_info(table).await?;
-            Ok(info.columns.iter().any(|c| c.name == column))
-        }
-    }
 
     /// Get row metadata for change detection.
     ///
