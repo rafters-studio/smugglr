@@ -7,10 +7,57 @@
 
 use sha2::{Digest, Sha256};
 use smugglr_core::config::column_excluded;
-use smugglr_core::datasource::RowMeta;
+use smugglr_core::datasource::{ColumnInfo, RowMeta, TableInfo};
 use std::collections::HashMap;
 
 use serde_json::Value;
+
+/// Parse the rows of a `PRAGMA table_info(...)` result into a [`TableInfo`].
+///
+/// Shared by both adapters, which differ only in how they obtain the
+/// `(columns, rows)` pair: `LocalSqlDataSource` via `run()`, `FetchDataSource`
+/// via `execute()` + `extract_columns`/`extract_rows`.
+pub(crate) fn parse_table_info(table: &str, columns: &[String], rows: &[Vec<Value>]) -> TableInfo {
+    let name_idx = columns.iter().position(|c| c == "name").unwrap_or(1);
+    let type_idx = columns.iter().position(|c| c == "type").unwrap_or(2);
+    let notnull_idx = columns.iter().position(|c| c == "notnull").unwrap_or(3);
+    let pk_idx = columns.iter().position(|c| c == "pk").unwrap_or(5);
+
+    let mut col_infos = Vec::new();
+    let mut primary_key = Vec::new();
+
+    for row in rows {
+        let name = row
+            .get(name_idx)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let col_type = row
+            .get(type_idx)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let notnull = row.get(notnull_idx).and_then(|v| v.as_i64()).unwrap_or(0) != 0;
+        let pk = row.get(pk_idx).and_then(|v| v.as_i64()).unwrap_or(0) != 0;
+
+        if pk {
+            primary_key.push(name.clone());
+        }
+
+        col_infos.push(ColumnInfo {
+            name,
+            col_type,
+            notnull,
+            pk,
+        });
+    }
+
+    TableInfo {
+        name: table.to_string(),
+        columns: col_infos,
+        primary_key,
+    }
+}
 
 /// Reshape positional result rows into per-row column->value maps.
 pub(crate) fn rows_to_maps(columns: &[String], rows: &[Vec<Value>]) -> Vec<HashMap<String, Value>> {

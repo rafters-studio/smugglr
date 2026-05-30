@@ -3,7 +3,7 @@
 //! Implements the DataSource trait from smugglr-core using web-sys fetch
 //! instead of reqwest. Shares profile definitions with the native http-sql plugin.
 
-use smugglr_core::datasource::{ColumnInfo, DataSource, RowMeta, TableInfo};
+use smugglr_core::datasource::{DataSource, RowMeta, TableInfo};
 use smugglr_core::error::{Result, SyncError};
 use smugglr_core::profile::{AuthFormat, Profile};
 use std::collections::HashMap;
@@ -277,46 +277,7 @@ impl DataSource for FetchDataSource {
 
         let columns = self.extract_columns(&response)?;
         let rows = self.extract_rows(&response, &columns)?;
-
-        let name_idx = columns.iter().position(|c| c == "name").unwrap_or(1);
-        let type_idx = columns.iter().position(|c| c == "type").unwrap_or(2);
-        let notnull_idx = columns.iter().position(|c| c == "notnull").unwrap_or(3);
-        let pk_idx = columns.iter().position(|c| c == "pk").unwrap_or(5);
-
-        let mut col_infos = Vec::new();
-        let mut primary_key = Vec::new();
-
-        for row in &rows {
-            let name = row
-                .get(name_idx)
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let col_type = row
-                .get(type_idx)
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let notnull = row.get(notnull_idx).and_then(|v| v.as_i64()).unwrap_or(0) != 0;
-            let pk = row.get(pk_idx).and_then(|v| v.as_i64()).unwrap_or(0) != 0;
-
-            if pk {
-                primary_key.push(name.clone());
-            }
-
-            col_infos.push(ColumnInfo {
-                name,
-                col_type,
-                notnull,
-                pk,
-            });
-        }
-
-        Ok(TableInfo {
-            name: table.to_string(),
-            columns: col_infos,
-            primary_key,
-        })
+        Ok(adapter_common::parse_table_info(table, &columns, &rows))
     }
 
     async fn get_row_metadata(
