@@ -23,7 +23,6 @@ pub struct Profile {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum AuthFormat {
     Bearer,
     Basic,

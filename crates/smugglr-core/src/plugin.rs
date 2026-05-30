@@ -61,8 +61,6 @@ struct RpcRequest<'a> {
 
 #[derive(Deserialize)]
 struct RpcResponse {
-    #[allow(dead_code)]
-    jsonrpc: String,
     result: Option<JsonValue>,
     error: Option<RpcError>,
     id: u64,

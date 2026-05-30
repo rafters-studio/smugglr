@@ -53,42 +53,6 @@ impl LocalDb {
         let tables = list_tables_inner(&conn)?;
         Ok(TableSchema::new(tables))
     }
-
-    /// Delete rows by primary key
-    #[allow(dead_code)]
-    pub fn delete_rows(&self, table: &str, pk_values: &[String]) -> Result<usize> {
-        if pk_values.is_empty() {
-            return Ok(0);
-        }
-
-        let conn = self.conn();
-        let info = table_info_inner(&conn, table)?;
-        let pk_cols = &info.primary_key;
-
-        let pk_expr = pk_cols
-            .iter()
-            .map(|c| format!("\"{}\"", c))
-            .collect::<Vec<_>>()
-            .join(" || '|' || ");
-
-        let placeholders = pk_values.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
-
-        let sql = format!(
-            "DELETE FROM \"{}\" WHERE {} IN ({})",
-            table, pk_expr, placeholders
-        );
-
-        debug!("Deleting {} rows from {}", pk_values.len(), table);
-
-        let params: Vec<&dyn rusqlite::ToSql> = pk_values
-            .iter()
-            .map(|v| v as &dyn rusqlite::ToSql)
-            .collect();
-
-        let count = conn.execute(&sql, params.as_slice())?;
-        info!("Deleted {} rows from {}", count, table);
-        Ok(count)
-    }
 }
 
 impl DataSource for LocalDb {
@@ -421,7 +385,7 @@ fn get_json_value(row: &Row, idx: usize) -> Result<JsonValue> {
         return Ok(v.map(JsonValue::from).unwrap_or(JsonValue::Null));
     }
     if let Ok(v) = row.get::<_, Option<Vec<u8>>>(idx) {
-        // Encode blobs as base64
+        // Encode blobs as hex
         return Ok(v
             .map(|b| JsonValue::String(hex::encode(b)))
             .unwrap_or(JsonValue::Null));

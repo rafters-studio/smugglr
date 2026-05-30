@@ -124,24 +124,6 @@ impl TableDiff {
         );
     }
 
-    /// Get rows to delete from remote (for push)
-    /// Reserved for full sync mode
-    #[allow(dead_code)]
-    pub fn rows_to_delete_remote(&self) -> Vec<String> {
-        // Rows that only exist in remote but not in local
-        // This is only for full sync mode, not incremental
-        vec![]
-    }
-
-    /// Get rows to delete from local (for pull)
-    /// Reserved for full sync mode
-    #[allow(dead_code)]
-    pub fn rows_to_delete_local(&self) -> Vec<String> {
-        // Rows that only exist in local but not in remote
-        // This is only for full sync mode, not incremental
-        vec![]
-    }
-
     /// Compute aggregate diff statistics (counts only).
     pub fn stats(&self) -> DiffStats {
         DiffStats {
@@ -272,94 +254,9 @@ pub async fn diff_table<A: DataSource, B: DataSource>(
     Ok(diff)
 }
 
-/// Compare all tables
-/// Reserved for batch operations
-#[allow(dead_code)]
-pub async fn diff_all<A: DataSource, B: DataSource>(
-    local: &A,
-    remote: &B,
-    tables: &[String],
-    timestamp_column: &str,
-    exclude_columns: &[String],
-) -> Result<Vec<TableDiff>> {
-    let mut diffs = Vec::new();
-
-    for table in tables {
-        let diff = diff_table(local, remote, table, timestamp_column, exclude_columns).await?;
-        diffs.push(diff);
-    }
-
-    Ok(diffs)
-}
-
-/// Extract Unix millisecond timestamp from a UUIDv7 string.
-///
-/// Returns `None` if the string is not a valid UUIDv7 (version nibble must be `7`
-/// and the string must contain exactly 32 hex digits).
-#[allow(dead_code)]
-pub(crate) fn extract_uuidv7_timestamp(uuid_str: &str) -> Option<u64> {
-    let hex_str: String = uuid_str.chars().filter(|c| *c != '-').collect();
-    if hex_str.len() != 32 {
-        return None;
-    }
-
-    // Version nibble is the 13th hex char (index 12), must be '7'
-    if hex_str.as_bytes().get(12)? != &b'7' {
-        return None;
-    }
-
-    // First 12 hex chars are the 48-bit Unix ms timestamp
-    let ts_hex = &hex_str[..12];
-    let mut ts_bytes = [0u8; 8];
-    let decoded = hex::decode(ts_hex).ok()?;
-    ts_bytes[2..8].copy_from_slice(&decoded);
-    Some(u64::from_be_bytes(ts_bytes))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_uuidv7_timestamp_extraction() {
-        // Timestamp 0x018EC7E6_1A80 = 1713494400640 ms
-        let uuid = "018ec7e6-1a80-7000-8000-000000000000";
-        assert_eq!(extract_uuidv7_timestamp(uuid), Some(0x018e_c7e6_1a80));
-    }
-
-    #[test]
-    fn test_uuidv7_timestamp_extraction_no_hyphens() {
-        let uuid = "018ec7e61a8070008000000000000000";
-        assert_eq!(extract_uuidv7_timestamp(uuid), Some(0x018e_c7e6_1a80));
-    }
-
-    #[test]
-    fn test_uuidv7_version_detection_rejects_v4() {
-        let v4 = "550e8400-e29b-41d4-a716-446655440000";
-        assert!(extract_uuidv7_timestamp(v4).is_none());
-    }
-
-    #[test]
-    fn test_uuidv7_version_detection_accepts_v7() {
-        let v7 = "018ec7e6-1a80-7abc-8000-000000000001";
-        assert!(extract_uuidv7_timestamp(v7).is_some());
-    }
-
-    #[test]
-    fn test_non_uuid_string_returns_none() {
-        assert!(extract_uuidv7_timestamp("not-a-uuid").is_none());
-        assert!(extract_uuidv7_timestamp("").is_none());
-        assert!(extract_uuidv7_timestamp("12345").is_none());
-    }
-
-    #[test]
-    fn test_uuidv7_ordering() {
-        let earlier = "018ec7e6-1a80-7000-8000-000000000000";
-        let later = "018ec7e6-1a81-7000-8000-000000000000";
-        let ts_early = extract_uuidv7_timestamp(earlier).unwrap();
-        let ts_late = extract_uuidv7_timestamp(later).unwrap();
-        assert!(ts_late > ts_early);
-    }
 
     #[test]
     fn test_uuidv7_wins_push_includes_local_only_and_newer() {
