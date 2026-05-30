@@ -176,19 +176,16 @@ impl DataSource for TargetSource {
     }
 }
 
-/// Emit the JSON/text output for a push/pull/sync/stash/retrieve result set.
-///
-/// Routes dry-run JSON to the verbose/compact dry-run shape, plain JSON to
-/// `CommandOutput`, and text to `print_summary`.
-fn emit_command_output(
+/// Emit the JSON form of a sync-style result, handling the dry-run vs plain
+/// split. Returns `true` if it printed (Json mode); `false` means the caller
+/// should render its own text summary.
+fn emit_command_json(
     fmt: OutputFormat,
     command: &'static str,
     results: &[SyncResult],
     dry_run: bool,
     verbose: bool,
-    summary_label: &str,
-    row_accessor: impl Fn(&SyncResult) -> usize,
-) {
+) -> bool {
     match fmt {
         OutputFormat::Json if dry_run => print_dry_run_json(command, results, verbose),
         OutputFormat::Json => {
@@ -198,10 +195,25 @@ fn emit_command_output(
                 serde_json::to_string(&out).expect("CommandOutput serialization")
             );
         }
-        OutputFormat::Text => {
-            print_summary(summary_label, results, row_accessor, command, dry_run);
-        }
+        OutputFormat::Text => return false,
     }
+    true
+}
+
+/// Emit a push/pull/stash/retrieve result: JSON if requested, else a
+/// one-line-per-table text summary. The heading/verb are derived from `command`.
+fn emit_command_output(
+    fmt: OutputFormat,
+    command: &'static str,
+    results: &[SyncResult],
+    dry_run: bool,
+    verbose: bool,
+    row_accessor: impl Fn(&SyncResult) -> usize,
+) {
+    if emit_command_json(fmt, command, results, dry_run, verbose) {
+        return;
+    }
+    print_summary(results, row_accessor, command, dry_run);
 }
 
 #[derive(Parser)]
@@ -567,9 +579,7 @@ async fn run_push(
     let target = TargetSource::open(&target, true).await?;
     let results = push_all(&local, &target, config, tables, dry_run, progress.as_ref()).await?;
 
-    emit_command_output(fmt, "push", &results, dry_run, verbose, "Push", |r| {
-        r.rows_pushed
-    });
+    emit_command_output(fmt, "push", &results, dry_run, verbose, |r| r.rows_pushed);
     Ok(())
 }
 
@@ -597,9 +607,7 @@ async fn run_pull(
     let target = TargetSource::open(&target, false).await?;
     let results = pull_all(&local, &target, config, tables, dry_run, progress.as_ref()).await?;
 
-    emit_command_output(fmt, "pull", &results, dry_run, verbose, "Pull", |r| {
-        r.rows_pulled
-    });
+    emit_command_output(fmt, "pull", &results, dry_run, verbose, |r| r.rows_pulled);
     Ok(())
 }
 
@@ -630,35 +638,29 @@ async fn run_sync(
     let target = TargetSource::open(&target, true).await?;
     let results = sync_all(&local, &target, config, tables, dry_run, progress.as_ref()).await?;
 
-    match fmt {
-        OutputFormat::Json if dry_run => print_dry_run_json("sync", &results, verbose),
-        OutputFormat::Json => {
-            let out = CommandOutput::from_sync_results("sync", &results);
+    // JSON output is identical to the other commands; only sync's text summary
+    // is bespoke (per-table pushed/pulled counts), so it can't use print_summary.
+    if emit_command_json(fmt, "sync", &results, dry_run, verbose) {
+        return Ok(());
+    }
+
+    println!("\n--- Sync Summary ---");
+    let mut total_pushed = 0;
+    let mut total_pulled = 0;
+    for result in &results {
+        if result.has_changes() {
             println!(
-                "{}",
-                serde_json::to_string(&out).expect("CommandOutput serialization")
+                "  {}: {} pushed, {} pulled",
+                result.table, result.rows_pushed, result.rows_pulled
             );
+            total_pushed += result.rows_pushed;
+            total_pulled += result.rows_pulled;
         }
-        OutputFormat::Text => {
-            println!("\n--- Sync Summary ---");
-            let mut total_pushed = 0;
-            let mut total_pulled = 0;
-            for result in &results {
-                if result.has_changes() {
-                    println!(
-                        "  {}: {} pushed, {} pulled",
-                        result.table, result.rows_pushed, result.rows_pulled
-                    );
-                    total_pushed += result.rows_pushed;
-                    total_pulled += result.rows_pulled;
-                }
-            }
-            if total_pushed == 0 && total_pulled == 0 {
-                println!("  No changes to sync");
-            } else if dry_run {
-                println!("\n  (dry run - no actual changes made)");
-            }
-        }
+    }
+    if total_pushed == 0 && total_pulled == 0 {
+        println!("  No changes to sync");
+    } else if dry_run {
+        println!("\n  (dry run - no actual changes made)");
     }
 
     Ok(())
@@ -749,14 +751,22 @@ async fn output_diffs<A: DataSource, B: DataSource>(
 ///
 /// `verb` is the lowercase action name used in the no-changes message
 /// (e.g. "No changes to push").
+/// Capitalize the first character of an ASCII command verb ("push" -> "Push").
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
 fn print_summary(
-    heading: &str,
     results: &[smugglr_core::sync::SyncResult],
     get_count: impl Fn(&smugglr_core::sync::SyncResult) -> usize,
     verb: &str,
     dry_run: bool,
 ) {
-    println!("\n--- {} Summary ---", heading);
+    println!("\n--- {} Summary ---", capitalize(verb));
     let mut total = 0;
     for result in results {
         let count = get_count(result);
@@ -961,9 +971,7 @@ async fn run_stash(
     )
     .await?;
 
-    emit_command_output(fmt, "stash", &results, dry_run, verbose, "Stash", |r| {
-        r.rows_pushed
-    });
+    emit_command_output(fmt, "stash", &results, dry_run, verbose, |r| r.rows_pushed);
     Ok(())
 }
 
@@ -988,15 +996,9 @@ async fn run_retrieve(
     )
     .await?;
 
-    emit_command_output(
-        fmt,
-        "retrieve",
-        &results,
-        dry_run,
-        verbose,
-        "Retrieve",
-        |r| r.rows_pulled,
-    );
+    emit_command_output(fmt, "retrieve", &results, dry_run, verbose, |r| {
+        r.rows_pulled
+    });
     Ok(())
 }
 
