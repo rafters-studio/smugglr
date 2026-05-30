@@ -21,7 +21,7 @@ pub struct DiffStats {
 /// Represents the differences between local and remote for a table
 #[derive(Debug, Default)]
 pub struct TableDiff {
-    #[allow(dead_code)]
+    /// Table this diff is for (used in conflict warnings).
     pub table: String,
     /// Rows that exist only in local
     pub local_only: Vec<String>,
@@ -60,34 +60,12 @@ impl TableDiff {
         rows.extend(self.local_only.clone());
         rows.extend(self.local_newer.clone());
 
-        match conflict_resolution {
-            ConflictResolution::LocalWins => {
-                rows.extend(self.content_differs.clone());
-            }
-            ConflictResolution::RemoteWins => {
-                // Don't push content_differs
-            }
-            ConflictResolution::NewerWins => {
-                if !self.content_differs.is_empty() {
-                    warn!(
-                        "{} row(s) in '{}' have different content but no usable timestamps -- \
-                         skipped under newer_wins. Use local_wins or remote_wins to resolve.",
-                        self.content_differs.len(),
-                        self.table
-                    );
-                }
-            }
-            ConflictResolution::UuidV7Wins => {
-                if !self.content_differs.is_empty() {
-                    warn!(
-                        "{} row(s) in '{}' have different content but same PK (identical \
-                         UUIDv7 timestamp) -- skipped under uuid_v7_wins. \
-                         Use local_wins or remote_wins to resolve.",
-                        self.content_differs.len(),
-                        self.table
-                    );
-                }
-            }
+        // local_wins pushes the local side of a content conflict. The other
+        // policies pull it (remote_wins) or skip it (newer/uuid). The "skipped"
+        // warning is emitted once per diff via `warn_unresolved_conflicts`, not
+        // here -- this accessor stays pure (no logging side effect).
+        if matches!(conflict_resolution, ConflictResolution::LocalWins) {
+            rows.extend(self.content_differs.clone());
         }
 
         rows
@@ -99,22 +77,51 @@ impl TableDiff {
         rows.extend(self.remote_only.clone());
         rows.extend(self.remote_newer.clone());
 
-        match conflict_resolution {
-            ConflictResolution::LocalWins => {
-                // Don't pull content_differs
-            }
-            ConflictResolution::RemoteWins => {
-                rows.extend(self.content_differs.clone());
-            }
-            ConflictResolution::NewerWins => {
-                // Warning already emitted in rows_to_push
-            }
-            ConflictResolution::UuidV7Wins => {
-                // Warning already emitted in rows_to_push
-            }
+        // remote_wins pulls the remote side of a content conflict; the others
+        // push it (local_wins) or skip it (newer/uuid). Pure accessor; see
+        // `warn_unresolved_conflicts` for the skipped-rows warning.
+        if matches!(conflict_resolution, ConflictResolution::RemoteWins) {
+            rows.extend(self.content_differs.clone());
         }
 
         rows
+    }
+
+    /// Content-differing rows this policy leaves UNRESOLVED -- skipped in both
+    /// directions because there's no usable tiebreaker. `newer_wins` /
+    /// `uuid_v7_wins` skip same-timestamp/same-PK conflicts; `local_wins` /
+    /// `remote_wins` always resolve them, so none are unresolved.
+    pub fn unresolved_conflicts(&self, conflict_resolution: ConflictResolution) -> &[String] {
+        match conflict_resolution {
+            ConflictResolution::NewerWins | ConflictResolution::UuidV7Wins => &self.content_differs,
+            ConflictResolution::LocalWins | ConflictResolution::RemoteWins => &[],
+        }
+    }
+
+    /// Warn once about content-differing rows skipped under the conflict policy.
+    ///
+    /// Call this at each diff-creation site (not inside the row accessors) so the
+    /// warning fires exactly once per table in every direction -- including a
+    /// pull-only run, which previously got no warning at all.
+    pub fn warn_unresolved_conflicts(&self, conflict_resolution: ConflictResolution) {
+        let count = self.unresolved_conflicts(conflict_resolution).len();
+        if count == 0 {
+            return;
+        }
+        match conflict_resolution {
+            ConflictResolution::NewerWins => warn!(
+                "{} row(s) in '{}' have different content but no usable timestamps -- \
+                 skipped under newer_wins. Use local_wins or remote_wins to resolve.",
+                count, self.table
+            ),
+            ConflictResolution::UuidV7Wins => warn!(
+                "{} row(s) in '{}' have different content but same PK (identical \
+                 UUIDv7 timestamp) -- skipped under uuid_v7_wins. \
+                 Use local_wins or remote_wins to resolve.",
+                count, self.table
+            ),
+            _ => {}
+        }
     }
 
     /// Get rows to delete from remote (for push)
@@ -391,6 +398,45 @@ mod tests {
 
         assert!(diff.rows_to_push(ConflictResolution::UuidV7Wins).is_empty());
         assert!(diff.rows_to_pull(ConflictResolution::UuidV7Wins).is_empty());
+    }
+
+    #[test]
+    fn unresolved_conflicts_tracks_only_newer_and_uuid() {
+        let diff = TableDiff {
+            table: "t".to_string(),
+            local_only: vec![],
+            remote_only: vec![],
+            local_newer: vec![],
+            remote_newer: vec![],
+            content_differs: vec!["a".to_string(), "b".to_string()],
+            identical: vec![],
+        };
+        // newer/uuid leave same-content conflicts unresolved (skipped both ways)
+        assert_eq!(
+            diff.unresolved_conflicts(ConflictResolution::NewerWins)
+                .len(),
+            2
+        );
+        assert_eq!(
+            diff.unresolved_conflicts(ConflictResolution::UuidV7Wins)
+                .len(),
+            2
+        );
+        // local/remote always resolve them -> none unresolved
+        assert!(diff
+            .unresolved_conflicts(ConflictResolution::LocalWins)
+            .is_empty());
+        assert!(diff
+            .unresolved_conflicts(ConflictResolution::RemoteWins)
+            .is_empty());
+        // Regression for #144: the skip is symmetric -- a pull-only run under
+        // newer_wins also skips the content-differs rows (the warning is now
+        // emitted at the diff-creation site, not only on the push path).
+        assert!(diff.rows_to_pull(ConflictResolution::NewerWins).is_empty());
+        assert!(diff.rows_to_push(ConflictResolution::NewerWins).is_empty());
+        // local_wins pushes them; remote_wins pulls them.
+        assert_eq!(diff.rows_to_push(ConflictResolution::LocalWins).len(), 2);
+        assert_eq!(diff.rows_to_pull(ConflictResolution::RemoteWins).len(), 2);
     }
 
     #[test]
