@@ -11,17 +11,19 @@ mod watch;
 use output::{
     CommandOutput, DiffOutput, DryRunOutput, DryRunTableOutput, DryRunVerboseTableOutput,
     ErrorOutput, OutputFormat, SnapshotListEntry, SnapshotListOutput, SnapshotOutput,
-    SnapshotTableInfo, StatusConfig, StatusDb, StatusOutput, StatusTable,
+    SnapshotTableInfo, Status, StatusConfig, StatusDb, StatusOutput, StatusTable,
 };
+use serde_json::Value as JsonValue;
 use smugglr_core::config::{Config, ResolvedTarget};
-use smugglr_core::datasource::DataSource;
+use smugglr_core::datasource::{DataSource, RowMeta, TableInfo};
 use smugglr_core::diff::diff_table;
 use smugglr_core::error;
 use smugglr_core::local::LocalDb;
 use smugglr_core::plugin::PluginDataSource;
 use smugglr_core::sync::{
-    get_tables_to_sync, pull_all, push_all, sync_all, NoProgress, SyncProgress,
+    get_tables_to_sync, pull_all, push_all, sync_all, NoProgress, SyncProgress, SyncResult,
 };
+use std::collections::HashMap;
 
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -73,6 +75,145 @@ fn make_progress(fmt: OutputFormat) -> Box<dyn SyncProgress> {
     } else {
         Box::new(NoProgress)
     }
+}
+
+/// An opened sync target: either a local SQLite file or a running plugin.
+///
+/// Both `LocalDb` and `PluginDataSource` implement [`DataSource`], but the
+/// trait uses RPITIT (not object-safe), so we unify them with this enum and
+/// delegate each method. This lets `run_push`/`run_pull`/`run_sync`/`run_diff`
+/// share a single engine call instead of duplicating a per-variant `match`.
+enum TargetSource {
+    Sqlite(LocalDb),
+    Plugin(Box<PluginDataSource>),
+}
+
+impl TargetSource {
+    /// Open the resolved target. `writable` selects read-write vs read-only for
+    /// SQLite targets (plugins manage their own access mode).
+    async fn open(target: &ResolvedTarget, writable: bool) -> error::Result<Self> {
+        match target {
+            ResolvedTarget::Sqlite { database } => {
+                let db = if writable {
+                    LocalDb::open(database)?
+                } else {
+                    LocalDb::open_readonly(database)?
+                };
+                Ok(TargetSource::Sqlite(db))
+            }
+            ResolvedTarget::Plugin {
+                path,
+                name,
+                config: plugin_config,
+            } => {
+                let plugin = PluginDataSource::start(path, name, plugin_config).await?;
+                Ok(TargetSource::Plugin(Box::new(plugin)))
+            }
+        }
+    }
+}
+
+impl DataSource for TargetSource {
+    async fn list_tables(&self) -> error::Result<Vec<String>> {
+        match self {
+            TargetSource::Sqlite(db) => db.list_tables().await,
+            TargetSource::Plugin(p) => p.list_tables().await,
+        }
+    }
+
+    async fn table_info(&self, table: &str) -> error::Result<TableInfo> {
+        match self {
+            TargetSource::Sqlite(db) => db.table_info(table).await,
+            TargetSource::Plugin(p) => p.table_info(table).await,
+        }
+    }
+
+    async fn get_row_metadata(
+        &self,
+        table: &str,
+        timestamp_column: &str,
+        exclude_columns: &[String],
+    ) -> error::Result<HashMap<String, RowMeta>> {
+        match self {
+            TargetSource::Sqlite(db) => {
+                db.get_row_metadata(table, timestamp_column, exclude_columns)
+                    .await
+            }
+            TargetSource::Plugin(p) => {
+                p.get_row_metadata(table, timestamp_column, exclude_columns)
+                    .await
+            }
+        }
+    }
+
+    async fn get_rows(
+        &self,
+        table: &str,
+        pk_values: &[String],
+    ) -> error::Result<Vec<HashMap<String, JsonValue>>> {
+        match self {
+            TargetSource::Sqlite(db) => db.get_rows(table, pk_values).await,
+            TargetSource::Plugin(p) => p.get_rows(table, pk_values).await,
+        }
+    }
+
+    async fn upsert_rows(
+        &self,
+        table: &str,
+        rows: &[HashMap<String, JsonValue>],
+    ) -> error::Result<usize> {
+        match self {
+            TargetSource::Sqlite(db) => db.upsert_rows(table, rows).await,
+            TargetSource::Plugin(p) => p.upsert_rows(table, rows).await,
+        }
+    }
+
+    async fn row_count(&self, table: &str) -> error::Result<usize> {
+        match self {
+            TargetSource::Sqlite(db) => db.row_count(table).await,
+            TargetSource::Plugin(p) => p.row_count(table).await,
+        }
+    }
+}
+
+/// Emit the JSON form of a sync-style result, handling the dry-run vs plain
+/// split. Returns `true` if it printed (Json mode); `false` means the caller
+/// should render its own text summary.
+fn emit_command_json(
+    fmt: OutputFormat,
+    command: &'static str,
+    results: &[SyncResult],
+    dry_run: bool,
+    verbose: bool,
+) -> bool {
+    match fmt {
+        OutputFormat::Json if dry_run => print_dry_run_json(command, results, verbose),
+        OutputFormat::Json => {
+            let out = CommandOutput::from_sync_results(command, results);
+            println!(
+                "{}",
+                serde_json::to_string(&out).expect("CommandOutput serialization")
+            );
+        }
+        OutputFormat::Text => return false,
+    }
+    true
+}
+
+/// Emit a push/pull/stash/retrieve result: JSON if requested, else a
+/// one-line-per-table text summary. The heading/verb are derived from `command`.
+fn emit_command_output(
+    fmt: OutputFormat,
+    command: &'static str,
+    results: &[SyncResult],
+    dry_run: bool,
+    verbose: bool,
+    row_accessor: impl Fn(&SyncResult) -> usize,
+) {
+    if emit_command_json(fmt, command, results, dry_run, verbose) {
+        return;
+    }
+    print_summary(results, row_accessor, command, dry_run);
 }
 
 #[derive(Parser)]
@@ -217,7 +358,7 @@ enum Commands {
 fn exit_json_error(command: &'static str, err: &error::SyncError) -> ! {
     let out = ErrorOutput {
         command,
-        status: "error",
+        status: Status::Error,
         error: err.to_string(),
         exit_code: err.exit_code(),
     };
@@ -429,47 +570,16 @@ async fn run_push(
 ) -> error::Result<()> {
     let local = LocalDb::open_readonly(config.local_db_path())?;
     let tables = resolve_tables(&local, table)?;
-
     let progress = make_progress(fmt);
 
-    let results = match target {
-        ResolvedTarget::Sqlite { database } => {
-            info!("Push mode: local -> SQLite ({})", database);
-            let target_db = LocalDb::open(&database)?;
-            push_all(
-                &local,
-                &target_db,
-                config,
-                tables,
-                dry_run,
-                progress.as_ref(),
-            )
-            .await?
-        }
-        ResolvedTarget::Plugin {
-            ref path,
-            ref name,
-            config: ref plugin_config,
-        } => {
-            info!("Push mode: local -> plugin ({})", name);
-            let plugin = PluginDataSource::start(path, name, plugin_config).await?;
-            push_all(&local, &plugin, config, tables, dry_run, progress.as_ref()).await?
-        }
-    };
-
-    match fmt {
-        OutputFormat::Json if dry_run => print_dry_run_json("push", &results, verbose),
-        OutputFormat::Json => {
-            let out = CommandOutput::from_sync_results("push", &results, false);
-            println!(
-                "{}",
-                serde_json::to_string(&out).expect("CommandOutput serialization")
-            );
-        }
-        OutputFormat::Text => {
-            print_summary("Push", &results, |r| r.rows_pushed, "push", dry_run);
-        }
+    match &target {
+        ResolvedTarget::Sqlite { database } => info!("Push mode: local -> SQLite ({})", database),
+        ResolvedTarget::Plugin { name, .. } => info!("Push mode: local -> plugin ({})", name),
     }
+    let target = TargetSource::open(&target, true).await?;
+    let results = push_all(&local, &target, config, tables, dry_run, progress.as_ref()).await?;
+
+    emit_command_output(fmt, "push", &results, dry_run, verbose, |r| r.rows_pushed);
     Ok(())
 }
 
@@ -487,47 +597,17 @@ async fn run_pull(
         LocalDb::open(config.local_db_path())?
     };
     let tables = resolve_tables(&local, table)?;
-
     let progress = make_progress(fmt);
 
-    let results = match target {
-        ResolvedTarget::Sqlite { database } => {
-            info!("Pull mode: SQLite ({}) -> local", database);
-            let source_db = LocalDb::open_readonly(&database)?;
-            pull_all(
-                &local,
-                &source_db,
-                config,
-                tables,
-                dry_run,
-                progress.as_ref(),
-            )
-            .await?
-        }
-        ResolvedTarget::Plugin {
-            ref path,
-            ref name,
-            config: ref plugin_config,
-        } => {
-            info!("Pull mode: plugin ({}) -> local", name);
-            let plugin = PluginDataSource::start(path, name, plugin_config).await?;
-            pull_all(&local, &plugin, config, tables, dry_run, progress.as_ref()).await?
-        }
-    };
-
-    match fmt {
-        OutputFormat::Json if dry_run => print_dry_run_json("pull", &results, verbose),
-        OutputFormat::Json => {
-            let out = CommandOutput::from_sync_results("pull", &results, false);
-            println!(
-                "{}",
-                serde_json::to_string(&out).expect("CommandOutput serialization")
-            );
-        }
-        OutputFormat::Text => {
-            print_summary("Pull", &results, |r| r.rows_pulled, "pull", dry_run);
-        }
+    match &target {
+        ResolvedTarget::Sqlite { database } => info!("Pull mode: SQLite ({}) -> local", database),
+        ResolvedTarget::Plugin { name, .. } => info!("Pull mode: plugin ({}) -> local", name),
     }
+    // Pull reads from the target, so it is opened read-only.
+    let target = TargetSource::open(&target, false).await?;
+    let results = pull_all(&local, &target, config, tables, dry_run, progress.as_ref()).await?;
+
+    emit_command_output(fmt, "pull", &results, dry_run, verbose, |r| r.rows_pulled);
     Ok(())
 }
 
@@ -545,63 +625,42 @@ async fn run_sync(
         LocalDb::open(config.local_db_path())?
     };
     let tables = resolve_tables(&local, table)?;
-
     let progress = make_progress(fmt);
 
-    let results = match target {
+    match &target {
         ResolvedTarget::Sqlite { database } => {
-            info!("Sync mode: bidirectional (local <-> SQLite {})", database);
-            let target_db = LocalDb::open(&database)?;
-            sync_all(
-                &local,
-                &target_db,
-                config,
-                tables,
-                dry_run,
-                progress.as_ref(),
-            )
-            .await?
+            info!("Sync mode: bidirectional (local <-> SQLite {})", database)
         }
-        ResolvedTarget::Plugin {
-            ref path,
-            ref name,
-            config: ref plugin_config,
-        } => {
-            info!("Sync mode: bidirectional (local <-> plugin {})", name);
-            let plugin = PluginDataSource::start(path, name, plugin_config).await?;
-            sync_all(&local, &plugin, config, tables, dry_run, progress.as_ref()).await?
+        ResolvedTarget::Plugin { name, .. } => {
+            info!("Sync mode: bidirectional (local <-> plugin {})", name)
         }
-    };
+    }
+    let target = TargetSource::open(&target, true).await?;
+    let results = sync_all(&local, &target, config, tables, dry_run, progress.as_ref()).await?;
 
-    match fmt {
-        OutputFormat::Json if dry_run => print_dry_run_json("sync", &results, verbose),
-        OutputFormat::Json => {
-            let out = CommandOutput::from_sync_results("sync", &results, false);
+    // JSON output is identical to the other commands; only sync's text summary
+    // is bespoke (per-table pushed/pulled counts), so it can't use print_summary.
+    if emit_command_json(fmt, "sync", &results, dry_run, verbose) {
+        return Ok(());
+    }
+
+    println!("\n--- Sync Summary ---");
+    let mut total_pushed = 0;
+    let mut total_pulled = 0;
+    for result in &results {
+        if result.has_changes() {
             println!(
-                "{}",
-                serde_json::to_string(&out).expect("CommandOutput serialization")
+                "  {}: {} pushed, {} pulled",
+                result.table, result.rows_pushed, result.rows_pulled
             );
+            total_pushed += result.rows_pushed;
+            total_pulled += result.rows_pulled;
         }
-        OutputFormat::Text => {
-            println!("\n--- Sync Summary ---");
-            let mut total_pushed = 0;
-            let mut total_pulled = 0;
-            for result in &results {
-                if result.has_changes() {
-                    println!(
-                        "  {}: {} pushed, {} pulled",
-                        result.table, result.rows_pushed, result.rows_pulled
-                    );
-                    total_pushed += result.rows_pushed;
-                    total_pulled += result.rows_pulled;
-                }
-            }
-            if total_pushed == 0 && total_pulled == 0 {
-                println!("  No changes to sync");
-            } else if dry_run {
-                println!("\n  (dry run - no actual changes made)");
-            }
-        }
+    }
+    if total_pushed == 0 && total_pulled == 0 {
+        println!("  No changes to sync");
+    } else if dry_run {
+        println!("\n  (dry run - no actual changes made)");
     }
 
     Ok(())
@@ -615,53 +674,26 @@ async fn run_diff(
 ) -> error::Result<()> {
     info!("Computing differences...");
     let local = LocalDb::open_readonly(config.local_db_path())?;
+    let remote = TargetSource::open(&target, false).await?;
 
-    match target {
-        ResolvedTarget::Sqlite { database } => {
-            let target_db = LocalDb::open_readonly(&database)?;
-            let tables = match table {
-                Some(t) => {
-                    let schema = local.get_schema()?;
-                    let _ = schema.validate(&t)?;
-                    vec![t]
-                }
-                None => get_tables_to_sync(&local, &target_db, config).await?,
-            };
-            output_diffs(
-                &local,
-                &target_db,
-                &tables,
-                &config.sync.timestamp_column,
-                &config.sync.exclude_columns,
-                fmt,
-            )
-            .await
+    let tables = match table {
+        Some(t) => {
+            let schema = local.get_schema()?;
+            let _ = schema.validate(&t)?;
+            vec![t]
         }
-        ResolvedTarget::Plugin {
-            ref path,
-            ref name,
-            config: ref plugin_config,
-        } => {
-            let plugin = PluginDataSource::start(path, name, plugin_config).await?;
-            let tables = match table {
-                Some(t) => {
-                    let schema = local.get_schema()?;
-                    let _ = schema.validate(&t)?;
-                    vec![t]
-                }
-                None => get_tables_to_sync(&local, &plugin, config).await?,
-            };
-            output_diffs(
-                &local,
-                &plugin,
-                &tables,
-                &config.sync.timestamp_column,
-                &config.sync.exclude_columns,
-                fmt,
-            )
-            .await
-        }
-    }
+        None => get_tables_to_sync(&local, &remote, config).await?,
+    };
+
+    output_diffs(
+        &local,
+        &remote,
+        &tables,
+        &config.sync.timestamp_column,
+        &config.sync.exclude_columns,
+        fmt,
+    )
+    .await
 }
 
 async fn output_diffs<A: DataSource, B: DataSource>(
@@ -719,14 +751,22 @@ async fn output_diffs<A: DataSource, B: DataSource>(
 ///
 /// `verb` is the lowercase action name used in the no-changes message
 /// (e.g. "No changes to push").
+/// Capitalize the first character of an ASCII command verb ("push" -> "Push").
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
 fn print_summary(
-    heading: &str,
     results: &[smugglr_core::sync::SyncResult],
     get_count: impl Fn(&smugglr_core::sync::SyncResult) -> usize,
     verb: &str,
     dry_run: bool,
 ) {
-    println!("\n--- {} Summary ---", heading);
+    println!("\n--- {} Summary ---", capitalize(verb));
     let mut total = 0;
     for result in results {
         let count = get_count(result);
@@ -755,6 +795,30 @@ fn print_diff_category(label: &str, keys: &[String]) {
     }
 }
 
+/// Connect to a data source and collect per-table row counts for `status`.
+///
+/// Returns a connected `StatusDb` with row counts for every synced table.
+/// Connection failures are handled by the caller (which builds the
+/// disconnected `StatusDb` variant).
+async fn gather_status<D: DataSource>(db: &D, config: &Config) -> error::Result<StatusDb> {
+    let tables = db.list_tables().await?;
+    let mut table_rows = Vec::new();
+    for table in &tables {
+        if config.should_sync_table(table) {
+            let count = db.row_count(table).await?;
+            table_rows.push(StatusTable {
+                name: table.clone(),
+                rows: count,
+            });
+        }
+    }
+    Ok(StatusDb {
+        connected: true,
+        error: None,
+        tables: table_rows,
+    })
+}
+
 async fn run_status(
     config: &Config,
     target: ResolvedTarget,
@@ -767,24 +831,7 @@ async fn run_status(
 
     // Gather local DB info
     let local_status = match LocalDb::open_readonly(config.local_db_path()) {
-        Ok(local) => {
-            let tables = local.list_tables().await?;
-            let mut table_rows = Vec::new();
-            for table in &tables {
-                if config.should_sync_table(table) {
-                    let count = local.row_count(table).await?;
-                    table_rows.push(StatusTable {
-                        name: table.clone(),
-                        rows: count,
-                    });
-                }
-            }
-            StatusDb {
-                connected: true,
-                error: None,
-                tables: table_rows,
-            }
-        }
+        Ok(local) => gather_status(&local, config).await?,
         Err(e) => StatusDb {
             connected: false,
             error: Some(e.to_string()),
@@ -793,60 +840,12 @@ async fn run_status(
     };
 
     // Gather target info
-    let target_status = match &target {
-        ResolvedTarget::Sqlite { database } => match LocalDb::open_readonly(database) {
-            Ok(target_db) => {
-                let tables = target_db.list_tables().await?;
-                let mut table_rows = Vec::new();
-                for table in &tables {
-                    if config.should_sync_table(table) {
-                        let count = target_db.row_count(table).await?;
-                        table_rows.push(StatusTable {
-                            name: table.clone(),
-                            rows: count,
-                        });
-                    }
-                }
-                StatusDb {
-                    connected: true,
-                    error: None,
-                    tables: table_rows,
-                }
-            }
-            Err(e) => StatusDb {
-                connected: false,
-                error: Some(e.to_string()),
-                tables: vec![],
-            },
-        },
-        ResolvedTarget::Plugin {
-            ref path,
-            ref name,
-            config: ref plugin_config,
-        } => match PluginDataSource::start(path, name, plugin_config).await {
-            Ok(plugin) => {
-                let tables = plugin.list_tables().await?;
-                let mut table_rows = Vec::new();
-                for table in &tables {
-                    if config.should_sync_table(table) {
-                        let count = plugin.row_count(table).await?;
-                        table_rows.push(StatusTable {
-                            name: table.clone(),
-                            rows: count,
-                        });
-                    }
-                }
-                StatusDb {
-                    connected: true,
-                    error: None,
-                    tables: table_rows,
-                }
-            }
-            Err(e) => StatusDb {
-                connected: false,
-                error: Some(e.to_string()),
-                tables: vec![],
-            },
+    let target_status = match TargetSource::open(&target, false).await {
+        Ok(remote) => gather_status(&remote, config).await?,
+        Err(e) => StatusDb {
+            connected: false,
+            error: Some(e.to_string()),
+            tables: vec![],
         },
     };
 
@@ -854,7 +853,7 @@ async fn run_status(
         OutputFormat::Json => {
             let out = StatusOutput {
                 command: "status",
-                status: "ok",
+                status: Status::Ok,
                 config: StatusConfig {
                     local_db: config.local_db_path().to_string(),
                     target_type: target_type.to_string(),
@@ -972,19 +971,7 @@ async fn run_stash(
     )
     .await?;
 
-    match fmt {
-        OutputFormat::Json if dry_run => print_dry_run_json("stash", &results, verbose),
-        OutputFormat::Json => {
-            let out = CommandOutput::from_sync_results("stash", &results, false);
-            println!(
-                "{}",
-                serde_json::to_string(&out).expect("CommandOutput serialization")
-            );
-        }
-        OutputFormat::Text => {
-            print_summary("Stash", &results, |r| r.rows_pushed, "stash", dry_run);
-        }
-    }
+    emit_command_output(fmt, "stash", &results, dry_run, verbose, |r| r.rows_pushed);
     Ok(())
 }
 
@@ -1009,19 +996,9 @@ async fn run_retrieve(
     )
     .await?;
 
-    match fmt {
-        OutputFormat::Json if dry_run => print_dry_run_json("retrieve", &results, verbose),
-        OutputFormat::Json => {
-            let out = CommandOutput::from_sync_results("retrieve", &results, false);
-            println!(
-                "{}",
-                serde_json::to_string(&out).expect("CommandOutput serialization")
-            );
-        }
-        OutputFormat::Text => {
-            print_summary("Retrieve", &results, |r| r.rows_pulled, "retrieve", dry_run);
-        }
-    }
+    emit_command_output(fmt, "retrieve", &results, dry_run, verbose, |r| {
+        r.rows_pulled
+    });
     Ok(())
 }
 
@@ -1036,7 +1013,7 @@ async fn run_snapshot(config: &Config, dry_run: bool, fmt: OutputFormat) -> erro
         OutputFormat::Json => {
             let out = SnapshotOutput {
                 command: "snapshot",
-                status: if dry_run { "dry_run" } else { "ok" },
+                status: if dry_run { Status::DryRun } else { Status::Ok },
                 timestamp: result.timestamp,
                 size_bytes: result.size_bytes,
                 tables: result
@@ -1078,7 +1055,7 @@ async fn run_snapshots(config: &Config, fmt: OutputFormat) -> error::Result<()> 
         OutputFormat::Json => {
             let out = SnapshotListOutput {
                 command: "snapshots",
-                status: "ok",
+                status: Status::Ok,
                 snapshots: entries
                     .into_iter()
                     .map(|e| SnapshotListEntry {
@@ -1139,7 +1116,7 @@ async fn run_restore(
         OutputFormat::Json => {
             let out = SnapshotOutput {
                 command: "restore",
-                status: if dry_run { "dry_run" } else { "ok" },
+                status: if dry_run { Status::DryRun } else { Status::Ok },
                 timestamp: result.timestamp,
                 size_bytes: result.size_bytes,
                 tables: result
