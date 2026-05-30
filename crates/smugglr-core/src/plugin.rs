@@ -2,7 +2,7 @@
 //!
 //! Plugins are standalone binaries that implement the DataSource interface
 //! via JSON-RPC over stdin/stdout. This enables adapter development in any
-//! language without recompiling smuggler.
+//! language without recompiling smugglr.
 //!
 //! ## Protocol
 //!
@@ -325,19 +325,25 @@ impl DataSource for PluginDataSource {
     }
 }
 
+/// Directory under `$HOME` where smugglr looks for plugin binaries.
+///
+/// Single source of truth so the path we search and the path we name in errors
+/// cannot drift apart -- that drift was bug #140 (the join said `.smuggler`
+/// while the error message said `.smugglr`).
+const PLUGIN_HOME_SUBDIR: &str = ".smugglr/plugins";
+
 /// Resolve a plugin name to its binary path.
 ///
 /// Search order:
-/// 1. `~/.smugglr/plugins/smuggler-{name}`
-/// 2. `smuggler-{name}` on `$PATH`
+/// 1. `~/.smugglr/plugins/smugglr-{name}`
+/// 2. `smugglr-{name}` on `$PATH`
 pub fn resolve_plugin_path(name: &str) -> Result<PathBuf> {
     let binary_name = format!("smugglr-{}", name);
 
     // Check ~/.smugglr/plugins/
     if let Ok(home) = std::env::var("HOME") {
         let candidate = PathBuf::from(home)
-            .join(".smuggler")
-            .join("plugins")
+            .join(PLUGIN_HOME_SUBDIR)
             .join(&binary_name);
         if candidate.is_file() {
             return Ok(candidate);
@@ -350,8 +356,8 @@ pub fn resolve_plugin_path(name: &str) -> Result<PathBuf> {
     }
 
     Err(SyncError::Plugin(format!(
-        "Plugin '{}' not found. Searched: ~/.smugglr/plugins/{}, $PATH/{}",
-        name, binary_name, binary_name
+        "Plugin '{}' not found. Searched: ~/{}/{}, $PATH/{}",
+        name, PLUGIN_HOME_SUBDIR, binary_name, binary_name
     )))
 }
 
