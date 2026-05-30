@@ -234,7 +234,8 @@ fn encrypt_packet(plaintext: &[u8], key: &[u8; 32]) -> Result<Vec<u8>> {
 /// Decrypt a received packet.
 ///
 /// Expects wire format: `[24-byte nonce][ciphertext + 16-byte Poly1305 tag]`
-#[allow(dead_code)]
+///
+/// Reached via [`maybe_decrypt`], which multicast uses to open every datagram.
 fn decrypt_packet(data: &[u8], key: &[u8; 32]) -> Result<Vec<u8>> {
     if data.len() < ENCRYPTION_OVERHEAD {
         return Err(SyncError::Broadcast(format!(
@@ -254,7 +255,6 @@ fn decrypt_packet(data: &[u8], key: &[u8; 32]) -> Result<Vec<u8>> {
 }
 
 /// Wrap plaintext in an encryption envelope if a key is provided.
-#[allow(dead_code)]
 pub fn maybe_encrypt(plaintext: &[u8], key: &Option<[u8; 32]>) -> Result<Vec<u8>> {
     match key {
         Some(k) => encrypt_packet(plaintext, k),
@@ -263,7 +263,6 @@ pub fn maybe_encrypt(plaintext: &[u8], key: &Option<[u8; 32]>) -> Result<Vec<u8>
 }
 
 /// Unwrap a potentially encrypted packet. Returns None to signal "drop this packet".
-#[allow(dead_code)]
 pub fn maybe_decrypt(data: &[u8], key: &Option<[u8; 32]>) -> Result<Option<Vec<u8>>> {
     match key {
         Some(k) => {
