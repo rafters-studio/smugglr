@@ -274,16 +274,22 @@ struct JsTableDiff {
     identical: usize,
 }
 
-fn parse_conflict_resolution(s: Option<&str>) -> ConflictResolution {
+fn parse_conflict_resolution(s: Option<&str>) -> Result<ConflictResolution, JsValue> {
     match s {
-        Some("remote_wins") => ConflictResolution::RemoteWins,
-        Some("newer_wins") => ConflictResolution::NewerWins,
-        Some("uuid_v7_wins") => ConflictResolution::UuidV7Wins,
-        _ => ConflictResolution::LocalWins,
+        None | Some("local_wins") => Ok(ConflictResolution::LocalWins),
+        Some("remote_wins") => Ok(ConflictResolution::RemoteWins),
+        Some("newer_wins") => Ok(ConflictResolution::NewerWins),
+        Some("uuid_v7_wins") => Ok(ConflictResolution::UuidV7Wins),
+        // Reject unknown values loudly: silently defaulting to LocalWins would
+        // sync the wrong direction (data-loss-shaped) on a typo like "remoteWins".
+        Some(other) => Err(JsValue::from_str(&format!(
+            "unknown conflict_resolution '{}'; expected one of: local_wins, remote_wins, newer_wins, uuid_v7_wins",
+            other
+        ))),
     }
 }
 
-fn build_sync_config(js: &JsSyncConfig) -> SyncConfig {
+fn build_sync_config(js: &JsSyncConfig) -> Result<SyncConfig, JsValue> {
     let mut sync = SyncConfig::default();
     if !js.tables.is_empty() {
         sync.tables = js.tables.clone();
@@ -297,11 +303,11 @@ fn build_sync_config(js: &JsSyncConfig) -> SyncConfig {
     if let Some(ref ts) = js.timestamp_column {
         sync.timestamp_column = ts.clone();
     }
-    sync.conflict_resolution = parse_conflict_resolution(js.conflict_resolution.as_deref());
+    sync.conflict_resolution = parse_conflict_resolution(js.conflict_resolution.as_deref())?;
     if let Some(bs) = js.batch_size {
         sync.batch_size = bs;
     }
-    sync
+    Ok(sync)
 }
 
 /// Dispatch endpoint config -> adapter.
@@ -566,7 +572,7 @@ impl Smugglr {
                 .map_err(|e| JsValue::from_str(&format!("invalid sync config: {}", e)))?
         };
 
-        let sync_config = build_sync_config(&js_sync);
+        let sync_config = build_sync_config(&js_sync)?;
         let source = build_datasource(&source_js)?;
         let dest = if dest_js.is_undefined() || dest_js.is_null() {
             None

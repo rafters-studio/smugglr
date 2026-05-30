@@ -309,6 +309,7 @@ pub async fn sync_table<A: DataSource, B: DataSource>(
     progress: &dyn SyncProgress,
 ) -> Result<SyncResult> {
     let diff = diff_table(a, b, table, timestamp_column, exclude_columns).await?;
+    diff.warn_unresolved_conflicts(conflict_resolution);
     let (stats, detail) = if dry_run {
         (Some(diff.stats()), Some(DiffDetail::from_diff(&diff)))
     } else {
@@ -434,6 +435,7 @@ pub async fn push_all<Src: DataSource, Dst: DataSource>(
             &config.sync.exclude_columns,
         )
         .await?;
+        diff.warn_unresolved_conflicts(config.sync.conflict_resolution);
 
         let (stats, detail) = if dry_run {
             (Some(diff.stats()), Some(DiffDetail::from_diff(&diff)))
@@ -496,6 +498,7 @@ pub async fn pull_all<Src: DataSource, Dst: DataSource>(
             &config.sync.exclude_columns,
         )
         .await?;
+        diff.warn_unresolved_conflicts(config.sync.conflict_resolution);
 
         let (stats, detail) = if dry_run {
             (Some(diff.stats()), Some(DiffDetail::from_diff(&diff)))

@@ -4,6 +4,7 @@
 //! instead of reqwest. Shares profile definitions with the native http-sql plugin.
 
 use sha2::{Digest, Sha256};
+use smugglr_core::config::column_excluded;
 use smugglr_core::datasource::{ColumnInfo, DataSource, RowMeta, TableInfo};
 use smugglr_core::error::{Result, SyncError};
 use smugglr_core::profile::{AuthFormat, Profile};
@@ -254,7 +255,10 @@ impl FetchDataSource {
         result
     }
 
-    /// Content hash matching smugglr-core local.rs algorithm exactly.
+    /// Content hash matching smugglr-core local.rs exactly, including the
+    /// glob-pattern column exclusion (via `column_excluded`) -- exact-string
+    /// matching here would diverge from transfer-time stripping and produce
+    /// phantom `content_differs` for glob-excluded columns.
     fn content_hash(
         row: &HashMap<String, Value>,
         columns_in_order: &[String],
@@ -265,7 +269,7 @@ impl FetchDataSource {
         let mut hasher = Sha256::new();
         for col in columns_in_order {
             if timestamp_columns.contains(&col.as_str())
-                || exclude.iter().any(|e| e == col)
+                || column_excluded(col, exclude)
                 || col == timestamp_column
             {
                 continue;

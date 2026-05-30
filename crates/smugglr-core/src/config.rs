@@ -47,7 +47,7 @@ pub enum TargetConfig {
     Sqlite { database: String },
     /// External plugin adapter
     Plugin {
-        /// Plugin name (resolved from ~/.smugglr/plugins/smuggler-{name} or $PATH)
+        /// Plugin name (resolved from ~/.smugglr/plugins/smugglr-{name} or $PATH)
         name: Option<String>,
         /// Explicit path to plugin binary
         path: Option<String>,

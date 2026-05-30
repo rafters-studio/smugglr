@@ -58,6 +58,12 @@ pub const DEFAULT_GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 43, 21);
 /// Receive buffer: the largest datagram we will accept (one full UDP payload).
 const RECV_BUF: usize = 65_536;
 
+/// Wire headroom reserved when chunking deltas for multicast: the `Msg` JSON
+/// wrapper (`{"version":N,"body":{"t":"Delta",...}}`, a fixed ~35 bytes) plus the
+/// XChaCha20-Poly1305 nonce+tag (40 bytes). Conservative, so a sealed `Delta`
+/// datagram never exceeds [`SAFE_PACKET_SIZE`].
+const DELTA_WIRE_RESERVE: usize = 128;
+
 /// A `primary_key -> content_hash` advertisement for one table (one datagram).
 ///
 /// Large tables are chunked across several parts; each part is processed and
@@ -358,7 +364,14 @@ impl Gossip {
         upserts: Vec<HashMap<String, serde_json::Value>>,
         deletes: Vec<String>,
     ) -> Result<Vec<Body>> {
-        let parts = crate::broadcast::split_delta(&self.instance_id, 0, table, upserts, deletes)?;
+        let parts = crate::broadcast::split_delta(
+            &self.instance_id,
+            0,
+            table,
+            upserts,
+            deletes,
+            DELTA_WIRE_RESERVE,
+        )?;
         Ok(parts
             .into_iter()
             .map(|mut part| {
@@ -867,6 +880,43 @@ mod tests {
         );
         assert!(out.is_empty());
         assert_eq!(count(&b_path), 0, "foreign-key node must not converge");
+    }
+
+    // Regression for the AEAD-envelope-overhead bug (#143): a delta chunked for
+    // multicast, once SEALED (Msg wrapper + XChaCha20 nonce+tag), must stay
+    // within SAFE_PACKET_SIZE. split_delta reserves DELTA_WIRE_RESERVE for it;
+    // with a key set the seal adds the full 40-byte AEAD overhead.
+    #[tokio::test]
+    async fn keyed_delta_parts_stay_under_mtu_when_sealed() {
+        let key = "ab".repeat(32);
+        let dir = tempfile::tempdir().unwrap();
+        let a_path = dir.path().join("a.db").to_str().unwrap().to_string();
+        let b_path = dir.path().join("b.db").to_str().unwrap().to_string();
+        seed(&a_path, &[]);
+        seed(&b_path, &[]);
+        let (a, _ac, _al, _b, _bc, _bl) =
+            two_nodes_keyed(&a_path, &b_path, Some(&key), Some(&key)).await;
+
+        // Enough rows to force multiple delta parts.
+        let rows: Vec<HashMap<String, serde_json::Value>> = (0..400)
+            .map(|i| {
+                HashMap::from([
+                    ("id".to_string(), serde_json::json!(format!("pk-{i:020}"))),
+                    ("data".to_string(), serde_json::json!("x".repeat(40))),
+                ])
+            })
+            .collect();
+        let bodies = a.delta_bodies("users", rows, Vec::new()).unwrap();
+        assert!(bodies.len() > 1, "rows should span multiple delta parts");
+        for body in bodies {
+            let sealed = a.seal(body).unwrap();
+            assert!(
+                sealed.len() <= SAFE_PACKET_SIZE,
+                "sealed delta part is {} bytes, exceeds SAFE_PACKET_SIZE {}",
+                sealed.len(),
+                SAFE_PACKET_SIZE
+            );
+        }
     }
 
     // Live multicast smoke test: proves bind/join/send/recv over a real socket.

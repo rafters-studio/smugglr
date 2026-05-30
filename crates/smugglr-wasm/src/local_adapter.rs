@@ -7,6 +7,7 @@
 //! changes here.
 
 use sha2::{Digest, Sha256};
+use smugglr_core::config::column_excluded;
 use smugglr_core::datasource::{ColumnInfo, DataSource, RowMeta, TableInfo};
 use smugglr_core::error::{Result, SyncError};
 use std::collections::HashMap;
@@ -132,7 +133,7 @@ impl LocalSqlDataSource {
         let mut hasher = Sha256::new();
         for col in columns_in_order {
             if timestamp_columns.contains(&col.as_str())
-                || exclude.iter().any(|e| e == col)
+                || column_excluded(col, exclude)
                 || col == timestamp_column
             {
                 continue;
