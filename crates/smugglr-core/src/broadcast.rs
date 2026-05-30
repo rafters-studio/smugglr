@@ -1,13 +1,21 @@
-//! LAN broadcast sync: peer discovery, delta serialization, and encryption.
+//! LAN broadcast primitives: peer discovery, delta serialization, and encryption.
 //!
-//! Smuggler instances on the same subnet discover each other via UDP broadcast
-//! on a configurable port (default: 31337). Each instance periodically announces
-//! its presence, and maintains a peer table with TTL-based expiry.
+//! The live LAN sync engine is [`crate::multicast`] -- a masterless gossip
+//! protocol where membership is key possession, not a designated master. This
+//! module is no longer a transport in its own right; it provides two things:
 //!
-//! The delta protocol serializes table diffs into packets for network transport,
-//! handling UDP size limits by splitting large deltas into multiple parts.
+//! 1. **Embedder discovery API** -- [`PeerDiscovery`] / [`Announcement`]: UDP
+//!    broadcast announce-and-listen on a configurable port (default: 31337),
+//!    with a TTL-pruned peer table. Embedders such as legion consume this to
+//!    enumerate instances on the subnet. It is intentionally decoupled from the
+//!    multicast wire protocol (see the note on [`Announcement`]).
+//! 2. **Shared primitives reused by multicast** -- [`DeltaPacket`] /
+//!    [`split_delta`] (table-diff serialization, splitting large deltas to fit
+//!    UDP size limits), [`ReplayGuard`] (per-peer sliding-window replay
+//!    rejection), and the XChaCha20-Poly1305 helpers
+//!    ([`maybe_encrypt`] / [`maybe_decrypt`]).
 //!
-//! When a pre-shared key is configured, all broadcast traffic is encrypted with
+//! When a pre-shared key is configured, multicast traffic is encrypted with
 //! XChaCha20-Poly1305 AEAD. Plaintext and encrypted modes are mutually exclusive.
 
 use crate::error::{Result, SyncError};
@@ -65,8 +73,9 @@ pub struct BroadcastConfig {
     pub instance_id: Option<String>,
 
     /// 256-bit pre-shared key, hex-encoded (64 hex chars).
-    /// When set, all broadcast traffic is encrypted with XChaCha20-Poly1305.
-    #[allow(dead_code)] // Will be used when encryption is integrated into TCP framing
+    /// When set, all multicast traffic is encrypted with XChaCha20-Poly1305
+    /// (decoded via [`BroadcastConfig::encryption_key`] and consumed by
+    /// [`crate::multicast`]).
     pub secret: Option<String>,
 }
 
@@ -102,9 +111,8 @@ impl BroadcastConfig {
         Duration::from_secs(self.interval_secs * PEER_TTL_MULTIPLIER)
     }
 
-    /// Parse the hex-encoded secret into a 256-bit key.
+    /// Parse the hex-encoded secret into a 256-bit key for multicast encryption.
     /// Returns None if no secret is configured.
-    #[allow(dead_code)] // Will be used when encryption is integrated into TCP framing
     pub fn encryption_key(&self) -> Result<Option<[u8; 32]>> {
         match &self.secret {
             None => Ok(None),
@@ -148,18 +156,30 @@ impl Peer {
     }
 }
 
-/// Announcement packet broadcast over UDP.
+/// Announcement packet broadcast over UDP for embedder discovery.
 ///
 /// Kept small to fit in a single UDP datagram with room to spare.
+///
+/// This is the embedder discovery payload (legion consumes it via
+/// [`PeerDiscovery`]). The `db_path_hash` and `sync_port` fields carry TCP-era
+/// scoping -- "two instances sync only if their database paths match, over a
+/// dedicated TCP port" -- that the masterless multicast model (PROTOCOL_VERSION
+/// v3, where membership = key possession) deliberately dropped. They remain on
+/// the wire for the discovery use case, but an embedder must NOT assume they
+/// mean anything to multicast sync: a peer with a different `db_path_hash` can
+/// still be a valid multicast group member, and `sync_port` does not name any
+/// live transport.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Announcement {
     /// Protocol version (for forward compatibility)
     pub version: u8,
     /// Unique instance identifier
     pub instance_id: String,
-    /// SHA256 hash of the database path (not the path itself, for privacy)
+    /// SHA256 hash of the database path (not the path itself, for privacy).
+    /// TCP-era scoping; not used by multicast membership -- see the type doc.
     pub db_path_hash: String,
-    /// TCP port for sync connections (may differ from broadcast port in future)
+    /// TCP-era sync port; names no live transport under multicast -- see the
+    /// type doc.
     pub sync_port: u16,
 }
 
@@ -192,7 +212,8 @@ impl Announcement {
 /// Encrypt a serialized packet for broadcast.
 ///
 /// Wire format: `[24-byte nonce][ciphertext + 16-byte Poly1305 tag]`
-#[allow(dead_code)] // Used by tests; will be used by TCP framing when encryption lands
+///
+/// Reached via [`maybe_encrypt`], which multicast uses to seal every datagram.
 fn encrypt_packet(plaintext: &[u8], key: &[u8; 32]) -> Result<Vec<u8>> {
     let cipher = XChaCha20Poly1305::new(key.into());
 
@@ -213,7 +234,8 @@ fn encrypt_packet(plaintext: &[u8], key: &[u8; 32]) -> Result<Vec<u8>> {
 /// Decrypt a received packet.
 ///
 /// Expects wire format: `[24-byte nonce][ciphertext + 16-byte Poly1305 tag]`
-#[allow(dead_code)]
+///
+/// Reached via [`maybe_decrypt`], which multicast uses to open every datagram.
 fn decrypt_packet(data: &[u8], key: &[u8; 32]) -> Result<Vec<u8>> {
     if data.len() < ENCRYPTION_OVERHEAD {
         return Err(SyncError::Broadcast(format!(
@@ -233,7 +255,6 @@ fn decrypt_packet(data: &[u8], key: &[u8; 32]) -> Result<Vec<u8>> {
 }
 
 /// Wrap plaintext in an encryption envelope if a key is provided.
-#[allow(dead_code)]
 pub fn maybe_encrypt(plaintext: &[u8], key: &Option<[u8; 32]>) -> Result<Vec<u8>> {
     match key {
         Some(k) => encrypt_packet(plaintext, k),
@@ -242,7 +263,6 @@ pub fn maybe_encrypt(plaintext: &[u8], key: &Option<[u8; 32]>) -> Result<Vec<u8>
 }
 
 /// Unwrap a potentially encrypted packet. Returns None to signal "drop this packet".
-#[allow(dead_code)]
 pub fn maybe_decrypt(data: &[u8], key: &Option<[u8; 32]>) -> Result<Option<Vec<u8>>> {
     match key {
         Some(k) => {
@@ -270,6 +290,14 @@ pub fn maybe_decrypt(data: &[u8], key: &Option<[u8; 32]>) -> Result<Option<Vec<u
 // ---------------------------------------------------------------------------
 
 /// Manages peer discovery via UDP subnet broadcast.
+///
+/// This is the embedder discovery API: embedders such as legion construct a
+/// `PeerDiscovery`, drive [`PeerDiscovery::discover_once`] (or the
+/// announce/receive/prune primitives directly), and read the TTL-pruned peer
+/// table. It announces [`Announcement`] packets and is intentionally separate
+/// from the masterless multicast sync engine ([`crate::multicast`]); see the
+/// note on [`Announcement`] for why its `db_path_hash`/`sync_port` scoping does
+/// not carry multicast semantics.
 pub struct PeerDiscovery {
     config: BroadcastConfig,
     instance_id: String,
@@ -409,18 +437,6 @@ impl PeerDiscovery {
     /// Get a snapshot of all currently known peers.
     pub async fn peers(&self) -> Vec<Peer> {
         self.peers.read().await.values().cloned().collect()
-    }
-
-    /// Get peers that share the same database path hash (compatible for sync).
-    #[allow(dead_code)]
-    pub async fn compatible_peers(&self, db_path_hash: &str) -> Vec<Peer> {
-        self.peers
-            .read()
-            .await
-            .values()
-            .filter(|p| p.db_path_hash == db_path_hash && !p.is_expired(self.config.peer_ttl()))
-            .cloned()
-            .collect()
     }
 
     /// Run the announce-listen-prune loop for a single cycle.
@@ -640,29 +656,6 @@ pub fn split_delta(
     Ok(packets)
 }
 
-#[derive(Debug, Default)]
-pub struct SequenceTracker {
-    sequences: HashMap<String, u64>,
-}
-
-impl SequenceTracker {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn next(&mut self, table: &str) -> u64 {
-        let seq = self.sequences.entry(table.to_string()).or_insert(0);
-        let current = *seq;
-        *seq += 1;
-        current
-    }
-
-    #[allow(dead_code)]
-    pub fn current(&self, table: &str) -> u64 {
-        self.sequences.get(table).copied().unwrap_or(0)
-    }
-}
-
 /// Tracks seen sequence numbers per peer to detect replay attacks.
 ///
 /// Uses a sliding window of 64 sequence numbers per peer. Packets with
@@ -759,502 +752,6 @@ impl Default for ReplayGuard {
     fn default() -> Self {
         Self::new()
     }
-}
-
-#[allow(dead_code)]
-pub fn reassemble_delta(parts: &[DeltaPacket]) -> Option<DeltaPacket> {
-    if parts.is_empty() {
-        return None;
-    }
-
-    let expected_total = parts[0].total_parts as usize;
-    if parts.len() != expected_total {
-        return None;
-    }
-
-    let seq = parts[0].seq;
-    let table = &parts[0].table;
-    if parts.iter().any(|p| p.seq != seq || p.table != *table) {
-        return None;
-    }
-
-    let mut sorted: Vec<&DeltaPacket> = parts.iter().collect();
-    sorted.sort_by_key(|p| p.part);
-
-    let mut merged = DeltaPacket::new(parts[0].source_id.clone(), seq, table.clone());
-    merged.total_parts = 1;
-
-    for part in sorted {
-        merged.upserts.extend(part.upserts.clone());
-        merged.deletes.extend(part.deletes.clone());
-    }
-
-    Some(merged)
-}
-
-// ---------------------------------------------------------------------------
-// TCP sync protocol
-// ---------------------------------------------------------------------------
-
-/// A sync request sent over TCP from one peer to another.
-///
-/// Contains the requester's instance identity, the database path hash for
-/// verification, and per-table row hashes so the responder can compute
-/// what the requester is missing.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SyncRequest {
-    pub instance_id: String,
-    pub db_path_hash: String,
-    pub tables: Vec<TableSyncRequest>,
-}
-
-/// Per-table portion of a sync request.
-///
-/// `row_hashes` maps primary_key -> content_hash for every row the
-/// requester currently has. The responder diffs against its own data
-/// to determine what to send back.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct TableSyncRequest {
-    pub table: String,
-    /// Map of primary_key -> content_hash for all rows the requester has
-    pub row_hashes: HashMap<String, String>,
-}
-
-/// Response to a sync request, containing deltas and want-lists.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SyncResponse {
-    pub instance_id: String,
-    /// Delta packets containing rows the requester is missing or that are newer
-    pub deltas: Vec<DeltaPacket>,
-    /// Rows the requester has that the responder wants (their PKs by table)
-    pub want_rows: Vec<TableWantRows>,
-}
-
-/// Rows the responder wants from the requester, grouped by table.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct TableWantRows {
-    pub table: String,
-    pub pk_values: Vec<String>,
-}
-
-/// Write a length-prefixed JSON message to a TCP stream.
-///
-/// Wire format: [4-byte big-endian length][JSON payload]
-async fn write_framed<T: Serialize>(
-    stream: &mut tokio::net::tcp::OwnedWriteHalf,
-    msg: &T,
-) -> Result<()> {
-    use tokio::io::AsyncWriteExt;
-
-    let payload = serde_json::to_vec(msg)
-        .map_err(|e| SyncError::Broadcast(format!("serialize frame: {}", e)))?;
-    let len = payload.len() as u32;
-    stream
-        .write_all(&len.to_be_bytes())
-        .await
-        .map_err(|e| SyncError::Broadcast(format!("write frame length: {}", e)))?;
-    stream
-        .write_all(&payload)
-        .await
-        .map_err(|e| SyncError::Broadcast(format!("write frame payload: {}", e)))?;
-    Ok(())
-}
-
-/// Read a length-prefixed JSON message from a TCP stream.
-///
-/// Wire format: [4-byte big-endian length][JSON payload]
-async fn read_framed<T: serde::de::DeserializeOwned>(
-    stream: &mut tokio::net::tcp::OwnedReadHalf,
-) -> Result<T> {
-    use tokio::io::AsyncReadExt;
-
-    let mut len_buf = [0u8; 4];
-    stream
-        .read_exact(&mut len_buf)
-        .await
-        .map_err(|e| SyncError::Broadcast(format!("read frame length: {}", e)))?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-
-    if len > 64 * 1024 * 1024 {
-        return Err(SyncError::Broadcast(format!(
-            "frame too large: {} bytes (max 64MB)",
-            len
-        )));
-    }
-
-    let mut buf = vec![0u8; len];
-    stream
-        .read_exact(&mut buf)
-        .await
-        .map_err(|e| SyncError::Broadcast(format!("read frame payload: {}", e)))?;
-
-    serde_json::from_slice(&buf)
-        .map_err(|e| SyncError::Broadcast(format!("deserialize frame: {}", e)))
-}
-
-/// Handle a single inbound TCP sync connection (server side).
-///
-/// Reads a SyncRequest, diffs against local data, and sends back a
-/// SyncResponse with delta packets for rows the requester needs.
-pub async fn handle_sync_connection(
-    stream: tokio::net::TcpStream,
-    config: &crate::config::Config,
-    broadcast_config: &BroadcastConfig,
-    db_path_hash: &str,
-    replay_guard: &Arc<tokio::sync::Mutex<ReplayGuard>>,
-) -> Result<()> {
-    use crate::datasource::DataSource;
-    use crate::local::LocalDb;
-
-    let peer_addr = stream
-        .peer_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_else(|_| "unknown".to_string());
-
-    let (mut read_half, mut write_half) = stream.into_split();
-
-    let request: SyncRequest = read_framed(&mut read_half).await?;
-    debug!(
-        "Sync request from {} (instance: {})",
-        peer_addr, request.instance_id
-    );
-
-    // Verify db_path_hash matches
-    if request.db_path_hash != db_path_hash {
-        warn!(
-            "Rejecting sync from {}: db_path_hash mismatch (theirs={}, ours={})",
-            peer_addr,
-            &request.db_path_hash[..8.min(request.db_path_hash.len())],
-            &db_path_hash[..8.min(db_path_hash.len())]
-        );
-        let response = SyncResponse {
-            instance_id: broadcast_config.resolve_instance_id(),
-            deltas: Vec::new(),
-            want_rows: Vec::new(),
-        };
-        write_framed(&mut write_half, &response).await?;
-        return Ok(());
-    }
-
-    let local = LocalDb::open(config.local_db_path())?;
-
-    let mut deltas: Vec<DeltaPacket> = Vec::new();
-    let mut want_rows: Vec<TableWantRows> = Vec::new();
-    let instance_id = broadcast_config.resolve_instance_id();
-    let mut seq_tracker = SequenceTracker::new();
-
-    for table_req in &request.tables {
-        if !config.should_sync_table(&table_req.table) {
-            debug!("Skipping excluded table: {}", table_req.table);
-            continue;
-        }
-
-        // Get our local row metadata
-        let local_meta = match local
-            .get_row_metadata(
-                &table_req.table,
-                &config.sync.timestamp_column,
-                &config.sync.exclude_columns,
-            )
-            .await
-        {
-            Ok(m) => m,
-            Err(e) => {
-                warn!(
-                    "Failed to get metadata for table {}: {}",
-                    table_req.table, e
-                );
-                continue;
-            }
-        };
-
-        // Find rows the requester is missing or has stale versions of
-        let mut missing_pks: Vec<String> = Vec::new();
-        for (pk, meta) in &local_meta {
-            match table_req.row_hashes.get(pk) {
-                None => missing_pks.push(pk.clone()),
-                Some(their_hash) => {
-                    if *their_hash != meta.content_hash {
-                        missing_pks.push(pk.clone());
-                    }
-                }
-            }
-        }
-
-        // Find rows the requester has that we don't (we want these)
-        let mut wanted_pks: Vec<String> = Vec::new();
-        for (pk, their_hash) in &table_req.row_hashes {
-            match local_meta.get(pk) {
-                None => wanted_pks.push(pk.clone()),
-                Some(our_meta) => {
-                    if *their_hash != our_meta.content_hash {
-                        // They have a different version; we already send ours above,
-                        // but also request theirs so the requester can send them back
-                        wanted_pks.push(pk.clone());
-                    }
-                }
-            }
-        }
-
-        // Fetch and pack rows we need to send
-        if !missing_pks.is_empty() {
-            let rows = local.get_rows(&table_req.table, &missing_pks).await?;
-            if !rows.is_empty() {
-                let seq = seq_tracker.next(&table_req.table);
-                let packets =
-                    split_delta(&instance_id, seq, &table_req.table, rows, Vec::new(), 0)?;
-                deltas.extend(packets);
-            }
-        }
-
-        if !wanted_pks.is_empty() {
-            want_rows.push(TableWantRows {
-                table: table_req.table.clone(),
-                pk_values: wanted_pks,
-            });
-        }
-    }
-
-    let response = SyncResponse {
-        instance_id: instance_id.clone(),
-        deltas,
-        want_rows,
-    };
-
-    let has_want_rows = !response.want_rows.is_empty();
-    write_framed(&mut write_half, &response).await?;
-    debug!("Sync response sent to {}", peer_addr);
-
-    // Read follow-up deltas the client sends in response to our want_rows
-    if has_want_rows {
-        while let Ok(Ok(delta)) = tokio::time::timeout(
-            Duration::from_secs(10),
-            read_framed::<DeltaPacket>(&mut read_half),
-        )
-        .await
-        {
-            if delta.is_empty() {
-                continue;
-            }
-            {
-                let mut guard = replay_guard.lock().await;
-                if !guard.check(&delta.source_id, delta.seq) {
-                    continue;
-                }
-            }
-            match local.upsert_rows(&delta.table, &delta.upserts).await {
-                Ok(count) => {
-                    debug!(
-                        "Applied {} follow-up rows to '{}' from {}",
-                        count, delta.table, peer_addr
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to apply follow-up delta for '{}': {}",
-                        delta.table, e
-                    );
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Broadcast orchestration
-// ---------------------------------------------------------------------------
-
-/// Results from a single broadcast sync cycle.
-pub struct BroadcastResult {
-    pub peers_discovered: usize,
-    pub peers_synced: usize,
-    pub tables_synced: usize,
-    pub rows_sent: usize,
-    pub rows_received: usize,
-}
-
-/// Run a single broadcast sync cycle: discover peers, connect, exchange deltas.
-pub async fn run_broadcast_once(
-    config: &crate::config::Config,
-    broadcast_config: &BroadcastConfig,
-    replay_guard: &Arc<tokio::sync::Mutex<ReplayGuard>>,
-) -> Result<BroadcastResult> {
-    use crate::datasource::DataSource;
-    use crate::local::LocalDb;
-
-    let db_path_hash = hash_db_path(config.local_db_path());
-    let instance_id = broadcast_config.resolve_instance_id();
-
-    // Discover peers
-    let discovery = PeerDiscovery::new(broadcast_config.clone(), db_path_hash.clone()).await?;
-    let listen_duration = Duration::from_secs(broadcast_config.interval_secs.min(5));
-    let all_peers = discovery.discover_once(listen_duration).await?;
-
-    let compatible: Vec<&Peer> = all_peers
-        .iter()
-        .filter(|p| p.db_path_hash == db_path_hash)
-        .collect();
-
-    let mut result = BroadcastResult {
-        peers_discovered: compatible.len(),
-        peers_synced: 0,
-        tables_synced: 0,
-        rows_sent: 0,
-        rows_received: 0,
-    };
-
-    if compatible.is_empty() {
-        debug!("No compatible peers found");
-        return Ok(result);
-    }
-
-    // Prune replay windows for peers no longer discovered
-    {
-        let active_ids: Vec<&str> = compatible.iter().map(|p| p.instance_id.as_str()).collect();
-        let mut guard = replay_guard.lock().await;
-        guard.prune(&active_ids);
-    }
-
-    info!("Found {} compatible peer(s)", compatible.len());
-
-    let local = LocalDb::open(config.local_db_path())?;
-
-    // Build our row hashes for all syncable tables
-    let all_tables = local.list_tables().await?;
-    let syncable_tables: Vec<String> = all_tables
-        .into_iter()
-        .filter(|t| config.should_sync_table(t))
-        .collect();
-
-    let mut table_requests: Vec<TableSyncRequest> = Vec::new();
-    for table in &syncable_tables {
-        let meta = local
-            .get_row_metadata(
-                table,
-                &config.sync.timestamp_column,
-                &config.sync.exclude_columns,
-            )
-            .await?;
-        let row_hashes: HashMap<String, String> = meta
-            .into_iter()
-            .map(|(pk, m)| (pk, m.content_hash))
-            .collect();
-        table_requests.push(TableSyncRequest {
-            table: table.clone(),
-            row_hashes,
-        });
-    }
-
-    let request = SyncRequest {
-        instance_id: instance_id.clone(),
-        db_path_hash: db_path_hash.clone(),
-        tables: table_requests,
-    };
-
-    // Connect to each compatible peer
-    for peer in &compatible {
-        let peer_addr = peer.addr;
-        // Use the sync_port from the peer's announcement, preserving the IP
-        let sync_addr = SocketAddr::new(peer_addr.ip(), peer.addr.port());
-
-        info!("Syncing with peer {} at {}", peer.instance_id, sync_addr);
-
-        match sync_with_peer(&local, &request, sync_addr, replay_guard).await {
-            Ok((rows_recv, rows_sent)) => {
-                result.peers_synced += 1;
-                result.rows_received += rows_recv;
-                result.rows_sent += rows_sent;
-                if rows_recv > 0 || rows_sent > 0 {
-                    result.tables_synced += syncable_tables.len();
-                }
-                info!(
-                    "Synced with {}: {} received, {} sent",
-                    peer.instance_id, rows_recv, rows_sent
-                );
-            }
-            Err(e) => {
-                warn!("Failed to sync with peer {}: {}", peer.instance_id, e);
-            }
-        }
-    }
-
-    Ok(result)
-}
-
-/// Connect to a single peer via TCP, exchange sync data, and apply deltas.
-///
-/// Returns (rows_received, rows_sent).
-async fn sync_with_peer(
-    local: &crate::local::LocalDb,
-    request: &SyncRequest,
-    addr: SocketAddr,
-    replay_guard: &Arc<tokio::sync::Mutex<ReplayGuard>>,
-) -> Result<(usize, usize)> {
-    use crate::datasource::DataSource;
-
-    let connect_timeout = Duration::from_secs(10);
-    let stream = tokio::time::timeout(connect_timeout, tokio::net::TcpStream::connect(addr))
-        .await
-        .map_err(|_| SyncError::Broadcast(format!("TCP connect timeout to {}", addr)))?
-        .map_err(|e| SyncError::Broadcast(format!("TCP connect to {}: {}", addr, e)))?;
-
-    let (mut read_half, mut write_half) = stream.into_split();
-
-    // Send our sync request
-    write_framed(&mut write_half, request).await?;
-
-    // Read the response
-    let response: SyncResponse = read_framed(&mut read_half).await?;
-
-    let mut rows_received: usize = 0;
-    let mut rows_sent: usize = 0;
-
-    // Apply received deltas (after replay check)
-    for delta in &response.deltas {
-        if delta.is_empty() {
-            continue;
-        }
-        {
-            let mut guard = replay_guard.lock().await;
-            if !guard.check(&delta.source_id, delta.seq) {
-                continue;
-            }
-        }
-        let count = local.upsert_rows(&delta.table, &delta.upserts).await?;
-        rows_received += count;
-        debug!(
-            "Applied {} rows to table '{}' from peer {}",
-            count, delta.table, response.instance_id
-        );
-    }
-
-    // Send rows the peer wants from us
-    let mut seq_tracker = SequenceTracker::new();
-    for want in &response.want_rows {
-        if want.pk_values.is_empty() {
-            continue;
-        }
-        let rows = local.get_rows(&want.table, &want.pk_values).await?;
-        if !rows.is_empty() {
-            let seq = seq_tracker.next(&want.table);
-            let packet = DeltaPacket {
-                version: PROTOCOL_VERSION,
-                source_id: request.instance_id.clone(),
-                seq,
-                part: 0,
-                total_parts: 1,
-                table: want.table.clone(),
-                upserts: rows,
-                deletes: Vec::new(),
-            };
-            write_framed(&mut write_half, &packet).await?;
-            rows_sent += packet.upserts.len();
-        }
-    }
-
-    Ok((rows_received, rows_sent))
 }
 
 /// Resolve the PID lock file path for the broadcast daemon.
@@ -1387,12 +884,6 @@ mod tests {
         let peers = discovery.peers().await;
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].instance_id, "remote-peer");
-
-        let compatible = discovery.compatible_peers(&hash).await;
-        assert_eq!(compatible.len(), 1);
-
-        let incompatible = discovery.compatible_peers("different-hash").await;
-        assert_eq!(incompatible.len(), 0);
     }
 
     // -----------------------------------------------------------------------
@@ -1485,94 +976,6 @@ mod tests {
         let packets = split_delta("machine-a", 0, "empty_table", vec![], vec![], 0).unwrap();
         assert_eq!(packets.len(), 1);
         assert!(packets[0].is_empty());
-    }
-
-    #[test]
-    fn test_reassemble_delta_single_part() {
-        let mut packet = DeltaPacket::new("machine-a".to_string(), 1, "users".to_string());
-        packet.upserts.push(make_row("1", "Alice"));
-        packet.total_parts = 1;
-        let reassembled = reassemble_delta(&[packet.clone()]);
-        assert!(reassembled.is_some());
-        assert_eq!(reassembled.unwrap().upserts.len(), 1);
-    }
-
-    #[test]
-    fn test_reassemble_delta_multi_part() {
-        let part0 = DeltaPacket {
-            version: PROTOCOL_VERSION,
-            source_id: "machine-a".to_string(),
-            seq: 5,
-            part: 0,
-            total_parts: 2,
-            table: "users".to_string(),
-            upserts: vec![make_row("1", "Alice")],
-            deletes: vec!["99".to_string()],
-        };
-        let mut part1 = part0.clone();
-        part1.part = 1;
-        part1.upserts = vec![make_row("2", "Bob")];
-        part1.deletes = vec![];
-
-        let reassembled = reassemble_delta(&[part0, part1]);
-        assert!(reassembled.is_some());
-        let merged = reassembled.unwrap();
-        assert_eq!(merged.upserts.len(), 2);
-        assert_eq!(merged.deletes.len(), 1);
-        assert_eq!(merged.seq, 5);
-    }
-
-    #[test]
-    fn test_reassemble_delta_incomplete_returns_none() {
-        let part0 = DeltaPacket {
-            version: PROTOCOL_VERSION,
-            source_id: "machine-a".to_string(),
-            seq: 5,
-            part: 0,
-            total_parts: 3,
-            table: "users".to_string(),
-            upserts: vec![make_row("1", "Alice")],
-            deletes: vec![],
-        };
-        assert!(reassemble_delta(&[part0]).is_none());
-    }
-
-    #[test]
-    fn test_sequence_tracker() {
-        let mut tracker = SequenceTracker::new();
-        assert_eq!(tracker.current("users"), 0);
-        assert_eq!(tracker.next("users"), 0);
-        assert_eq!(tracker.next("users"), 1);
-        assert_eq!(tracker.next("users"), 2);
-        assert_eq!(tracker.current("users"), 3);
-        assert_eq!(tracker.next("orders"), 0);
-        assert_eq!(tracker.current("users"), 3);
-    }
-
-    #[test]
-    fn test_split_and_reassemble_roundtrip() {
-        let big_value = "x".repeat(500);
-        let upserts: Vec<HashMap<String, serde_json::Value>> = (0..20)
-            .map(|i| {
-                let mut row = HashMap::new();
-                row.insert("id".to_string(), serde_json::Value::String(i.to_string()));
-                row.insert(
-                    "data".to_string(),
-                    serde_json::Value::String(big_value.clone()),
-                );
-                row
-            })
-            .collect();
-
-        let original_count = upserts.len();
-        let packets =
-            split_delta("machine-a", 7, "data", upserts, vec!["del1".to_string()], 0).unwrap();
-        assert!(packets.len() > 1);
-
-        let reassembled = reassemble_delta(&packets).unwrap();
-        assert_eq!(reassembled.upserts.len(), original_count);
-        assert_eq!(reassembled.deletes, vec!["del1".to_string()]);
-        assert_eq!(reassembled.seq, 7);
     }
 
     // -----------------------------------------------------------------------
@@ -1728,366 +1131,6 @@ mod tests {
         let decrypted = decrypt_packet(&encrypted, &key).expect("decrypt");
         let decoded = DeltaPacket::from_bytes(&decrypted).expect("deserialize");
         assert_eq!(packet, decoded);
-    }
-
-    // -----------------------------------------------------------------------
-    // TCP sync integration tests
-    // -----------------------------------------------------------------------
-
-    fn test_config(db_path: &str) -> crate::config::Config {
-        crate::config::Config {
-            cloudflare_account_id: None,
-            cloudflare_api_token: None,
-            database_id: None,
-            local_db: Some(db_path.to_string()),
-            sync: crate::config::SyncConfig::default(),
-            stash: None,
-            target: Some(crate::config::TargetConfig::Sqlite {
-                database: "unused".to_string(),
-            }),
-            broadcast: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn test_tcp_sync_bidirectional() {
-        use crate::datasource::DataSource;
-        use crate::local::LocalDb;
-
-        let dir = tempfile::tempdir().unwrap();
-        let db_a_path = dir.path().join("a.db").to_str().unwrap().to_string();
-        let db_b_path = dir.path().join("b.db").to_str().unwrap().to_string();
-
-        // Database A: has Alice and Bob
-        {
-            let conn = rusqlite::Connection::open(&db_a_path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT, updated_at TEXT);
-                 INSERT INTO users VALUES ('1', 'Alice', '2026-01-01T00:00:00Z');
-                 INSERT INTO users VALUES ('2', 'Bob', '2026-01-01T00:00:00Z');",
-            )
-            .unwrap();
-        }
-
-        // Database B: has Bob and Carol
-        {
-            let conn = rusqlite::Connection::open(&db_b_path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT, updated_at TEXT);
-                 INSERT INTO users VALUES ('2', 'Bob', '2026-01-01T00:00:00Z');
-                 INSERT INTO users VALUES ('3', 'Carol', '2026-01-01T00:00:00Z');",
-            )
-            .unwrap();
-        }
-
-        let _config_a = test_config(&db_a_path);
-        let config_b = test_config(&db_b_path);
-        let bc = BroadcastConfig::default();
-        let db_hash = hash_db_path(&db_a_path);
-
-        // Start TCP sync server for database B on a random port
-        let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_port = tcp_listener.local_addr().unwrap().port();
-
-        let server_config = config_b.clone();
-        let server_bc = bc.clone();
-        let server_hash = db_hash.clone();
-        tokio::spawn(async move {
-            loop {
-                if let Ok((stream, _)) = tcp_listener.accept().await {
-                    let guard = Arc::new(tokio::sync::Mutex::new(ReplayGuard::new()));
-                    let _ = handle_sync_connection(
-                        stream,
-                        &server_config,
-                        &server_bc,
-                        &server_hash,
-                        &guard,
-                    )
-                    .await;
-                }
-            }
-        });
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // Build sync request from A's perspective
-        let local_a = LocalDb::open(&db_a_path).unwrap();
-        let meta = local_a
-            .get_row_metadata("users", "updated_at", &[])
-            .await
-            .unwrap();
-        let row_hashes: HashMap<String, String> = meta
-            .into_iter()
-            .map(|(pk, m)| (pk, m.content_hash))
-            .collect();
-
-        let request = SyncRequest {
-            instance_id: "machine-a".to_string(),
-            db_path_hash: db_hash.clone(),
-            tables: vec![TableSyncRequest {
-                table: "users".to_string(),
-                row_hashes,
-            }],
-        };
-
-        let sync_addr: SocketAddr = format!("127.0.0.1:{}", server_port).parse().unwrap();
-        let client_guard = Arc::new(tokio::sync::Mutex::new(ReplayGuard::new()));
-        let (rows_recv, rows_sent) = sync_with_peer(&local_a, &request, sync_addr, &client_guard)
-            .await
-            .unwrap();
-
-        // A should have received Carol (1 row) from B
-        assert_eq!(rows_recv, 1, "A should receive 1 row (Carol) from B");
-
-        // A asked B for rows, B should have requested Alice (1 row)
-        assert_eq!(rows_sent, 1, "A should send 1 row (Alice) to B");
-
-        // Verify A now has all 3 rows
-        let count_a: i64 = {
-            let conn = rusqlite::Connection::open(&db_a_path).unwrap();
-            conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
-                .unwrap()
-        };
-        assert_eq!(count_a, 3, "Database A should have 3 rows after sync");
-    }
-
-    #[tokio::test]
-    async fn test_tcp_sync_respects_column_exclusion() {
-        use crate::datasource::DataSource;
-        use crate::local::LocalDb;
-
-        let dir = tempfile::tempdir().unwrap();
-        let db_a_path = dir.path().join("a.db").to_str().unwrap().to_string();
-        let db_b_path = dir.path().join("b.db").to_str().unwrap().to_string();
-
-        // Both databases have same content but different embeddings.
-        // With exclude_columns, the diff should treat them as identical.
-        {
-            let conn = rusqlite::Connection::open(&db_a_path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE docs (id TEXT PRIMARY KEY, content TEXT,
-                    content_embedding BLOB, updated_at TEXT);
-                 INSERT INTO docs VALUES ('1', 'hello', X'DEADBEEF',
-                    '2026-01-01T00:00:00Z');",
-            )
-            .unwrap();
-        }
-        {
-            let conn = rusqlite::Connection::open(&db_b_path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE docs (id TEXT PRIMARY KEY, content TEXT,
-                    content_embedding BLOB, updated_at TEXT);
-                 INSERT INTO docs VALUES ('1', 'hello', X'CAFEBABE',
-                    '2026-01-01T00:00:00Z');",
-            )
-            .unwrap();
-        }
-
-        let mut config_b = test_config(&db_b_path);
-        config_b.sync.exclude_columns = vec!["*_embedding".to_string()];
-        let bc = BroadcastConfig::default();
-        let db_hash = hash_db_path(&db_a_path);
-
-        // Start TCP sync server for B
-        let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_port = tcp_listener.local_addr().unwrap().port();
-        let server_config = config_b.clone();
-        let server_bc = bc.clone();
-        let server_hash = db_hash.clone();
-        tokio::spawn(async move {
-            loop {
-                if let Ok((stream, _)) = tcp_listener.accept().await {
-                    let guard = Arc::new(tokio::sync::Mutex::new(ReplayGuard::new()));
-                    let _ = handle_sync_connection(
-                        stream,
-                        &server_config,
-                        &server_bc,
-                        &server_hash,
-                        &guard,
-                    )
-                    .await;
-                }
-            }
-        });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // Build request from A, also excluding embeddings from hash
-        let local_a = LocalDb::open(&db_a_path).unwrap();
-        let exclude = vec!["*_embedding".to_string()];
-        let meta = local_a
-            .get_row_metadata("docs", "updated_at", &exclude)
-            .await
-            .unwrap();
-        let row_hashes: HashMap<String, String> = meta
-            .into_iter()
-            .map(|(pk, m)| (pk, m.content_hash))
-            .collect();
-
-        let request = SyncRequest {
-            instance_id: "machine-a".to_string(),
-            db_path_hash: db_hash.clone(),
-            tables: vec![TableSyncRequest {
-                table: "docs".to_string(),
-                row_hashes,
-            }],
-        };
-
-        let sync_addr: SocketAddr = format!("127.0.0.1:{}", server_port).parse().unwrap();
-        let client_guard = Arc::new(tokio::sync::Mutex::new(ReplayGuard::new()));
-        let (rows_recv, rows_sent) = sync_with_peer(&local_a, &request, sync_addr, &client_guard)
-            .await
-            .unwrap();
-
-        // With embedding excluded, both see the row as identical
-        assert_eq!(
-            rows_recv, 0,
-            "No rows received (identical excluding embedding)"
-        );
-        assert_eq!(rows_sent, 0, "No rows sent (identical excluding embedding)");
-
-        // A embedding should be untouched
-        let conn_a = rusqlite::Connection::open(&db_a_path).unwrap();
-        let embedding: Vec<u8> = conn_a
-            .query_row(
-                "SELECT content_embedding FROM docs WHERE id = '1'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(embedding, vec![0xDE, 0xAD, 0xBE, 0xEF]);
-    }
-
-    #[tokio::test]
-    async fn test_tcp_sync_db_hash_mismatch_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("test.db").to_str().unwrap().to_string();
-
-        {
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE items (id TEXT PRIMARY KEY, name TEXT);
-                 INSERT INTO items VALUES ('1', 'test');",
-            )
-            .unwrap();
-        }
-
-        let config = test_config(&db_path);
-        let bc = BroadcastConfig::default();
-        let db_hash = hash_db_path(&db_path);
-
-        let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_port = tcp_listener.local_addr().unwrap().port();
-
-        let server_config = config.clone();
-        let server_bc = bc.clone();
-        let server_hash = db_hash.clone();
-        tokio::spawn(async move {
-            loop {
-                if let Ok((stream, _)) = tcp_listener.accept().await {
-                    let guard = Arc::new(tokio::sync::Mutex::new(ReplayGuard::new()));
-                    let _ = handle_sync_connection(
-                        stream,
-                        &server_config,
-                        &server_bc,
-                        &server_hash,
-                        &guard,
-                    )
-                    .await;
-                }
-            }
-        });
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // Send request with wrong db_path_hash
-        let request = SyncRequest {
-            instance_id: "wrong-machine".to_string(),
-            db_path_hash: "completely_wrong_hash".to_string(),
-            tables: vec![],
-        };
-
-        let sync_addr: SocketAddr = format!("127.0.0.1:{}", server_port).parse().unwrap();
-        let local = crate::local::LocalDb::open(&db_path).unwrap();
-        let client_guard = Arc::new(tokio::sync::Mutex::new(ReplayGuard::new()));
-        let (recv, sent) = sync_with_peer(&local, &request, sync_addr, &client_guard)
-            .await
-            .unwrap();
-
-        // Server should have rejected with empty response
-        assert_eq!(recv, 0);
-        assert_eq!(sent, 0);
-    }
-
-    #[tokio::test]
-    async fn test_framed_protocol_roundtrip() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let (mut read, mut write) = stream.into_split();
-            let req: SyncRequest = read_framed(&mut read).await.unwrap();
-            assert_eq!(req.instance_id, "test-client");
-            assert_eq!(req.tables.len(), 1);
-
-            let resp = SyncResponse {
-                instance_id: "test-server".to_string(),
-                deltas: Vec::new(),
-                want_rows: Vec::new(),
-            };
-            write_framed(&mut write, &resp).await.unwrap();
-        });
-
-        let stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
-            .await
-            .unwrap();
-        let (mut read, mut write) = stream.into_split();
-
-        let req = SyncRequest {
-            instance_id: "test-client".to_string(),
-            db_path_hash: "abc123".to_string(),
-            tables: vec![TableSyncRequest {
-                table: "users".to_string(),
-                row_hashes: HashMap::new(),
-            }],
-        };
-        write_framed(&mut write, &req).await.unwrap();
-
-        let resp: SyncResponse = read_framed(&mut read).await.unwrap();
-        assert_eq!(resp.instance_id, "test-server");
-        assert!(resp.deltas.is_empty());
-
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_broadcast_no_peers_graceful() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("test.db").to_str().unwrap().to_string();
-
-        {
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE items (id TEXT PRIMARY KEY, name TEXT, updated_at TEXT);
-                 INSERT INTO items VALUES ('1', 'test', '2026-01-01T00:00:00Z');",
-            )
-            .unwrap();
-        }
-
-        let config = test_config(&db_path);
-        let bc = BroadcastConfig {
-            port: 0,
-            interval_secs: 1,
-            ..Default::default()
-        };
-
-        // run_broadcast_once with no peers listening should return gracefully
-        let guard = Arc::new(tokio::sync::Mutex::new(ReplayGuard::new()));
-        let result = run_broadcast_once(&config, &bc, &guard).await.unwrap();
-        assert_eq!(result.peers_discovered, 0);
-        assert_eq!(result.peers_synced, 0);
-        assert_eq!(result.rows_received, 0);
-        assert_eq!(result.rows_sent, 0);
     }
 
     // -----------------------------------------------------------------------
