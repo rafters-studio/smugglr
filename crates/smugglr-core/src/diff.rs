@@ -108,20 +108,20 @@ impl TableDiff {
         if count == 0 {
             return;
         }
-        match conflict_resolution {
-            ConflictResolution::NewerWins => warn!(
-                "{} row(s) in '{}' have different content but no usable timestamps -- \
-                 skipped under newer_wins. Use local_wins or remote_wins to resolve.",
-                count, self.table
-            ),
-            ConflictResolution::UuidV7Wins => warn!(
-                "{} row(s) in '{}' have different content but same PK (identical \
-                 UUIDv7 timestamp) -- skipped under uuid_v7_wins. \
-                 Use local_wins or remote_wins to resolve.",
-                count, self.table
-            ),
-            _ => {}
-        }
+        // count > 0 implies a skipping policy (unresolved_conflicts is empty for
+        // local_wins/remote_wins); pick the reason, sharing one warning template.
+        let reason = match conflict_resolution {
+            ConflictResolution::NewerWins => "no usable timestamps (skipped under newer_wins)",
+            ConflictResolution::UuidV7Wins => {
+                "same PK with identical UUIDv7 timestamp (skipped under uuid_v7_wins)"
+            }
+            ConflictResolution::LocalWins | ConflictResolution::RemoteWins => return,
+        };
+        warn!(
+            "{} row(s) in '{}' have different content but {}. \
+             Use local_wins or remote_wins to resolve.",
+            count, self.table, reason
+        );
     }
 
     /// Get rows to delete from remote (for push)
