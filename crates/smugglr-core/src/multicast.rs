@@ -6,8 +6,10 @@
 //!   is no coordinator and no client/server distinction.
 //! - **Membership = key possession.** All datagrams are XChaCha20-Poly1305
 //!   sealed with a shared key (see [`crate::broadcast::maybe_encrypt`]); holding
-//!   the key is the only access control. `db_path_hash` further scopes a node to
-//!   one logical database, so unrelated DBs sharing a key+group do not merge.
+//!   the key is the only access control. There is no path-, filename-, or
+//!   DB-identity scoping: two replicas of one logical database sync regardless of
+//!   where each stores its file. Isolate clusters on one LAN with distinct keys
+//!   (a foreign key's datagrams simply fail to decrypt and are dropped).
 //! - **Idempotent apply / last-received-wins.** An incoming row is applied with
 //!   `INSERT OR REPLACE`; applying the same row twice is a no-op, so lost
 //!   datagrams are safe. On same-PK divergence the received row wins.
@@ -92,21 +94,21 @@ pub enum Body {
     Delta(DeltaPacket),
 }
 
-/// A versioned, DB-scoped gossip datagram. Serialized to JSON, then sealed with
-/// the shared key before it hits the wire.
+/// A versioned gossip datagram. Serialized to JSON, then sealed with the shared
+/// key before it hits the wire. Membership is key possession: a node that can
+/// decrypt the datagram is on the network. There is no path- or filename-based
+/// scoping -- two replicas of one logical database sync regardless of where each
+/// stores its file. Run isolated clusters on the same LAN by using different keys.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Msg {
     pub version: u8,
-    /// Scopes the message to one logical database (see module docs).
-    pub db_path_hash: String,
     pub body: Body,
 }
 
 impl Msg {
-    fn new(db_path_hash: String, body: Body) -> Self {
+    fn new(body: Body) -> Self {
         Self {
             version: PROTOCOL_VERSION,
-            db_path_hash,
             body,
         }
     }
@@ -130,8 +132,6 @@ pub enum IgnoreReason {
     Replay,
     /// Table not in this node's sync set.
     Table,
-    /// A different logical database (db_path_hash mismatch).
-    OtherDb,
     /// Protocol version mismatch.
     Version,
     /// Could not decrypt with our key.
@@ -184,7 +184,7 @@ pub fn split_digest(
     for (pk, hash) in hashes {
         current.hashes.insert(pk.clone(), hash.clone());
         // Measure with the envelope so we stay under the wire limit end-to-end.
-        let probe = Msg::new(String::new(), Body::Digest(current.clone())).to_bytes()?;
+        let probe = Msg::new(Body::Digest(current.clone())).to_bytes()?;
         if probe.len() > SAFE_PACKET_SIZE && current.hashes.len() > 1 {
             current.hashes.remove(&pk);
             parts.push(std::mem::replace(&mut current, mk()));
@@ -254,19 +254,15 @@ pub struct Gossip {
     socket: Arc<UdpSocket>,
     dest: SocketAddrV4,
     instance_id: String,
-    db_path_hash: String,
     key: Option<[u8; 32]>,
     seq: Arc<AtomicU64>,
     replay: Arc<Mutex<ReplayGuard>>,
 }
 
 impl Gossip {
-    /// Join the multicast group for `config`'s database and prepare to gossip.
-    pub async fn bind(
-        broadcast: &BroadcastConfig,
-        db_path_hash: String,
-        group: Ipv4Addr,
-    ) -> Result<Self> {
+    /// Join the multicast group and prepare to gossip. Membership is the shared
+    /// key in `broadcast` -- any node that can decrypt is on the network.
+    pub async fn bind(broadcast: &BroadcastConfig, group: Ipv4Addr) -> Result<Self> {
         let port = if broadcast.port == 0 {
             DEFAULT_PORT
         } else {
@@ -277,7 +273,6 @@ impl Gossip {
             socket: Arc::new(socket),
             dest: SocketAddrV4::new(group, port),
             instance_id: broadcast.resolve_instance_id(),
-            db_path_hash,
             key: broadcast.encryption_key()?,
             seq: Arc::new(AtomicU64::new(0)),
             replay: Arc::new(Mutex::new(ReplayGuard::new())),
@@ -309,7 +304,7 @@ impl Gossip {
 
     /// Seal a message body into an on-the-wire datagram (JSON + AEAD).
     fn seal(&self, body: Body) -> Result<Vec<u8>> {
-        let plain = Msg::new(self.db_path_hash.clone(), body).to_bytes()?;
+        let plain = Msg::new(body).to_bytes()?;
         maybe_encrypt(&plain, &self.key)
     }
 
@@ -423,9 +418,6 @@ impl Gossip {
         };
         if msg.version != PROTOCOL_VERSION {
             return Ok((GossipEvent::Ignored(IgnoreReason::Version), none));
-        }
-        if msg.db_path_hash != self.db_path_hash {
-            return Ok((GossipEvent::Ignored(IgnoreReason::OtherDb), none));
         }
 
         match msg.body {
@@ -631,7 +623,7 @@ mod tests {
                 hashes: HashMap::from([("1".into(), "h".into())]),
             }),
         ] {
-            let msg = Msg::new("db".into(), body);
+            let msg = Msg::new(body);
             let bytes = msg.to_bytes().unwrap();
             assert_eq!(Msg::from_bytes(&bytes).unwrap(), msg);
         }
@@ -666,9 +658,7 @@ mod tests {
         let mut nums = std::collections::HashSet::new();
         let mut reunion = HashMap::new();
         for p in &parts {
-            let sealed = Msg::new("db".into(), Body::Digest(p.clone()))
-                .to_bytes()
-                .unwrap();
+            let sealed = Msg::new(Body::Digest(p.clone())).to_bytes().unwrap();
             assert!(sealed.len() <= SAFE_PACKET_SIZE, "part exceeds safe size");
             assert_eq!(p.total_parts, total, "total_parts set on every part");
             assert!(nums.insert(p.part), "part numbers must be unique");
@@ -677,7 +667,9 @@ mod tests {
         assert_eq!(reunion, big, "chunking must be lossless");
     }
 
-    /// Bind two gossip nodes that share one logical DB but have distinct ids.
+    /// Bind two gossip nodes with distinct instance ids on a test group. They
+    /// share no path or DB identity -- membership is purely the (implicit) key
+    /// plus group, which is the whole point of the fix.
     async fn two_nodes(
         a_path: &str,
         b_path: &str,
@@ -687,7 +679,6 @@ mod tests {
         let a_local = LocalDb::open(a_path).unwrap();
         let b_local = LocalDb::open(b_path).unwrap();
 
-        let db_hash = crate::broadcast::hash_db_path("shared-logical-db");
         let bc_a = BroadcastConfig {
             instance_id: Some("node-a".into()),
             ..Default::default()
@@ -698,8 +689,8 @@ mod tests {
         };
 
         let group = Ipv4Addr::new(239, 255, 99, 88);
-        let a = Gossip::bind(&bc_a, db_hash.clone(), group).await.unwrap();
-        let b = Gossip::bind(&bc_b, db_hash, group).await.unwrap();
+        let a = Gossip::bind(&bc_a, group).await.unwrap();
+        let b = Gossip::bind(&bc_b, group).await.unwrap();
         (a, a_cfg, a_local, b, b_cfg, b_local)
     }
 

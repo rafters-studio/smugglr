@@ -10,7 +10,7 @@
 //! cross-subnet sync, where an embedder bridges what multicast cannot reach.
 //! Both shapes coexist; this daemon drives the multicast one.
 
-use smugglr_core::broadcast::{broadcast_pid_lock_path, hash_db_path, BroadcastConfig};
+use smugglr_core::broadcast::{broadcast_pid_lock_path, BroadcastConfig};
 use smugglr_core::config::Config;
 use smugglr_core::daemon::PidLock;
 use smugglr_core::error::Result;
@@ -43,7 +43,6 @@ pub async fn run_broadcast(
     let pid_path = broadcast_pid_lock_path(config_path);
     let _pid_lock = PidLock::acquire(&pid_path)?;
 
-    let db_path_hash = hash_db_path(config.local_db_path());
     let instance_id = broadcast_config.resolve_instance_id();
     let interval_secs = broadcast_config.interval_secs;
 
@@ -56,7 +55,7 @@ pub async fn run_broadcast(
 
     if dry_run {
         // Advertise nothing, apply nothing -- just report what we would gossip.
-        let gossip = Gossip::bind(broadcast_config, db_path_hash, DEFAULT_GROUP).await?;
+        let gossip = Gossip::bind(broadcast_config, DEFAULT_GROUP).await?;
         let bodies = gossip.digest_bodies(&local, config).await?;
         info!(
             "Dry run: would multicast {} digest datagram(s); not sending, not applying",
@@ -65,7 +64,7 @@ pub async fn run_broadcast(
         return Ok(());
     }
 
-    let gossip = Arc::new(Gossip::bind(broadcast_config, db_path_hash, DEFAULT_GROUP).await?);
+    let gossip = Arc::new(Gossip::bind(broadcast_config, DEFAULT_GROUP).await?);
 
     // Continuous listener. A masterless node keeps gossiping through transient
     // errors, so a recv failure is logged, never fatal.
