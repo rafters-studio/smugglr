@@ -1,21 +1,24 @@
 # cli-lan-broadcast example config.
 #
-# Copy to config.toml on each machine; the encryption_key MUST be identical
-# across peers. Generate one with: openssl rand -hex 32
+# Copy to config.toml on each machine. For nodes to sync, all that must match is:
+#   1. the same `secret` (the shared key IS membership + encryption), and
+#   2. the same `port`, on the same subnet.
+# File paths do NOT need to match -- membership is key possession, not location.
 
-local_db = "./shared.sqlite"
+local_db = "./node.db"
 
 [sync]
-tables = []
+tables = []                       # empty = sync all non-excluded tables
 exclude_tables = ["sqlite_sequence"]
 timestamp_column = "updated_at"
-# UUIDv7 PKs encode creation time, so newer writes win without clock sync.
-conflict_resolution = "uuid_v7_wins"
+# Skip large columns (embeddings, blobs) from sync payloads. Lives under [sync].
+exclude_columns = ["*_embedding", "vector"]
 
 [broadcast]
-# Hex-encoded 256-bit key. Identical on every peer.
-encryption_key = "REPLACE_WITH_OUTPUT_OF_openssl_rand_-hex_32"
-# Default UDP port for peer announcements.
-port = 47291
-# Skip large columns (embeddings, blobs) from broadcast payloads.
-exclude_columns = ["*_embedding", "vector"]
+# 256-bit key, hex-encoded (64 chars). MUST be byte-identical on every node.
+# Generate once and distribute securely: openssl rand -hex 32
+secret = "REPLACE_WITH_OUTPUT_OF_openssl_rand_-hex_32"
+# UDP port for the multicast group. Same on every node.
+port = 31337
+# How often each node multicasts its content-hash digest (the heartbeat).
+interval_secs = 5

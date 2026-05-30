@@ -6,8 +6,10 @@
 //!   is no coordinator and no client/server distinction.
 //! - **Membership = key possession.** All datagrams are XChaCha20-Poly1305
 //!   sealed with a shared key (see [`crate::broadcast::maybe_encrypt`]); holding
-//!   the key is the only access control. `db_path_hash` further scopes a node to
-//!   one logical database, so unrelated DBs sharing a key+group do not merge.
+//!   the key is the only access control. There is no path-, filename-, or
+//!   DB-identity scoping: two replicas of one logical database sync regardless of
+//!   where each stores its file. Isolate clusters on one LAN with distinct keys
+//!   (a foreign key's datagrams simply fail to decrypt and are dropped).
 //! - **Idempotent apply / last-received-wins.** An incoming row is applied with
 //!   `INSERT OR REPLACE`; applying the same row twice is a no-op, so lost
 //!   datagrams are safe. On same-PK divergence the received row wins.
@@ -92,21 +94,21 @@ pub enum Body {
     Delta(DeltaPacket),
 }
 
-/// A versioned, DB-scoped gossip datagram. Serialized to JSON, then sealed with
-/// the shared key before it hits the wire.
+/// A versioned gossip datagram. Serialized to JSON, then sealed with the shared
+/// key before it hits the wire. Membership is key possession: a node that can
+/// decrypt the datagram is on the network. There is no path- or filename-based
+/// scoping -- two replicas of one logical database sync regardless of where each
+/// stores its file. Run isolated clusters on the same LAN by using different keys.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Msg {
     pub version: u8,
-    /// Scopes the message to one logical database (see module docs).
-    pub db_path_hash: String,
     pub body: Body,
 }
 
 impl Msg {
-    fn new(db_path_hash: String, body: Body) -> Self {
+    fn new(body: Body) -> Self {
         Self {
             version: PROTOCOL_VERSION,
-            db_path_hash,
             body,
         }
     }
@@ -130,8 +132,6 @@ pub enum IgnoreReason {
     Replay,
     /// Table not in this node's sync set.
     Table,
-    /// A different logical database (db_path_hash mismatch).
-    OtherDb,
     /// Protocol version mismatch.
     Version,
     /// Could not decrypt with our key.
@@ -184,7 +184,7 @@ pub fn split_digest(
     for (pk, hash) in hashes {
         current.hashes.insert(pk.clone(), hash.clone());
         // Measure with the envelope so we stay under the wire limit end-to-end.
-        let probe = Msg::new(String::new(), Body::Digest(current.clone())).to_bytes()?;
+        let probe = Msg::new(Body::Digest(current.clone())).to_bytes()?;
         if probe.len() > SAFE_PACKET_SIZE && current.hashes.len() > 1 {
             current.hashes.remove(&pk);
             parts.push(std::mem::replace(&mut current, mk()));
@@ -254,19 +254,15 @@ pub struct Gossip {
     socket: Arc<UdpSocket>,
     dest: SocketAddrV4,
     instance_id: String,
-    db_path_hash: String,
     key: Option<[u8; 32]>,
     seq: Arc<AtomicU64>,
     replay: Arc<Mutex<ReplayGuard>>,
 }
 
 impl Gossip {
-    /// Join the multicast group for `config`'s database and prepare to gossip.
-    pub async fn bind(
-        broadcast: &BroadcastConfig,
-        db_path_hash: String,
-        group: Ipv4Addr,
-    ) -> Result<Self> {
+    /// Join the multicast group and prepare to gossip. Membership is the shared
+    /// key in `broadcast` -- any node that can decrypt is on the network.
+    pub async fn bind(broadcast: &BroadcastConfig, group: Ipv4Addr) -> Result<Self> {
         let port = if broadcast.port == 0 {
             DEFAULT_PORT
         } else {
@@ -277,7 +273,6 @@ impl Gossip {
             socket: Arc::new(socket),
             dest: SocketAddrV4::new(group, port),
             instance_id: broadcast.resolve_instance_id(),
-            db_path_hash,
             key: broadcast.encryption_key()?,
             seq: Arc::new(AtomicU64::new(0)),
             replay: Arc::new(Mutex::new(ReplayGuard::new())),
@@ -309,7 +304,7 @@ impl Gossip {
 
     /// Seal a message body into an on-the-wire datagram (JSON + AEAD).
     fn seal(&self, body: Body) -> Result<Vec<u8>> {
-        let plain = Msg::new(self.db_path_hash.clone(), body).to_bytes()?;
+        let plain = Msg::new(body).to_bytes()?;
         maybe_encrypt(&plain, &self.key)
     }
 
@@ -413,9 +408,15 @@ impl Gossip {
         config: &Config,
     ) -> Result<(GossipEvent, Vec<Body>)> {
         let none = Vec::new();
-        let plain = match maybe_decrypt(datagram, &self.key)? {
-            Some(p) => p,
-            None => return Ok((GossipEvent::Ignored(IgnoreReason::Undecryptable), none)),
+        // A datagram we cannot turn into plaintext is not ours: a foreign key
+        // (AEAD auth failure), a runt packet, or noise. Drop it as a clean,
+        // counted Ignored -- never an error -- so a different-keyed cluster
+        // sharing the LAN is silent, not a stream of recv-error logs.
+        let plain = match maybe_decrypt(datagram, &self.key) {
+            Ok(Some(p)) => p,
+            Ok(None) | Err(_) => {
+                return Ok((GossipEvent::Ignored(IgnoreReason::Undecryptable), none))
+            }
         };
         let msg = match Msg::from_bytes(&plain) {
             Ok(m) => m,
@@ -423,9 +424,6 @@ impl Gossip {
         };
         if msg.version != PROTOCOL_VERSION {
             return Ok((GossipEvent::Ignored(IgnoreReason::Version), none));
-        }
-        if msg.db_path_hash != self.db_path_hash {
-            return Ok((GossipEvent::Ignored(IgnoreReason::OtherDb), none));
         }
 
         match msg.body {
@@ -631,7 +629,7 @@ mod tests {
                 hashes: HashMap::from([("1".into(), "h".into())]),
             }),
         ] {
-            let msg = Msg::new("db".into(), body);
+            let msg = Msg::new(body);
             let bytes = msg.to_bytes().unwrap();
             assert_eq!(Msg::from_bytes(&bytes).unwrap(), msg);
         }
@@ -666,9 +664,7 @@ mod tests {
         let mut nums = std::collections::HashSet::new();
         let mut reunion = HashMap::new();
         for p in &parts {
-            let sealed = Msg::new("db".into(), Body::Digest(p.clone()))
-                .to_bytes()
-                .unwrap();
+            let sealed = Msg::new(Body::Digest(p.clone())).to_bytes().unwrap();
             assert!(sealed.len() <= SAFE_PACKET_SIZE, "part exceeds safe size");
             assert_eq!(p.total_parts, total, "total_parts set on every part");
             assert!(nums.insert(p.part), "part numbers must be unique");
@@ -677,29 +673,43 @@ mod tests {
         assert_eq!(reunion, big, "chunking must be lossless");
     }
 
-    /// Bind two gossip nodes that share one logical DB but have distinct ids.
+    /// Bind two gossip nodes with distinct instance ids on a test group. They
+    /// share no path or DB identity, so convergence proves sync is scoped by
+    /// group/key membership alone, never by file location.
     async fn two_nodes(
         a_path: &str,
         b_path: &str,
+    ) -> (Gossip, Config, LocalDb, Gossip, Config, LocalDb) {
+        two_nodes_keyed(a_path, b_path, None, None).await
+    }
+
+    /// Like `two_nodes` but with explicit per-node encryption keys (hex), so
+    /// tests can exercise the sealed wire and cross-key isolation.
+    async fn two_nodes_keyed(
+        a_path: &str,
+        b_path: &str,
+        key_a: Option<&str>,
+        key_b: Option<&str>,
     ) -> (Gossip, Config, LocalDb, Gossip, Config, LocalDb) {
         let a_cfg = cfg(a_path);
         let b_cfg = cfg(b_path);
         let a_local = LocalDb::open(a_path).unwrap();
         let b_local = LocalDb::open(b_path).unwrap();
 
-        let db_hash = crate::broadcast::hash_db_path("shared-logical-db");
         let bc_a = BroadcastConfig {
             instance_id: Some("node-a".into()),
+            secret: key_a.map(String::from),
             ..Default::default()
         };
         let bc_b = BroadcastConfig {
             instance_id: Some("node-b".into()),
+            secret: key_b.map(String::from),
             ..Default::default()
         };
 
         let group = Ipv4Addr::new(239, 255, 99, 88);
-        let a = Gossip::bind(&bc_a, db_hash.clone(), group).await.unwrap();
-        let b = Gossip::bind(&bc_b, db_hash, group).await.unwrap();
+        let a = Gossip::bind(&bc_a, group).await.unwrap();
+        let b = Gossip::bind(&bc_b, group).await.unwrap();
         (a, a_cfg, a_local, b, b_cfg, b_local)
     }
 
@@ -795,6 +805,68 @@ mod tests {
             Some("Alice2"),
             "divergent row resolves last-received-wins"
         );
+    }
+
+    // Convergence over the ENCRYPTED wire: the same shared key on both nodes.
+    // Proves seal-on-A / decrypt-on-B round-trips real XChaCha20-Poly1305
+    // ciphertext -- the production path. The keyless convergence test above
+    // exercises only the plaintext passthrough.
+    #[tokio::test]
+    async fn keyed_convergence() {
+        let key = "ab".repeat(32); // 64 hex chars -> valid 256-bit key
+        let dir = tempfile::tempdir().unwrap();
+        let a_path = dir.path().join("a.db").to_str().unwrap().to_string();
+        let b_path = dir.path().join("b.db").to_str().unwrap().to_string();
+        seed(&a_path, &[("1", "Alice"), ("2", "Bob")]);
+        seed(&b_path, &[]);
+        let (a, a_cfg, a_local, b, b_cfg, b_local) =
+            two_nodes_keyed(&a_path, &b_path, Some(&key), Some(&key)).await;
+
+        let digest = only(a.digest_bodies(&a_local, &a_cfg).await.unwrap());
+        let (ev, out) = route(&a, digest, &b, &b_local, &b_cfg).await;
+        assert!(
+            matches!(ev, GossipEvent::Digest { wanted: 2, .. }),
+            "got {ev:?}"
+        );
+        let (ev, out) = route(&b, only(out), &a, &a_local, &a_cfg).await;
+        assert!(
+            matches!(ev, GossipEvent::Served { rows: 2, .. }),
+            "got {ev:?}"
+        );
+        let (ev, _) = route(&a, only(out), &b, &b_local, &b_cfg).await;
+        assert!(
+            matches!(ev, GossipEvent::Applied { rows: 2, .. }),
+            "got {ev:?}"
+        );
+        assert_eq!(count(&b_path), 2, "encrypted convergence");
+        assert_eq!(name_of(&b_path, "1").as_deref(), Some("Alice"));
+    }
+
+    // Cross-key isolation -- the only isolation mechanism after db_path_hash was
+    // removed, so it is load-bearing. A datagram sealed with key K1 is dropped
+    // CLEANLY (Ignored(Undecryptable), never an error) by a node holding K2, and
+    // that node's data is untouched. If `handle` ever let the decrypt error
+    // propagate instead, `route`'s unwrap would panic here.
+    #[tokio::test]
+    async fn wrong_key_datagram_is_dropped() {
+        let k1 = "ab".repeat(32);
+        let k2 = "cd".repeat(32);
+        let dir = tempfile::tempdir().unwrap();
+        let a_path = dir.path().join("a.db").to_str().unwrap().to_string();
+        let b_path = dir.path().join("b.db").to_str().unwrap().to_string();
+        seed(&a_path, &[("1", "Alice")]);
+        seed(&b_path, &[]);
+        let (a, a_cfg, a_local, b, b_cfg, b_local) =
+            two_nodes_keyed(&a_path, &b_path, Some(&k1), Some(&k2)).await;
+
+        let digest = only(a.digest_bodies(&a_local, &a_cfg).await.unwrap());
+        let (ev, out) = route(&a, digest, &b, &b_local, &b_cfg).await;
+        assert!(
+            matches!(ev, GossipEvent::Ignored(IgnoreReason::Undecryptable)),
+            "foreign-key datagram must drop cleanly, got {ev:?}"
+        );
+        assert!(out.is_empty());
+        assert_eq!(count(&b_path), 0, "foreign-key node must not converge");
     }
 
     // Live multicast smoke test: proves bind/join/send/recv over a real socket.

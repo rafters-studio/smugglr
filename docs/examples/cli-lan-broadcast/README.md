@@ -1,54 +1,82 @@
 # cli-lan-broadcast
 
-Two laptops on the same Wi-Fi network keep their SQLite databases in sync via UDP broadcast. No cloud, no S3, no relay -- peers discover each other and exchange encrypted deltas directly.
+Two (or two hundred) machines on the same LAN keep their SQLite databases in sync
+via masterless UDP multicast. No cloud, no relay, no coordinator: every node runs
+the identical loop, multicasts a `primary_key -> content_hash` digest of its
+tables, and pulls any rows it is missing. Rows ride multicast and apply
+idempotently, so one node's answer converges the whole group.
 
 ## Prerequisites
 
-- `smugglr` on both machines (same major version)
-- Both machines on the same subnet (typically: same Wi-Fi)
-- A shared 256-bit encryption key (a hex string both sides know)
-- Each machine has its own copy of the SQLite database file at the same path-relative-to-config
+- `smugglr` built from a version with multicast sync (`smugglr broadcast` runs
+  the masterless gossip loop). Build from source if your release predates it:
+  `cargo build --release -p smugglr`.
+- All machines on the same subnet (multicast does not cross routers/VLANs).
+- A shared 256-bit key (one hex string every node knows).
 
 ## Setup
 
-1. Generate a shared key once:
+1. Generate the shared key once and distribute it securely (do not commit it):
 
    ```sh
    openssl rand -hex 32
    ```
 
-   Distribute this securely to both machines. Don't put it in git.
-
 2. On each machine, copy `config.example.toml` to `config.toml` and:
-   - paste the same key into `[broadcast].encryption_key`
-   - point `local_db` at this machine's copy of the database
-   - leave the rest at defaults
+   - paste the same key into `[broadcast].secret` (this key IS the membership
+     check -- nodes with it sync, nodes without it can't decrypt and are ignored),
+   - set the same `[broadcast].port` on every node,
+   - point `local_db` at this machine's database. **The path does not need to
+     match across machines** -- sync is scoped by key, not by file location.
 
-3. Make sure UDP traffic on the broadcast port (default `47291`) isn't blocked by firewall.
+3. Create the table(s) you want synced on each machine (smugglr syncs rows, not
+   schema -- the table must exist on both, with a PRIMARY KEY):
+
+   ```sh
+   sqlite3 ./node.db "CREATE TABLE items (id TEXT PRIMARY KEY, name TEXT, updated_at TEXT);"
+   ```
+
+4. Allow UDP on the broadcast port through the firewall (on macOS, click Allow
+   when prompted on first run).
 
 ## Run
 
 On each machine:
 
 ```sh
-smugglr daemon
+smugglr -c config.toml broadcast -v
 ```
 
-The daemon registers as a peer, listens for broadcast announcements from other smugglr peers, and exchanges deltas every time a row changes locally or arrives from a peer.
+You'll see it join the group and emit a heartbeat each interval:
 
-You can verify discovery with:
+```
+Starting masterless multicast sync (group 239.255.43.21, port 31337, ...)
+Heartbeat #1: multicast 1 digest datagram(s)
+```
+
+To preview what a node would advertise without sending or applying anything:
 
 ```sh
-smugglr daemon --output json | jq '.peers'
+smugglr -c config.toml broadcast --dry-run -v
 ```
 
 ## Expected behavior
 
-- Insert a row on machine A. Within a second, the same row appears on machine B.
-- Disconnect machine A from Wi-Fi, write more rows. Reconnect. Machine B catches up automatically; conflicts resolve per `conflict_resolution`.
+- Insert a row on machine A; within a few heartbeats it appears on machine B
+  (B logs `Applied 1 row(s)`). The reverse works identically -- every node both
+  broadcasts and listens.
+- A late joiner that starts empty hears the next heartbeat and converges to the
+  group's full state, no extra steps.
+- Drop a machine off the network, write rows, reconnect: it re-converges on the
+  next heartbeat. Lost packets are safe -- applying a row twice is a no-op.
 
 ## What this demonstrates
 
-- Offline-tolerant peer-to-peer sync. No central server, no internet required.
-- All broadcast payloads are encrypted with the shared key. Anyone on the LAN can see the announcement headers but not the row contents.
-- `uuid_v7_wins` conflict resolution is the recommended setting for master-master topologies because UUIDv7 PKs encode creation time -- newer writes deterministically win without a clock-sync requirement.
+- **Masterless, peer-symmetric sync.** No primary, no leader, no central server,
+  no internet required.
+- **Membership = key possession.** The shared key is the only access control and
+  the encryption key (XChaCha20-Poly1305, unique nonce per datagram). Run an
+  isolated cluster on the same LAN by using a different key.
+- **Last-received-wins on divergence.** Same primary key with different contents:
+  the received row replaces the local one. UUIDv7 PKs make concurrent divergence
+  on the same logical row rare; there are no CRDTs or vector clocks.
