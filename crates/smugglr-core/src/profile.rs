@@ -35,15 +35,13 @@ pub enum RequestFormat {
     Turso,
     /// rqlite: `[["<sql>", ...params]]`
     Rqlite,
-    /// Cloudflare D1 REST: `{"sql": "<sql>", "params": [...]}`
-    D1,
     /// Datasette: `{"sql": "<sql>", "params": {...}}`
     Datasette,
-    /// Flat JSON: `{"sql": "<sql>", "params": [...]}`
+    /// Flat JSON: `{"sql": "<sql>", "params": [...]}`. Shared by Cloudflare D1,
+    /// the http-sql v0.1 spec, and generic endpoints -- they emit this exact
+    /// request body. Per-platform differences (response paths, bind limits) live
+    /// in the `Profile` constructors, not in this enum.
     Generic,
-    /// http-sql v0.1 spec: `{"sql": "<sql>", "params": [...]}`
-    /// See <https://github.com/rafters-studio/http-sql>.
-    HttpSql,
 }
 
 impl Profile {
@@ -96,7 +94,7 @@ impl Profile {
     pub fn d1() -> Self {
         Self {
             auth_format: AuthFormat::Bearer,
-            request_format: RequestFormat::D1,
+            request_format: RequestFormat::Generic,
             rows_path: vec!["result".into(), "0".into(), "results".into()],
             columns_path: vec!["result".into(), "0".into(), "results".into()],
             max_bind_params: 100,
@@ -148,7 +146,7 @@ impl Profile {
     pub fn http_sql() -> Self {
         Self {
             auth_format: AuthFormat::Bearer,
-            request_format: RequestFormat::HttpSql,
+            request_format: RequestFormat::Generic,
             rows_path: vec!["rows".into()],
             columns_path: vec!["columns".into()],
             max_bind_params: 0,
@@ -198,24 +196,10 @@ impl Profile {
                     serde_json::json!([stmt])
                 }
             }
-            RequestFormat::D1 => {
-                if params.is_empty() {
-                    serde_json::json!({"sql": sql})
-                } else {
-                    serde_json::json!({"sql": sql, "params": params})
-                }
-            }
             RequestFormat::Datasette => {
                 serde_json::json!({"sql": sql, "_shape": "array"})
             }
             RequestFormat::Generic => {
-                if params.is_empty() {
-                    serde_json::json!({"sql": sql})
-                } else {
-                    serde_json::json!({"sql": sql, "params": params})
-                }
-            }
-            RequestFormat::HttpSql => {
                 if params.is_empty() {
                     serde_json::json!({"sql": sql})
                 } else {
