@@ -456,7 +456,10 @@ impl Gossip {
             // No local view (e.g. the table is absent on a late joiner) -> treat
             // as empty so we want everything the peer advertises.
             Err(e) => {
-                debug!("no local hashes for '{}' ({}); treating as empty", d.table, e);
+                debug!(
+                    "no local hashes for '{}' ({}); treating as empty",
+                    d.table, e
+                );
                 HashMap::new()
             }
         };
@@ -472,7 +475,13 @@ impl Gossip {
                 pks: want,
             })]
         };
-        Ok((GossipEvent::Digest { table: d.table, wanted }, out))
+        Ok((
+            GossipEvent::Digest {
+                table: d.table,
+                wanted,
+            },
+            out,
+        ))
     }
 
     async fn on_want(
@@ -491,15 +500,33 @@ impl Gossip {
             Ok(r) => r,
             Err(e) => {
                 warn!("cannot serve '{}': {}", w.table, e);
-                return Ok((GossipEvent::Served { table: w.table, rows: 0 }, Vec::new()));
+                return Ok((
+                    GossipEvent::Served {
+                        table: w.table,
+                        rows: 0,
+                    },
+                    Vec::new(),
+                ));
             }
         };
         if rows.is_empty() {
-            return Ok((GossipEvent::Served { table: w.table, rows: 0 }, Vec::new()));
+            return Ok((
+                GossipEvent::Served {
+                    table: w.table,
+                    rows: 0,
+                },
+                Vec::new(),
+            ));
         }
         let n = rows.len();
         let out = self.delta_bodies(&w.table, rows, Vec::new())?;
-        Ok((GossipEvent::Served { table: w.table, rows: n }, out))
+        Ok((
+            GossipEvent::Served {
+                table: w.table,
+                rows: n,
+            },
+            out,
+        ))
     }
 
     async fn on_delta(
@@ -533,7 +560,13 @@ impl Gossip {
                 d.table
             );
         }
-        Ok((GossipEvent::Applied { table: d.table, rows: changed }, Vec::new()))
+        Ok((
+            GossipEvent::Applied {
+                table: d.table,
+                rows: changed,
+            },
+            Vec::new(),
+        ))
     }
 }
 
@@ -558,10 +591,8 @@ mod tests {
 
     fn seed(path: &str, rows: &[(&str, &str)]) {
         let conn = rusqlite::Connection::open(path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT, updated_at TEXT);",
-        )
-        .unwrap();
+        conn.execute_batch("CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT, updated_at TEXT);")
+            .unwrap();
         for (id, name) in rows {
             conn.execute(
                 "INSERT INTO users VALUES (?1, ?2, '2026-01-01T00:00:00Z')",
@@ -616,7 +647,7 @@ mod tests {
         let local = HashMap::from([
             ("1".to_string(), "h1".to_string()), // identical -> skip
             ("2".to_string(), "DIFFERENT".to_string()), // differ -> want
-            // 3 missing -> want
+                                                 // 3 missing -> want
         ]);
         let mut got = want_set(&peer, &local);
         got.sort();
@@ -657,10 +688,14 @@ mod tests {
         let b_local = LocalDb::open(b_path).unwrap();
 
         let db_hash = crate::broadcast::hash_db_path("shared-logical-db");
-        let mut bc_a = BroadcastConfig::default();
-        bc_a.instance_id = Some("node-a".into());
-        let mut bc_b = bc_a.clone();
-        bc_b.instance_id = Some("node-b".into());
+        let bc_a = BroadcastConfig {
+            instance_id: Some("node-a".into()),
+            ..Default::default()
+        };
+        let bc_b = BroadcastConfig {
+            instance_id: Some("node-b".into()),
+            ..Default::default()
+        };
 
         let group = Ipv4Addr::new(239, 255, 99, 88);
         let a = Gossip::bind(&bc_a, db_hash.clone(), group).await.unwrap();
@@ -708,24 +743,36 @@ mod tests {
 
         // 2) B hears it and wants both rows.
         let (ev, out) = route(&a, digest, &b, &b_local, &b_cfg).await;
-        assert!(matches!(ev, GossipEvent::Digest { wanted: 2, .. }), "got {ev:?}");
+        assert!(
+            matches!(ev, GossipEvent::Digest { wanted: 2, .. }),
+            "got {ev:?}"
+        );
         let want = only(out);
 
         // 3) A hears the want and serves both rows.
         let (ev, out) = route(&b, want, &a, &a_local, &a_cfg).await;
-        assert!(matches!(ev, GossipEvent::Served { rows: 2, .. }), "got {ev:?}");
+        assert!(
+            matches!(ev, GossipEvent::Served { rows: 2, .. }),
+            "got {ev:?}"
+        );
         let delta = only(out);
 
         // 4) B hears the delta and applies -> converged.
         let (ev, out) = route(&a, delta.clone(), &b, &b_local, &b_cfg).await;
-        assert!(matches!(ev, GossipEvent::Applied { rows: 2, .. }), "got {ev:?}");
+        assert!(
+            matches!(ev, GossipEvent::Applied { rows: 2, .. }),
+            "got {ev:?}"
+        );
         assert!(out.is_empty());
         assert_eq!(count(&b_path), 2, "late joiner B converged to A");
         assert_eq!(name_of(&b_path, "1").as_deref(), Some("Alice"));
 
         // 4b) Replaying the very same delta is dropped by the replay guard.
         let (ev, _) = route(&a, delta, &b, &b_local, &b_cfg).await;
-        assert!(matches!(ev, GossipEvent::Ignored(IgnoreReason::Replay)), "got {ev:?}");
+        assert!(
+            matches!(ev, GossipEvent::Ignored(IgnoreReason::Replay)),
+            "got {ev:?}"
+        );
 
         // 5) Divergent edit: A changes Alice, re-heartbeats; B pulls and the
         //    received row wins.
@@ -736,7 +783,10 @@ mod tests {
         }
         let digest = only(a.digest_bodies(&a_local, &a_cfg).await.unwrap());
         let (ev, out) = route(&a, digest, &b, &b_local, &b_cfg).await;
-        assert!(matches!(ev, GossipEvent::Digest { wanted: 1, .. }), "got {ev:?}");
+        assert!(
+            matches!(ev, GossipEvent::Digest { wanted: 1, .. }),
+            "got {ev:?}"
+        );
         let (_ev, out) = route(&b, only(out), &a, &a_local, &a_cfg).await;
         let (ev, _) = route(&a, only(out), &b, &b_local, &b_cfg).await;
         assert!(matches!(ev, GossipEvent::Applied { .. }), "got {ev:?}");
