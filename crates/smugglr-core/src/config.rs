@@ -117,21 +117,12 @@ pub struct SyncConfig {
     #[serde(default)]
     pub conflict_resolution: ConflictResolution,
 
-    /// Maximum number of retry attempts for transient failures
-    #[serde(default = "default_max_retries")]
-    pub max_retries: u32,
-
-    /// Initial delay in milliseconds before first retry (doubles each attempt)
-    #[serde(default = "default_initial_retry_delay_ms")]
-    pub initial_retry_delay_ms: u64,
-
-    /// Maximum delay in milliseconds between retries (cap for exponential backoff)
-    #[serde(default = "default_max_retry_delay_ms")]
-    pub max_retry_delay_ms: u64,
-
-    /// Backoff multiplier for exponential backoff (default: 2.0)
-    #[serde(default = "default_backoff_multiplier")]
-    pub backoff_multiplier: f64,
+    /// Retry policy for transient failures. Flattened into the `[sync]` table,
+    /// so the TOML keys stay `max_retries`, `initial_retry_delay_ms`,
+    /// `max_retry_delay_ms`, and `backoff_multiplier`. These are the raw
+    /// (unvalidated) values; [`RetryConfig::from_sync_config`] applies the caps.
+    #[serde(flatten)]
+    pub retry: RetryConfig,
 
     /// Maximum number of rows per batch for upsert operations
     #[serde(default = "default_batch_size")]
@@ -159,10 +150,7 @@ impl Default for SyncConfig {
             exclude_columns: Vec::new(),
             timestamp_column: default_timestamp_column(),
             conflict_resolution: ConflictResolution::default(),
-            max_retries: default_max_retries(),
-            initial_retry_delay_ms: default_initial_retry_delay_ms(),
-            max_retry_delay_ms: default_max_retry_delay_ms(),
-            backoff_multiplier: default_backoff_multiplier(),
+            retry: RetryConfig::default(),
             batch_size: default_batch_size(),
             max_statement_bytes: default_max_statement_bytes(),
         }
@@ -286,16 +274,26 @@ pub enum ConflictResolution {
     UuidV7Wins,
 }
 
-/// Retry configuration for D1 API calls
-#[derive(Debug, Clone, Copy)]
+/// Retry configuration for transient write failures.
+///
+/// Deserialized (flattened) from the `[sync]` table; the `rename`s map the
+/// TOML keys onto the runtime field names.
+#[derive(Debug, Clone, Copy, Deserialize)]
 pub struct RetryConfig {
     /// Maximum number of retry attempts
+    #[serde(default = "default_max_retries")]
     pub max_retries: u32,
     /// Initial delay in milliseconds before first retry
+    #[serde(
+        default = "default_initial_retry_delay_ms",
+        rename = "initial_retry_delay_ms"
+    )]
     pub initial_delay_ms: u64,
     /// Maximum delay in milliseconds (cap for exponential backoff)
+    #[serde(default = "default_max_retry_delay_ms", rename = "max_retry_delay_ms")]
     pub max_delay_ms: u64,
     /// Backoff multiplier for exponential backoff
+    #[serde(default = "default_backoff_multiplier")]
     pub backoff_multiplier: f64,
 }
 
@@ -316,11 +314,11 @@ impl RetryConfig {
     /// Validates that backoff_multiplier >= 1.0 (clamps invalid values).
     pub fn from_sync_config(sync: &SyncConfig) -> Self {
         Self {
-            max_retries: sync.max_retries.min(100), // cap at reasonable max
-            initial_delay_ms: sync.initial_retry_delay_ms,
-            max_delay_ms: sync.max_retry_delay_ms,
+            max_retries: sync.retry.max_retries.min(100), // cap at reasonable max
+            initial_delay_ms: sync.retry.initial_delay_ms,
+            max_delay_ms: sync.retry.max_delay_ms,
             // Ensure multiplier is at least 1.0 to avoid zero/negative delays
-            backoff_multiplier: sync.backoff_multiplier.max(1.0),
+            backoff_multiplier: sync.retry.backoff_multiplier.max(1.0),
         }
     }
 
@@ -850,7 +848,10 @@ mod tests {
     #[test]
     fn test_backoff_multiplier_clamped() {
         let sync = SyncConfig {
-            backoff_multiplier: 0.5,
+            retry: RetryConfig {
+                backoff_multiplier: 0.5,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let retry = RetryConfig::from_sync_config(&sync);
@@ -860,7 +861,10 @@ mod tests {
     #[test]
     fn test_max_retries_capped() {
         let sync = SyncConfig {
-            max_retries: 1000,
+            retry: RetryConfig {
+                max_retries: 1000,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let retry = RetryConfig::from_sync_config(&sync);
@@ -870,10 +874,12 @@ mod tests {
     #[test]
     fn test_retry_config_from_sync_config() {
         let sync = SyncConfig {
-            max_retries: 3,
-            initial_retry_delay_ms: 500,
-            max_retry_delay_ms: 30000,
-            backoff_multiplier: 1.5,
+            retry: RetryConfig {
+                max_retries: 3,
+                initial_delay_ms: 500,
+                max_delay_ms: 30000,
+                backoff_multiplier: 1.5,
+            },
             ..Default::default()
         };
         let retry = RetryConfig::from_sync_config(&sync);
@@ -881,6 +887,41 @@ mod tests {
         assert_eq!(retry.initial_delay_ms, 500);
         assert_eq!(retry.max_delay_ms, 30000);
         assert_eq!(retry.backoff_multiplier, 1.5);
+    }
+
+    #[test]
+    fn test_parse_toml_retry_keys_flattened() {
+        // The retry fields are flattened into [sync]; the TOML keys must keep
+        // their original names and map onto RetryConfig's runtime field names.
+        let toml_str = r#"
+local_db = "game.db"
+
+[sync]
+max_retries = 7
+initial_retry_delay_ms = 250
+max_retry_delay_ms = 12000
+backoff_multiplier = 3.0
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.sync.retry.max_retries, 7);
+        assert_eq!(config.sync.retry.initial_delay_ms, 250);
+        assert_eq!(config.sync.retry.max_delay_ms, 12000);
+        assert_eq!(config.sync.retry.backoff_multiplier, 3.0);
+    }
+
+    #[test]
+    fn test_parse_toml_retry_keys_default_when_absent() {
+        let toml_str = r#"
+local_db = "game.db"
+
+[sync]
+tables = ["abilities"]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.sync.retry.max_retries, 5);
+        assert_eq!(config.sync.retry.initial_delay_ms, 100);
+        assert_eq!(config.sync.retry.max_delay_ms, 30_000);
+        assert_eq!(config.sync.retry.backoff_multiplier, 2.0);
     }
 
     #[test]
