@@ -668,8 +668,8 @@ mod tests {
     }
 
     /// Bind two gossip nodes with distinct instance ids on a test group. They
-    /// share no path or DB identity -- membership is purely the (implicit) key
-    /// plus group, which is the whole point of the fix.
+    /// share no path or DB identity, so convergence proves sync is scoped by
+    /// group/key membership alone, never by file location.
     async fn two_nodes(
         a_path: &str,
         b_path: &str,
