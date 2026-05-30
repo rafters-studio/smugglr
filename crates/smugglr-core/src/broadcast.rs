@@ -23,8 +23,12 @@ use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-/// Protocol version for announcement packets. Bump on breaking changes.
-const PROTOCOL_VERSION: u8 = 1;
+/// Protocol version for UDP packets. Bump on breaking wire changes.
+///
+/// v2 introduced the masterless multicast gossip envelope (`multicast::Msg`:
+/// `Digest`/`Want`/`Delta`). v1 nodes (which only spoke bare `Announcement`)
+/// version-skip a v2 node and vice versa -- there is no cross-version sync.
+pub(crate) const PROTOCOL_VERSION: u8 = 2;
 
 /// Default UDP port for broadcast discovery.
 pub const DEFAULT_PORT: u16 = 31337;
@@ -494,7 +498,7 @@ pub fn hash_db_path(path: &str) -> String {
 const MAX_UDP_PAYLOAD: usize = 65507;
 
 /// Conservative packet size to avoid IP fragmentation on most networks.
-const SAFE_PACKET_SIZE: usize = 1400;
+pub(crate) const SAFE_PACKET_SIZE: usize = 1400;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DeltaPacket {

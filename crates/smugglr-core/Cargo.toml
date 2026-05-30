@@ -25,6 +25,7 @@ native = [
     "dep:chacha20poly1305",
     "dep:rand",
     "dep:libc",
+    "dep:socket2",
 ]
 
 [dependencies]
@@ -71,3 +72,7 @@ rand = { version = "0.9", optional = true }
 
 # Unix process checking (PID lock)
 libc = { version = "0.2", optional = true }
+
+# Multicast socket setup (SO_REUSEADDR/SO_REUSEPORT, group join)
+# "all" feature exposes set_reuse_port on unix.
+socket2 = { version = "0.5", features = ["all"], optional = true }
