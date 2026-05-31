@@ -169,3 +169,46 @@ jobs:
       - name: Publish
         run: npm publish --access=public --provenance
         working-directory: packages/smugglr
+
+      # Framework plugins. They build against the local `smugglr` package
+      # (`smugglr` devDep is `link:../smugglr`, built above), so they need no
+      # published smugglr and have no propagation-timing dependency. Each is a
+      # pure-tsc build; published after smugglr so a smugglr publish failure
+      # short-circuits before any plugin ships.
+      - name: Install @smugglr/zustand deps
+        run: pnpm install --frozen-lockfile
+        working-directory: packages/zustand-plugin
+
+      - name: Build @smugglr/zustand
+        run: pnpm build
+        working-directory: packages/zustand-plugin
+
+      - name: Publish @smugglr/zustand
+        working-directory: packages/zustand-plugin
+        run: |
+          name=$(node -p "require('./package.json').name")
+          version=$(node -p "require('./package.json').version")
+          if npm view "$name@$version" version >/dev/null 2>&1; then
+            echo "$name@$version already on npm, skipping"
+          else
+            npm publish --access=public --provenance
+          fi
+
+      - name: Install @smugglr/nanostores deps
+        run: pnpm install --frozen-lockfile
+        working-directory: packages/nanostores-plugin
+
+      - name: Build @smugglr/nanostores
+        run: pnpm build
+        working-directory: packages/nanostores-plugin
+
+      - name: Publish @smugglr/nanostores
+        working-directory: packages/nanostores-plugin
+        run: |
+          name=$(node -p "require('./package.json').name")
+          version=$(node -p "require('./package.json').version")
+          if npm view "$name@$version" version >/dev/null 2>&1; then
+            echo "$name@$version already on npm, skipping"
+          else
+            npm publish --access=public --provenance
+          fi
