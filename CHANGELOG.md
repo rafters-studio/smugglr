@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.4.0 (2026-05-30)
+
+Browser sync surface fills in. The npm package gets the four runtime affordances a real app needs (auto-sync, anonymous-first, auth rotation, right-to-erasure), the OPFS local-source path lands behind `wa-sqlite`, and a `table-changed` event lets reactive plugins react without polling. Two such plugins ship: `@smugglr/zustand` and `@smugglr/nanostores`. On the config side, `config.toml` gains `${VAR}` secret expansion and the documented retry/backoff now actually runs on the write path. A round of correctness fixes and a structural-debt cleanup round it out.
+
+### Added
+
+- **`autoSync` config** on `Smugglr.init()`: empty-state hydration on init plus sync-on-reconnect when the browser fires `online`. Multi-tab safe via `navigator.locks` (one tab runs, the rest wait). Exponential backoff with jitter on failure, capped at 5 min. No-op in Node. `s.stopAutoSync()` cancels the loop. (#113)
+- **Optional `dest` in `Smugglr.init()`**: omit `dest` to run with no network at all -- nothing leaves the device. `.push()` / `.sync()` throw with a clear error; `.diff()` still reports local rows. Foundation for the "let users try the app before signing up" flow. (#111)
+- **`updateAuth(token)` and `updateDest(dest)`** for runtime endpoint changes: rotate the dest auth token without re-initializing the WASM module or losing the metadata cache; replace the entire dest endpoint (URL, profile, token) for the anonymous -> account upgrade path. Source cache survives a dest swap. (#112)
+- **`eraseLocal()`** GDPR / right-to-erasure helper: empties every configured sync table on the local SQLite database and clears smugglr's in-memory caches. Schema and non-synced tables untouched; dest is not contacted (server-side erasure is the app's concern). (#117)
+- **`table-changed` reactive event**: subscribe via `s.on("table-changed", cb)`. Fires once per affected table after `pull` or `sync` completes the local write; `push` and `diff` never emit. Carries `{ table, changedPks, removedPks, source }`. The primitive that the framework binding plugins are built on. (#114)
+- **`@smugglr/zustand`** middleware: wraps a Zustand store, hydrates from a smugglr-managed SQLite table on init, and re-pulls on `table-changed`. (#115)
+- **`@smugglr/nanostores`** adapter: same shape for nanostores -- a writable atom backed by a smugglr table, kept fresh by sync events. (#116)
+- **Local SQLite DataSource for browser (OPFS)** via `wa-sqlite`: `Smugglr.init({ source: { type: "local", executor: createWaSqliteExecutor(...) }, ... })`. Real SQLite in the browser, content-hashed delta against any HTTP-SQL backend. Generic `SqlExecutor` contract -- better-sqlite3 in Node, sql.js, or your own works too. Playwright e2e suite covers the full local-OPFS path. (#97)
+- **Runnable examples set** under `docs/examples/`: CLI (D1, LAN broadcast), Node (server-to-D1, auto-sync), Rust (custom DataSource, tokio service), browser (OPFS + Turso, IndexedDB + Turso). Each runs as written from a fresh clone. (#119)
+- **Masterless multicast LAN sync**: `smugglr broadcast` is now true masterless UDP multicast gossip -- every node multicasts a `primary_key -> content_hash` digest, peers pull divergence, rows ride multicast and apply idempotently (last-received-wins), late joiners reconcile via the heartbeat. Two or two hundred nodes on a subnet converge with no coordinator (O(N), replacing the previous pairwise-TCP discovery+exchange). Membership is key possession: nodes with the shared key sync regardless of where each stores its database file (no path-based scoping). The delta wire-format primitives and peer-discovery types remain available as an embedder API. **Wire `PROTOCOL_VERSION` is 3; nodes on other versions version-skip.** v0.1 limits: concurrent same-PK divergence resolves silently (no CRDT); deletes via the live delta path only. (#133)
+- **`http-sql` target profile**: a built-in profile for any endpoint speaking the http-sql v0.1 spec (`{sql, params}` request, `{columns, rows}` response). Select with `profile = "http-sql"`; shared by the native plugin and the browser fetch adapter. (#131)
+- **`${VAR}` expansion in `config.toml`**: string values expand `${NAME}` and `${NAME:-default}` from the environment at load time, so secrets (D1 tokens, stash keys, the broadcast key) come from the environment instead of the file. Unset with no default errors with the variable named; `$$` escapes a literal `$`. Expansion runs post-parse on the TOML value tree, so a substituted secret can neither inject TOML structure nor leak into a parse error. (#136)
+- **Automatic retry with backoff on the write path**: transient upsert failures (HTTP 5xx / network / timeout) retry per `[sync]` config (`max_retries`, `initial_retry_delay_ms`, `max_retry_delay_ms`, `backoff_multiplier`); deterministic errors (4xx, bad SQL) fail fast; exhaustion exits 3. A server `Retry-After` is honored, capped by `max_retry_delay_ms`. (#137)
+
+### Changed
+
+- **WASM binary size**: release profile with `wasm-opt` cuts `smugglr_wasm_bg.wasm` from ~1.2 MB to ~277 KB compressed (~75% reduction). No API change. (#110)
+- **Removed the orphaned in-process TCP sync transport** (~955 LOC): it was never wired into a shipping command. LAN sync is masterless multicast (#133); the delta wire primitives and peer-discovery types stay as an embedder API. (#145)
+- Internal structural-debt cleanup across core, CLI, and the WASM adapters -- dead-code removal plus deduplication (config retry fields, snapshot structs, request-format arms, table-name validation, CLI command/output plumbing, shared WASM adapter helpers). No API or behavior change. (#146, #147, #148, #149, #150, #151, #152)
+
+### Fixed
+
+- Plugin lookup searches `~/.smugglr/plugins/` -- it was `~/.smuggler/` (a typo), which broke name-based plugin resolution. (#140)
+- WASM content-hash honors glob `exclude_columns` patterns (e.g. `*_embedding`), matching transfer-time stripping; previously only exact column names were excluded, so glob-excluded columns produced phantom `content_differs`. (#141)
+- WASM `conflict_resolution` errors on an unknown value instead of silently falling back to `local_wins` (which could sync the wrong direction). (#142)
+- Conflict-skip warnings (`newer_wins` / `uuid_v7_wins` with no usable tiebreaker) fire in every sync direction, once per table -- a pull-only run previously gave no warning. (#144)
+- Multicast deltas reserve wire-envelope + AEAD headroom when split, so a sealed delta part cannot exceed the safe datagram size. (#143)
+
+### Notes
+
+The 0.3.1 -> 0.3.3 patch releases were release-infrastructure only (crate metadata, npm README pointing at smugglr.dev, CI pnpm version + cache pins). No user-visible runtime changes.
+
 ## 0.3.0 (2026-04-11)
 
 The core engine no longer knows about any specific remote backend. `D1Client` and `ResolvedTarget::D1` are gone from `smugglr-core`; every remote is a plugin. The same release ships the sync engine to the browser via WebAssembly and npm.

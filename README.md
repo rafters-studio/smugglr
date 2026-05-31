@@ -241,7 +241,16 @@ s.dispose();
 
 The package exports `Smugglr.init(config)` and the same verbs as the CLI: `.push()`, `.pull()`, `.sync()`, `.diff()`. All return typed results. The `./wasm` subpath export is available for consumers who need to control WASM binary loading directly (CDN URL, pre-fetched buffer, bundler import).
 
-This is the current browser story: sync between two remote HTTP SQL endpoints from the browser. Local SQLite storage in the browser is a separate track, not yet shipped.
+The 0.4.0 release adds the runtime affordances a real browser app needs:
+
+- **Local SQLite (OPFS)** via `wa-sqlite`: pass `source: { type: "local", executor }` to sync a real SQLite database in the browser against any HTTP-SQL backend. Generic `SqlExecutor` contract -- swap wa-sqlite for the official sqlite-wasm, sql.js, better-sqlite3 in Node, or your own.
+- **`autoSync`**: opt-in hands-off triggers. Hydrate from dest when the local DB is empty on init, re-sync on `online` events, multi-tab safe via `navigator.locks`, exponential backoff on failure.
+- **Anonymous-first**: omit `dest` entirely to run with no network at all. Attach a dest later via `updateDest()` for the anonymous-to-account upgrade path.
+- **`updateAuth(token)` / `updateDest(dest)`**: token rotation and endpoint replacement without re-initializing the WASM module.
+- **`table-changed` events**: subscribe to per-table writes after pull/sync. The primitive `@smugglr/zustand` and `@smugglr/nanostores` build on for reactive state.
+- **`eraseLocal()`**: GDPR-shaped right-to-erasure helper. Empties every configured sync table locally; dest is the app's concern.
+
+See the [npm README](packages/smugglr/README.md) for the full API, OPFS setup, and bundle-size breakdown.
 
 ## LAN Broadcast Sync
 
