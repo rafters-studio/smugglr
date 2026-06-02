@@ -17,6 +17,28 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 
+/// Conservative per-statement bind-parameter cap for the local executor.
+///
+/// The JS executor may be backed by sql.js, official sqlite-wasm,
+/// better-sqlite3, or wa-sqlite. The most restrictive historical default for
+/// `SQLITE_MAX_VARIABLE_NUMBER` is 999, so we chunk a batch upsert so no single
+/// `INSERT OR REPLACE` exceeds it. wa-sqlite (32766) and newer builds survive
+/// larger batches, but capping at the lowest common limit keeps the adapter
+/// correct against every documented executor. Mirrors the `max_bind_params`
+/// guard in `FetchDataSource::upsert_rows`.
+const LOCAL_MAX_BIND_PARAMS: usize = 999;
+
+/// Largest number of rows that fit under `LOCAL_MAX_BIND_PARAMS` for a
+/// statement with `num_columns` columns per row. Always at least 1 so a very
+/// wide single row is still attempted (and fails loudly at the executor rather
+/// than silently emitting an empty batch).
+fn max_rows_per_batch(num_columns: usize) -> usize {
+    if num_columns == 0 {
+        return 1;
+    }
+    (LOCAL_MAX_BIND_PARAMS / num_columns).max(1)
+}
+
 pub struct LocalSqlDataSource {
     executor: JsValue,
     table_info_cache: std::sync::Mutex<HashMap<String, TableInfo>>,
@@ -85,8 +107,15 @@ impl LocalSqlDataSource {
 
         let pk_expr = adapter_common::build_pk_text_expr(&info.primary_key);
         let column_order: Vec<String> = info.columns.iter().map(|c| c.name.clone()).collect();
+        // `>=` (not `>`): a row written at exactly `since_timestamp` AFTER the
+        // scan that established that cursor would never satisfy `> cursor` on a
+        // later pass (same-tick / whole-second granularity), silently dropping
+        // its change until clearCache(). Re-fetching the boundary tick is safe
+        // because the caller merges results into the PK-keyed cache, so rows
+        // already seen at the boundary are overwritten idempotently and only
+        // genuinely-new boundary rows are admitted. See bug #199.
         let sql = format!(
-            "SELECT *, {} AS __pk FROM \"{}\" WHERE \"{}\" > ?",
+            "SELECT *, {} AS __pk FROM \"{}\" WHERE \"{}\" >= ?",
             pk_expr, table, timestamp_column
         );
         let params = vec![Value::String(since_timestamp.to_string())];
@@ -208,16 +237,22 @@ impl DataSource for LocalSqlDataSource {
             return Ok(0);
         }
         let columns: Vec<String> = rows[0].keys().cloned().collect();
-        let (sql, params) = adapter_common::generate_batch_sql(table, &columns, rows);
-        self.run(&sql, &params).await.map_err(|e| {
-            SyncError::Remote(format!(
-                "batch upsert failed for table '{}' ({} rows): {}",
-                table,
-                rows.len(),
-                e
-            ))
-        })?;
-        Ok(rows.len())
+        let batch_size = max_rows_per_batch(columns.len());
+
+        let mut total = 0;
+        for batch in rows.chunks(batch_size) {
+            let (sql, params) = adapter_common::generate_batch_sql(table, &columns, batch);
+            self.run(&sql, &params).await.map_err(|e| {
+                SyncError::Remote(format!(
+                    "batch upsert failed for table '{}' ({} rows in batch): {}",
+                    table,
+                    batch.len(),
+                    e
+                ))
+            })?;
+            total += batch.len();
+        }
+        Ok(total)
     }
 
     async fn row_count(&self, table: &str) -> Result<usize> {
@@ -230,5 +265,66 @@ impl DataSource for LocalSqlDataSource {
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
         Ok(count as usize)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    fn make_rows(n: usize, num_columns: usize) -> Vec<HashMap<String, Value>> {
+        (0..n)
+            .map(|r| {
+                (0..num_columns)
+                    .map(|c| (format!("col{}", c), Value::from(r as i64 * 100 + c as i64)))
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[wasm_bindgen_test]
+    fn max_rows_per_batch_respects_variable_limit() {
+        // 10 columns -> 99 rows -> 990 binds (<= 999), 100 rows would be 1000.
+        assert_eq!(max_rows_per_batch(10), 99);
+        // single wide row always attempted.
+        assert_eq!(max_rows_per_batch(2000), 1);
+        // degenerate zero-column input does not divide by zero.
+        assert_eq!(max_rows_per_batch(0), 1);
+    }
+
+    #[wasm_bindgen_test]
+    fn upsert_batching_keeps_each_statement_under_sqlite_var_limit() {
+        // Regression for #196: a default batch_size of 100 rows at >9 columns
+        // exceeds the historical 999-variable limit when emitted as ONE
+        // INSERT OR REPLACE. The chunking must keep every emitted statement's
+        // bind-parameter count <= LOCAL_MAX_BIND_PARAMS.
+        let num_columns = 10usize;
+        let rows = make_rows(100, num_columns);
+        let columns: Vec<String> = rows[0].keys().cloned().collect();
+
+        // Pre-fix behavior would emit 100 * 10 = 1000 binds in one statement.
+        let single = adapter_common::generate_batch_sql("t", &columns, &rows);
+        assert!(
+            single.1.len() > LOCAL_MAX_BIND_PARAMS,
+            "unchunked statement should exceed the limit (proves the bug exists)"
+        );
+
+        // Post-fix: chunk and assert every statement stays within the cap, and
+        // the total rows covered equals the input.
+        let batch_size = max_rows_per_batch(num_columns);
+        let mut covered = 0;
+        for batch in rows.chunks(batch_size) {
+            let (_sql, params) = adapter_common::generate_batch_sql("t", &columns, batch);
+            assert!(
+                params.len() <= LOCAL_MAX_BIND_PARAMS,
+                "each chunk must stay <= {} binds, got {}",
+                LOCAL_MAX_BIND_PARAMS,
+                params.len()
+            );
+            covered += batch.len();
+        }
+        assert_eq!(covered, rows.len(), "every row must be covered by a chunk");
     }
 }

@@ -78,6 +78,10 @@ jobs:
           node-version: 22
           cache: pnpm
           cache-dependency-path: packages/smugglr/pnpm-lock.yaml
+      - name: Run smugglr-wasm unit tests (wasm32, node)
+        # The crate is #![cfg(target_arch = "wasm32")], so host `cargo test`
+        # runs none of its tests; they execute only via wasm-pack (#155).
+        run: wasm-pack test --node crates/smugglr-wasm
       - name: Install deps
         working-directory: packages/smugglr
         run: pnpm install --frozen-lockfile
