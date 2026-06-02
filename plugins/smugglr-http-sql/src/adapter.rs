@@ -3,7 +3,6 @@
 use crate::profile::{AuthFormat, Profile};
 use reqwest::Client;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use smugglr_plugin_sdk::{ColumnInfo, PluginAdapter, PluginError, RowMeta, TableInfo};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -198,40 +197,6 @@ impl HttpSqlAdapter {
 
         (sql, params)
     }
-
-    /// Hash row content for change detection.
-    ///
-    /// IMPORTANT: This must match smugglr-core local.rs hashing algorithm exactly.
-    /// local.rs hashes values only (no keys) in column definition order, using
-    /// empty string for NULL. Any divergence breaks cross-source sync.
-    fn content_hash(
-        row: &HashMap<String, Value>,
-        columns_in_order: &[String],
-        exclude: &[String],
-        timestamp_column: &str,
-    ) -> String {
-        let timestamp_columns = ["updated_at", "created_at"];
-        let mut hasher = Sha256::new();
-        for col in columns_in_order {
-            if timestamp_columns.contains(&col.as_str())
-                || exclude.iter().any(|e| e == col)
-                || col == timestamp_column
-            {
-                continue;
-            }
-            if let Some(val) = row.get(col) {
-                match val {
-                    Value::Null => {} // empty string -- matches local.rs None behavior
-                    Value::String(s) => hasher.update(s.as_bytes()),
-                    Value::Number(n) => hasher.update(n.to_string().as_bytes()),
-                    Value::Bool(b) => hasher.update(if *b { "1" } else { "0" }.as_bytes()),
-                    other => hasher.update(other.to_string().as_bytes()),
-                }
-            }
-            hasher.update(b"|");
-        }
-        hex::encode(hasher.finalize())
-    }
 }
 
 impl PluginAdapter for HttpSqlAdapter {
@@ -338,16 +303,7 @@ impl PluginAdapter for HttpSqlAdapter {
             )));
         }
 
-        let pk_expr = if info.primary_key.len() == 1 {
-            format!("CAST(\"{}\" AS TEXT)", info.primary_key[0])
-        } else {
-            let parts: Vec<String> = info
-                .primary_key
-                .iter()
-                .map(|k| format!("CAST(\"{}\" AS TEXT)", k))
-                .collect();
-            parts.join(" || '|' || ")
-        };
+        let pk_expr = smugglr_core::rowhash::pk_text_expr(&info.primary_key);
 
         // Column order from table_info -- must match local.rs hashing order
         let column_order: Vec<String> = info.columns.iter().map(|c| c.name.clone()).collect();
@@ -369,7 +325,12 @@ impl PluginAdapter for HttpSqlAdapter {
                 .get(timestamp_column)
                 .and_then(|v| v.as_str())
                 .map(String::from);
-            let hash = Self::content_hash(row, &column_order, exclude_columns, timestamp_column);
+            let hash = smugglr_core::rowhash::content_hash(
+                row,
+                &column_order,
+                exclude_columns,
+                timestamp_column,
+            );
 
             result.insert(
                 pk.clone(),
@@ -394,16 +355,7 @@ impl PluginAdapter for HttpSqlAdapter {
         }
 
         let info = self.cached_table_info(table).await?;
-        let pk_expr = if info.primary_key.len() == 1 {
-            format!("CAST(\"{}\" AS TEXT)", info.primary_key[0])
-        } else {
-            let parts: Vec<String> = info
-                .primary_key
-                .iter()
-                .map(|k| format!("CAST(\"{}\" AS TEXT)", k))
-                .collect();
-            parts.join(" || '|' || ")
-        };
+        let pk_expr = smugglr_core::rowhash::pk_text_expr(&info.primary_key);
 
         let placeholders: Vec<String> = pk_values.iter().map(|_| "?".to_string()).collect();
         let params: Vec<Value> = pk_values.iter().map(|v| Value::String(v.clone())).collect();
@@ -477,10 +429,10 @@ mod tests {
         row.insert("name".into(), Value::from("alice"));
         row.insert("updated_at".into(), Value::from("2026-01-01"));
 
-        let hash1 = HttpSqlAdapter::content_hash(&row, &cols, &[], "updated_at");
+        let hash1 = smugglr_core::rowhash::content_hash(&row, &cols, &[], "updated_at");
 
         row.insert("updated_at".into(), Value::from("2026-12-31"));
-        let hash2 = HttpSqlAdapter::content_hash(&row, &cols, &[], "updated_at");
+        let hash2 = smugglr_core::rowhash::content_hash(&row, &cols, &[], "updated_at");
 
         assert_eq!(hash1, hash2);
     }
@@ -493,10 +445,12 @@ mod tests {
         row.insert("name".into(), Value::from("alice"));
         row.insert("embedding".into(), Value::from("big blob"));
 
-        let hash1 = HttpSqlAdapter::content_hash(&row, &cols, &["embedding".into()], "updated_at");
+        let hash1 =
+            smugglr_core::rowhash::content_hash(&row, &cols, &["embedding".into()], "updated_at");
 
         row.insert("embedding".into(), Value::from("different blob"));
-        let hash2 = HttpSqlAdapter::content_hash(&row, &cols, &["embedding".into()], "updated_at");
+        let hash2 =
+            smugglr_core::rowhash::content_hash(&row, &cols, &["embedding".into()], "updated_at");
 
         assert_eq!(hash1, hash2);
     }
@@ -508,10 +462,10 @@ mod tests {
         row.insert("id".into(), Value::from(1));
         row.insert("name".into(), Value::from("alice"));
 
-        let hash1 = HttpSqlAdapter::content_hash(&row, &cols, &[], "updated_at");
+        let hash1 = smugglr_core::rowhash::content_hash(&row, &cols, &[], "updated_at");
 
         row.insert("name".into(), Value::from("bob"));
-        let hash2 = HttpSqlAdapter::content_hash(&row, &cols, &[], "updated_at");
+        let hash2 = smugglr_core::rowhash::content_hash(&row, &cols, &[], "updated_at");
 
         assert_ne!(hash1, hash2);
     }

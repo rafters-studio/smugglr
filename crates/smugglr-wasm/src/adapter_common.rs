@@ -5,12 +5,16 @@
 //! These functions are self-free (no adapter state) so they live here once
 //! and are called from both adapters as `adapter_common::<fn>`.
 
-use sha2::{Digest, Sha256};
-use smugglr_core::config::column_excluded;
 use smugglr_core::datasource::{ColumnInfo, RowMeta, TableInfo};
 use std::collections::HashMap;
 
 use serde_json::Value;
+
+// Row content hash and primary-key text expression -- the one canonical
+// definition lives in smugglr-core::rowhash so the native, plugin, and wasm
+// paths cannot drift. Re-exported under the names this crate already uses.
+pub(crate) use smugglr_core::rowhash::content_hash;
+pub(crate) use smugglr_core::rowhash::pk_text_expr as build_pk_text_expr;
 
 /// Parse the rows of a `PRAGMA table_info(...)` result into a [`TableInfo`].
 ///
@@ -72,23 +76,6 @@ pub(crate) fn rows_to_maps(columns: &[String], rows: &[Vec<Value>]) -> Vec<HashM
         .collect()
 }
 
-/// Build a SQLite expression that casts primary key columns to TEXT.
-///
-/// For single-column PKs this is `CAST("col" AS TEXT)`. For composite PKs
-/// the parts are joined with `|` to produce a stable string form matching
-/// the rest of smugglr's primary key encoding.
-pub(crate) fn build_pk_text_expr(primary_key: &[String]) -> String {
-    if primary_key.len() == 1 {
-        format!("CAST(\"{}\" AS TEXT)", primary_key[0])
-    } else {
-        primary_key
-            .iter()
-            .map(|k| format!("CAST(\"{}\" AS TEXT)", k))
-            .collect::<Vec<_>>()
-            .join(" || '|' || ")
-    }
-}
-
 /// Convert result rows (each with a synthetic `__pk` column) into RowMeta
 /// entries keyed by primary key. Used by both full-scan and incremental
 /// metadata fetches.
@@ -121,39 +108,6 @@ pub(crate) fn row_maps_to_metadata(
         );
     }
     result
-}
-
-/// Content hash matching smugglr-core local.rs exactly, including the
-/// glob-pattern column exclusion (via `column_excluded`) -- exact-string
-/// matching here would diverge from transfer-time stripping and produce
-/// phantom `content_differs` for glob-excluded columns.
-pub(crate) fn content_hash(
-    row: &HashMap<String, Value>,
-    columns_in_order: &[String],
-    exclude: &[String],
-    timestamp_column: &str,
-) -> String {
-    let timestamp_columns = ["updated_at", "created_at"];
-    let mut hasher = Sha256::new();
-    for col in columns_in_order {
-        if timestamp_columns.contains(&col.as_str())
-            || column_excluded(col, exclude)
-            || col == timestamp_column
-        {
-            continue;
-        }
-        if let Some(val) = row.get(col) {
-            match val {
-                Value::Null => {}
-                Value::String(s) => hasher.update(s.as_bytes()),
-                Value::Number(n) => hasher.update(n.to_string().as_bytes()),
-                Value::Bool(b) => hasher.update(if *b { "1" } else { "0" }.as_bytes()),
-                other => hasher.update(other.to_string().as_bytes()),
-            }
-        }
-        hasher.update(b"|");
-    }
-    hex::encode(hasher.finalize())
 }
 
 /// Build an `INSERT OR REPLACE` batch statement plus its flattened params.
