@@ -8,7 +8,7 @@ use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Wrapper for local SQLite database
 pub struct LocalDb {
@@ -185,7 +185,17 @@ fn get_row_metadata_inner(
 
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
-        let pk_value = row.get::<_, Option<String>>(0)?.unwrap_or_default();
+        // A NULL `__pk` (a NULL part in a composite PK, since `||` propagates
+        // NULL) cannot key pk-based sync. Coercing it to "" would collapse every
+        // such row onto one map entry, silently dropping rows and provoking
+        // spurious deletes. Skip and warn instead.
+        let pk_value = match row.get::<_, Option<String>>(0)? {
+            Some(pk) => pk,
+            None => {
+                warn!("skipping row in {} with NULL primary key", table);
+                continue;
+            }
+        };
 
         // Build the column->JSON map (cols start at index 1, after __pk).
         let mut row_map: HashMap<String, JsonValue> = HashMap::with_capacity(column_order.len());
@@ -201,24 +211,40 @@ fn get_row_metadata_inner(
         );
 
         // updated_at carries either an integer Unix timestamp or a string.
+        // get_json_value only ever yields Null/Number/String, so the catch-all
+        // is defensive against a future extension silently dropping a timestamp.
         let updated_at: Option<String> = if has_timestamp {
             match row_map.get(timestamp_column) {
                 Some(JsonValue::Number(n)) => Some(n.to_string()),
                 Some(JsonValue::String(s)) => Some(s.clone()),
-                _ => None,
+                Some(JsonValue::Null) | None => None,
+                Some(other) => {
+                    warn!(
+                        "unexpected value type for timestamp column {} in {}: {}",
+                        timestamp_column, table, other
+                    );
+                    None
+                }
             }
         } else {
             None
         };
 
-        result.insert(
+        if let Some(prev) = result.insert(
             pk_value.clone(),
             RowMeta {
-                pk_value,
+                pk_value: pk_value.clone(),
                 updated_at,
                 content_hash,
             },
-        );
+        ) {
+            // Two rows rendering to the same PK text means the PK is not unique
+            // as encoded -- the metadata map silently lost `prev`. Surface it.
+            warn!(
+                "duplicate primary key {} in {} -- a row was overwritten in change metadata (prev hash {})",
+                pk_value, table, prev.content_hash
+            );
+        }
     }
 
     debug!("Got {} rows from {}", result.len(), table);
