@@ -44,7 +44,10 @@ pub async fn run_broadcast(
     let _pid_lock = PidLock::acquire(&pid_path)?;
 
     let instance_id = broadcast_config.resolve_instance_id();
-    let interval_secs = broadcast_config.interval_secs;
+    // `tokio::time::interval` panics on a zero period; clamp defensively so a
+    // `--interval 0` (or a config carrying interval_secs == 0) cannot crash the
+    // daemon.
+    let interval_secs = broadcast_config.interval_secs.max(1);
 
     info!(
         "Starting masterless multicast sync (group {}, port {}, interval {}s, instance {}, dry_run {})",

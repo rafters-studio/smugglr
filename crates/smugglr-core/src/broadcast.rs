@@ -108,7 +108,7 @@ impl BroadcastConfig {
 
     /// Peer TTL based on broadcast interval.
     pub fn peer_ttl(&self) -> Duration {
-        Duration::from_secs(self.interval_secs * PEER_TTL_MULTIPLIER)
+        Duration::from_secs(self.interval_secs.saturating_mul(PEER_TTL_MULTIPLIER))
     }
 
     /// Parse the hex-encoded secret into a 256-bit key for multicast encryption.
@@ -832,6 +832,25 @@ mod tests {
         let bytes = original.to_bytes().expect("serialize");
         let decoded = Announcement::from_bytes(&bytes).expect("deserialize");
         assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn peer_ttl_saturates_instead_of_overflowing() {
+        // Regression for #194: interval_secs is operator-controlled with no upper
+        // bound, so interval_secs * PEER_TTL_MULTIPLIER can overflow u64 --
+        // panicking in debug, wrapping to a tiny TTL in release. saturating_mul
+        // pins it to the max instead.
+        let bc = BroadcastConfig {
+            interval_secs: u64::MAX,
+            ..BroadcastConfig::default()
+        };
+        assert_eq!(bc.peer_ttl(), Duration::from_secs(u64::MAX));
+
+        let bc = BroadcastConfig {
+            interval_secs: 30,
+            ..BroadcastConfig::default()
+        };
+        assert_eq!(bc.peer_ttl(), Duration::from_secs(30 * PEER_TTL_MULTIPLIER));
     }
 
     #[test]

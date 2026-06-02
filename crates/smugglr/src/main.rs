@@ -306,7 +306,7 @@ enum Commands {
     /// Watch for changes and sync periodically (daemon mode)
     Watch {
         /// Sync interval in seconds
-        #[arg(short, long, default_value = "30")]
+        #[arg(short, long, default_value = "30", value_parser = clap::value_parser!(u64).range(1..=86400))]
         interval: u64,
 
         /// Show what would be synced without actually syncing
@@ -341,7 +341,7 @@ enum Commands {
         port: Option<u16>,
 
         /// Sync interval in seconds
-        #[arg(short, long)]
+        #[arg(short, long, value_parser = clap::value_parser!(u64).range(1..=86400))]
         interval: Option<u64>,
 
         /// Run a single sync cycle and exit
@@ -795,28 +795,49 @@ fn print_diff_category(label: &str, keys: &[String]) {
     }
 }
 
-/// Connect to a data source and collect per-table row counts for `status`.
+/// Collect per-table row counts for `status` from an already-open data source.
 ///
-/// Returns a connected `StatusDb` with row counts for every synced table.
-/// Connection failures are handled by the caller (which builds the
-/// disconnected `StatusDb` variant).
-async fn gather_status<D: DataSource>(db: &D, config: &Config) -> error::Result<StatusDb> {
-    let tables = db.list_tables().await?;
+/// The connection has already succeeded by the time this is called, so a
+/// post-connection failure (locked table, transient plugin RPC error, etc.)
+/// must NOT abort the whole status report -- `status` is designed to degrade
+/// gracefully and always report both sides. A list_tables/row_count failure
+/// here is captured as `connected: true` with an `error` string and whatever
+/// table counts were gathered before the failure, mirroring the disconnected
+/// `StatusDb` the caller builds when `open` itself fails (#192).
+async fn gather_status<D: DataSource>(db: &D, config: &Config) -> StatusDb {
+    let tables = match db.list_tables().await {
+        Ok(tables) => tables,
+        Err(e) => {
+            return StatusDb {
+                connected: true,
+                error: Some(e.to_string()),
+                tables: vec![],
+            }
+        }
+    };
     let mut table_rows = Vec::new();
     for table in &tables {
         if config.should_sync_table(table) {
-            let count = db.row_count(table).await?;
-            table_rows.push(StatusTable {
-                name: table.clone(),
-                rows: count,
-            });
+            match db.row_count(table).await {
+                Ok(count) => table_rows.push(StatusTable {
+                    name: table.clone(),
+                    rows: count,
+                }),
+                Err(e) => {
+                    return StatusDb {
+                        connected: true,
+                        error: Some(e.to_string()),
+                        tables: table_rows,
+                    }
+                }
+            }
         }
     }
-    Ok(StatusDb {
+    StatusDb {
         connected: true,
         error: None,
         tables: table_rows,
-    })
+    }
 }
 
 async fn run_status(
@@ -831,7 +852,7 @@ async fn run_status(
 
     // Gather local DB info
     let local_status = match LocalDb::open_readonly(config.local_db_path()) {
-        Ok(local) => gather_status(&local, config).await?,
+        Ok(local) => gather_status(&local, config).await,
         Err(e) => StatusDb {
             connected: false,
             error: Some(e.to_string()),
@@ -841,7 +862,7 @@ async fn run_status(
 
     // Gather target info
     let target_status = match TargetSource::open(&target, false).await {
-        Ok(remote) => gather_status(&remote, config).await?,
+        Ok(remote) => gather_status(&remote, config).await,
         Err(e) => StatusDb {
             connected: false,
             error: Some(e.to_string()),
@@ -1146,4 +1167,153 @@ async fn run_restore(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    /// Regression for #190/#194: `watch --interval 0` must be rejected at parse
+    /// time rather than reaching `tokio::time::interval`, which panics on a zero
+    /// period. The clap range also caps the upper bound that drives peer_ttl.
+    #[test]
+    fn watch_interval_zero_is_rejected_at_parse() {
+        let result = Cli::try_parse_from(["smugglr", "watch", "--interval", "0"]);
+        let err = match result {
+            Ok(_) => panic!("interval 0 must be rejected"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+
+        // A sane interval still parses.
+        let cli = Cli::try_parse_from(["smugglr", "watch", "--interval", "30"])
+            .unwrap_or_else(|e| panic!("interval 30 parses: {e}"));
+        match cli.command {
+            Commands::Watch { interval, .. } => assert_eq!(interval, 30),
+            _ => panic!("expected watch command"),
+        }
+    }
+
+    /// Regression for #190/#194: `broadcast --interval 0` is likewise rejected at
+    /// parse time; the same construction lives in run_broadcast's loop.
+    #[test]
+    fn broadcast_interval_zero_is_rejected_at_parse() {
+        let result = Cli::try_parse_from(["smugglr", "broadcast", "--interval", "0"]);
+        let err = match result {
+            Ok(_) => panic!("interval 0 must be rejected"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    /// A `DataSource` whose connection has succeeded (`list_tables` works) but
+    /// whose `row_count` fails on a specific table -- modelling a locked table or
+    /// a transient plugin RPC error after a successful open.
+    struct FlakyRowCount {
+        tables: Vec<String>,
+        fail_on: &'static str,
+    }
+
+    impl DataSource for FlakyRowCount {
+        async fn list_tables(&self) -> error::Result<Vec<String>> {
+            Ok(self.tables.clone())
+        }
+
+        async fn table_info(&self, _table: &str) -> error::Result<TableInfo> {
+            unreachable!("status does not call table_info")
+        }
+
+        async fn get_row_metadata(
+            &self,
+            _table: &str,
+            _timestamp_column: &str,
+            _exclude_columns: &[String],
+        ) -> error::Result<HashMap<String, RowMeta>> {
+            unreachable!("status does not call get_row_metadata")
+        }
+
+        async fn get_rows(
+            &self,
+            _table: &str,
+            _pk_values: &[String],
+        ) -> error::Result<Vec<HashMap<String, JsonValue>>> {
+            unreachable!("status does not call get_rows")
+        }
+
+        async fn upsert_rows(
+            &self,
+            _table: &str,
+            _rows: &[HashMap<String, JsonValue>],
+        ) -> error::Result<usize> {
+            unreachable!("status does not call upsert_rows")
+        }
+
+        async fn row_count(&self, table: &str) -> error::Result<usize> {
+            if table == self.fail_on {
+                Err(error::SyncError::Config(format!(
+                    "table '{table}' is locked"
+                )))
+            } else {
+                Ok(7)
+            }
+        }
+    }
+
+    fn test_config() -> Config {
+        Config {
+            cloudflare_account_id: None,
+            cloudflare_api_token: None,
+            database_id: None,
+            local_db: Some("game.db".to_string()),
+            sync: smugglr_core::config::SyncConfig::default(),
+            stash: None,
+            target: None,
+            broadcast: None,
+        }
+    }
+
+    /// Regression for #192: a post-connection failure (row_count erroring) must
+    /// not abort the whole status report. `gather_status` reports the side as
+    /// connected with an error string instead of bubbling the error out.
+    #[tokio::test]
+    async fn gather_status_reports_partial_on_row_count_error() {
+        let db = FlakyRowCount {
+            tables: vec!["abilities".into(), "items".into()],
+            fail_on: "items",
+        };
+        let config = test_config();
+
+        let status = gather_status(&db, &config).await;
+
+        assert!(
+            status.connected,
+            "connection succeeded, so connected stays true"
+        );
+        assert!(
+            status.error.is_some(),
+            "the row_count failure must surface as an error string"
+        );
+        // The table counted before the failure is preserved.
+        assert_eq!(status.tables.len(), 1);
+        assert_eq!(status.tables[0].name, "abilities");
+        assert_eq!(status.tables[0].rows, 7);
+    }
+
+    /// Companion to #192: when every table counts cleanly, the status is fully
+    /// connected with no error.
+    #[tokio::test]
+    async fn gather_status_reports_all_tables_on_success() {
+        let db = FlakyRowCount {
+            tables: vec!["abilities".into(), "items".into()],
+            fail_on: "__none__",
+        };
+        let config = test_config();
+
+        let status = gather_status(&db, &config).await;
+
+        assert!(status.connected);
+        assert!(status.error.is_none());
+        assert_eq!(status.tables.len(), 2);
+    }
 }
