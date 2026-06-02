@@ -88,13 +88,25 @@ interface WasmSmugglr {
  * // Point to a CDN-hosted binary
  * import { setWasm } from "smugglr";
  * const mod = await import("smugglr/wasm");
- * await mod.default("https://cdn.example.com/smugglr_wasm_bg.wasm");
- * setWasm(mod);
+ * await setWasm(mod, "https://cdn.example.com/smugglr_wasm_bg.wasm");
  * ```
+ *
+ * @param input Optional argument forwarded to the wasm-bindgen `default()`
+ *   initializer (a URL/path to the `.wasm` binary, a fetched `Response`, a
+ *   `BufferSource`, or a compiled `WebAssembly.Module`). Omit it to use the
+ *   module's default-resolved binary.
  */
-export function setWasm(mod: WasmModule): void {
+export async function setWasm(
+  mod: WasmModule,
+  input?: RequestInfo | URL | BufferSource | WebAssembly.Module,
+): Promise<WasmModule> {
+  // Actually instantiate the WebAssembly instance. Without this the
+  // wasm-bindgen glue is loaded but no memory/exports exist, so the first
+  // Smugglr.init() faults against an uninitialized module.
+  await mod.default(input);
   wasmModule = mod;
   wasmReady = Promise.resolve(mod);
+  return mod;
 }
 
 async function loadWasm(options?: InitOptions): Promise<WasmModule> {
@@ -115,7 +127,13 @@ async function loadWasm(options?: InitOptions): Promise<WasmModule> {
     await mod.default(options?.wasmUrl);
     wasmModule = mod;
     return mod;
-  })();
+  })().catch((e) => {
+    // A transient load failure (network blip, CDN 503) must not brick init
+    // forever. Clear the cached rejected promise so a later init() can retry.
+    wasmReady = null;
+    wasmModule = null;
+    throw e;
+  });
 
   return wasmReady;
 }
@@ -124,6 +142,10 @@ async function loadWasm(options?: InitOptions): Promise<WasmModule> {
 export class Smugglr {
   private inner: WasmSmugglr;
   private auto: AutoSyncRuntime | null = null;
+  private disposed = false;
+  // Unsubscribe wrappers handed out by on(). dispose() neutralizes them so a
+  // stale handle invoked after free() cannot deref freed WASM memory.
+  private unsubs = new Set<() => void>();
 
   private constructor(inner: WasmSmugglr) {
     this.inner = inner;
@@ -239,8 +261,22 @@ export class Smugglr {
     event: K,
     handler: (e: SmugglrEventMap[K]) => void,
   ): Unsubscribe {
+    if (this.disposed) {
+      throw new SmugglrError("Smugglr.on() called after dispose()", 1);
+    }
     const wrapped = (raw: unknown) => handler(raw as SmugglrEventMap[K]);
-    return this.inner.on(event, wrapped);
+    const innerUnsub = this.inner.on(event, wrapped);
+    // The inner unsubscribe dereferences a raw pointer back into the Rust
+    // Smugglr (crates/smugglr-wasm/src/lib.rs on()). Once dispose() has called
+    // free(), that pointer is dangling. Guard so a post-dispose unsubscribe is
+    // a safe no-op instead of a use-after-free.
+    const guarded: Unsubscribe = () => {
+      if (this.disposed) return;
+      this.unsubs.delete(guarded);
+      innerUnsub();
+    };
+    this.unsubs.add(guarded);
+    return guarded;
   }
 
   /**
@@ -310,7 +346,14 @@ export class Smugglr {
 
   /** Release WASM resources. Called automatically if using `using` syntax. */
   dispose(): void {
+    if (this.disposed) return;
     this.stopAutoSync();
+    // Drain listeners on the JS side and neutralize outstanding unsubscribe
+    // handles BEFORE free(), so any handle a consumer still holds becomes an
+    // inert no-op rather than a deref of freed WASM memory.
+    for (const unsub of this.unsubs) unsub();
+    this.unsubs.clear();
+    this.disposed = true;
     this.inner.free();
   }
 

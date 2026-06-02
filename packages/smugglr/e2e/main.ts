@@ -10,6 +10,10 @@ declare global {
       syncWithAuthSwap(opts: unknown): Promise<unknown>;
       anonymousMode(): Promise<unknown>;
       autoSync(opts: unknown): Promise<unknown>;
+      autoSyncRetryIsolation(): Promise<unknown>;
+      unsubAfterDispose(opts: unknown): Promise<unknown>;
+      setWasmInitsModule(opts: unknown): Promise<unknown>;
+      loadWasmTransientRetry(): Promise<unknown>;
       reset(): Promise<unknown>;
     };
   }
@@ -46,6 +50,10 @@ window.e2e = {
   syncWithAuthSwap: (opts) => call("syncWithAuthSwap", [opts]),
   anonymousMode: () => call("anonymousMode", []),
   autoSync: (opts) => call("autoSync", [opts]),
+  autoSyncRetryIsolation: () => call("autoSyncRetryIsolation", []),
+  unsubAfterDispose: (opts) => call("unsubAfterDispose", [opts]),
+  setWasmInitsModule: (opts) => call("setWasmInitsModule", [opts]),
+  loadWasmTransientRetry: () => call("loadWasmTransientRetry", []),
   reset: () => call("reset", []),
 };
 
