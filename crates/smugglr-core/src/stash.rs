@@ -149,15 +149,41 @@ async fn upload_relay(
 
     let payload = PutPayload::from(data);
 
-    // First upload (no existing relay) -- unconditional put
+    // First upload (no existing relay) -- conditional create so a concurrent
+    // first stash from another machine cannot silently clobber this one.
     let Some(tag) = etag else {
-        debug!("Uploading relay (first upload)");
-        store
-            .put(path, payload)
-            .await
-            .map_err(|e| SyncError::Stash(format!("Failed to upload relay to {}: {}", path, e)))?;
-        info!("Relay uploaded successfully");
-        return Ok(());
+        debug!("Uploading relay (first upload, create-if-absent)");
+        let opts = PutOptions {
+            mode: PutMode::Create,
+            ..Default::default()
+        };
+        match store.put_opts(path, payload.clone(), opts).await {
+            Ok(_) => {
+                info!("Relay uploaded successfully");
+                return Ok(());
+            }
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                return Err(SyncError::ConcurrentWrite);
+            }
+            Err(object_store::Error::NotImplemented) => {
+                // Backend does not support conditional creates (e.g., local filesystem).
+                warn!(
+                    "Backend does not support conditional creates. \
+                     Concurrent first stash from multiple machines may overwrite each other."
+                );
+                store.put(path, payload).await.map_err(|e| {
+                    SyncError::Stash(format!("Failed to upload relay to {}: {}", path, e))
+                })?;
+                info!("Relay uploaded successfully (unconditional)");
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(SyncError::Stash(format!(
+                    "Failed to upload relay to {}: {}",
+                    path, e
+                )));
+            }
+        }
     };
 
     // Subsequent upload -- conditional put with ETag to prevent concurrent overwrites
@@ -1202,6 +1228,49 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].table, "items");
         assert_eq!(results[0].rows_pulled, 1); // only "beta" is new
+    }
+
+    // Regression for #185: a first upload (etag == None) must not blindly
+    // overwrite an object another machine already created in the same race.
+    // PutMode::Create surfaces the collision as ConcurrentWrite. The local
+    // filesystem backend supports conditional create, so this is observable.
+    #[tokio::test]
+    async fn test_upload_relay_first_upload_rejects_existing_object() {
+        let dir = TempDir::new().unwrap();
+        let store_dir = dir.path().join("relay_store");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        let config = StashConfig {
+            url: format!("file://{}/relay.sqlite", store_dir.display()),
+            access_key_id: None,
+            secret_access_key: None,
+            region: None,
+            endpoint: None,
+        };
+        let (store, path) = build_store(&config).unwrap();
+
+        // Machine A wins the race and creates the relay first.
+        let a_payload = dir.path().join("a.bin");
+        std::fs::write(&a_payload, b"machine-a-rows").unwrap();
+        upload_relay(store.as_ref(), &path, &a_payload, None)
+            .await
+            .unwrap();
+
+        // Machine B also saw etag == None and tries an unconditional first
+        // upload. It must be rejected, not silently clobber A's data.
+        let b_payload = dir.path().join("b.bin");
+        std::fs::write(&b_payload, b"machine-b-rows").unwrap();
+        let err = upload_relay(store.as_ref(), &path, &b_payload, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SyncError::ConcurrentWrite),
+            "expected ConcurrentWrite, got {:?}",
+            err
+        );
+
+        // A's data must survive intact.
+        let got = std::fs::read(store_dir.join("relay.sqlite")).unwrap();
+        assert_eq!(got, b"machine-a-rows");
     }
 
     fn default_excludes() -> Vec<String> {

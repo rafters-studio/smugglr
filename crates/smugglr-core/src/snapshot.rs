@@ -13,7 +13,7 @@ use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, PutPayload};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// A snapshot's metadata: the sidecar stored alongside each snapshot, and the
 /// value returned by `snapshot`, `restore`, and `list_snapshots` (the JSON shape
@@ -47,6 +47,16 @@ fn snapshots_prefix(relay_path: &ObjectPath) -> ObjectPath {
     }
 }
 
+/// A short random hex suffix used to make snapshot keys unique within a
+/// millisecond. Kept short (8 hex chars) since it only needs to break ties
+/// between snapshots taken in the same instant, not be globally unique.
+fn snapshot_suffix() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 4];
+    rand::rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
 /// Create a point-in-time snapshot of the local database.
 pub async fn snapshot(
     config: &StashConfig,
@@ -57,9 +67,14 @@ pub async fn snapshot(
     let prefix = snapshots_prefix(&relay_path);
 
     let local = LocalDb::open_readonly(local_db_path)?;
-    let timestamp = chrono::Utc::now()
-        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-        .to_string();
+    // Millisecond resolution alone collides when two snapshots fire in the same
+    // ms (watch loop, scripted double-fire); a short random suffix disambiguates
+    // while keeping the timestamp prefix lexically sortable.
+    let timestamp = format!(
+        "{}-{}",
+        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ"),
+        snapshot_suffix()
+    );
 
     // Gather table metadata
     let all_tables = local.list_tables().await?;
@@ -132,29 +147,55 @@ pub async fn list_snapshots(config: &StashConfig) -> Result<Vec<SnapshotMeta>> {
             continue;
         }
 
-        // Download and parse metadata
-        match store.get(&obj.location).await {
-            Ok(result) => {
-                let bytes = result.bytes().await.map_err(|e| {
-                    SyncError::Stash(format!("Failed to read snapshot metadata: {}", e))
-                })?;
-                match serde_json::from_slice::<SnapshotMeta>(&bytes) {
-                    Ok(meta) => {
-                        entries.push(meta);
-                    }
-                    Err(e) => {
-                        debug!("Skipping malformed metadata at {}: {}", path_str, e);
-                    }
-                }
-            }
-            Err(e) => {
-                debug!("Failed to read metadata at {}: {}", path_str, e);
-            }
+        // Fetch the sidecar bytes, folding the get() and bytes() errors into one
+        // result so a single classifier decides skip-vs-propagate.
+        let bytes_result = match store.get(&obj.location).await {
+            Ok(result) => result.bytes().await.map(|b| b.to_vec()),
+            Err(e) => Err(e),
+        };
+        if let Some(meta) = parse_snapshot_meta_entry(path_str, bytes_result)? {
+            entries.push(meta);
         }
     }
 
     entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
     Ok(entries)
+}
+
+/// Classify one snapshot sidecar fetch into "use it", "skip it", or "fail the
+/// whole listing".
+///
+/// - A missing sidecar (`NotFound`) is skipped: the snapshot blob may exist
+///   without its metadata, and that should not abort the list.
+/// - Any OTHER fetch error (throttling, 5xx, timeout) is propagated: silently
+///   skipping it could drive `restore` to an older snapshot or a false "none
+///   found" -- the exact silent-drop #187 exists to prevent.
+/// - A malformed sidecar (valid fetch, bad JSON) is skipped but WARNED, so a
+///   corrupt metadata file is visible rather than invisible.
+fn parse_snapshot_meta_entry(
+    path_str: &str,
+    bytes_result: std::result::Result<Vec<u8>, object_store::Error>,
+) -> Result<Option<SnapshotMeta>> {
+    match bytes_result {
+        Ok(bytes) => match serde_json::from_slice::<SnapshotMeta>(&bytes) {
+            Ok(meta) => Ok(Some(meta)),
+            Err(e) => {
+                warn!(
+                    "Skipping malformed snapshot metadata at {}: {}",
+                    path_str, e
+                );
+                Ok(None)
+            }
+        },
+        Err(object_store::Error::NotFound { .. }) => {
+            debug!("Snapshot metadata missing at {}, skipping", path_str);
+            Ok(None)
+        }
+        Err(e) => Err(SyncError::Stash(format!(
+            "Failed to read snapshot metadata at {}: {}",
+            path_str, e
+        ))),
+    }
 }
 
 /// Restore a snapshot to the local database path.
@@ -245,13 +286,24 @@ pub async fn restore(
                 e
             ))
         })?;
-        conn.execute_batch("SELECT 1").map_err(|e| {
+        // Walk the b-trees, not just the header: quick_check is far cheaper
+        // than integrity_check but still detects truncation and corrupt pages.
+        let check: String = conn
+            .query_row("PRAGMA quick_check", [], |r| r.get(0))
+            .map_err(|e| {
+                let _ = std::fs::remove_file(&temp_path);
+                SyncError::Stash(format!(
+                    "Downloaded snapshot is not a valid SQLite database: {}",
+                    e
+                ))
+            })?;
+        if check != "ok" {
             let _ = std::fs::remove_file(&temp_path);
-            SyncError::Stash(format!(
-                "Downloaded snapshot is not a valid SQLite database: {}",
-                e
-            ))
-        })?;
+            return Err(SyncError::Stash(format!(
+                "Downloaded snapshot failed integrity check: {}",
+                check
+            )));
+        }
     }
 
     std::fs::rename(&temp_path, local_path).map_err(|e| {
@@ -587,5 +639,162 @@ mod tests {
         let path = ObjectPath::from("relay.sqlite");
         let prefix = snapshots_prefix(&path);
         assert_eq!(prefix.as_ref(), "snapshots");
+    }
+
+    // Regression for #186: restore must reject a structurally-broken database
+    // (corrupt b-tree pages) that passes a bare header/`SELECT 1` check but
+    // fails PRAGMA quick_check, rather than renaming it over the live db.
+    #[tokio::test]
+    async fn test_restore_rejects_corrupt_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let local_path = dir.path().join("local.sqlite");
+        let snap_dir = dir.path().join("snap_store");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+
+        create_test_db(&local_path, &[(1, "good", "2024-01-01")]);
+        let config = make_file_stash_config(&snap_dir);
+
+        // Take a real snapshot so list/select succeed, then overwrite the
+        // uploaded .sqlite payload with a corrupt-but-header-valid file:
+        // copy a valid header from a real db, then truncate/zero the body so
+        // the b-tree pages are torn. `SELECT 1` passes; quick_check must not.
+        let snap = snapshot(&config, local_path.to_str().unwrap(), false)
+            .await
+            .unwrap();
+
+        let snap_obj = snap_dir
+            .join("snapshots")
+            .join(format!("{}.sqlite", snap.timestamp));
+        let mut good = std::fs::read(&snap_obj).unwrap();
+        // Keep the first SQLite page header (100 bytes) intact, corrupt the rest.
+        assert!(good.len() > 200, "snapshot should be larger than a header");
+        for b in good.iter_mut().skip(100) {
+            *b = 0xFF;
+        }
+        std::fs::write(&snap_obj, &good).unwrap();
+
+        let result = restore(
+            &config,
+            local_path.to_str().unwrap(),
+            &snap.timestamp,
+            false,
+        )
+        .await;
+
+        assert!(result.is_err(), "corrupt snapshot must not restore");
+        assert!(matches!(result.unwrap_err(), SyncError::Stash(_)));
+
+        // The live database must be untouched (temp file removed, no rename).
+        let conn =
+            Connection::open_with_flags(&local_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "live db preserved when snapshot is corrupt");
+    }
+
+    // Regression for #188: two snapshots taken back-to-back (potentially within
+    // the same millisecond) must produce distinct object keys so neither
+    // clobbers the other.
+    #[tokio::test]
+    async fn test_consecutive_snapshots_have_unique_keys() {
+        let dir = TempDir::new().unwrap();
+        let local_path = dir.path().join("local.sqlite");
+        let snap_dir = dir.path().join("snap_store");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+
+        create_test_db(&local_path, &[(1, "alpha", "2024-01-01")]);
+        let config = make_file_stash_config(&snap_dir);
+
+        let a = snapshot(&config, local_path.to_str().unwrap(), false)
+            .await
+            .unwrap();
+        let b = snapshot(&config, local_path.to_str().unwrap(), false)
+            .await
+            .unwrap();
+
+        assert_ne!(
+            a.timestamp, b.timestamp,
+            "snapshot keys must be unique even within the same millisecond"
+        );
+
+        // Both snapshots' files must coexist (4 objects: 2x .sqlite + 2x .meta.json).
+        let list = list_snapshots(&config).await.unwrap();
+        assert_eq!(list.len(), 2, "both snapshots survive without overwrite");
+    }
+
+    // Regression for #187: a malformed (parse-failing) sidecar is skipped, but
+    // that is the *only* swallow path -- a non-NotFound read error now
+    // propagates. Here we assert the skip path still works so a single bad
+    // sidecar does not abort the whole list.
+    #[tokio::test]
+    async fn test_list_snapshots_skips_malformed_sidecar() {
+        let dir = TempDir::new().unwrap();
+        let local_path = dir.path().join("local.sqlite");
+        let snap_dir = dir.path().join("snap_store");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+
+        create_test_db(&local_path, &[(1, "alpha", "2024-01-01")]);
+        let config = make_file_stash_config(&snap_dir);
+
+        let good = snapshot(&config, local_path.to_str().unwrap(), false)
+            .await
+            .unwrap();
+
+        // Drop a malformed sidecar alongside the good one.
+        let snaps = snap_dir.join("snapshots");
+        std::fs::write(snaps.join("9999-garbage.meta.json"), b"not json").unwrap();
+
+        let list = list_snapshots(&config).await.unwrap();
+        assert_eq!(list.len(), 1, "malformed sidecar skipped, good one kept");
+        assert_eq!(list[0].timestamp, good.timestamp);
+    }
+
+    fn sample_meta_bytes() -> Vec<u8> {
+        serde_json::to_vec(&SnapshotMeta {
+            timestamp: "2026-01-01T00:00:00.000Z-abcd1234".into(),
+            size_bytes: 10,
+            tables: vec![SnapshotTableMeta {
+                name: "items".into(),
+                row_count: 1,
+            }],
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn meta_entry_good_json_is_parsed() {
+        let got = parse_snapshot_meta_entry("p.meta.json", Ok(sample_meta_bytes())).unwrap();
+        assert_eq!(got.unwrap().timestamp, "2026-01-01T00:00:00.000Z-abcd1234");
+    }
+
+    #[test]
+    fn meta_entry_malformed_json_is_skipped() {
+        let got = parse_snapshot_meta_entry("p.meta.json", Ok(b"not json".to_vec())).unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn meta_entry_not_found_is_skipped() {
+        let err = object_store::Error::NotFound {
+            path: "p.meta.json".into(),
+            source: "missing".into(),
+        };
+        let got = parse_snapshot_meta_entry("p.meta.json", Err(err)).unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn meta_entry_transient_error_propagates() {
+        // THE #187 guard: a non-NotFound fetch error must fail the listing, not
+        // silently drop the snapshot. Fails on the pre-fix code, which debug-logged
+        // and continued.
+        let err = object_store::Error::Generic {
+            store: "test",
+            source: "503 slow down".into(),
+        };
+        let got = parse_snapshot_meta_entry("p.meta.json", Err(err));
+        assert!(matches!(got, Err(SyncError::Stash(_))));
     }
 }
