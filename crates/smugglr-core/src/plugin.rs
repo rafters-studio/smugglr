@@ -72,6 +72,36 @@ struct RpcError {
     message: String,
 }
 
+/// JSON-RPC error code a plugin uses to signal a transient/retryable failure.
+///
+/// MUST match `smugglr_plugin_sdk::TRANSIENT_ERROR_CODE` -- it is the wire
+/// contract between a plugin (which constructs the error via
+/// `PluginError::transient`) and the host (which routes it here). Duplicated
+/// rather than shared because core does not depend on the SDK crate; a shared
+/// wire crate would unify the two (see #228).
+const PLUGIN_TRANSIENT_ERROR_CODE: i64 = -32010;
+
+/// Map a plugin's JSON-RPC error onto a [`SyncError`].
+///
+/// A plugin's backend can fail transiently (HTTP 429/5xx, timeout); the plugin
+/// signals that with [`PLUGIN_TRANSIENT_ERROR_CODE`]. Such errors map to a
+/// retryable `ServerError` so `upsert_with_retry` backs off and retries, instead
+/// of the hardwired-non-retryable `SyncError::Plugin`. All other codes stay
+/// `Plugin` (permanent).
+fn rpc_error_to_sync_error(plugin_name: &str, err: &RpcError) -> SyncError {
+    if err.code == PLUGIN_TRANSIENT_ERROR_CODE {
+        SyncError::ServerError {
+            status: 503,
+            message: format!("plugin '{}': {}", plugin_name, err.message),
+        }
+    } else {
+        SyncError::Plugin(format!(
+            "Plugin '{}' error (code {}): {}",
+            plugin_name, err.code, err.message
+        ))
+    }
+}
+
 #[derive(Deserialize)]
 struct WireTableInfo {
     name: String,
@@ -210,10 +240,7 @@ impl PluginDataSource {
         }
 
         if let Some(err) = response.error {
-            return Err(SyncError::Plugin(format!(
-                "Plugin '{}' error (code {}): {}",
-                self.plugin_name, err.code, err.message
-            )));
+            return Err(rpc_error_to_sync_error(&self.plugin_name, &err));
         }
 
         let result = response.result.ok_or_else(|| {
@@ -455,5 +482,31 @@ mod tests {
         assert_eq!(meta.pk_value, "42");
         assert_eq!(meta.updated_at.unwrap(), "2026-04-03T12:00:00Z");
         assert_eq!(meta.content_hash, "abc123");
+    }
+
+    #[test]
+    fn transient_plugin_error_maps_to_retryable() {
+        // A plugin signalling the transient code becomes a retryable ServerError
+        // (so upsert_with_retry backs off), exit code 3.
+        let transient = rpc_error_to_sync_error(
+            "turso",
+            &RpcError {
+                code: PLUGIN_TRANSIENT_ERROR_CODE,
+                message: "429 from backend".into(),
+            },
+        );
+        assert!(transient.is_retryable());
+        assert_eq!(transient.exit_code(), 3);
+
+        // Any other code stays a permanent Plugin error.
+        let permanent = rpc_error_to_sync_error(
+            "turso",
+            &RpcError {
+                code: -32000,
+                message: "bad sql".into(),
+            },
+        );
+        assert!(!permanent.is_retryable());
+        assert!(matches!(permanent, SyncError::Plugin(_)));
     }
 }
