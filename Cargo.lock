@@ -1734,6 +1734,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smugglr-core",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
