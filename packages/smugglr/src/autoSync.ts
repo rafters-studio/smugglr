@@ -58,8 +58,13 @@ export function startAutoSync(opts: {
   const locks = g.navigator.locks;
 
   let stopped = false;
-  let attempt = 0;
-  let retryTimer: ReturnType<typeof setTimeout> | null = null;
+  // Each retry loop ("pull" from init, "sync" from online) backs off
+  // independently: a failing pull must not inflate the sync's next delay, and
+  // a new sync must not orphan the pull's pending retry timer.
+  const attempts: Record<"pull" | "sync", number> = { pull: 0, sync: 0 };
+  // Every live retry timer, so stop() can clear them all -- not just the
+  // most-recently-assigned one.
+  const retryTimers = new Set<ReturnType<typeof setTimeout>>();
   let onlineDebounce: ReturnType<typeof setTimeout> | null = null;
   const onlineHandler = () => {
     if (onlineDebounce !== null) clearTimeout(onlineDebounce);
@@ -74,7 +79,7 @@ export function startAutoSync(opts: {
       if (stopped) return;
       if (kind === "pull") await opts.target.pull();
       else await opts.target.sync();
-      attempt = 0;
+      attempts[kind] = 0;
     });
   }
 
@@ -84,8 +89,12 @@ export function startAutoSync(opts: {
       await runOnce(kind);
     } catch {
       if (stopped) return;
-      const delay = nextDelay(backoff, attempt++);
-      retryTimer = setTimeout(() => { void runWithRetry(kind); }, delay);
+      const delay = nextDelay(backoff, attempts[kind]++);
+      const timer: ReturnType<typeof setTimeout> = setTimeout(() => {
+        retryTimers.delete(timer);
+        void runWithRetry(kind);
+      }, delay);
+      retryTimers.add(timer);
     }
   }
 
@@ -105,7 +114,8 @@ export function startAutoSync(opts: {
     ready,
     stop() {
       stopped = true;
-      if (retryTimer !== null) clearTimeout(retryTimer);
+      for (const timer of retryTimers) clearTimeout(timer);
+      retryTimers.clear();
       if (onlineDebounce !== null) clearTimeout(onlineDebounce);
       if (onReconnect) g.removeEventListener?.("online", onlineHandler);
     },
