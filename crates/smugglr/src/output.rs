@@ -309,11 +309,11 @@ impl DiffOutput {
 }
 
 impl WatchTickOutput {
-    pub fn from_results(tick: u64, results: &[SyncResult]) -> Self {
+    pub fn from_results(tick: u64, results: &[SyncResult], dry_run: bool) -> Self {
         Self {
             command: "watch",
             tick,
-            status: Status::Ok,
+            status: if dry_run { Status::DryRun } else { Status::Ok },
             tables: results
                 .iter()
                 .filter(|r| r.has_changes())
@@ -419,7 +419,7 @@ mod tests {
             diff_detail: None,
         }];
 
-        let out = WatchTickOutput::from_results(5, &results);
+        let out = WatchTickOutput::from_results(5, &results, false);
         let json = serde_json::to_string(&out).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
 
@@ -783,13 +783,36 @@ mod tests {
             diff_stats: None,
             diff_detail: None,
         }];
-        let out = WatchTickOutput::from_results(5, &results);
+        let out = WatchTickOutput::from_results(5, &results, false);
         assert_eq!(
             serde_json::to_value(&out).unwrap(),
             json!({
                 "command": "watch",
                 "tick": 5,
                 "status": "ok",
+                "tables": [{ "name": "t", "rows_pushed": 3, "rows_pulled": 7 }]
+            })
+        );
+    }
+
+    #[test]
+    fn golden_watch_tick_dry_run_output() {
+        // Regression for #193: a dry-run watch tick must report status
+        // "dry_run", matching every other command's dry-run JSON contract.
+        let results = vec![SyncResult {
+            table: "t".into(),
+            rows_pushed: 3,
+            rows_pulled: 7,
+            diff_stats: None,
+            diff_detail: None,
+        }];
+        let out = WatchTickOutput::from_results(5, &results, true);
+        assert_eq!(
+            serde_json::to_value(&out).unwrap(),
+            json!({
+                "command": "watch",
+                "tick": 5,
+                "status": "dry_run",
                 "tables": [{ "name": "t", "rows_pushed": 3, "rows_pulled": 7 }]
             })
         );

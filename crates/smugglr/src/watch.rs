@@ -48,6 +48,11 @@ pub async fn run_watch(
         None
     };
 
+    // `tokio::time::interval` panics on a zero period; clamp defensively so a
+    // `--interval 0` (or any path that bypasses clap's range validation) cannot
+    // crash the daemon.
+    let interval_secs = interval_secs.max(1);
+
     let mut tick_count: u64 = 0;
     let mut interval = time::interval(Duration::from_secs(interval_secs));
 
@@ -76,7 +81,7 @@ pub async fn run_watch(
                         let total_pulled: usize = results.iter().map(|r| r.rows_pulled).sum();
 
                         if fmt == OutputFormat::Json {
-                            let out = WatchTickOutput::from_results(tick_count, &results);
+                            let out = WatchTickOutput::from_results(tick_count, &results, dry_run);
                             println!("{}", serde_json::to_string(&out).expect("WatchTickOutput is always serializable"));
                         } else if total_pushed > 0 || total_pulled > 0 {
                             info!(
@@ -104,8 +109,14 @@ pub async fn run_watch(
                         } else {
                             error!("Fatal error on tick #{}: {}", tick_count, e);
                             if fmt == OutputFormat::Json {
+                                // In JSON mode the WatchTickOutput error line is the single
+                                // failure record for this stream. Exit directly with the
+                                // SyncError's code rather than returning Err, which would make
+                                // main's `exit_json_error` emit a second, differently-shaped
+                                // ErrorOutput line for the same failure.
                                 let out = WatchTickOutput::from_error(tick_count, &e.to_string());
                                 println!("{}", serde_json::to_string(&out).expect("WatchTickOutput is always serializable"));
+                                std::process::exit(e.exit_code());
                             }
                             return Err(e);
                         }
