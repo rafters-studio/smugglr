@@ -36,3 +36,9 @@ serde_json = "1"
 serde-wasm-bindgen = "0.6"
 sha2 = "0.10"
 hex = "0.4"
+
+[dev-dependencies]
+# Lets the crate's tests actually run on the wasm32 target via `wasm-pack test`.
+# A plain `#[test]` here is dead -- host `cargo test` compiles the crate (which
+# is `#![cfg(target_arch = "wasm32")]`) to nothing. See #155.
+wasm-bindgen-test = "0.3"

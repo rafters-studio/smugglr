@@ -210,12 +210,9 @@ impl FetchDataSource {
             )));
         }
 
-        let pk_expr = adapter_common::build_pk_text_expr(&info.primary_key);
         let column_order: Vec<String> = info.columns.iter().map(|c| c.name.clone()).collect();
-        let sql = format!(
-            "SELECT *, {} AS __pk FROM \"{}\" WHERE \"{}\" > ?",
-            pk_expr, table, timestamp_column
-        );
+        let sql =
+            adapter_common::incremental_metadata_sql(table, &info.primary_key, timestamp_column);
         let params = vec![Value::String(since_timestamp.to_string())];
         let response = self.execute(&sql, &params).await?;
         let columns = self.extract_columns(&response)?;

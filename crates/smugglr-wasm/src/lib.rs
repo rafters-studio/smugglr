@@ -1247,4 +1247,46 @@ mod tests {
         );
         assert_eq!(cache.max_timestamp.as_deref(), Some("2024-06-01"));
     }
+
+    // Guards the cache-merge half of #199 (same-tick row admitted). The `>=`
+    // SQL predicate itself is pinned by
+    // `adapter_common::tests::incremental_metadata_sql_uses_inclusive_predicate`.
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    fn boundary_tick_row_is_admitted_via_inclusive_incremental() {
+        // Regression for #199: a row written at exactly the cached cursor tick
+        // AFTER the seed scan must still be admitted on the next incremental
+        // pass. The `get_row_metadata_since` predicate is now `>=` (inclusive),
+        // so the incremental result includes the boundary tick. This test
+        // models the cache half of that contract: merging a same-tick new row
+        // admits it without disturbing existing boundary rows.
+        let mut cache = CachedMeta::new();
+        let mut full = HashMap::new();
+        // Seed established the cursor at "2024-06-01" (whole-second granularity).
+        full.insert("pk1".into(), make_meta("pk1", Some("2024-06-01"), "h1"));
+        cache.seed(full);
+        assert_eq!(cache.max_timestamp.as_deref(), Some("2024-06-01"));
+
+        // An inclusive (`>=`) incremental scan against the cursor re-fetches the
+        // boundary tick: it returns the already-seen pk1 plus a genuinely-new
+        // pk2 written in the SAME tick after the seed. A strict `>` scan would
+        // have returned neither, silently dropping pk2 forever.
+        let mut incremental = HashMap::new();
+        incremental.insert("pk1".into(), make_meta("pk1", Some("2024-06-01"), "h1"));
+        incremental.insert("pk2".into(), make_meta("pk2", Some("2024-06-01"), "h2_new"));
+        cache.merge(incremental);
+
+        assert_eq!(
+            cache.hashes.len(),
+            2,
+            "same-tick boundary row must be admitted, not dropped"
+        );
+        assert_eq!(
+            cache.hashes["pk2"].content_hash, "h2_new",
+            "new boundary-tick row must land in the cache"
+        );
+        // Re-fetching pk1 at the same tick is idempotent: no duplication, cursor
+        // unchanged.
+        assert_eq!(cache.max_timestamp.as_deref(), Some("2024-06-01"));
+        assert_eq!(cache.hashes["pk1"].content_hash, "h1");
+    }
 }

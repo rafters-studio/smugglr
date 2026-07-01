@@ -110,6 +110,29 @@ pub(crate) fn row_maps_to_metadata(
     result
 }
 
+/// Build the incremental-metadata query: every row whose `timestamp_column`
+/// is at or after the cursor, with a synthetic `__pk` text column.
+///
+/// `>=` (not `>`): a row written at exactly the cursor timestamp AFTER the
+/// scan that established that cursor would never satisfy `> cursor` on a
+/// later pass (same-tick / whole-second granularity), silently dropping its
+/// change until clearCache(). Re-fetching the boundary tick is safe because
+/// the caller merges results into the PK-keyed cache, so rows already seen at
+/// the boundary are overwritten idempotently and only genuinely-new boundary
+/// rows are admitted. See bug #199 -- the predicate must stay `>=`.
+pub(crate) fn incremental_metadata_sql(
+    table: &str,
+    primary_key: &[String],
+    timestamp_column: &str,
+) -> String {
+    format!(
+        "SELECT *, {} AS __pk FROM \"{}\" WHERE \"{}\" >= ?",
+        build_pk_text_expr(primary_key),
+        table,
+        timestamp_column
+    )
+}
+
 /// Build an `INSERT OR REPLACE` batch statement plus its flattened params.
 pub(crate) fn generate_batch_sql(
     table: &str,
@@ -140,4 +163,22 @@ pub(crate) fn generate_batch_sql(
         .collect();
 
     (sql, params)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    #[wasm_bindgen_test]
+    fn incremental_metadata_sql_uses_inclusive_predicate() {
+        // Regression for #199: the incremental cursor predicate must be `>=`,
+        // not `>`, so a boundary-tick row is re-admitted. Pinning the exact
+        // SQL string fails loudly if the operator ever reverts to `>`.
+        let sql = incremental_metadata_sql("items", &["id".to_string()], "updated_at");
+        assert_eq!(
+            sql,
+            "SELECT *, CAST(\"id\" AS TEXT) AS __pk FROM \"items\" WHERE \"updated_at\" >= ?"
+        );
+    }
 }
