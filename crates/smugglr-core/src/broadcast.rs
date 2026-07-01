@@ -134,6 +134,12 @@ impl BroadcastConfig {
 }
 
 /// A discovered peer on the LAN.
+///
+/// No `protocol_version` is stored: [`PeerDiscovery::receive_one`] already drops
+/// announcements whose version differs from [`PROTOCOL_VERSION`] before
+/// `register_peer` is ever called, so every registered peer is on the current
+/// protocol. The field was vestigial TCP-era state advertising a version
+/// guarantee the table did not enforce (#175).
 #[derive(Debug, Clone)]
 pub struct Peer {
     /// Unique instance identifier
@@ -144,9 +150,6 @@ pub struct Peer {
     pub db_path_hash: String,
     /// When we last heard from this peer
     pub last_seen: Instant,
-    /// Protocol version the peer is running
-    #[allow(dead_code)]
-    pub protocol_version: u8,
 }
 
 impl Peer {
@@ -398,7 +401,6 @@ impl PeerDiscovery {
             addr,
             db_path_hash: announcement.db_path_hash.clone(),
             last_seen: Instant::now(),
-            protocol_version: announcement.version,
         };
 
         let mut peers = self.peers.write().await;
@@ -656,21 +658,43 @@ pub fn split_delta(
     Ok(packets)
 }
 
+/// Hard cap on distinct peers tracked at once. When full, the
+/// least-recently-seen peer is evicted to admit a new one (rather than rejecting
+/// the newcomer), so a masterless LAN with churning instance_ids never locks out
+/// live peers. See #174.
+const REPLAY_PEER_CAP: usize = 256;
+
+/// Per-peer replay window plus a last-seen ordinal for LRU eviction.
+#[derive(Debug, Clone, Copy)]
+struct Window {
+    /// Highest sequence number seen from this peer.
+    highest: u64,
+    /// Bitfield of recently seen sequences below `highest`.
+    bitfield: u64,
+    /// Monotonic ordinal of the most recent `check` that touched this peer,
+    /// used only to pick the least-recently-seen peer to evict at the cap.
+    last_seen: u64,
+}
+
 /// Tracks seen sequence numbers per peer to detect replay attacks.
 ///
 /// Uses a sliding window of 64 sequence numbers per peer. Packets with
-/// previously seen or too-old sequence numbers are rejected.
+/// previously seen or too-old sequence numbers are rejected. The peer table is
+/// capped at [`REPLAY_PEER_CAP`]; at the cap the least-recently-seen peer is
+/// evicted so a fresh peer is always admitted (no permanent lockout, #174).
 #[derive(Debug)]
 pub struct ReplayGuard {
-    /// Per-peer sliding window of seen sequences.
-    /// Key: source_id, Value: (highest_seen_seq, bitfield of recent seqs)
-    windows: HashMap<String, (u64, u64)>,
+    /// Per-peer sliding window of seen sequences keyed by source_id.
+    windows: HashMap<String, Window>,
+    /// Monotonic clock stamped onto each touched peer's `last_seen`.
+    clock: u64,
 }
 
 impl ReplayGuard {
     pub fn new() -> Self {
         Self {
             windows: HashMap::new(),
+            clock: 0,
         }
     }
 
@@ -680,10 +704,22 @@ impl ReplayGuard {
             .retain(|id, _| active_peers.contains(&id.as_str()));
     }
 
+    /// Evict the least-recently-seen peer to make room for a newcomer. Returns
+    /// the evicted source_id, if any.
+    fn evict_lru(&mut self) -> Option<String> {
+        let victim = self
+            .windows
+            .iter()
+            .min_by_key(|(_, w)| w.last_seen)
+            .map(|(id, _)| id.clone())?;
+        self.windows.remove(&victim);
+        Some(victim)
+    }
+
     /// Check whether a packet with the given source_id and seq should be accepted.
     /// Returns `true` if accepted (not a replay), `false` if rejected.
     pub fn check(&mut self, source_id: &str, seq: u64) -> bool {
-        // Cap source_id length and total peers to prevent DoS via crafted packets
+        // Cap source_id length to prevent DoS via crafted packets.
         if source_id.len() > 128 {
             warn!(
                 "Replay guard: rejecting oversized source_id ({}B)",
@@ -691,21 +727,39 @@ impl ReplayGuard {
             );
             return false;
         }
-        if !self.windows.contains_key(source_id) && self.windows.len() >= 256 {
-            warn!(
-                "Replay guard: peer limit reached, rejecting new peer '{}'",
-                source_id
-            );
-            return false;
+        // At the peer cap, evict the least-recently-seen peer rather than reject
+        // the newcomer, so churning instance_ids cannot lock out live peers.
+        if !self.windows.contains_key(source_id) && self.windows.len() >= REPLAY_PEER_CAP {
+            if let Some(victim) = self.evict_lru() {
+                debug!(
+                    "Replay guard: peer cap reached, evicting least-recently-seen '{}' for '{}'",
+                    victim, source_id
+                );
+            }
         }
+
+        self.clock += 1;
+        let now = self.clock;
 
         let entry = self.windows.get_mut(source_id);
         match entry {
             None => {
-                self.windows.insert(source_id.to_string(), (seq, 0));
+                self.windows.insert(
+                    source_id.to_string(),
+                    Window {
+                        highest: seq,
+                        bitfield: 0,
+                        last_seen: now,
+                    },
+                );
                 true
             }
-            Some((highest, bitfield)) => {
+            Some(Window {
+                highest,
+                bitfield,
+                last_seen,
+            }) => {
+                *last_seen = now;
                 if seq > *highest {
                     let shift = seq - *highest;
                     if shift < 64 {
@@ -809,7 +863,6 @@ mod tests {
             addr: "127.0.0.1:31337".parse().unwrap(),
             db_path_hash: "abc".to_string(),
             last_seen: Instant::now() - Duration::from_secs(100),
-            protocol_version: 1,
         };
         assert!(peer.is_expired(Duration::from_secs(90)));
         assert!(!peer.is_expired(Duration::from_secs(110)));
@@ -1232,5 +1285,36 @@ mod tests {
     fn test_replay_guard_default() {
         let guard = ReplayGuard::default();
         assert!(guard.windows.is_empty());
+    }
+
+    /// Regression for #174: at the peer cap, a brand-new peer must be admitted
+    /// by evicting the least-recently-seen peer, not rejected. Before the fix,
+    /// `check` returned false for every new source_id once the table hit 256,
+    /// permanently locking out fresh peers on a churning LAN.
+    #[test]
+    fn test_replay_guard_evicts_lru_instead_of_rejecting_new_peer() {
+        let mut guard = ReplayGuard::new();
+
+        // Fill to the cap. peer-0 is touched first, so it is the LRU.
+        for i in 0..REPLAY_PEER_CAP {
+            assert!(guard.check(&format!("peer-{i}"), 1));
+        }
+        assert_eq!(guard.windows.len(), REPLAY_PEER_CAP);
+
+        // Re-touch every peer except peer-0 so peer-0 stays the LRU.
+        for i in 1..REPLAY_PEER_CAP {
+            assert!(guard.check(&format!("peer-{i}"), 2));
+        }
+
+        // A fresh peer at the cap must be ACCEPTED (the bug returned false here).
+        assert!(
+            guard.check("fresh-peer", 1),
+            "new peer must be admitted at the cap, not locked out"
+        );
+
+        // The table stays bounded and the LRU peer-0 was the one evicted.
+        assert_eq!(guard.windows.len(), REPLAY_PEER_CAP);
+        assert!(!guard.windows.contains_key("peer-0"));
+        assert!(guard.windows.contains_key("fresh-peer"));
     }
 }

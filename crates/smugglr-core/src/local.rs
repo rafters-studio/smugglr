@@ -5,11 +5,10 @@ use crate::error::{Result, SyncError};
 use crate::table::TableSchema;
 use rusqlite::{Connection, OpenFlags, Row};
 use serde_json::Value as JsonValue;
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Wrapper for local SQLite database
 pub struct LocalDb {
@@ -161,83 +160,91 @@ fn get_row_metadata_inner(
     let pk_cols = &info.primary_key;
     let has_timestamp = info.columns.iter().any(|c| c.name == timestamp_column);
 
-    // Build the SELECT query
-    let pk_select = pk_cols
+    // Column definition order -- the hash folds these (minus timestamp/excluded
+    // columns) in exactly this order, shared with the plugin and wasm paths.
+    let column_order: Vec<String> = info.columns.iter().map(|c| c.name.clone()).collect();
+
+    // Select the PK rendered as TEXT (`__pk`) plus every column. Hashing each
+    // column's JSON value through `crate::rowhash` is what keeps the native hash
+    // byte-identical to the JSON-based plugin/wasm hashes.
+    let pk_expr = crate::rowhash::pk_text_expr(pk_cols);
+    let col_list = column_order
         .iter()
         .map(|c| format!("\"{}\"", c))
         .collect::<Vec<_>>()
-        .join(" || '|' || ");
-
-    let timestamp_select = if has_timestamp {
-        format!(", \"{}\"", timestamp_column)
-    } else {
-        String::new()
-    };
-
-    // For content hash, exclude timestamp columns and user-configured exclusions
-    let timestamp_columns = ["updated_at", "created_at"];
-    let hash_cols: Vec<_> = info
-        .columns
-        .iter()
-        .filter(|c| {
-            !timestamp_columns.contains(&c.name.as_str())
-                && !crate::config::column_excluded(&c.name, exclude_columns)
-        })
-        .collect();
-    let all_cols = hash_cols
-        .iter()
-        .map(|c| format!("\"{}\"", c.name))
-        .collect::<Vec<_>>()
         .join(", ");
-
     let sql = format!(
-        "SELECT {}, {} {} FROM \"{}\"",
-        pk_select, all_cols, timestamp_select, table
+        "SELECT {} AS __pk, {} FROM \"{}\"",
+        pk_expr, col_list, table
     );
 
     debug!("Executing: {}", sql);
 
     let mut stmt = conn.prepare(&sql)?;
-    let hash_col_count = hash_cols.len();
-
     let mut result = HashMap::new();
 
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
-        // Primary key can be integer or string - handle both
-        let pk_value = get_value_as_string(row, 0)?;
+        // A NULL `__pk` (a NULL part in a composite PK, since `||` propagates
+        // NULL) cannot key pk-based sync. Coercing it to "" would collapse every
+        // such row onto one map entry, silently dropping rows and provoking
+        // spurious deletes. Skip and warn instead.
+        let pk_value = match row.get::<_, Option<String>>(0)? {
+            Some(pk) => pk,
+            None => {
+                warn!("skipping row in {} with NULL primary key", table);
+                continue;
+            }
+        };
 
-        // Collect column values for hashing (excluding timestamp columns)
-        let mut hasher = Sha256::new();
-        for i in 0..hash_col_count {
-            let val = get_value_as_string(row, i + 1)?;
-            hasher.update(val.as_bytes());
-            hasher.update(b"|");
+        // Build the column->JSON map (cols start at index 1, after __pk).
+        let mut row_map: HashMap<String, JsonValue> = HashMap::with_capacity(column_order.len());
+        for (i, name) in column_order.iter().enumerate() {
+            row_map.insert(name.clone(), get_json_value(row, i + 1)?);
         }
-        let content_hash = hex::encode(hasher.finalize());
 
-        // Handle updated_at as either integer (Unix timestamp) or string
-        // Index is 1 (pk) + hash_col_count (content columns) = hash_col_count + 1
+        let content_hash = crate::rowhash::content_hash(
+            &row_map,
+            &column_order,
+            exclude_columns,
+            timestamp_column,
+        );
+
+        // updated_at carries either an integer Unix timestamp or a string.
+        // get_json_value only ever yields Null/Number/String, so the catch-all
+        // is defensive against a future extension silently dropping a timestamp.
         let updated_at: Option<String> = if has_timestamp {
-            let ts_idx = hash_col_count + 1;
-            // Try integer first (Unix timestamp), then string
-            if let Ok(ts) = row.get::<_, Option<i64>>(ts_idx) {
-                ts.map(|t| t.to_string())
-            } else {
-                row.get::<_, Option<String>>(ts_idx).unwrap_or_default()
+            match row_map.get(timestamp_column) {
+                Some(JsonValue::Number(n)) => Some(n.to_string()),
+                Some(JsonValue::String(s)) => Some(s.clone()),
+                Some(JsonValue::Null) | None => None,
+                Some(other) => {
+                    warn!(
+                        "unexpected value type for timestamp column {} in {}: {}",
+                        timestamp_column, table, other
+                    );
+                    None
+                }
             }
         } else {
             None
         };
 
-        result.insert(
+        if let Some(prev) = result.insert(
             pk_value.clone(),
             RowMeta {
-                pk_value,
+                pk_value: pk_value.clone(),
                 updated_at,
                 content_hash,
             },
-        );
+        ) {
+            // Two rows rendering to the same PK text means the PK is not unique
+            // as encoded -- the metadata map silently lost `prev`. Surface it.
+            warn!(
+                "duplicate primary key {} in {} -- a row was overwritten in change metadata (prev hash {})",
+                pk_value, table, prev.content_hash
+            );
+        }
     }
 
     debug!("Got {} rows from {}", result.len(), table);
@@ -352,24 +359,6 @@ fn upsert_rows_inner(
     tx.commit()?;
     info!("Upserted {} rows into {}", count, table);
     Ok(count)
-}
-
-/// Helper to get a row value as string for hashing
-fn get_value_as_string(row: &Row, idx: usize) -> Result<String> {
-    // Try different types
-    if let Ok(v) = row.get::<_, Option<i64>>(idx) {
-        return Ok(v.map(|n| n.to_string()).unwrap_or_default());
-    }
-    if let Ok(v) = row.get::<_, Option<f64>>(idx) {
-        return Ok(v.map(|n| n.to_string()).unwrap_or_default());
-    }
-    if let Ok(v) = row.get::<_, Option<String>>(idx) {
-        return Ok(v.unwrap_or_default());
-    }
-    if let Ok(v) = row.get::<_, Option<Vec<u8>>>(idx) {
-        return Ok(v.map(hex::encode).unwrap_or_default());
-    }
-    Ok(String::new())
 }
 
 /// Helper to convert row value to JSON

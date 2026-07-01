@@ -64,6 +64,14 @@ const RECV_BUF: usize = 65_536;
 /// datagram never exceeds [`SAFE_PACKET_SIZE`].
 const DELTA_WIRE_RESERVE: usize = 128;
 
+/// Wire headroom reserved when chunking digests for multicast: the
+/// XChaCha20-Poly1305 nonce+tag (24 + 16 = 40 bytes) that [`Gossip::seal`] adds
+/// on top of the serialized `Msg`. `split_digest` already probes against the
+/// full `Msg` envelope, so unlike [`DELTA_WIRE_RESERVE`] only the AEAD seal
+/// overhead must be reserved here. Conservative, so a sealed `Digest` datagram
+/// never exceeds [`SAFE_PACKET_SIZE`].
+const DIGEST_WIRE_RESERVE: usize = 64;
+
 /// A `primary_key -> content_hash` advertisement for one table (one datagram).
 ///
 /// Large tables are chunked across several parts; each part is processed and
@@ -184,6 +192,11 @@ pub fn split_digest(
         return Ok(vec![mk()]);
     }
 
+    // Reserve AEAD seal headroom so a *sealed* part stays under the safe MTU,
+    // mirroring split_delta's `reserve` discipline (the probe already includes
+    // the Msg envelope, so only the 40-byte nonce+tag must be reserved here).
+    let limit = SAFE_PACKET_SIZE.saturating_sub(DIGEST_WIRE_RESERVE);
+
     let mut parts: Vec<DigestPacket> = Vec::new();
     let mut current = mk();
 
@@ -191,7 +204,7 @@ pub fn split_digest(
         current.hashes.insert(pk.clone(), hash.clone());
         // Measure with the envelope so we stay under the wire limit end-to-end.
         let probe = Msg::new(Body::Digest(current.clone())).to_bytes()?;
-        if probe.len() > SAFE_PACKET_SIZE && current.hashes.len() > 1 {
+        if probe.len() > limit && current.hashes.len() > 1 {
             current.hashes.remove(&pk);
             parts.push(std::mem::replace(&mut current, mk()));
             current.hashes.insert(pk, hash);
@@ -684,6 +697,38 @@ mod tests {
             reunion.extend(p.hashes.clone());
         }
         assert_eq!(reunion, big, "chunking must be lossless");
+    }
+
+    /// Regression for #168/#173: a sealed digest part must stay under the safe
+    /// MTU. Before the fix, split_digest sized parts against the bare `Msg`
+    /// envelope up to SAFE_PACKET_SIZE, so adding the 40-byte AEAD seal pushed
+    /// the on-the-wire datagram over the limit. Mirrors
+    /// `keyed_delta_parts_stay_under_mtu_when_sealed` by sealing each part.
+    #[tokio::test]
+    async fn keyed_digest_parts_stay_under_mtu_when_sealed() {
+        let dir = tempfile::tempdir().unwrap();
+        let a_path = dir.path().join("a.db").to_str().unwrap().to_string();
+        let b_path = dir.path().join("b.db").to_str().unwrap().to_string();
+        let key = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        seed(&a_path, &[]);
+        seed(&b_path, &[]);
+        let (a, _ac, _al, _b, _bc, _bl) =
+            two_nodes_keyed(&a_path, &b_path, Some(key), Some(key)).await;
+
+        let big: HashMap<String, String> = (0..2000)
+            .map(|i| (format!("pk-{i:020}"), format!("hash-{i:032}")))
+            .collect();
+        let parts = split_digest("node-a", "users", big).unwrap();
+        assert!(parts.len() > 1, "2000 entries must span multiple datagrams");
+        for part in parts {
+            let sealed = a.seal(Body::Digest(part)).unwrap();
+            assert!(
+                sealed.len() <= SAFE_PACKET_SIZE,
+                "sealed digest part is {} bytes, exceeds SAFE_PACKET_SIZE {}",
+                sealed.len(),
+                SAFE_PACKET_SIZE
+            );
+        }
     }
 
     /// Bind two gossip nodes with distinct instance ids on a test group. They

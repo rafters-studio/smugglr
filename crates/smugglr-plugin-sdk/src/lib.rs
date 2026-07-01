@@ -62,6 +62,20 @@ pub struct RowMeta {
     pub content_hash: String,
 }
 
+/// Well-known JSON-RPC error code that a plugin uses to signal a *transient*
+/// failure (rate limit, 5xx, timeout against a remote backend) that smugglr
+/// should treat as retryable, mirroring the native `is_retryable` retry path.
+///
+/// Codes are conveyed on the wire in the JSON-RPC `error.code` field. The host
+/// honors this specific code by routing the error onto the retry/backoff path
+/// instead of failing permanently. Plugin authors construct such errors with
+/// [`PluginError::transient`].
+///
+/// This sits in the JSON-RPC "server error" reserved range (-32099..=-32000)
+/// and is distinct from the default plugin error code (-32000) so the host can
+/// distinguish "retry me" from "this is fatal".
+pub const TRANSIENT_ERROR_CODE: i64 = -32010;
+
 #[derive(Debug)]
 pub struct PluginError {
     pub message: String,
@@ -81,6 +95,20 @@ impl PluginError {
             message: message.into(),
             code,
         }
+    }
+
+    /// Construct an error the host should treat as transient and retry.
+    ///
+    /// Use this when the underlying backend reports a recoverable failure
+    /// (HTTP 429/5xx, connection timeout, etc.). The error carries
+    /// [`TRANSIENT_ERROR_CODE`] on the JSON-RPC wire.
+    pub fn transient(message: impl Into<String>) -> Self {
+        Self::with_code(message, TRANSIENT_ERROR_CODE)
+    }
+
+    /// Whether this error is tagged as transient/retryable via its code.
+    pub fn is_transient(&self) -> bool {
+        self.code == TRANSIENT_ERROR_CODE
     }
 }
 
@@ -208,31 +236,44 @@ fn param_str(params: &Value, key: &str) -> Result<String, PluginError> {
 }
 
 fn param_str_slice(params: &Value, key: &str) -> Result<Vec<String>, PluginError> {
-    params
+    let arr = params
         .get(key)
         .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
+        .ok_or_else(|| PluginError::with_code(format!("missing param: {}", key), -32602))?;
+
+    // Error loudly on non-string elements rather than silently dropping them:
+    // a numeric pk_value (e.g. `[1, 2, 3]`) would otherwise shorten the list
+    // and cause silent data divergence in get_rows.
+    arr.iter()
+        .enumerate()
+        .map(|(idx, v)| {
+            v.as_str().map(String::from).ok_or_else(|| {
+                PluginError::with_code(
+                    format!(
+                        "invalid param: {}[{}]: expected string, got {}",
+                        key, idx, v
+                    ),
+                    -32602,
+                )
+            })
         })
-        .ok_or_else(|| PluginError::with_code(format!("missing param: {}", key), -32602))
+        .collect()
 }
 
 fn param_rows(params: &mut Value) -> Result<Vec<HashMap<String, Value>>, PluginError> {
-    params
-        .get_mut("rows")
-        .map(Value::take)
-        .and_then(|v| serde_json::from_value(v).ok())
-        .ok_or_else(|| PluginError::with_code("missing param: rows", -32602))
+    match params.get_mut("rows").map(Value::take) {
+        None => Err(PluginError::with_code("missing param: rows", -32602)),
+        Some(v) => serde_json::from_value(v)
+            .map_err(|e| PluginError::with_code(format!("invalid param: rows: {}", e), -32602)),
+    }
 }
 
 fn param_config(params: &mut Value) -> Result<HashMap<String, String>, PluginError> {
-    params
-        .get_mut("config")
-        .map(Value::take)
-        .and_then(|v| serde_json::from_value(v).ok())
-        .ok_or_else(|| PluginError::with_code("missing param: config", -32602))
+    match params.get_mut("config").map(Value::take) {
+        None => Err(PluginError::with_code("missing param: config", -32602)),
+        Some(v) => serde_json::from_value(v)
+            .map_err(|e| PluginError::with_code(format!("invalid param: config: {}", e), -32602)),
+    }
 }
 
 // -- Dispatch --
@@ -306,7 +347,11 @@ pub async fn run(mut adapter: impl PluginAdapter) {
         let mut req: RpcRequest = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
-                let resp = RpcResponse::err(0, -32700, format!("parse error: {}", e));
+                // Recover the request id with a lenient pre-parse so the host's
+                // strict `response.id == request.id` check still matches and the
+                // real -32700 parse error surfaces instead of an ID mismatch.
+                let id = recover_id(&line);
+                let resp = RpcResponse::err(id, -32700, format!("parse error: {}", e));
                 write_response(&mut stdout, &resp).await;
                 continue;
             }
@@ -320,6 +365,17 @@ pub async fn run(mut adapter: impl PluginAdapter) {
 
         write_response(&mut stdout, &resp).await;
     }
+}
+
+/// Best-effort extraction of the JSON-RPC request id from a line that failed to
+/// parse as a full [`RpcRequest`]. Returns the recovered id, or 0 if the id
+/// cannot be recovered (the id is fundamentally unknowable when the line is not
+/// valid JSON at all).
+fn recover_id(line: &str) -> u64 {
+    serde_json::from_str::<Value>(line)
+        .ok()
+        .and_then(|v| v.get("id").and_then(Value::as_u64))
+        .unwrap_or(0)
 }
 
 async fn write_response(stdout: &mut BufWriter<tokio::io::Stdout>, resp: &RpcResponse) {
@@ -363,6 +419,105 @@ mod tests {
         let params = serde_json::json!({"pk_values": ["1", "2", "3"]});
         let vals = param_str_slice(&params, "pk_values").unwrap();
         assert_eq!(vals, vec!["1", "2", "3"]);
+    }
+
+    // Regression for #204: a non-string array element (e.g. numeric pk) must
+    // error loudly with -32602 rather than being silently dropped, which would
+    // shorten the pk_value list and cause silent data divergence in get_rows.
+    #[test]
+    fn test_param_str_slice_rejects_non_string_elements() {
+        let params = serde_json::json!({"pk_values": ["1", 2, "3"]});
+        let err = param_str_slice(&params, "pk_values").unwrap_err();
+        assert_eq!(err.code, -32602);
+        assert!(err.message.contains("pk_values[1]"), "{}", err.message);
+        // Pre-fix behavior would have returned ["1", "3"] silently.
+        assert!(param_str_slice(&params, "pk_values").is_err());
+    }
+
+    #[test]
+    fn test_param_str_slice_missing_vs_invalid() {
+        // Absent key is still a "missing param" error.
+        let absent = serde_json::json!({});
+        let err = param_str_slice(&absent, "pk_values").unwrap_err();
+        assert!(err.message.contains("missing param"), "{}", err.message);
+    }
+
+    // Regression for #205: a present-but-malformed `rows` param must report an
+    // "invalid param" decode error, not the misleading "missing param: rows".
+    #[test]
+    fn test_param_rows_malformed_reports_invalid_not_missing() {
+        // rows present but an object instead of an array.
+        let mut params = serde_json::json!({"rows": {"id": 1}});
+        let err = param_rows(&mut params).unwrap_err();
+        assert_eq!(err.code, -32602);
+        assert!(
+            err.message.contains("invalid param: rows"),
+            "{}",
+            err.message
+        );
+        assert!(!err.message.contains("missing"), "{}", err.message);
+    }
+
+    #[test]
+    fn test_param_rows_missing_still_reports_missing() {
+        let mut params = serde_json::json!({});
+        let err = param_rows(&mut params).unwrap_err();
+        assert!(
+            err.message.contains("missing param: rows"),
+            "{}",
+            err.message
+        );
+    }
+
+    // Regression for #205: a present-but-malformed `config` param must report an
+    // "invalid param" decode error, not the misleading "missing param: config".
+    #[test]
+    fn test_param_config_malformed_reports_invalid_not_missing() {
+        // config present but a string instead of a map.
+        let mut params = serde_json::json!({"config": "not-a-map"});
+        let err = param_config(&mut params).unwrap_err();
+        assert_eq!(err.code, -32602);
+        assert!(
+            err.message.contains("invalid param: config"),
+            "{}",
+            err.message
+        );
+        assert!(!err.message.contains("missing"), "{}", err.message);
+    }
+
+    // Regression for #206: a parse-failed line carrying a recoverable id must
+    // echo that id, not a hardcoded 0, so the host's id-match check passes and
+    // the real -32700 parse error surfaces instead of an "ID mismatch".
+    #[test]
+    fn test_recover_id_from_unparseable_request() {
+        // Valid JSON object with an id, but missing required fields (no method),
+        // so it fails RpcRequest deserialization yet still yields its id.
+        let line = r#"{"jsonrpc":"2.0","id":7}"#;
+        assert!(serde_json::from_str::<RpcRequest>(line).is_err());
+        assert_eq!(recover_id(line), 7);
+    }
+
+    #[test]
+    fn test_recover_id_falls_back_to_zero_on_garbage() {
+        // Not valid JSON at all -- the id is unknowable, so fall back to 0.
+        assert_eq!(recover_id("this is not json"), 0);
+        // Valid JSON but no id field.
+        assert_eq!(recover_id(r#"{"method":"x"}"#), 0);
+    }
+
+    // Regression for #203: the SDK exposes a well-known transient error code so
+    // plugins can signal retryable failures to the host. The code must serialize
+    // onto the JSON-RPC wire so the host can honor it.
+    #[test]
+    fn test_transient_error_code() {
+        let err = PluginError::transient("rate limited");
+        assert_eq!(err.code, TRANSIENT_ERROR_CODE);
+        assert!(err.is_transient());
+        assert!(!PluginError::new("oops").is_transient());
+
+        let resp = RpcResponse::err(1, err.code, err.message);
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains(&TRANSIENT_ERROR_CODE.to_string()));
     }
 
     #[test]

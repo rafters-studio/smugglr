@@ -165,7 +165,10 @@ impl SyncError {
 
             SyncError::D1Api { .. } | SyncError::BadRequest { .. } => 5,
 
-            SyncError::Plugin(_) => 6,
+            // Plugin/adapter failures are non-retryable and have no dedicated
+            // class in the documented 0-5 contract, so they fold into the
+            // general/unknown bucket rather than emitting an out-of-range code.
+            SyncError::Plugin(_) => 1,
 
             _ => 1,
         }
@@ -343,7 +346,14 @@ mod tests {
 
     #[test]
     fn test_exit_code_plugin() {
-        assert_eq!(SyncError::Plugin("err".into()).exit_code(), 6);
+        // Plugin failures map into the documented 0-5 contract (general/1),
+        // never an out-of-range code. Regression guard for #181.
+        let code = SyncError::Plugin("err".into()).exit_code();
+        assert_eq!(code, 1);
+        assert!(
+            (0..=5).contains(&code),
+            "exit_code must stay within the documented 0-5 contract, got {code}"
+        );
         assert!(!SyncError::Plugin("err".into()).is_retryable());
     }
 

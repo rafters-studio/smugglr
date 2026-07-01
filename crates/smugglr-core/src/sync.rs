@@ -194,7 +194,11 @@ async fn transfer_rows<Src: DataSource, Dst: DataSource>(
     for chunk in rows.chunks(batch_config.batch_size) {
         let count = upsert_with_retry(dest, table, chunk, &batch_config.retry).await?;
         total += count;
-        progress.on_batch_complete(chunk.len());
+        // Advance progress by the upsert-reported count, not the attempted
+        // chunk size, so the running progress total always matches the final
+        // `total` reported to on_transfer_finish even if an adapter returns
+        // affected-rows (< submitted) rather than submitted-rows.
+        progress.on_batch_complete(count);
     }
 
     progress.on_transfer_finish(total, label);
@@ -781,6 +785,153 @@ mod tests {
                 1,
                 "no retry on permanent error"
             );
+        }
+    }
+
+    // Regression for #189: progress accounting must use the upsert-reported
+    // count, not the attempted chunk size, so the running progress total agrees
+    // with the `total` reported to on_transfer_finish for adapters that return
+    // affected-rows (< submitted).
+    #[cfg(feature = "native")]
+    mod transfer_accounting {
+        use super::super::{transfer_rows, SyncProgress};
+        use crate::config::BatchConfig;
+        use crate::datasource::{DataSource, RowMeta, TableInfo};
+        use crate::error::{Result, SyncError};
+        use serde_json::{json, Value};
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Source returning `n` single-column rows keyed by the requested pks.
+        struct CountedSource {
+            n: usize,
+        }
+
+        impl DataSource for CountedSource {
+            async fn list_tables(&self) -> Result<Vec<String>> {
+                Ok(vec![])
+            }
+            async fn table_info(&self, _t: &str) -> Result<TableInfo> {
+                Err(SyncError::TableNotFound("unused".into()))
+            }
+            async fn get_row_metadata(
+                &self,
+                _t: &str,
+                _ts: &str,
+                _ex: &[String],
+            ) -> Result<HashMap<String, RowMeta>> {
+                Ok(HashMap::new())
+            }
+            async fn get_rows(
+                &self,
+                _t: &str,
+                _pks: &[String],
+            ) -> Result<Vec<HashMap<String, Value>>> {
+                Ok((0..self.n)
+                    .map(|i| HashMap::from([("id".to_string(), json!(i.to_string()))]))
+                    .collect())
+            }
+            async fn upsert_rows(&self, _t: &str, _r: &[HashMap<String, Value>]) -> Result<usize> {
+                Ok(0)
+            }
+            async fn row_count(&self, _t: &str) -> Result<usize> {
+                Ok(self.n)
+            }
+        }
+
+        /// Dest whose upsert reports fewer rows than submitted (affected-rows
+        /// semantics): returns `submitted - 1`, flooring at 0.
+        struct UndercountDest;
+
+        impl DataSource for UndercountDest {
+            async fn list_tables(&self) -> Result<Vec<String>> {
+                Ok(vec![])
+            }
+            async fn table_info(&self, _t: &str) -> Result<TableInfo> {
+                Err(SyncError::TableNotFound("unused".into()))
+            }
+            async fn get_row_metadata(
+                &self,
+                _t: &str,
+                _ts: &str,
+                _ex: &[String],
+            ) -> Result<HashMap<String, RowMeta>> {
+                Ok(HashMap::new())
+            }
+            async fn get_rows(
+                &self,
+                _t: &str,
+                _pks: &[String],
+            ) -> Result<Vec<HashMap<String, Value>>> {
+                Ok(vec![])
+            }
+            async fn upsert_rows(
+                &self,
+                _t: &str,
+                rows: &[HashMap<String, Value>],
+            ) -> Result<usize> {
+                Ok(rows.len().saturating_sub(1))
+            }
+            async fn row_count(&self, _t: &str) -> Result<usize> {
+                Ok(0)
+            }
+        }
+
+        /// Sums the rows reported to on_batch_complete and on_transfer_finish.
+        struct RecordingProgress {
+            batch_sum: AtomicUsize,
+            finish_total: AtomicUsize,
+        }
+
+        impl SyncProgress for RecordingProgress {
+            fn on_transfer_start(&self, _: usize, _: &str, _: &str) {}
+            fn on_batch_complete(&self, rows_in_batch: usize) {
+                self.batch_sum.fetch_add(rows_in_batch, Ordering::SeqCst);
+            }
+            fn on_transfer_finish(&self, total_rows: usize, _: &str) {
+                self.finish_total.store(total_rows, Ordering::SeqCst);
+            }
+        }
+
+        #[tokio::test]
+        async fn progress_sum_matches_finish_total_on_undercount() {
+            // 5 rows, batch_size 2 -> chunks of 2, 2, 1. Each chunk upsert
+            // reports len-1, so total = 1 + 1 + 0 = 2.
+            let source = CountedSource { n: 5 };
+            let dest = UndercountDest;
+            let pks: Vec<String> = (0..5).map(|i| i.to_string()).collect();
+            let batch = BatchConfig {
+                batch_size: 2,
+                ..Default::default()
+            };
+
+            let progress = RecordingProgress {
+                batch_sum: AtomicUsize::new(0),
+                finish_total: AtomicUsize::new(0),
+            };
+
+            let total = transfer_rows(
+                &source,
+                &dest,
+                "items",
+                &pks,
+                &batch,
+                &[],
+                "push",
+                &progress,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(total, 2, "returned total is the sum of upsert counts");
+            // The bug: progress advanced by chunk.len() (5) while finish total
+            // was 2. After the fix both equal the returned total.
+            assert_eq!(
+                progress.batch_sum.load(Ordering::SeqCst),
+                total,
+                "progress batch sum must equal the reported total"
+            );
+            assert_eq!(progress.finish_total.load(Ordering::SeqCst), total);
         }
     }
 }
