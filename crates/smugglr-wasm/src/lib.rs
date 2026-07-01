@@ -1248,9 +1248,9 @@ mod tests {
         assert_eq!(cache.max_timestamp.as_deref(), Some("2024-06-01"));
     }
 
-    // NOTE: guards the cache-merge half of #199 (same-tick row admitted); the
-    // `>=` SQL predicate in get_row_metadata_since itself needs an executor-level
-    // test, tracked as a residual under #155/#199.
+    // Guards the cache-merge half of #199 (same-tick row admitted). The `>=`
+    // SQL predicate itself is pinned by
+    // `adapter_common::tests::incremental_metadata_sql_uses_inclusive_predicate`.
     #[wasm_bindgen_test::wasm_bindgen_test]
     fn boundary_tick_row_is_admitted_via_inclusive_incremental() {
         // Regression for #199: a row written at exactly the cached cursor tick

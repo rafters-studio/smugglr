@@ -210,19 +210,9 @@ impl FetchDataSource {
             )));
         }
 
-        let pk_expr = adapter_common::build_pk_text_expr(&info.primary_key);
         let column_order: Vec<String> = info.columns.iter().map(|c| c.name.clone()).collect();
-        // `>=` (not `>`): a row written at exactly `since_timestamp` AFTER the
-        // scan that established that cursor would never satisfy `> cursor` on a
-        // later pass (same-tick / whole-second granularity), silently dropping
-        // its change until clearCache(). Re-fetching the boundary tick is safe
-        // because the caller merges results into the PK-keyed cache, so rows
-        // already seen at the boundary are overwritten idempotently and only
-        // genuinely-new boundary rows are admitted. See bug #199.
-        let sql = format!(
-            "SELECT *, {} AS __pk FROM \"{}\" WHERE \"{}\" >= ?",
-            pk_expr, table, timestamp_column
-        );
+        let sql =
+            adapter_common::incremental_metadata_sql(table, &info.primary_key, timestamp_column);
         let params = vec![Value::String(since_timestamp.to_string())];
         let response = self.execute(&sql, &params).await?;
         let columns = self.extract_columns(&response)?;
