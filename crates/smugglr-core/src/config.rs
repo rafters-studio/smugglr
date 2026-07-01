@@ -47,7 +47,7 @@ pub enum TargetConfig {
     Sqlite { database: String },
     /// External plugin adapter
     Plugin {
-        /// Plugin name (resolved from ~/.smugglr/plugins/smuggler-{name} or $PATH)
+        /// Plugin name (resolved from ~/.smugglr/plugins/smugglr-{name} or $PATH)
         name: Option<String>,
         /// Explicit path to plugin binary
         path: Option<String>,
@@ -400,7 +400,9 @@ fn expand_env_vars(input: &str) -> Result<String> {
                     ));
                 }
                 let (name, default) = match spec.split_once(":-") {
-                    Some((n, d)) => (n.trim(), Some(d)),
+                    // Trim the default symmetrically with the name so a default
+                    // cannot inject leading/trailing whitespace into a credential.
+                    Some((n, d)) => (n.trim(), Some(d.trim())),
                     None => (spec.trim(), None),
                 };
                 if name.is_empty() {
@@ -441,7 +443,9 @@ impl Config {
             return Err(SyncError::ConfigNotFound(path.display().to_string()));
         }
 
-        let content = std::fs::read_to_string(path)?;
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            SyncError::Config(format!("failed to read config {}: {}", path.display(), e))
+        })?;
         let mut config: Config = parse_with_env(&content)?;
 
         // Auto-detect local_db if not specified
@@ -1200,5 +1204,28 @@ path = "/usr/local/bin/smuggler-custom"
         // No `injected` key leaked into the config as structure.
         assert!(cfg.database_id.is_none());
         std::env::remove_var("SMUGGLR_TEST_ENV_NASTY");
+    }
+
+    #[test]
+    fn env_expand_default_is_trimmed_symmetrically() {
+        // Regression for #184: surrounding whitespace around the default must be
+        // stripped (matching the name's trim) so a default cannot inject blanks
+        // into a credential.
+        let out = expand_env_vars("${ SMUGGLR_TEST_ENV_UNSET_Z :- s3cr3t }").unwrap();
+        assert_eq!(out, "s3cr3t");
+    }
+
+    #[test]
+    fn load_read_error_maps_to_exit_2() {
+        // Regression for #182: a config-phase I/O failure (here, the path is a
+        // directory, which read_to_string rejects) must classify as a config
+        // error (exit 2), not the general/unknown bucket (exit 1).
+        let dir = std::env::temp_dir();
+        let err = Config::load(&dir).unwrap_err();
+        assert!(
+            matches!(err, SyncError::Config(_)),
+            "expected SyncError::Config, got {err:?}"
+        );
+        assert_eq!(err.exit_code(), 2);
     }
 }
