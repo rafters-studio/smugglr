@@ -211,21 +211,10 @@ fn get_row_metadata_inner(
         );
 
         // updated_at carries either an integer Unix timestamp or a string.
-        // get_json_value only ever yields Null/Number/String, so the catch-all
-        // is defensive against a future extension silently dropping a timestamp.
+        // Shared with the plugin and wasm metadata builders via the one
+        // canonical extractor so the three renderings cannot drift.
         let updated_at: Option<String> = if has_timestamp {
-            match row_map.get(timestamp_column) {
-                Some(JsonValue::Number(n)) => Some(n.to_string()),
-                Some(JsonValue::String(s)) => Some(s.clone()),
-                Some(JsonValue::Null) | None => None,
-                Some(other) => {
-                    warn!(
-                        "unexpected value type for timestamp column {} in {}: {}",
-                        timestamp_column, table, other
-                    );
-                    None
-                }
-            }
+            crate::datasource::extract_updated_at(row_map.get(timestamp_column))
         } else {
             None
         };

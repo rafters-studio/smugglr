@@ -321,10 +321,8 @@ impl PluginAdapter for HttpSqlAdapter {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let updated_at = row
-                .get(timestamp_column)
-                .and_then(|v| v.as_str())
-                .map(String::from);
+            let updated_at =
+                smugglr_core::datasource::extract_updated_at(row.get(timestamp_column));
             let hash = smugglr_core::rowhash::content_hash(
                 row,
                 &column_order,

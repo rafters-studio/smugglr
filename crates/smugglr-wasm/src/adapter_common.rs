@@ -5,7 +5,7 @@
 //! These functions are self-free (no adapter state) so they live here once
 //! and are called from both adapters as `adapter_common::<fn>`.
 
-use smugglr_core::datasource::{ColumnInfo, RowMeta, TableInfo};
+use smugglr_core::datasource::{extract_updated_at, ColumnInfo, RowMeta, TableInfo};
 use std::collections::HashMap;
 
 use serde_json::Value;
@@ -92,10 +92,7 @@ pub(crate) fn row_maps_to_metadata(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let updated_at = row
-            .get(timestamp_column)
-            .and_then(|v| v.as_str())
-            .map(String::from);
+        let updated_at = extract_updated_at(row.get(timestamp_column));
         let content_hash = content_hash(row, column_order, exclude_columns, timestamp_column);
 
         result.insert(
@@ -179,6 +176,36 @@ mod tests {
         assert_eq!(
             sql,
             "SELECT *, CAST(\"id\" AS TEXT) AS __pk FROM \"items\" WHERE \"updated_at\" >= ?"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn row_maps_to_metadata_round_trips_integer_timestamp() {
+        // Regression for #177: a remote SQL-over-HTTP endpoint returns an integer
+        // Unix timestamp as a JSON number. The pre-fix as_str()-only extraction in
+        // this builder dropped it to None, which forced the changed row into
+        // content_differs -- skipped in both directions under newer_wins/uuid_v7_wins.
+        // It must round-trip to the decimal string, matching how local.rs renders
+        // the same value, so the two sides compare equal. Fails on the pre-fix code
+        // (updated_at == None), passes after.
+        let mut row = HashMap::new();
+        row.insert("__pk".to_string(), Value::String("k1".to_string()));
+        row.insert(
+            "updated_at".to_string(),
+            Value::Number(serde_json::Number::from(1_700_000_000_i64)),
+        );
+        row.insert("name".to_string(), Value::String("alice".to_string()));
+
+        let meta = row_maps_to_metadata(
+            &[row],
+            &["name".to_string(), "updated_at".to_string()],
+            "updated_at",
+            &[],
+        );
+
+        assert_eq!(
+            meta.get("k1").expect("row keyed by __pk").updated_at,
+            Some("1700000000".to_string())
         );
     }
 }
