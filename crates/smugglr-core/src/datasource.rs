@@ -37,6 +37,24 @@ pub struct RowMeta {
     pub content_hash: String,
 }
 
+/// Normalize a row's timestamp-column value to the `RowMeta.updated_at` string.
+///
+/// Integer Unix timestamps arrive as JSON numbers from remote SQL-over-HTTP
+/// endpoints and as rusqlite integers locally; both must render to the same
+/// decimal string so the two sides compare equal. Extracting via `as_str()`
+/// alone (the old remote path) silently dropped an integer timestamp to `None`,
+/// which forced every genuinely-changed row into `content_differs` -- skipped in
+/// both directions under `newer_wins`/`uuid_v7_wins`. This is the single
+/// canonical extractor for the native, plugin, and wasm metadata builders so
+/// the three cannot drift.
+pub fn extract_updated_at(value: Option<&JsonValue>) -> Option<String> {
+    match value {
+        Some(JsonValue::Number(n)) => Some(n.to_string()),
+        Some(JsonValue::String(s)) => Some(s.clone()),
+        _ => None,
+    }
+}
+
 /// Conditional Send bound: required on native (for tokio), absent on WASM (single-threaded).
 #[cfg(not(target_arch = "wasm32"))]
 pub trait MaybeSend: Send {}
@@ -95,4 +113,41 @@ pub trait DataSource: Sync {
         &self,
         table: &str,
     ) -> impl std::future::Future<Output = Result<usize>> + MaybeSend;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn extract_updated_at_renders_integer_timestamps() {
+        // The whole point of #177: a JSON integer timestamp must survive as its
+        // decimal string, not get dropped to None by an as_str()-only path.
+        let v = json!(1_700_000_000_i64);
+        assert_eq!(extract_updated_at(Some(&v)), Some("1700000000".to_string()));
+    }
+
+    #[test]
+    fn extract_updated_at_renders_string_timestamps() {
+        let v = json!("2023-06-01T00:00:00Z");
+        assert_eq!(
+            extract_updated_at(Some(&v)),
+            Some("2023-06-01T00:00:00Z".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_updated_at_is_none_for_null_and_missing() {
+        assert_eq!(extract_updated_at(Some(&JsonValue::Null)), None);
+        assert_eq!(extract_updated_at(None), None);
+    }
+
+    #[test]
+    fn extract_updated_at_renders_float_as_number_string() {
+        // Float timestamps are out of scope for numeric ordering but must still
+        // round-trip a stable string (both sides render via this one path).
+        let v = json!(1.5);
+        assert_eq!(extract_updated_at(Some(&v)), Some("1.5".to_string()));
+    }
 }

@@ -4,8 +4,28 @@ use crate::config::ConflictResolution;
 use crate::datasource::{DataSource, RowMeta};
 use crate::error::Result;
 use serde::Serialize;
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use tracing::{debug, info, warn};
+
+/// Order two `updated_at` timestamps for conflict resolution.
+///
+/// Integer Unix timestamps render as decimal strings ("999", "1000"); comparing
+/// those lexicographically is wrong across a digit-count boundary ("999" sorts
+/// after "1000"), so parse and compare numerically when BOTH sides are integers.
+/// ISO-8601 text timestamps are fixed-width, where lexical order == chronological,
+/// so fall back to string comparison when NEITHER side is an integer. A mixed
+/// pair (one integer, one non-integer) has no meaningful ordering -- return
+/// `None` so the caller routes it to `content_differs` rather than inventing a
+/// confident (and likely wrong) winner from a lexical compare of unlike
+/// representations.
+fn compare_ts(a: &str, b: &str) -> Option<Ordering> {
+    match (a.parse::<i64>(), b.parse::<i64>()) {
+        (Ok(x), Ok(y)) => Some(x.cmp(&y)),
+        (Err(_), Err(_)) => Some(a.cmp(b)),
+        _ => None,
+    }
+}
 
 /// Per-table diff statistics (counts only, no PK values).
 #[derive(Debug, Clone, Serialize)]
@@ -201,16 +221,13 @@ pub fn classify_diff(
         }
 
         match (&local_row.updated_at, &remote_row.updated_at) {
-            (Some(local_ts), Some(remote_ts)) => {
-                if local_ts > remote_ts {
-                    diff.local_newer.push((*pk).clone());
-                } else if remote_ts > local_ts {
-                    diff.remote_newer.push((*pk).clone());
-                } else {
-                    // Same timestamp, different content: treat as conflict.
-                    diff.content_differs.push((*pk).clone());
-                }
-            }
+            (Some(local_ts), Some(remote_ts)) => match compare_ts(local_ts, remote_ts) {
+                Some(Ordering::Greater) => diff.local_newer.push((*pk).clone()),
+                Some(Ordering::Less) => diff.remote_newer.push((*pk).clone()),
+                // Equal timestamps or unlike representations (one integer, one
+                // text): no safe tiebreaker, so treat as a content conflict.
+                Some(Ordering::Equal) | None => diff.content_differs.push((*pk).clone()),
+            },
             _ => {
                 diff.content_differs.push((*pk).clone());
             }
@@ -351,5 +368,89 @@ mod tests {
         let push = diff.rows_to_push(ConflictResolution::UuidV7Wins);
         assert_eq!(push, vec!["42".to_string()]);
         assert!(diff.rows_to_pull(ConflictResolution::UuidV7Wins).is_empty());
+    }
+
+    // --- Integer-timestamp conflict resolution (#176 / #177) ---
+
+    fn one(hash: &str, ts: Option<&str>) -> HashMap<String, RowMeta> {
+        let mut m = HashMap::new();
+        m.insert(
+            "r".to_string(),
+            RowMeta {
+                pk_value: "r".to_string(),
+                updated_at: ts.map(String::from),
+                content_hash: hash.to_string(),
+            },
+        );
+        m
+    }
+
+    // #177: an integer-timestamp row whose content changed must be classified by
+    // direction and actually sync -- NOT dropped into content_differs (which is
+    // skipped in both directions under newer_wins). This is the literal symptom
+    // the bug produced once both sides finally carry the integer timestamp.
+    #[test]
+    fn integer_timestamp_changed_row_syncs_not_skipped() {
+        // remote newer (larger unix ts), different content
+        let local = one("A", Some("1700000000"));
+        let remote = one("B", Some("1700000100"));
+        let diff = classify_diff(&local, &remote, "t");
+
+        assert_eq!(diff.remote_newer, vec!["r".to_string()]);
+        assert!(diff.content_differs.is_empty());
+        // ...and it is actually pulled under newer_wins, not silently skipped.
+        assert!(diff
+            .rows_to_pull(ConflictResolution::NewerWins)
+            .contains(&"r".to_string()));
+        assert!(diff.rows_to_push(ConflictResolution::NewerWins).is_empty());
+    }
+
+    // #176: integer timestamps straddling a digit-count boundary. Lexically
+    // "1000" < "999" (wrong); numerically 1000 > 999. The newer row (local) must
+    // win and be pushed -- the pre-fix code picked the OLDER remote row.
+    #[test]
+    fn integer_timestamp_lexicographic_boundary_orders_numerically() {
+        let local = one("A", Some("1000")); // newer
+        let remote = one("B", Some("999")); // older
+        let diff = classify_diff(&local, &remote, "t");
+
+        assert_eq!(diff.local_newer, vec!["r".to_string()]);
+        assert!(diff.remote_newer.is_empty());
+        assert!(diff
+            .rows_to_push(ConflictResolution::NewerWins)
+            .contains(&"r".to_string()));
+    }
+
+    // ISO-8601 text timestamps are fixed-width -> lexical order is chronological.
+    // Must keep working unchanged (they never enter the numeric branch).
+    #[test]
+    fn iso8601_timestamps_still_compare_lexically() {
+        let local = one("A", Some("2023-06-01T00:00:01Z")); // newer
+        let remote = one("B", Some("2023-06-01T00:00:00Z"));
+        let diff = classify_diff(&local, &remote, "t");
+        assert_eq!(diff.local_newer, vec!["r".to_string()]);
+    }
+
+    // Mixed representation (one integer, one ISO text for the same column --
+    // reachable via schema skew between local and remote). There is no honest
+    // ordering, so route to content_differs rather than invent a confident
+    // lexical winner ("2023-..." vs "1700..." would always pick local).
+    #[test]
+    fn mixed_timestamp_representation_is_content_differs() {
+        let local = one("A", Some("1700000000")); // integer
+        let remote = one("B", Some("2023-06-01T00:00:00Z")); // ISO text
+        let diff = classify_diff(&local, &remote, "t");
+        assert_eq!(diff.content_differs, vec!["r".to_string()]);
+        assert!(diff.local_newer.is_empty());
+        assert!(diff.remote_newer.is_empty());
+    }
+
+    // Equal integer timestamps with differing content: no tiebreaker -> conflict.
+    #[test]
+    fn equal_integer_timestamps_are_content_differs() {
+        let local = one("A", Some("1700000000"));
+        let remote = one("B", Some("1700000000"));
+        let diff = classify_diff(&local, &remote, "t");
+        assert_eq!(diff.content_differs, vec!["r".to_string()]);
     }
 }

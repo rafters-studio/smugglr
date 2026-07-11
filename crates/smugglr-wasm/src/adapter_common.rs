@@ -5,7 +5,7 @@
 //! These functions are self-free (no adapter state) so they live here once
 //! and are called from both adapters as `adapter_common::<fn>`.
 
-use smugglr_core::datasource::{ColumnInfo, RowMeta, TableInfo};
+use smugglr_core::datasource::{extract_updated_at, ColumnInfo, RowMeta, TableInfo};
 use std::collections::HashMap;
 
 use serde_json::Value;
@@ -92,10 +92,7 @@ pub(crate) fn row_maps_to_metadata(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let updated_at = row
-            .get(timestamp_column)
-            .and_then(|v| v.as_str())
-            .map(String::from);
+        let updated_at = extract_updated_at(row.get(timestamp_column));
         let content_hash = content_hash(row, column_order, exclude_columns, timestamp_column);
 
         result.insert(
