@@ -131,7 +131,9 @@ impl TableDiff {
         // count > 0 implies a skipping policy (unresolved_conflicts is empty for
         // local_wins/remote_wins); pick the reason, sharing one warning template.
         let reason = match conflict_resolution {
-            ConflictResolution::NewerWins => "no usable timestamps (skipped under newer_wins)",
+            ConflictResolution::NewerWins => {
+                "missing or incomparable timestamps (skipped under newer_wins)"
+            }
             ConflictResolution::UuidV7Wins => {
                 "same PK with identical UUIDv7 timestamp (skipped under uuid_v7_wins)"
             }
