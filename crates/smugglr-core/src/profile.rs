@@ -5,6 +5,7 @@
 //! so both the http-sql plugin (reqwest) and the WASM adapter (fetch)
 //! can share profile definitions without duplication.
 
+use crate::error::SyncError;
 use serde_json::Value;
 
 /// How to talk to a specific HTTP SQL endpoint.
@@ -35,7 +36,8 @@ pub enum RequestFormat {
     Turso,
     /// rqlite: `[["<sql>", ...params]]`
     Rqlite,
-    /// Datasette: `{"sql": "<sql>", "params": {...}}`
+    /// Datasette: `{"sql": "<sql>", "_shape": "array"}`. No positional bind API,
+    /// so `build_request` errors rather than drop bound params (see #201).
     Datasette,
     /// Flat JSON: `{"sql": "<sql>", "params": [...]}`. Shared by Cloudflare D1,
     /// the http-sql v0.1 spec, and generic endpoints -- they emit this exact
@@ -154,8 +156,14 @@ impl Profile {
     }
 
     /// Build the request body for a SQL query.
-    pub fn build_request(&self, sql: &str, params: &[Value]) -> Value {
-        match self.request_format {
+    ///
+    /// Errors for the datasette profile when `params` is non-empty: Datasette's
+    /// HTTP API has no positional (`?`) bind mechanism, so the previous behavior
+    /// silently dropped the bound values and sent SQL with unbound `?`
+    /// placeholders (endpoint error or, worse, a mis-bind). Surfacing the
+    /// incompatibility as an error is the fix for #201.
+    pub fn build_request(&self, sql: &str, params: &[Value]) -> Result<Value, SyncError> {
+        let body = match self.request_format {
             RequestFormat::Turso => {
                 if params.is_empty() {
                     serde_json::json!({
@@ -197,6 +205,15 @@ impl Profile {
                 }
             }
             RequestFormat::Datasette => {
+                if !params.is_empty() {
+                    return Err(SyncError::Config(format!(
+                        "the datasette profile does not support parameterized queries: {} bind \
+                         parameter(s) would be silently dropped. Datasette has no positional bind \
+                         API; use a profile with parameter support (turso, rqlite, generic) for \
+                         this endpoint.",
+                        params.len()
+                    )));
+                }
                 serde_json::json!({"sql": sql, "_shape": "array"})
             }
             RequestFormat::Generic => {
@@ -206,7 +223,8 @@ impl Profile {
                     serde_json::json!({"sql": sql, "params": params})
                 }
             }
-        }
+        };
+        Ok(body)
     }
 
     /// Navigate a JSON path to extract a nested value.
@@ -230,7 +248,7 @@ mod tests {
     #[test]
     fn test_turso_request_no_params() {
         let p = Profile::turso();
-        let body = p.build_request("SELECT 1", &[]);
+        let body = p.build_request("SELECT 1", &[]).unwrap();
         assert!(body["requests"][0]["stmt"]["sql"]
             .as_str()
             .unwrap()
@@ -240,10 +258,12 @@ mod tests {
     #[test]
     fn test_turso_request_with_params() {
         let p = Profile::turso();
-        let body = p.build_request(
-            "SELECT * FROM users WHERE id = ?",
-            &[Value::String("42".into())],
-        );
+        let body = p
+            .build_request(
+                "SELECT * FROM users WHERE id = ?",
+                &[Value::String("42".into())],
+            )
+            .unwrap();
         let args = &body["requests"][0]["stmt"]["args"];
         assert_eq!(args[0]["type"], "text");
         assert_eq!(args[0]["value"], "42");
@@ -252,14 +272,14 @@ mod tests {
     #[test]
     fn test_rqlite_request() {
         let p = Profile::rqlite();
-        let body = p.build_request("SELECT 1", &[]);
+        let body = p.build_request("SELECT 1", &[]).unwrap();
         assert_eq!(body[0][0], "SELECT 1");
     }
 
     #[test]
     fn test_generic_request() {
         let p = Profile::generic();
-        let body = p.build_request("SELECT 1", &[]);
+        let body = p.build_request("SELECT 1", &[]).unwrap();
         assert_eq!(body["sql"], "SELECT 1");
     }
 
@@ -287,16 +307,35 @@ mod tests {
     #[test]
     fn test_d1_request() {
         let p = Profile::d1();
-        let body = p.build_request("SELECT 1", &[]);
+        let body = p.build_request("SELECT 1", &[]).unwrap();
         assert_eq!(body["sql"], "SELECT 1");
     }
 
     #[test]
     fn test_datasette_request() {
         let p = Profile::datasette();
-        let body = p.build_request("SELECT 1", &[]);
+        let body = p.build_request("SELECT 1", &[]).unwrap();
         assert_eq!(body["sql"], "SELECT 1");
         assert_eq!(body["_shape"], "array");
+    }
+
+    #[test]
+    fn datasette_rejects_parameterized_query() {
+        // Regression for #201: Datasette has no positional bind API, so the
+        // pre-fix build_request silently DROPPED params and emitted
+        // {"sql": ..., "_shape": "array"} with unbound `?` placeholders (endpoint
+        // error or mis-bind). It must now return an error instead of a
+        // silently-misbinding body. Paramless datasette still works
+        // (test_datasette_request above).
+        let p = Profile::datasette();
+        let result = p.build_request(
+            "SELECT * FROM t WHERE id IN (?)",
+            &[Value::String("k1".into())],
+        );
+        assert!(
+            result.is_err(),
+            "datasette must reject bound params, not silently drop them"
+        );
     }
 
     #[test]
@@ -320,7 +359,7 @@ mod tests {
     #[test]
     fn test_http_sql_request_no_params() {
         let p = Profile::http_sql();
-        let body = p.build_request("SELECT 1", &[]);
+        let body = p.build_request("SELECT 1", &[]).unwrap();
         assert_eq!(body["sql"], "SELECT 1");
         assert!(body.get("params").is_none());
     }
@@ -328,10 +367,12 @@ mod tests {
     #[test]
     fn test_http_sql_request_with_params() {
         let p = Profile::http_sql();
-        let body = p.build_request(
-            "SELECT * FROM notes WHERE id = ?",
-            &[Value::String("42".into())],
-        );
+        let body = p
+            .build_request(
+                "SELECT * FROM notes WHERE id = ?",
+                &[Value::String("42".into())],
+            )
+            .unwrap();
         assert_eq!(body["sql"], "SELECT * FROM notes WHERE id = ?");
         assert_eq!(body["params"][0], "42");
     }

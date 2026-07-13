@@ -44,7 +44,10 @@ impl HttpSqlAdapter {
             .as_ref()
             .ok_or_else(|| PluginError::new("not initialized"))?;
 
-        let body = self.profile.build_request(sql, params);
+        let body = self
+            .profile
+            .build_request(sql, params)
+            .map_err(|e| PluginError::new(e.to_string()))?;
         let mut req = client.post(&self.url).json(&body);
 
         req = match self.profile.auth_format {
