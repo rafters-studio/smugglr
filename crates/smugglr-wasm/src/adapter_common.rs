@@ -84,25 +84,44 @@ pub(crate) fn row_maps_to_metadata(
     column_order: &[String],
     timestamp_column: &str,
     exclude_columns: &[String],
+    table: &str,
 ) -> HashMap<String, RowMeta> {
     let mut result = HashMap::with_capacity(maps.len());
     for row in maps {
-        let pk = row
-            .get("__pk")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+        // Parity with core local.rs: a NULL rendered __pk (a NULL part in a
+        // composite PK propagates through `||`) cannot key pk-based sync.
+        // Coercing it to "" would collapse every such row onto one entry --
+        // silently dropping rows and provoking spurious deletes. Skip and warn.
+        let pk = match row.get("__pk").and_then(|v| v.as_str()) {
+            Some(pk) => pk.to_string(),
+            None => {
+                web_sys::console::warn_1(
+                    &format!("smugglr: skipping row in {} with NULL primary key", table).into(),
+                );
+                continue;
+            }
+        };
         let updated_at = extract_updated_at(row.get(timestamp_column));
         let content_hash = content_hash(row, column_order, exclude_columns, timestamp_column);
 
-        result.insert(
+        if let Some(prev) = result.insert(
             pk.clone(),
             RowMeta {
-                pk_value: pk,
+                pk_value: pk.clone(),
                 updated_at,
                 content_hash,
             },
-        );
+        ) {
+            // Two rows rendering to the same PK text means the PK is not unique
+            // as encoded -- the metadata map silently lost `prev`. Surface it.
+            web_sys::console::warn_1(
+                &format!(
+                    "smugglr: duplicate primary key {} in {} -- a row was overwritten in change metadata (prev hash {})",
+                    pk, table, prev.content_hash
+                )
+                .into(),
+            );
+        }
     }
     result
 }
@@ -201,11 +220,35 @@ mod tests {
             &["name".to_string(), "updated_at".to_string()],
             "updated_at",
             &[],
+            "items",
         );
 
         assert_eq!(
             meta.get("k1").expect("row keyed by __pk").updated_at,
             Some("1700000000".to_string())
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn row_maps_to_metadata_skips_null_primary_key() {
+        // Regression for #231: a NULL rendered __pk (e.g. a NULL part of a
+        // composite PK, since `||` propagates NULL) must be skipped, not coerced
+        // to "". Two such rows previously collapsed onto a single "" key --
+        // silently dropping one and provoking spurious deletes. Pre-fix this
+        // returns 1 entry (keyed ""); after the fix it returns 0.
+        let mut a = HashMap::new();
+        a.insert("__pk".to_string(), Value::Null);
+        a.insert("name".to_string(), Value::String("alice".to_string()));
+        let mut b = HashMap::new();
+        b.insert("__pk".to_string(), Value::Null);
+        b.insert("name".to_string(), Value::String("bob".to_string()));
+
+        let meta = row_maps_to_metadata(&[a, b], &["name".to_string()], "updated_at", &[], "items");
+
+        assert!(
+            meta.is_empty(),
+            "NULL-__pk rows must be skipped, not collapsed onto one key; got {} entries",
+            meta.len()
         );
     }
 }
