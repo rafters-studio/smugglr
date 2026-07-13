@@ -319,16 +319,8 @@ impl DataSource for FetchDataSource {
         }
 
         let info = self.cached_table_info(table).await?;
-        let pk_expr = adapter_common::build_pk_text_expr(&info.primary_key);
-
-        let placeholders: Vec<String> = pk_values.iter().map(|_| "?".to_string()).collect();
+        let sql = smugglr_core::rowhash::pk_in_query(table, &info.primary_key, pk_values.len())?;
         let params: Vec<Value> = pk_values.iter().map(|v| Value::String(v.clone())).collect();
-        let sql = format!(
-            "SELECT * FROM \"{}\" WHERE {} IN ({})",
-            table,
-            pk_expr,
-            placeholders.join(", ")
-        );
 
         let response = self.execute(&sql, &params).await?;
         let columns = self.extract_columns(&response)?;

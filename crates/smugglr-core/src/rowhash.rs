@@ -22,6 +22,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::config::column_excluded;
+use crate::error::SyncError;
 
 /// Columns never folded into the content hash: they carry change-tracking
 /// timestamps, not content. A row whose only delta is its timestamp must NOT
@@ -136,6 +137,33 @@ pub fn pk_text_expr(primary_key: &[String]) -> String {
         .map(|k| format!("CAST(\"{}\" AS TEXT)", k))
         .collect::<Vec<_>>()
         .join(" || '|' || ")
+}
+
+/// Build the `SELECT * ... WHERE <pk> IN (?, ...)` query the adapters use to
+/// fetch full rows by primary key, guarding the empty-primary-key case.
+///
+/// `pk_text_expr` returns "" for an empty primary key, which would splice into
+/// `WHERE  IN (?, ?)` -- malformed SQL that fails with an opaque remote/executor
+/// error. `get_row_metadata` guards this; `get_rows` did not, across all three
+/// adapters (native http-sql, wasm fetch, wasm local). This is the one guarded
+/// builder they now share, so the guard cannot drift or be forgotten (#198).
+pub fn pk_in_query(
+    table: &str,
+    primary_key: &[String],
+    pk_count: usize,
+) -> Result<String, SyncError> {
+    if primary_key.is_empty() {
+        return Err(SyncError::Config(format!(
+            "no primary key for table: {table}"
+        )));
+    }
+    let placeholders = vec!["?"; pk_count].join(", ");
+    Ok(format!(
+        "SELECT * FROM \"{}\" WHERE {} IN ({})",
+        table,
+        pk_text_expr(primary_key),
+        placeholders
+    ))
 }
 
 #[cfg(test)]
@@ -282,6 +310,26 @@ mod tests {
         assert_eq!(
             pk_text_expr(&["a".to_string(), "b".to_string()]),
             "CAST(\"a\" AS TEXT) || '|' || CAST(\"b\" AS TEXT)"
+        );
+    }
+
+    #[test]
+    fn pk_in_query_rejects_empty_primary_key() {
+        // Regression for #198: an empty primary key renders pk_text_expr to "",
+        // which splices into malformed `WHERE  IN (?, ?)`. The builder must error
+        // rather than emit that SQL (which get_rows previously sent verbatim).
+        assert!(
+            pk_in_query("items", &[], 2).is_err(),
+            "empty primary key must be rejected, not spliced into malformed SQL"
+        );
+    }
+
+    #[test]
+    fn pk_in_query_builds_select_for_valid_pk() {
+        let sql = pk_in_query("notes", &["id".to_string()], 2).unwrap();
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"notes\" WHERE CAST(\"id\" AS TEXT) IN (?, ?)"
         );
     }
 }
