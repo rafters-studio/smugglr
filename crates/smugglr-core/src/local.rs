@@ -350,25 +350,33 @@ fn upsert_rows_inner(
     Ok(count)
 }
 
-/// Helper to convert row value to JSON
+/// Convert a row value to JSON by its SQLite storage class.
+///
+/// Inspecting the `ValueRef` once distinguishes a genuine SQL NULL (-> JSON
+/// null) from a value that fails to decode. Previously every branch was a
+/// `get::<T>` whose `Err` was discarded, so a TEXT column holding non-UTF-8
+/// bytes fell through all four and was returned as NULL -- folding into the
+/// content hash indistinguishably from a real NULL (a stable-but-wrong hash,
+/// silent divergence). Such a value now surfaces a conversion error instead of
+/// being silently swallowed. (#180)
+///
+/// Behavior is otherwise unchanged: Integer/Real become JSON numbers, valid
+/// UTF-8 Text becomes a JSON string, Blob becomes lowercase hex (the rowhash
+/// wire contract) -- identical to the previous typed reads.
 fn get_json_value(row: &Row, idx: usize) -> Result<JsonValue> {
-    // Try in order: NULL, integer, real, text, blob
-    if let Ok(v) = row.get::<_, Option<i64>>(idx) {
-        return Ok(v.map(JsonValue::from).unwrap_or(JsonValue::Null));
+    use rusqlite::types::{Type, ValueRef};
+    match row.get_ref(idx)? {
+        ValueRef::Null => Ok(JsonValue::Null),
+        ValueRef::Integer(i) => Ok(JsonValue::from(i)),
+        ValueRef::Real(f) => Ok(JsonValue::from(f)),
+        ValueRef::Text(bytes) => match std::str::from_utf8(bytes) {
+            Ok(s) => Ok(JsonValue::from(s.to_string())),
+            Err(e) => {
+                Err(rusqlite::Error::FromSqlConversionFailure(idx, Type::Text, Box::new(e)).into())
+            }
+        },
+        ValueRef::Blob(b) => Ok(JsonValue::String(hex::encode(b))),
     }
-    if let Ok(v) = row.get::<_, Option<f64>>(idx) {
-        return Ok(v.map(JsonValue::from).unwrap_or(JsonValue::Null));
-    }
-    if let Ok(v) = row.get::<_, Option<String>>(idx) {
-        return Ok(v.map(JsonValue::from).unwrap_or(JsonValue::Null));
-    }
-    if let Ok(v) = row.get::<_, Option<Vec<u8>>>(idx) {
-        // Encode blobs as hex
-        return Ok(v
-            .map(|b| JsonValue::String(hex::encode(b)))
-            .unwrap_or(JsonValue::Null));
-    }
-    Ok(JsonValue::Null)
 }
 
 /// Wrapper to allow JSON values as SQL parameters
@@ -394,5 +402,72 @@ impl rusqlite::ToSql for JsonToSql {
                 Ok(ToSqlOutput::Owned(Value::Text(self.0.to_string())))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn one_row_conn(value_sql: &str) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE t (v); INSERT INTO t VALUES ({});",
+            value_sql
+        ))
+        .unwrap();
+        conn
+    }
+
+    fn get_col0(conn: &Connection) -> Result<JsonValue> {
+        let mut stmt = conn.prepare("SELECT v FROM t").unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        let row = rows.next().unwrap().unwrap();
+        get_json_value(row, 0)
+    }
+
+    #[test]
+    fn get_json_value_errors_on_non_utf8_text() {
+        // Regression for #180: a TEXT column holding non-UTF-8 bytes (a lone 0xFF
+        // cast to TEXT) previously fell through every typed read and was returned
+        // as NULL -- hashing identically to a real NULL. It must now surface an
+        // error instead of being silently swallowed.
+        let conn = one_row_conn("CAST(x'ff' AS TEXT)");
+        assert!(
+            get_col0(&conn).is_err(),
+            "non-UTF-8 text must error, not fold to NULL"
+        );
+    }
+
+    #[test]
+    fn get_json_value_null_stays_null() {
+        // The other side of the distinction: a genuine SQL NULL is still Ok(Null),
+        // not an error -- the fix does not conflate empty with unreadable.
+        let conn = one_row_conn("NULL");
+        assert_eq!(get_col0(&conn).unwrap(), JsonValue::Null);
+    }
+
+    #[test]
+    fn get_json_value_preserves_normal_types() {
+        // Behavior preservation: int/real/text/blob render exactly as the prior
+        // typed reads did, so content hashes are unchanged.
+        assert_eq!(
+            get_col0(&one_row_conn("42")).unwrap(),
+            JsonValue::from(42i64)
+        );
+        assert_eq!(
+            get_col0(&one_row_conn("2.5")).unwrap(),
+            JsonValue::from(2.5f64)
+        );
+        assert_eq!(
+            get_col0(&one_row_conn("'hello'")).unwrap(),
+            JsonValue::from("hello")
+        );
+        // Blob x'01ff' hashes as lowercase hex "01ff".
+        assert_eq!(
+            get_col0(&one_row_conn("x'01ff'")).unwrap(),
+            JsonValue::from("01ff")
+        );
     }
 }
