@@ -313,34 +313,13 @@ impl PluginAdapter for HttpSqlAdapter {
         let columns = self.extract_columns(&response)?;
         let rows = self.extract_rows(&response, &columns)?;
         let maps = self.rows_to_maps(&columns, &rows);
-
-        let mut result = HashMap::new();
-        for row in &maps {
-            let pk = row
-                .get("__pk")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let updated_at =
-                smugglr_core::datasource::extract_updated_at(row.get(timestamp_column));
-            let hash = smugglr_core::rowhash::content_hash(
-                row,
-                &column_order,
-                exclude_columns,
-                timestamp_column,
-            );
-
-            result.insert(
-                pk.clone(),
-                RowMeta {
-                    pk_value: pk,
-                    updated_at,
-                    content_hash: hash,
-                },
-            );
-        }
-
-        Ok(result)
+        Ok(build_row_metadata(
+            &maps,
+            &column_order,
+            timestamp_column,
+            exclude_columns,
+            table,
+        ))
     }
 
     async fn get_rows(
@@ -415,9 +394,98 @@ impl PluginAdapter for HttpSqlAdapter {
     }
 }
 
+/// Build the PK-keyed RowMeta map from result rows carrying a synthetic `__pk`
+/// column. Extracted from the async/HTTP-bound `get_row_metadata` so the
+/// NULL-/duplicate-PK guard is host-testable. Plugin-local only -- this is NOT
+/// the cross-crate dedup tracked by #222.
+///
+/// Parity with core `local.rs`: a NULL rendered `__pk` (a NULL part of a
+/// composite PK propagates through `||`) cannot key pk-based sync, and coercing
+/// it to "" would collapse every such row onto one entry -- silently dropping
+/// rows and provoking spurious deletes. Skip and warn; likewise surface a
+/// duplicate PK-text that overwrites an existing entry.
+fn build_row_metadata(
+    maps: &[HashMap<String, Value>],
+    column_order: &[String],
+    timestamp_column: &str,
+    exclude_columns: &[String],
+    table: &str,
+) -> HashMap<String, RowMeta> {
+    let mut result = HashMap::new();
+    for row in maps {
+        let pk = match row.get("__pk").and_then(|v| v.as_str()) {
+            Some(pk) => pk.to_string(),
+            None => {
+                eprintln!(
+                    "smugglr-http-sql: skipping row in {} with NULL primary key",
+                    table
+                );
+                continue;
+            }
+        };
+        let updated_at = smugglr_core::datasource::extract_updated_at(row.get(timestamp_column));
+        let content_hash = smugglr_core::rowhash::content_hash(
+            row,
+            column_order,
+            exclude_columns,
+            timestamp_column,
+        );
+
+        if let Some(prev) = result.insert(
+            pk.clone(),
+            RowMeta {
+                pk_value: pk.clone(),
+                updated_at,
+                content_hash,
+            },
+        ) {
+            eprintln!(
+                "smugglr-http-sql: duplicate primary key {} in {} -- a row was overwritten in change metadata (prev hash {})",
+                pk, table, prev.content_hash
+            );
+        }
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_row_metadata_skips_null_primary_key() {
+        // Regression for #231 (plugin path): a NULL rendered __pk must be skipped,
+        // not coerced to "". Two NULL-pk rows previously collapsed onto a single
+        // "" key -- silently dropping one. Pre-fix this returns 1 entry (keyed
+        // ""); after the fix it returns 0.
+        let mut a = HashMap::new();
+        a.insert("__pk".to_string(), Value::Null);
+        a.insert("name".to_string(), Value::from("alice"));
+        let mut b = HashMap::new();
+        b.insert("__pk".to_string(), Value::Null);
+        b.insert("name".to_string(), Value::from("bob"));
+
+        let meta = build_row_metadata(&[a, b], &["name".to_string()], "updated_at", &[], "items");
+
+        assert!(
+            meta.is_empty(),
+            "NULL-__pk rows must be skipped, not collapsed onto one key; got {} entries",
+            meta.len()
+        );
+    }
+
+    #[test]
+    fn build_row_metadata_keeps_valid_rows() {
+        // Guard against over-skipping: a normal string __pk is retained.
+        let mut a = HashMap::new();
+        a.insert("__pk".to_string(), Value::from("k1"));
+        a.insert("name".to_string(), Value::from("alice"));
+
+        let meta = build_row_metadata(&[a], &["name".to_string()], "updated_at", &[], "items");
+
+        assert_eq!(meta.len(), 1);
+        assert!(meta.contains_key("k1"));
+    }
 
     #[test]
     fn test_content_hash_excludes_timestamp() {

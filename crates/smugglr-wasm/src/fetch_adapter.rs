@@ -224,6 +224,7 @@ impl FetchDataSource {
             &column_order,
             timestamp_column,
             exclude_columns,
+            table,
         ))
     }
 
@@ -304,6 +305,7 @@ impl DataSource for FetchDataSource {
             &column_order,
             timestamp_column,
             exclude_columns,
+            table,
         ))
     }
 

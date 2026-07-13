@@ -117,6 +117,7 @@ impl LocalSqlDataSource {
             &column_order,
             timestamp_column,
             exclude_columns,
+            table,
         ))
     }
 
@@ -194,6 +195,7 @@ impl DataSource for LocalSqlDataSource {
             &column_order,
             timestamp_column,
             exclude_columns,
+            table,
         ))
     }
 
