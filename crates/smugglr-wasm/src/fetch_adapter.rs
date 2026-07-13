@@ -41,7 +41,7 @@ impl FetchDataSource {
     }
 
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<Value> {
-        let body = self.profile.build_request(sql, params);
+        let body = self.profile.build_request(sql, params)?;
         let body_str =
             serde_json::to_string(&body).map_err(|e| SyncError::Remote(e.to_string()))?;
 
