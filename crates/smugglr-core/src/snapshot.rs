@@ -57,6 +57,20 @@ fn snapshot_suffix() -> String {
     hex::encode(bytes)
 }
 
+/// Render a snapshot timestamp as a filename-safe object-key component.
+///
+/// Snapshot object keys are used verbatim as filenames by the LocalFileSystem
+/// relay backend, and the ISO-8601 timestamp's `HH:MM:SS` colons are illegal in
+/// Windows filenames -- a colon starts an NTFS alternate-data-stream, so a `put`
+/// silently misbehaves rather than erroring. Replacing `:` with `-` keeps the
+/// key filename-safe on every platform while staying deterministic, so `restore`
+/// can reconstruct it. The colon-bearing timestamp is preserved untouched inside
+/// the `.meta.json` sidecar (`SnapshotMeta.timestamp`) -- what listing and restore
+/// sort/match on -- so sort order is unchanged across old and new keys. (#238)
+fn key_component(timestamp: &str) -> String {
+    timestamp.replace(':', "-")
+}
+
 /// Create a point-in-time snapshot of the local database.
 pub async fn snapshot(
     config: &StashConfig,
@@ -101,7 +115,7 @@ pub async fn snapshot(
     }
 
     // Upload snapshot database
-    let snap_path = ObjectPath::from(format!("{}/{}.sqlite", prefix, timestamp));
+    let snap_path = ObjectPath::from(format!("{}/{}.sqlite", prefix, key_component(&timestamp)));
     info!("Uploading snapshot to {}", snap_path);
     store
         .put(&snap_path, PutPayload::from(db_bytes))
@@ -115,7 +129,11 @@ pub async fn snapshot(
         tables,
     };
     let meta_json = serde_json::to_vec(&meta)?;
-    let meta_path = ObjectPath::from(format!("{}/{}.meta.json", prefix, meta.timestamp));
+    let meta_path = ObjectPath::from(format!(
+        "{}/{}.meta.json",
+        prefix,
+        key_component(&meta.timestamp)
+    ));
     store
         .put(&meta_path, PutPayload::from(meta_json))
         .await
@@ -248,16 +266,34 @@ pub async fn restore(
         return Ok(result);
     }
 
-    // Download the snapshot
-    let snap_path = ObjectPath::from(format!("{}/{}.sqlite", prefix, entry.timestamp));
+    // Download the snapshot. New keys are filename-safe (`key_component`); a relay
+    // that predates #238 (e.g. S3, where colons are legal) still holds the blob at
+    // the raw colon-bearing key, so fall back to it on NotFound.
+    let snap_path = ObjectPath::from(format!(
+        "{}/{}.sqlite",
+        prefix,
+        key_component(&entry.timestamp)
+    ));
     info!("Downloading snapshot from {}", snap_path);
 
-    let get_result = store.get(&snap_path).await.map_err(|e| {
-        SyncError::Stash(format!(
-            "Failed to download snapshot {}: {}",
-            entry.timestamp, e
-        ))
-    })?;
+    let get_result = match store.get(&snap_path).await {
+        Ok(r) => r,
+        Err(object_store::Error::NotFound { .. }) => {
+            let legacy_path = ObjectPath::from(format!("{}/{}.sqlite", prefix, entry.timestamp));
+            store.get(&legacy_path).await.map_err(|e| {
+                SyncError::Stash(format!(
+                    "Failed to download snapshot {}: {}",
+                    entry.timestamp, e
+                ))
+            })?
+        }
+        Err(e) => {
+            return Err(SyncError::Stash(format!(
+                "Failed to download snapshot {}: {}",
+                entry.timestamp, e
+            )))
+        }
+    };
 
     let bytes = get_result
         .bytes()
@@ -387,6 +423,108 @@ mod tests {
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(entries.len(), 2); // .sqlite + .meta.json
+    }
+
+    #[tokio::test]
+    async fn snapshot_object_keys_are_filename_safe() {
+        // Regression for #238: object keys are used verbatim as filenames by the
+        // LocalFileSystem relay, so they must contain NO colon -- a colon is
+        // illegal in a Windows filename (it opens an NTFS alternate-data-stream,
+        // so `put` silently misbehaves rather than erroring, which is exactly why
+        // the multi-key snapshot tests were gated off Windows). Assert the on-disk
+        // names directly, then confirm the colon-free key still round-trips.
+        let dir = TempDir::new().unwrap();
+        let local_path = dir.path().join("local.sqlite");
+        let snap_dir = dir.path().join("snap_store");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        create_test_db(&local_path, &[(1, "alpha", "2024-01-01")]);
+        let config = make_file_stash_config(&snap_dir);
+
+        snapshot(&config, local_path.to_str().unwrap(), false)
+            .await
+            .unwrap();
+
+        let names: Vec<String> = std::fs::read_dir(snap_dir.join("snapshots"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names.len(),
+            2,
+            "expected .sqlite + .meta.json, got {:?}",
+            names
+        );
+        for name in &names {
+            assert!(
+                !name.contains(':'),
+                "snapshot key must be filename-safe (no colon), got {}",
+                name
+            );
+        }
+
+        // The colon-free key must still be fetchable by restore.
+        let restored = restore(
+            &config,
+            local_path.to_str().unwrap(),
+            "2099-01-01T00:00:00.000Z",
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(!restored.timestamp.is_empty());
+    }
+
+    // A pre-#238 relay (e.g. S3, where colons are legal) holds the blob at the raw
+    // colon-bearing key; restore must fall back to it. Gated off Windows because
+    // the simulated legacy layout writes a colon-keyed file, which is itself
+    // impossible on a Windows filesystem -- exactly why such keys only ever exist
+    // on S3-style relays.
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn restore_finds_legacy_colon_keyed_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let local_path = dir.path().join("local.sqlite");
+        let snap_dir = dir.path().join("snap_store");
+        let snapshots_dir = snap_dir.join("snapshots");
+        std::fs::create_dir_all(&snapshots_dir).unwrap();
+        create_test_db(&local_path, &[(1, "alpha", "2024-01-01")]);
+
+        // A valid sqlite db to serve as the legacy snapshot blob (id=9 marks it).
+        let blob_src = dir.path().join("blob.sqlite");
+        create_test_db(&blob_src, &[(9, "restored", "2020-01-01")]);
+        let blob = std::fs::read(&blob_src).unwrap();
+
+        // Old on-disk layout: colon-bearing key for both blob and sidecar.
+        let legacy_ts = "2020-06-15T12:30:45.000Z-deadbeef";
+        std::fs::write(snapshots_dir.join(format!("{}.sqlite", legacy_ts)), &blob).unwrap();
+        let meta = SnapshotMeta {
+            timestamp: legacy_ts.to_string(),
+            size_bytes: blob.len() as u64,
+            tables: vec![],
+        };
+        std::fs::write(
+            snapshots_dir.join(format!("{}.meta.json", legacy_ts)),
+            serde_json::to_vec(&meta).unwrap(),
+        )
+        .unwrap();
+
+        let config = make_file_stash_config(&snap_dir);
+        let restored = restore(
+            &config,
+            local_path.to_str().unwrap(),
+            "2099-01-01T00:00:00.000Z",
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(restored.timestamp, legacy_ts);
+
+        // The local db was replaced by the legacy blob (id=9 present).
+        let conn = rusqlite::Connection::open(&local_path).unwrap();
+        let id: i64 = conn
+            .query_row("SELECT id FROM items WHERE id = 9", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(id, 9);
     }
 
     #[tokio::test]
@@ -644,12 +782,6 @@ mod tests {
     // Regression for #186: restore must reject a structurally-broken database
     // (corrupt b-tree pages) that passes a bare header/`SELECT 1` check but
     // fails PRAGMA quick_check, rather than renaming it over the live db.
-    // Windows CI: these tests write real snapshots to a LocalFileSystem relay,
-    // whose object keys embed the colon-bearing timestamp (HH:MM:SS) -- an
-    // invalid filename on Windows. The snapshot logic under test is
-    // platform-independent (exercised on macos/linux); the Windows key-encoding
-    // bug is tracked separately as #238.
-    #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn test_restore_rejects_corrupt_snapshot() {
         let dir = TempDir::new().unwrap();
@@ -670,7 +802,7 @@ mod tests {
 
         let snap_obj = snap_dir
             .join("snapshots")
-            .join(format!("{}.sqlite", snap.timestamp));
+            .join(format!("{}.sqlite", key_component(&snap.timestamp)));
         let mut good = std::fs::read(&snap_obj).unwrap();
         // Keep the first SQLite page header (100 bytes) intact, corrupt the rest.
         assert!(good.len() > 200, "snapshot should be larger than a header");
@@ -703,7 +835,6 @@ mod tests {
     // Regression for #188: two snapshots taken back-to-back (potentially within
     // the same millisecond) must produce distinct object keys so neither
     // clobbers the other.
-    #[cfg(not(target_os = "windows"))] // #238: colon-in-timestamp object key is an invalid Windows filename
     #[tokio::test]
     async fn test_consecutive_snapshots_have_unique_keys() {
         let dir = TempDir::new().unwrap();
@@ -735,7 +866,6 @@ mod tests {
     // that is the *only* swallow path -- a non-NotFound read error now
     // propagates. Here we assert the skip path still works so a single bad
     // sidecar does not abort the whole list.
-    #[cfg(not(target_os = "windows"))] // #238: colon-in-timestamp object key is an invalid Windows filename
     #[tokio::test]
     async fn test_list_snapshots_skips_malformed_sidecar() {
         let dir = TempDir::new().unwrap();
