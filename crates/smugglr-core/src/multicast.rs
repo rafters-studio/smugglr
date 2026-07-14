@@ -56,7 +56,10 @@ use tracing::{debug, warn};
 pub const DEFAULT_GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 43, 21);
 
 /// Receive buffer: the largest datagram we will accept (one full UDP payload).
-const RECV_BUF: usize = 65_536;
+///
+/// `pub` so callers of [`Gossip::recv_and_handle`] can size the reusable buffer
+/// they hoist out of their receive loop (see that method's doc comment).
+pub const RECV_BUF: usize = 65_536;
 
 /// Wire headroom reserved when chunking deltas for multicast: the `Msg` JSON
 /// wrapper (`{"version":N,"body":{"t":"Delta",...}}`, a fixed ~35 bytes) plus the
@@ -412,11 +415,20 @@ impl Gossip {
     /// This is the whole peer-symmetric loop body: a `Digest` we hear may make us
     /// send a `Want`; a `Want` we hear may make us send a `Delta`; a `Delta` we
     /// hear we apply idempotently.
-    pub async fn recv_and_handle(&self, local: &LocalDb, config: &Config) -> Result<GossipEvent> {
-        let mut buf = vec![0u8; RECV_BUF];
+    ///
+    /// `buf` is a scratch receive buffer owned by the caller, at least
+    /// [`RECV_BUF`] bytes -- callers running a receive loop should allocate it
+    /// once outside the loop and pass the same buffer on every call, so a
+    /// steady-state gossip listener does not allocate+zero 64 KiB per datagram.
+    pub async fn recv_and_handle(
+        &self,
+        buf: &mut [u8],
+        local: &LocalDb,
+        config: &Config,
+    ) -> Result<GossipEvent> {
         let (n, _addr) = self
             .socket
-            .recv_from(&mut buf)
+            .recv_from(buf)
             .await
             .map_err(|e| SyncError::Broadcast(format!("multicast recv: {e}")))?;
         let (event, out) = self.handle(&buf[..n], local, config).await?;
@@ -979,10 +991,11 @@ mod tests {
         let (a, a_cfg, a_local, b, b_cfg, b_local) = two_nodes(&a_path, &b_path).await;
 
         a.broadcast_digests(&a_local, &a_cfg).await.unwrap();
+        let mut recv_buf = vec![0u8; RECV_BUF];
         loop {
             let ev = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                b.recv_and_handle(&b_local, &b_cfg),
+                b.recv_and_handle(&mut recv_buf, &b_local, &b_cfg),
             )
             .await
             .expect("multicast recv timed out")
