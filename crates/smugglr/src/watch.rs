@@ -63,13 +63,16 @@ pub async fn run_watch(
                 info!("Watch tick #{}", tick_count);
 
                 let result = match &target {
-                    ResolvedTarget::Sqlite { database } => {
-                        let local = LocalDb::open(config.local_db_path())?;
-                        let target_db = LocalDb::open(database)?;
+                    ResolvedTarget::Sqlite { .. } => {
+                        let local = open_local(config, dry_run)?;
+                        // Mirrors run_sync/run_pull's dry-run-readonly convention: in
+                        // dry-run nothing is written (sync_all bails before
+                        // transfer_rows), so the target does not need write access.
+                        let target_db = crate::TargetSource::open(&target, !dry_run).await?;
                         sync_all(&local, &target_db, config, None, dry_run, &NoProgress).await
                     }
                     ResolvedTarget::Plugin { .. } => {
-                        let local = LocalDb::open(config.local_db_path())?;
+                        let local = open_local(config, dry_run)?;
                         let plugin = plugin.as_ref().expect("plugin initialized before loop");
                         sync_all(&local, plugin, config, None, dry_run, &NoProgress).await
                     }
@@ -132,4 +135,130 @@ pub async fn run_watch(
 
     info!("Watch daemon stopped after {} ticks", tick_count);
     Ok(())
+}
+
+/// Open the local DB in the same dry-run-readonly mode `run_sync`/`run_pull`
+/// use (main.rs): read-only when `dry_run` is true, read-write otherwise.
+///
+/// In dry-run, `sync_all` never reaches a writer -- `push_table`/`pull_table`
+/// both return before `transfer_rows`, the sole caller of `upsert_rows` -- so
+/// a read-write connection is unnecessary: it asks for write access dry-run
+/// never uses, can spuriously fail on a read-only filesystem or a locked DB,
+/// and it diverges from the dry-run-readonly convention `run_sync`/`run_pull`
+/// establish (#217).
+fn open_local(config: &Config, dry_run: bool) -> Result<LocalDb> {
+    if dry_run {
+        LocalDb::open_readonly(config.local_db_path())
+    } else {
+        LocalDb::open(config.local_db_path())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smugglr_core::config::SyncConfig;
+    use smugglr_core::datasource::DataSource;
+    use std::collections::HashMap;
+
+    /// Create a fresh SQLite file at `path` with one table, `t (id, v)`.
+    ///
+    /// `LocalDb`/`TargetSource` intentionally expose no raw-SQL or
+    /// table-creation API (production code never needs one), so the fixture
+    /// is built with a direct `rusqlite` connection instead.
+    fn make_db_with_table(path: &std::path::Path) {
+        let conn = rusqlite::Connection::open(path).expect("create fixture db");
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+            .expect("create fixture table");
+    }
+
+    fn sample_row() -> HashMap<String, serde_json::Value> {
+        let mut row = HashMap::new();
+        row.insert("id".to_string(), serde_json::json!(1));
+        row.insert("v".to_string(), serde_json::json!("x"));
+        row
+    }
+
+    fn config_for(db_path: &std::path::Path) -> Config {
+        Config {
+            cloudflare_account_id: None,
+            cloudflare_api_token: None,
+            database_id: None,
+            local_db: Some(db_path.to_string_lossy().into_owned()),
+            sync: SyncConfig::default(),
+            stash: None,
+            target: None,
+            broadcast: None,
+        }
+    }
+
+    /// Regression for #217 (local DB): a dry-run watch tick's local
+    /// connection must be genuinely read-only, not merely "unwritten in
+    /// practice." Before the fix, `open_local`'s equivalent (the raw
+    /// `LocalDb::open(...)` call in watch.rs) opened read-write
+    /// unconditionally, ignoring `dry_run`. On that code, a write attempt
+    /// against the dry-run connection succeeds -- the no-writes guarantee
+    /// lived only in caller discipline (`sync_all` bailing before
+    /// `transfer_rows`), not in the connection itself. This test fails
+    /// against that code (the first assertion below) and passes once
+    /// `open_local` opens read-only in dry-run, because SQLite itself then
+    /// rejects the write.
+    #[tokio::test]
+    async fn open_local_dry_run_connection_rejects_writes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("local.db");
+        make_db_with_table(&db_path);
+        let config = config_for(&db_path);
+
+        let db = open_local(&config, true).expect("dry-run open should succeed");
+        let write = db
+            .upsert_rows("t", std::slice::from_ref(&sample_row()))
+            .await;
+        assert!(
+            write.is_err(),
+            "dry-run's local connection must reject writes, but a write succeeded"
+        );
+
+        // Control: the same DB opened non-dry-run accepts the identical
+        // write. This proves the failure above is specifically about the
+        // dry-run open mode, not an unrelated problem with the fixture.
+        let db_rw = open_local(&config, false).expect("non-dry-run open should succeed");
+        let write_rw = db_rw
+            .upsert_rows("t", std::slice::from_ref(&sample_row()))
+            .await;
+        assert!(
+            write_rw.is_ok(),
+            "non-dry-run's local connection should accept writes, got: {:?}",
+            write_rw
+        );
+    }
+
+    /// Regression for #217 (SQLite target): mirrors the local-DB assertion
+    /// above for the SQLite target opened via `TargetSource::open` in the
+    /// watch loop's `ResolvedTarget::Sqlite` arm. Before the fix this arm
+    /// called `LocalDb::open(database)` unconditionally (also ignoring
+    /// `dry_run`), so the same write-succeeds-when-it-shouldn't failure
+    /// applies to the target connection.
+    #[tokio::test]
+    async fn target_source_open_dry_run_connection_rejects_writes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("target.db");
+        make_db_with_table(&db_path);
+
+        let target = ResolvedTarget::Sqlite {
+            database: db_path.to_string_lossy().into_owned(),
+        };
+        let dry_run = true;
+
+        let target_db = crate::TargetSource::open(&target, !dry_run)
+            .await
+            .expect("dry-run target open should succeed");
+        let write = target_db
+            .upsert_rows("t", std::slice::from_ref(&sample_row()))
+            .await;
+        assert!(
+            write.is_err(),
+            "dry-run's target connection must reject writes, but a write succeeded"
+        );
+    }
 }
