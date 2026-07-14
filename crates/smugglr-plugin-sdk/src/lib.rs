@@ -30,6 +30,7 @@
 //! }
 //! ```
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -260,19 +261,20 @@ fn param_str_slice(params: &Value, key: &str) -> Result<Vec<String>, PluginError
         .collect()
 }
 
-fn param_rows(params: &mut Value) -> Result<Vec<HashMap<String, Value>>, PluginError> {
-    match params.get_mut("rows").map(Value::take) {
-        None => Err(PluginError::with_code("missing param: rows", -32602)),
+/// Take a JSON-RPC param by key and deserialize it into `T`, leaving `Value::Null`
+/// behind in `params` in its place (see [`Value::take`]).
+///
+/// Distinguishes "key absent" (missing param) from "key present but the wrong
+/// shape" (invalid param) so callers get an accurate error message instead of
+/// a misleading "missing" for malformed-but-present data.
+fn param_de<T: DeserializeOwned>(params: &mut Value, key: &str) -> Result<T, PluginError> {
+    match params.get_mut(key).map(Value::take) {
+        None => Err(PluginError::with_code(
+            format!("missing param: {}", key),
+            -32602,
+        )),
         Some(v) => serde_json::from_value(v)
-            .map_err(|e| PluginError::with_code(format!("invalid param: rows: {}", e), -32602)),
-    }
-}
-
-fn param_config(params: &mut Value) -> Result<HashMap<String, String>, PluginError> {
-    match params.get_mut("config").map(Value::take) {
-        None => Err(PluginError::with_code("missing param: config", -32602)),
-        Some(v) => serde_json::from_value(v)
-            .map_err(|e| PluginError::with_code(format!("invalid param: config: {}", e), -32602)),
+            .map_err(|e| PluginError::with_code(format!("invalid param: {}: {}", key, e), -32602)),
     }
 }
 
@@ -284,7 +286,7 @@ async fn dispatch(
 ) -> Result<Value, PluginError> {
     match req.method.as_str() {
         "initialize" => {
-            let config = param_config(&mut req.params)?;
+            let config: HashMap<String, String> = param_de(&mut req.params, "config")?;
             adapter.initialize(config).await?;
             Ok(Value::Bool(true))
         }
@@ -312,7 +314,7 @@ async fn dispatch(
         }
         "upsert_rows" => {
             let table = param_str(&req.params, "table")?;
-            let rows = param_rows(&mut req.params)?;
+            let rows: Vec<HashMap<String, Value>> = param_de(&mut req.params, "rows")?;
             let count = adapter.upsert_rows(&table, &rows).await?;
             Ok(serde_json::to_value(count).unwrap())
         }
@@ -448,7 +450,7 @@ mod tests {
     fn test_param_rows_malformed_reports_invalid_not_missing() {
         // rows present but an object instead of an array.
         let mut params = serde_json::json!({"rows": {"id": 1}});
-        let err = param_rows(&mut params).unwrap_err();
+        let err = param_de::<Vec<HashMap<String, Value>>>(&mut params, "rows").unwrap_err();
         assert_eq!(err.code, -32602);
         assert!(
             err.message.contains("invalid param: rows"),
@@ -461,7 +463,7 @@ mod tests {
     #[test]
     fn test_param_rows_missing_still_reports_missing() {
         let mut params = serde_json::json!({});
-        let err = param_rows(&mut params).unwrap_err();
+        let err = param_de::<Vec<HashMap<String, Value>>>(&mut params, "rows").unwrap_err();
         assert!(
             err.message.contains("missing param: rows"),
             "{}",
@@ -475,7 +477,7 @@ mod tests {
     fn test_param_config_malformed_reports_invalid_not_missing() {
         // config present but a string instead of a map.
         let mut params = serde_json::json!({"config": "not-a-map"});
-        let err = param_config(&mut params).unwrap_err();
+        let err = param_de::<HashMap<String, String>>(&mut params, "config").unwrap_err();
         assert_eq!(err.code, -32602);
         assert!(
             err.message.contains("invalid param: config"),
@@ -523,7 +525,7 @@ mod tests {
     #[test]
     fn test_param_config_extraction() {
         let mut params = serde_json::json!({"config": {"url": "http://localhost", "token": "abc"}});
-        let config = param_config(&mut params).unwrap();
+        let config = param_de::<HashMap<String, String>>(&mut params, "config").unwrap();
         assert_eq!(config.get("url").unwrap(), "http://localhost");
         assert_eq!(config.get("token").unwrap(), "abc");
     }
@@ -531,7 +533,7 @@ mod tests {
     #[test]
     fn test_param_rows_extraction() {
         let mut params = serde_json::json!({"rows": [{"id": 1, "name": "alice"}]});
-        let rows = param_rows(&mut params).unwrap();
+        let rows = param_de::<Vec<HashMap<String, Value>>>(&mut params, "rows").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get("name").unwrap(), "alice");
     }
