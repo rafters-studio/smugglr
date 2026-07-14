@@ -1786,6 +1786,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "smugglr-wire",
  "socket2 0.5.10",
  "tempfile",
  "thiserror",
@@ -1815,6 +1816,7 @@ version = "0.4.2"
 dependencies = [
  "serde",
  "serde_json",
+ "smugglr-wire",
  "tokio",
 ]
 
@@ -1833,6 +1835,14 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
  "web-sys",
+]
+
+[[package]]
+name = "smugglr-wire"
+version = "0.4.2"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

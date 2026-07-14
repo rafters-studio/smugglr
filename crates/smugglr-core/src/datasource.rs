@@ -9,33 +9,14 @@ use crate::error::Result;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 
-/// Table schema information
-#[derive(Debug, Clone)]
-pub struct TableInfo {
-    /// Exists for wire/serialization parity with the plugin's `WireTableInfo`.
-    pub name: String,
-    pub columns: Vec<ColumnInfo>,
-    pub primary_key: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ColumnInfo {
-    pub name: String,
-    #[allow(dead_code)]
-    pub col_type: String,
-    #[allow(dead_code)]
-    pub notnull: bool,
-    pub pk: bool,
-}
-
-/// A row with its primary key and optional timestamp
-#[derive(Debug, Clone)]
-pub struct RowMeta {
-    /// Exists for wire/serialization parity with the plugin's `WireRowMeta`.
-    pub pk_value: String,
-    pub updated_at: Option<String>,
-    pub content_hash: String,
-}
+/// Table schema information, row metadata, and column info.
+///
+/// Re-exported from `smugglr-wire`, the canonical definition shared with
+/// `smugglr-plugin-sdk` and the plugin JSON-RPC wire protocol -- see #228.
+/// This module keeps re-exporting them under their original names so
+/// `smugglr_core::datasource::{TableInfo, ColumnInfo, RowMeta}` importers
+/// (local.rs, plugin.rs, the wasm crate, the CLI) are unaffected.
+pub use smugglr_wire::{ColumnInfo, RowMeta, TableInfo};
 
 /// Normalize a row's timestamp-column value to the `RowMeta.updated_at` string.
 ///

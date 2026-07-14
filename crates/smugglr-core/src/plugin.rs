@@ -26,7 +26,7 @@
 //! - `upsert_rows` - params: `{table, rows}`
 //! - `row_count` - params: `{table}`
 
-use crate::datasource::{ColumnInfo, DataSource, RowMeta, TableInfo};
+use crate::datasource::{DataSource, RowMeta, TableInfo};
 use crate::error::{Result, SyncError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -100,31 +100,6 @@ fn rpc_error_to_sync_error(plugin_name: &str, err: &RpcError) -> SyncError {
             plugin_name, err.code, err.message
         ))
     }
-}
-
-#[derive(Deserialize)]
-struct WireTableInfo {
-    name: String,
-    columns: Vec<WireColumnInfo>,
-    primary_key: Vec<String>,
-}
-
-#[derive(Deserialize)]
-struct WireColumnInfo {
-    name: String,
-    #[serde(default)]
-    col_type: String,
-    #[serde(default)]
-    notnull: bool,
-    #[serde(default)]
-    pk: bool,
-}
-
-#[derive(Deserialize)]
-struct WireRowMeta {
-    pk_value: String,
-    updated_at: Option<String>,
-    content_hash: String,
 }
 
 impl PluginDataSource {
@@ -268,23 +243,8 @@ impl DataSource for PluginDataSource {
     }
 
     async fn table_info(&self, table: &str) -> Result<TableInfo> {
-        let wire: WireTableInfo = self
-            .call("table_info", serde_json::json!({ "table": table }))
-            .await?;
-        Ok(TableInfo {
-            name: wire.name,
-            columns: wire
-                .columns
-                .into_iter()
-                .map(|c| ColumnInfo {
-                    name: c.name,
-                    col_type: c.col_type,
-                    notnull: c.notnull,
-                    pk: c.pk,
-                })
-                .collect(),
-            primary_key: wire.primary_key,
-        })
+        self.call("table_info", serde_json::json!({ "table": table }))
+            .await
     }
 
     async fn get_row_metadata(
@@ -293,29 +253,15 @@ impl DataSource for PluginDataSource {
         timestamp_column: &str,
         exclude_columns: &[String],
     ) -> Result<HashMap<String, RowMeta>> {
-        let wire: HashMap<String, WireRowMeta> = self
-            .call(
-                "get_row_metadata",
-                serde_json::json!({
-                    "table": table,
-                    "timestamp_column": timestamp_column,
-                    "exclude_columns": exclude_columns,
-                }),
-            )
-            .await?;
-        Ok(wire
-            .into_iter()
-            .map(|(k, v)| {
-                (
-                    k,
-                    RowMeta {
-                        pk_value: v.pk_value,
-                        updated_at: v.updated_at,
-                        content_hash: v.content_hash,
-                    },
-                )
-            })
-            .collect())
+        self.call(
+            "get_row_metadata",
+            serde_json::json!({
+                "table": table,
+                "timestamp_column": timestamp_column,
+                "exclude_columns": exclude_columns,
+            }),
+        )
+        .await
     }
 
     async fn get_rows(
@@ -453,6 +399,11 @@ mod tests {
         assert_eq!(err.message, "table not found");
     }
 
+    // These two deserialize into the canonical `smugglr_wire::{TableInfo,
+    // RowMeta}` (re-exported here as `TableInfo`/`RowMeta`) rather than a
+    // host-local `Wire*` shim -- see #228. `smugglr-wire` itself carries the
+    // byte-level JSON snapshot tests; these confirm the host's `call()` path
+    // deserializes plugin responses into the same canonical types unchanged.
     #[test]
     fn test_wire_table_info_deserialization() {
         let json = r#"{
@@ -463,7 +414,7 @@ mod tests {
             ],
             "primary_key": ["id"]
         }"#;
-        let info: WireTableInfo = serde_json::from_str(json).unwrap();
+        let info: TableInfo = serde_json::from_str(json).unwrap();
         assert_eq!(info.name, "users");
         assert_eq!(info.columns.len(), 2);
         assert!(info.columns[0].pk);
@@ -478,7 +429,7 @@ mod tests {
             "updated_at": "2026-04-03T12:00:00Z",
             "content_hash": "abc123"
         }"#;
-        let meta: WireRowMeta = serde_json::from_str(json).unwrap();
+        let meta: RowMeta = serde_json::from_str(json).unwrap();
         assert_eq!(meta.pk_value, "42");
         assert_eq!(meta.updated_at.unwrap(), "2026-04-03T12:00:00Z");
         assert_eq!(meta.content_hash, "abc123");

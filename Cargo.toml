@@ -4,12 +4,14 @@ members = [
     "crates/smugglr",
     "crates/smugglr-plugin-sdk",
     "crates/smugglr-wasm",
+    "crates/smugglr-wire",
     "plugins/smugglr-http-sql",
 ]
 default-members = [
     "crates/smugglr-core",
     "crates/smugglr",
     "crates/smugglr-plugin-sdk",
+    "crates/smugglr-wire",
     "plugins/smugglr-http-sql",
 ]
 resolver = "2"
