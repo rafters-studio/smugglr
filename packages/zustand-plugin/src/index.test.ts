@@ -176,4 +176,28 @@ describe("@smugglr/zustand", () => {
     await flushMicrotasks();
     expect(onHydrate).toHaveBeenCalledTimes(1);
   });
+
+  it("rejects an unsafe table identifier synchronously", () => {
+    const { executor } = fixtureExecutor();
+    const smugglr = fixtureSmugglr();
+
+    // The shared createPersistBinding core validates `table` with the same
+    // identifier guard autoSync uses (packages/smugglr/src/autoSync.ts
+    // quoteIdent) before building any SQL. A crafted table name that would
+    // break out of the quoted identifier must throw at store-creation time
+    // rather than being interpolated into HYDRATE_SQL/UPSERT_SQL.
+    expect(() =>
+      createStore(
+        smuggl(
+          () => ({ items: [] as string[] }),
+          {
+            smugglr,
+            executor,
+            table: 'app_state"; DROP TABLE app_state; --',
+            key: "todos",
+          },
+        ),
+      ),
+    ).toThrow();
+  });
 });
