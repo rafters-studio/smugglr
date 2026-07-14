@@ -19,6 +19,12 @@ use serde_json::Value;
 pub(crate) use smugglr_core::rowhash::content_hash;
 pub(crate) use smugglr_core::rowhash::pk_text_expr as build_pk_text_expr;
 
+// Batch-SQL generation and row reshaping -- the one canonical definition
+// lives in smugglr-core::batch_sql so the http-sql plugin and wasm adapters
+// cannot drift (#222). Re-exported under the names this crate already uses.
+pub(crate) use smugglr_core::batch_sql::generate_batch_sql;
+pub(crate) use smugglr_core::batch_sql::rows_to_maps;
+
 /// Parse the rows of a `PRAGMA table_info(...)` result into a [`TableInfo`].
 ///
 /// Shared by both adapters, which differ only in how they obtain the
@@ -64,19 +70,6 @@ pub(crate) fn parse_table_info(table: &str, columns: &[String], rows: &[Vec<Valu
         columns: col_infos,
         primary_key,
     }
-}
-
-/// Reshape positional result rows into per-row column->value maps.
-pub(crate) fn rows_to_maps(columns: &[String], rows: &[Vec<Value>]) -> Vec<HashMap<String, Value>> {
-    rows.iter()
-        .map(|row| {
-            columns
-                .iter()
-                .zip(row.iter())
-                .map(|(col, val)| (col.clone(), val.clone()))
-                .collect()
-        })
-        .collect()
 }
 
 /// Convert result rows (each with a synthetic `__pk` column) into RowMeta
@@ -181,38 +174,6 @@ where
         .unwrap()
         .insert(table.to_string(), info.clone());
     Ok(info)
-}
-
-/// Build an `INSERT OR REPLACE` batch statement plus its flattened params.
-pub(crate) fn generate_batch_sql(
-    table: &str,
-    columns: &[String],
-    rows: &[HashMap<String, Value>],
-) -> (String, Vec<Value>) {
-    let col_list = columns
-        .iter()
-        .map(|c| format!("\"{}\"", c))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let row_placeholder = format!("({})", vec!["?"; columns.len()].join(", "));
-    let all_placeholders = vec![row_placeholder.as_str(); rows.len()].join(", ");
-
-    let sql = format!(
-        "INSERT OR REPLACE INTO \"{}\" ({}) VALUES {}",
-        table, col_list, all_placeholders
-    );
-
-    let params: Vec<Value> = rows
-        .iter()
-        .flat_map(|row| {
-            columns
-                .iter()
-                .map(|c| row.get(c).cloned().unwrap_or(Value::Null))
-        })
-        .collect();
-
-    (sql, params)
 }
 
 #[cfg(test)]

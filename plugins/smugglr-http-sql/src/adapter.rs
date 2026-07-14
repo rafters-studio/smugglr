@@ -147,18 +147,6 @@ impl HttpSqlAdapter {
         Err(PluginError::new("columns not found in response"))
     }
 
-    fn rows_to_maps(&self, columns: &[String], rows: &[Vec<Value>]) -> Vec<HashMap<String, Value>> {
-        rows.iter()
-            .map(|row| {
-                columns
-                    .iter()
-                    .zip(row.iter())
-                    .map(|(col, val)| (col.clone(), val.clone()))
-                    .collect()
-            })
-            .collect()
-    }
-
     /// Maximum rows per batch for a given column count and bind param limit.
     /// Returns `None` when there is no limit (max_bind_params == 0).
     fn max_rows_per_batch(num_columns: usize, max_bind_params: usize) -> Option<usize> {
@@ -167,38 +155,6 @@ impl HttpSqlAdapter {
         } else {
             None
         }
-    }
-
-    /// Generate a multi-row INSERT OR REPLACE statement with flattened params.
-    fn generate_batch_sql(
-        table: &str,
-        columns: &[String],
-        rows: &[HashMap<String, Value>],
-    ) -> (String, Vec<Value>) {
-        let col_list = columns
-            .iter()
-            .map(|c| format!("\"{}\"", c))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let row_placeholder = format!("({})", vec!["?"; columns.len()].join(", "));
-        let all_placeholders = vec![row_placeholder.as_str(); rows.len()].join(", ");
-
-        let sql = format!(
-            "INSERT OR REPLACE INTO \"{}\" ({}) VALUES {}",
-            table, col_list, all_placeholders
-        );
-
-        let params: Vec<Value> = rows
-            .iter()
-            .flat_map(|row| {
-                columns
-                    .iter()
-                    .map(|c| row.get(c).cloned().unwrap_or(Value::Null))
-            })
-            .collect();
-
-        (sql, params)
     }
 }
 
@@ -315,7 +271,7 @@ impl PluginAdapter for HttpSqlAdapter {
         let response = self.execute(&sql, &[]).await?;
         let columns = self.extract_columns(&response)?;
         let rows = self.extract_rows(&response, &columns)?;
-        let maps = self.rows_to_maps(&columns, &rows);
+        let maps = smugglr_core::batch_sql::rows_to_maps(&columns, &rows);
         Ok(build_row_metadata(
             &maps,
             &column_order,
@@ -342,7 +298,7 @@ impl PluginAdapter for HttpSqlAdapter {
         let response = self.execute(&sql, &params).await?;
         let columns = self.extract_columns(&response)?;
         let rows = self.extract_rows(&response, &columns)?;
-        Ok(self.rows_to_maps(&columns, &rows))
+        Ok(smugglr_core::batch_sql::rows_to_maps(&columns, &rows))
     }
 
     async fn upsert_rows(
@@ -360,7 +316,7 @@ impl PluginAdapter for HttpSqlAdapter {
 
         let mut total = 0;
         for batch in rows.chunks(batch_size) {
-            let (sql, params) = Self::generate_batch_sql(table, &columns, batch);
+            let (sql, params) = smugglr_core::batch_sql::generate_batch_sql(table, &columns, batch);
 
             self.execute(&sql, &params).await.map_err(|e| {
                 PluginError::new(format!(
@@ -532,26 +488,9 @@ mod tests {
         assert_ne!(hash1, hash2);
     }
 
-    #[test]
-    fn test_rows_to_maps() {
-        let adapter = HttpSqlAdapter::new();
-        let columns = vec!["id".into(), "name".into()];
-        let rows = vec![
-            vec![Value::from(1), Value::from("alice")],
-            vec![Value::from(2), Value::from("bob")],
-        ];
-        let maps = adapter.rows_to_maps(&columns, &rows);
-        assert_eq!(maps.len(), 2);
-        assert_eq!(maps[0]["name"], "alice");
-        assert_eq!(maps[1]["id"], 2);
-    }
-
-    fn make_row(id: i64, name: &str) -> HashMap<String, Value> {
-        let mut row = HashMap::new();
-        row.insert("id".to_string(), Value::from(id));
-        row.insert("name".to_string(), Value::from(name));
-        row
-    }
+    // test_rows_to_maps and the generate_batch_sql_* unit tests moved to
+    // smugglr_core::batch_sql (#222) alongside the hoisted implementations --
+    // the plugin no longer owns a private copy of either function to test.
 
     #[test]
     fn batch_size_no_limit() {
@@ -582,44 +521,6 @@ mod tests {
     }
 
     #[test]
-    fn generate_batch_sql_single_row() {
-        let rows = vec![make_row(1, "alice")];
-        let columns = vec!["id".to_string(), "name".to_string()];
-        let (sql, params) = HttpSqlAdapter::generate_batch_sql("users", &columns, &rows);
-
-        assert!(sql.starts_with("INSERT OR REPLACE INTO \"users\""));
-        assert!(sql.contains("(?, ?)"));
-        assert!(!sql.contains("), ("));
-        assert_eq!(params.len(), 2);
-    }
-
-    #[test]
-    fn generate_batch_sql_multi_row() {
-        let rows = vec![
-            make_row(1, "alice"),
-            make_row(2, "bob"),
-            make_row(3, "charlie"),
-        ];
-        let columns = vec!["id".to_string(), "name".to_string()];
-        let (sql, params) = HttpSqlAdapter::generate_batch_sql("users", &columns, &rows);
-
-        assert!(sql.contains("(?, ?), (?, ?), (?, ?)"));
-        assert_eq!(params.len(), 6);
-    }
-
-    #[test]
-    fn generate_batch_sql_null_for_missing_column() {
-        let mut row = HashMap::new();
-        row.insert("id".to_string(), Value::from(1));
-        // "name" is missing from this row
-        let columns = vec!["id".to_string(), "name".to_string()];
-        let (_, params) = HttpSqlAdapter::generate_batch_sql("users", &columns, &[row]);
-
-        assert_eq!(params[0], Value::from(1));
-        assert_eq!(params[1], Value::Null);
-    }
-
-    #[test]
     fn batch_splitting_respects_param_limit() {
         // 10 columns, 100 param limit -> max 10 rows per batch
         let columns: Vec<String> = (0..10).map(|i| format!("col_{}", i)).collect();
@@ -644,7 +545,7 @@ mod tests {
 
         // Verify no batch exceeds param limit
         for batch in &batches {
-            let (_, params) = HttpSqlAdapter::generate_batch_sql("test", &columns, batch);
+            let (_, params) = smugglr_core::batch_sql::generate_batch_sql("test", &columns, batch);
             assert!(params.len() <= 100);
         }
     }
