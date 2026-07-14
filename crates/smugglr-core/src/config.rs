@@ -181,8 +181,10 @@ fn column_glob_match(pattern: &str, value: &str) -> bool {
             // Exact match: "vector"
             pattern == value
         }
-        (true, true) if pattern.len() >= 2 => {
-            // Contains: "*embed*"
+        (true, true) => {
+            // Contains: "*embed*". The pattern == "*" case is intercepted
+            // above, so every pattern reaching here has len() >= 2 and the
+            // slice below never panics.
             let inner = &pattern[1..pattern.len() - 1];
             value.contains(inner)
         }
@@ -194,7 +196,6 @@ fn column_glob_match(pattern: &str, value: &str) -> bool {
             // Prefix: "embedding_*"
             value.starts_with(&pattern[..pattern.len() - 1])
         }
-        _ => false,
     }
 }
 
@@ -1020,6 +1021,39 @@ local_db = "game.db"
         assert!(column_excluded("blob_data", &patterns));
         assert!(!column_excluded("name", &patterns));
         assert!(!column_excluded("id", &patterns));
+    }
+
+    // Pins column_glob_match's behavior across the (starts_star, ends_star)
+    // boundary cases -- in particular the bare "*" short-circuit and the
+    // (true, true) "contains" arm, whose now-unreachable length guard and
+    // dead fallback arm were removed as part of #214. This is a
+    // behavior-preservation pin, not a fails-before-the-fix regression test:
+    // the removed guard and arm were provably unreachable, so there is no
+    // prior state in which these assertions could have failed.
+    #[test]
+    fn test_column_glob_match_boundary_cases() {
+        // Bare "*" matches anything, including the empty string.
+        assert!(column_glob_match("*", "anything"));
+        assert!(column_glob_match("*", ""));
+
+        // Leading star: suffix match.
+        assert!(column_glob_match("*_embedding", "title_embedding"));
+        assert!(!column_glob_match("*_embedding", "embedding_title"));
+
+        // Trailing star: prefix match.
+        assert!(column_glob_match("embedding_*", "embedding_title"));
+        assert!(!column_glob_match("embedding_*", "title_embedding"));
+
+        // Both star (len >= 2): contains match, including the len == 2
+        // "**" case where inner is empty and matches everything.
+        assert!(column_glob_match("*embed*", "title_embedding"));
+        assert!(!column_glob_match("*embed*", "title_vector"));
+        assert!(column_glob_match("**", "anything"));
+        assert!(column_glob_match("**", ""));
+
+        // No star: exact match only.
+        assert!(column_glob_match("vector", "vector"));
+        assert!(!column_glob_match("vector", "vectors"));
     }
 
     #[test]
