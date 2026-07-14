@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.2 (2026-07-14)
+
+Release-versioning alignment. The `@smugglr/zustand` and `@smugglr/nanostores` bridge packages had drifted to an independent `0.1.0` and are now versioned in lockstep with the rest of the release, so every published artifact -- the crates, the `smugglr` npm package, and the two bridge packages -- shares one version. No functional change from 0.4.1.
+
 ## 0.4.1 (2026-07-13)
 
 A correctness release for the sync engine. Six bugs in the change-detection and conflict-resolution path -- most of them silent -- are fixed: integer Unix timestamps now sync and order correctly, the plugin and wasm adapters gain the NULL-/duplicate-primary-key guards core already had, the datasette profile stops dropping bind parameters, `get_rows` guards the empty-primary-key case, non-UTF-8 text no longer hashes as NULL, and snapshot object keys are writable on Windows.

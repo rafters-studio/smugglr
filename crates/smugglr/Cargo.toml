@@ -22,7 +22,7 @@ name = "smugglr"
 path = "src/main.rs"
 
 [dependencies]
-smugglr-core = { path = "../smugglr-core", version = "0.4.1" }
+smugglr-core = { path = "../smugglr-core", version = "0.4.2" }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
