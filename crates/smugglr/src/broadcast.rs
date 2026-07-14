@@ -14,7 +14,7 @@ use smugglr_core::broadcast::{broadcast_pid_lock_path, BroadcastConfig};
 use smugglr_core::config::Config;
 use smugglr_core::daemon::PidLock;
 use smugglr_core::error::Result;
-use smugglr_core::multicast::{Gossip, GossipEvent, DEFAULT_GROUP};
+use smugglr_core::multicast::{Gossip, GossipEvent, DEFAULT_GROUP, RECV_BUF};
 use smugglr_core::LocalDb;
 use std::sync::Arc;
 use std::time::Duration;
@@ -76,8 +76,13 @@ pub async fn run_broadcast(
         let local = local.clone();
         let config = config.clone();
         tokio::spawn(async move {
+            // Allocated once, reused across every datagram: `recv_and_handle`
+            // previously allocated+zeroed a fresh RECV_BUF-sized (64 KiB) buffer
+            // per call, which churned the allocator on every packet in this
+            // steady-state gossip loop.
+            let mut recv_buf = vec![0u8; RECV_BUF];
             loop {
-                match gossip.recv_and_handle(&local, &config).await {
+                match gossip.recv_and_handle(&mut recv_buf, &local, &config).await {
                     Ok(GossipEvent::Applied { table, rows }) if rows > 0 => {
                         info!("Applied {} row(s) to '{}'", rows, table)
                     }
