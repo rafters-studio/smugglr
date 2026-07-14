@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.1 (2026-07-13)
+
+A correctness release for the sync engine. Six bugs in the change-detection and conflict-resolution path -- most of them silent -- are fixed: integer Unix timestamps now sync and order correctly, the plugin and wasm adapters gain the NULL-/duplicate-primary-key guards core already had, the datasette profile stops dropping bind parameters, `get_rows` guards the empty-primary-key case, non-UTF-8 text no longer hashes as NULL, and snapshot object keys are writable on Windows.
+
+### Fixed
+
+- **Integer Unix timestamps sync and order correctly.** The remote adapters (http-sql plugin, wasm fetch) read `updated_at` via `as_str()` only, so a JSON integer timestamp came back `None` while the local side had `Some(...)` -- every content-changed row fell into `content_differs` and was silently skipped in both directions under `newer_wins`/`uuid_v7_wins`. Separately, `classify_diff` compared timestamps as raw strings, reversing the conflict direction across a digit-count boundary (`"999"` sorts after `"1000"`). A single canonical `extract_updated_at` now renders integer timestamps for all three paths, and comparison is numeric-aware, routing mixed representations to `content_differs` rather than guessing. (#177, #176)
+- **NULL-/duplicate-primary-key guard parity in the plugin and wasm metadata builders.** A NULL rendered `__pk` was coerced to `""`, collapsing every such row onto one map key (silent drops, spurious deletes), and a duplicate PK-text overwrote its entry silently. Both paths now skip a NULL `__pk` with a warning and surface a duplicate, matching core `local.rs`. (#231)
+- **The datasette profile rejects parameterized queries instead of dropping them.** `build_request` discarded the params slice for the datasette profile, sending `?` placeholders with zero bound values (endpoint error or mis-bind). It now returns a clear error -- Datasette has no positional-bind API. (#201)
+- **`get_rows` guards the empty-primary-key case.** An empty primary key rendered to malformed `WHERE  IN (?, ?)` SQL; all three adapters now build the query through one guarded helper that errors instead. (#198)
+- **Non-UTF-8 text no longer hashes as NULL.** `get_json_value` swallowed each typed read's error and returned NULL, folding a non-UTF-8 text column into the content hash indistinguishably from a real NULL (a stable-but-wrong hash). It now inspects the value's storage class once and errors on the undecodable case. (#180)
+- **Snapshot object keys are filename-safe on Windows.** Keys embedded a colon-bearing timestamp (`HH:MM:SS`), invalid in a Windows filename; they are now colon-free, with restore falling back to the legacy colon key so snapshots written by an earlier version still restore. (#238)
+
 ## 0.4.0 (2026-05-30)
 
 Browser sync surface fills in. The npm package gets the four runtime affordances a real app needs (auto-sync, anonymous-first, auth rotation, right-to-erasure), the OPFS local-source path lands behind `wa-sqlite`, and a `table-changed` event lets reactive plugins react without polling. Two such plugins ship: `@smugglr/zustand` and `@smugglr/nanostores`. On the config side, `config.toml` gains `${VAR}` secret expansion and the documented retry/backoff now actually runs on the write path. A round of correctness fixes and a structural-debt cleanup round it out.
