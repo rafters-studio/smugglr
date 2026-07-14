@@ -105,11 +105,19 @@ pub enum SyncError {
 impl SyncError {
     /// Check if this error is retryable with exponential backoff.
     ///
+    /// This is the canonical retry classifier for `SyncError`: the native
+    /// one-shot retry loop (`sync::upsert_with_retry`) and the daemon's
+    /// `daemon::is_transient_error` both key off this method so the same
+    /// error carries the same retry verdict everywhere (issue #226). Anyone
+    /// adding a caller-specific delta (like the daemon's `ConcurrentWrite`
+    /// carve-out) must build on top of this, not maintain a second
+    /// independent classification.
+    ///
     /// Retryable errors:
     /// - 429 rate limits
     /// - 5xx server errors
     /// - Connection timeouts
-    /// - Network connectivity issues
+    /// - Network connectivity issues (HTTP timeout/connect failures)
     pub fn is_retryable(&self) -> bool {
         match self {
             SyncError::RateLimited { .. } => true,
