@@ -229,15 +229,8 @@ impl FetchDataSource {
     }
 
     async fn cached_table_info(&self, table: &str) -> Result<TableInfo> {
-        if let Some(info) = self.table_info_cache.lock().unwrap().get(table) {
-            return Ok(info.clone());
-        }
-        let info = self.table_info(table).await?;
-        self.table_info_cache
-            .lock()
-            .unwrap()
-            .insert(table.to_string(), info.clone());
-        Ok(info)
+        adapter_common::cached_table_info(&self.table_info_cache, table, self.table_info(table))
+            .await
     }
 
     fn max_rows_per_batch(num_columns: usize, max_bind_params: usize) -> Option<usize> {

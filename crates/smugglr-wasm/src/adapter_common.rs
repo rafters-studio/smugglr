@@ -6,7 +6,10 @@
 //! and are called from both adapters as `adapter_common::<fn>`.
 
 use smugglr_core::datasource::{extract_updated_at, ColumnInfo, RowMeta, TableInfo};
+use smugglr_core::error::Result;
 use std::collections::HashMap;
+use std::future::Future;
+use std::sync::Mutex;
 
 use serde_json::Value;
 
@@ -147,6 +150,37 @@ pub(crate) fn incremental_metadata_sql(
         table,
         timestamp_column
     )
+}
+
+/// Look up `table` in `cache`, computing and memoizing it via `fetch` on a
+/// miss.
+///
+/// Shared by both adapters' `cached_table_info` inherent methods, which
+/// differ only in how they obtain a fresh [`TableInfo`] on a cache miss
+/// (`self.table_info(table)`, a `DataSource` trait method both implement).
+/// `fetch` is passed as an already-constructed future rather than a closure:
+/// futures are lazy, so `self.table_info(table)` at the call site does no
+/// work until this function `.await`s it -- meaning the miss-only fetch
+/// semantics are identical to the pre-extraction inline code. The
+/// non-atomic check-then-insert (a benign duplicate-fetch race window) is
+/// preserved exactly, as is clone-on-hit / insert-then-clone-return on miss.
+pub(crate) async fn cached_table_info<F>(
+    cache: &Mutex<HashMap<String, TableInfo>>,
+    table: &str,
+    fetch: F,
+) -> Result<TableInfo>
+where
+    F: Future<Output = Result<TableInfo>>,
+{
+    if let Some(info) = cache.lock().unwrap().get(table) {
+        return Ok(info.clone());
+    }
+    let info = fetch.await?;
+    cache
+        .lock()
+        .unwrap()
+        .insert(table.to_string(), info.clone());
+    Ok(info)
 }
 
 /// Build an `INSERT OR REPLACE` batch statement plus its flattened params.
