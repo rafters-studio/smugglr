@@ -1760,6 +1760,7 @@ version = "0.4.2"
 dependencies = [
  "clap",
  "indicatif",
+ "rusqlite",
  "serde",
  "serde_json",
  "smugglr-core",

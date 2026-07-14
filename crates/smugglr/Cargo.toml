@@ -44,3 +44,8 @@ tokio = { version = "1", features = ["full"] }
 [dev-dependencies]
 # Isolated temp dirs for subprocess integration tests
 tempfile = "3"
+
+# Building fixture SQLite databases directly in watch.rs's dry-run/read-only
+# regression tests (smugglr-core's LocalDb intentionally exposes no raw-SQL
+# or table-creation API for production code to call).
+rusqlite = { version = "0.34", features = ["bundled"] }
