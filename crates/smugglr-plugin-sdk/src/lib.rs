@@ -38,30 +38,12 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 
 // -- Public types --
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TableInfo {
-    pub name: String,
-    pub columns: Vec<ColumnInfo>,
-    pub primary_key: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ColumnInfo {
-    pub name: String,
-    #[serde(default)]
-    pub col_type: String,
-    #[serde(default)]
-    pub notnull: bool,
-    #[serde(default)]
-    pub pk: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RowMeta {
-    pub pk_value: String,
-    pub updated_at: Option<String>,
-    pub content_hash: String,
-}
+/// Table schema information, row metadata, and column info.
+///
+/// Re-exported from `smugglr-wire`, the canonical definition shared with
+/// `smugglr-core`'s host-side plugin adapter -- see #228. Plugin authors keep
+/// importing these from `smugglr_plugin_sdk` as before.
+pub use smugglr_wire::{ColumnInfo, RowMeta, TableInfo};
 
 /// Well-known JSON-RPC error code that a plugin uses to signal a *transient*
 /// failure (rate limit, 5xx, timeout against a remote backend) that smugglr

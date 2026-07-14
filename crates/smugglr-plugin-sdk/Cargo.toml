@@ -14,6 +14,10 @@ keywords = ["smugglr", "plugin", "sqlite", "sync", "sdk"]
 categories = ["database", "development-tools"]
 
 [dependencies]
+# Canonical wire types (TableInfo/ColumnInfo/RowMeta), shared with
+# smugglr-core. See #228.
+smugglr-wire = { path = "../smugglr-wire", version = "0.4.2" }
+
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt-multi-thread"] }

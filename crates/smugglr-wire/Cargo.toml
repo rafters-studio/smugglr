@@ -1,0 +1,20 @@
+[package]
+name = "smugglr-wire"
+description = "Canonical wire types shared by smugglr-core and smugglr-plugin-sdk (serde-only, no tokio, wasm32-safe)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+keywords = ["smugglr", "wire", "sqlite", "sync", "serde"]
+categories = ["database", "wasm"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"
