@@ -37,8 +37,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
+      # smugglr-wasm is #![cfg(target_arch = "wasm32")], so the host clippy run
+      # above compiles it to nothing -- its lints never gate. Run clippy against
+      # the wasm32 target explicitly so wasm-only lints are caught (#155).
+      - name: Clippy (wasm32)
+        run: cargo clippy -p smugglr-wasm --target wasm32-unknown-unknown --all-targets -- -D warnings
 
   shellcheck:
     name: ShellCheck
