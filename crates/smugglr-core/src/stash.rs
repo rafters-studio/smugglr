@@ -236,21 +236,28 @@ async fn sync_table<S: DataSource, D: DataSource>(
     label: &str,
     set_count: impl FnOnce(&mut SyncResult, usize),
 ) -> Result<SyncResult> {
-    let mut result = SyncResult::new(table);
     // Stash operations use an empty exclusion list; column exclusion is
     // applied by the higher-level sync engine that owns the SyncConfig.
     let diff = diff_table(source, dest, table, timestamp_column, &[]).await?;
     diff.warn_unresolved_conflicts(conflict_resolution);
 
-    if dry_run {
-        result.diff_stats = Some(diff.stats());
-        result.diff_detail = Some(crate::sync::DiffDetail::from_diff(&diff));
+    let (stats, detail) = if dry_run {
+        (
+            Some(diff.stats()),
+            Some(crate::sync::DiffDetail::from_diff(&diff)),
+        )
+    } else {
+        (None, None)
+    };
+
+    // Shared with the sync-engine loops: log + build the in-sync result once.
+    if !diff.has_changes() {
+        return Ok(crate::sync::finalize_in_sync(table, stats, detail));
     }
 
-    if !diff.has_changes() {
-        info!("Table {} is in sync", table);
-        return Ok(result);
-    }
+    let mut result = SyncResult::new(table);
+    result.diff_stats = stats;
+    result.diff_detail = detail;
 
     // Both stash and retrieve use "push" semantics: source-only + source-newer rows go to dest.
     let rows_to_sync = diff.rows_to_push(conflict_resolution);

@@ -299,6 +299,25 @@ pub async fn pull_table<Src: DataSource, Dst: DataSource>(
     Ok(result)
 }
 
+/// Build the terminal [`SyncResult`] for a table that is already in sync.
+///
+/// Logs the "in sync" line and attaches the dry-run `stats`/`detail` (both
+/// `None` outside dry-run, so the transferred-row counts stay zero). Shared by
+/// the directional driver ([`run_directional`]), the bidirectional
+/// [`sync_table`], and `stash::sync_table` so the no-op-table result cannot
+/// drift between what were three separate copies of this block.
+pub(crate) fn finalize_in_sync(
+    table: &str,
+    stats: Option<DiffStats>,
+    detail: Option<DiffDetail>,
+) -> SyncResult {
+    info!("Table {} is in sync", table);
+    let mut r = SyncResult::new(table);
+    r.diff_stats = stats;
+    r.diff_detail = detail;
+    r
+}
+
 /// Bidirectional sync of a single table: push source->dest and pull dest->source.
 #[allow(clippy::too_many_arguments)]
 pub async fn sync_table<A: DataSource, B: DataSource>(
@@ -321,11 +340,7 @@ pub async fn sync_table<A: DataSource, B: DataSource>(
     };
 
     if !diff.has_changes() {
-        info!("Table {} is in sync", table);
-        let mut r = SyncResult::new(table);
-        r.diff_stats = stats;
-        r.diff_detail = detail;
-        return Ok(r);
+        return Ok(finalize_in_sync(table, stats, detail));
     }
 
     let push_result = push_table(
@@ -413,18 +428,41 @@ pub async fn get_tables_to_sync<A: DataSource, B: DataSource>(
     Ok(syncable)
 }
 
-/// Push all tables from source to destination.
-pub async fn push_all<Src: DataSource, Dst: DataSource>(
-    source: &Src,
-    dest: &Dst,
+/// Direction of a single-orientation, all-tables sync run.
+///
+/// Selects which per-table transfer the shared [`run_directional`] driver
+/// applies. The diff is computed identically in both directions
+/// (`diff_table(first, second)`); only the transferred rows and the populated
+/// [`SyncResult`] count field differ, and that difference lives entirely in the
+/// per-table transfer selected here.
+#[derive(Debug, Clone, Copy)]
+enum Direction {
+    /// `first -> second`: [`push_table`], recording `rows_pushed`.
+    Push,
+    /// `second -> first`: [`pull_table`], recording `rows_pulled`.
+    Pull,
+}
+
+/// Single-orientation sync of every table between `first` and `second`.
+///
+/// Backs both [`push_all`] and [`pull_all`]: they were byte-identical per-table
+/// loops (resolve tables, diff, warn on unresolved conflicts, capture dry-run
+/// stats/detail, skip in-sync tables, transfer, attach stats/detail) differing
+/// only by which per-table transfer ran. `direction` injects that one
+/// difference so the loop cannot drift between the two callers.
+#[allow(clippy::too_many_arguments)]
+async fn run_directional<A: DataSource, B: DataSource>(
+    first: &A,
+    second: &B,
     config: &Config,
     tables: Option<Vec<String>>,
     dry_run: bool,
     progress: &dyn SyncProgress,
+    direction: Direction,
 ) -> Result<Vec<SyncResult>> {
     let tables_to_sync = match tables {
         Some(t) => t,
-        None => get_tables_to_sync(source, dest, config).await?,
+        None => get_tables_to_sync(first, second, config).await?,
     };
 
     let batch_config = BatchConfig::from_sync_config(&config.sync);
@@ -432,8 +470,8 @@ pub async fn push_all<Src: DataSource, Dst: DataSource>(
 
     for table in &tables_to_sync {
         let diff = diff_table(
-            source,
-            dest,
+            first,
+            second,
             table,
             &config.sync.timestamp_column,
             &config.sync.exclude_columns,
@@ -448,32 +486,67 @@ pub async fn push_all<Src: DataSource, Dst: DataSource>(
         };
 
         if !diff.has_changes() {
-            info!("Table {} is in sync", table);
-            let mut r = SyncResult::new(table);
-            r.diff_stats = stats;
-            r.diff_detail = detail;
-            results.push(r);
+            results.push(finalize_in_sync(table, stats, detail));
             continue;
         }
 
-        let mut result = push_table(
-            source,
-            dest,
-            table,
-            &diff,
-            config.sync.conflict_resolution,
-            &batch_config,
-            &config.sync.exclude_columns,
-            dry_run,
-            progress,
-        )
-        .await?;
+        let mut result = match direction {
+            Direction::Push => {
+                push_table(
+                    first,
+                    second,
+                    table,
+                    &diff,
+                    config.sync.conflict_resolution,
+                    &batch_config,
+                    &config.sync.exclude_columns,
+                    dry_run,
+                    progress,
+                )
+                .await?
+            }
+            Direction::Pull => {
+                pull_table(
+                    first,
+                    second,
+                    table,
+                    &diff,
+                    config.sync.conflict_resolution,
+                    &batch_config,
+                    &config.sync.exclude_columns,
+                    dry_run,
+                    progress,
+                )
+                .await?
+            }
+        };
         result.diff_stats = stats;
         result.diff_detail = detail;
         results.push(result);
     }
 
     Ok(results)
+}
+
+/// Push all tables from source to destination.
+pub async fn push_all<Src: DataSource, Dst: DataSource>(
+    source: &Src,
+    dest: &Dst,
+    config: &Config,
+    tables: Option<Vec<String>>,
+    dry_run: bool,
+    progress: &dyn SyncProgress,
+) -> Result<Vec<SyncResult>> {
+    run_directional(
+        source,
+        dest,
+        config,
+        tables,
+        dry_run,
+        progress,
+        Direction::Push,
+    )
+    .await
 }
 
 /// Pull all tables from source to destination.
@@ -485,58 +558,16 @@ pub async fn pull_all<Src: DataSource, Dst: DataSource>(
     dry_run: bool,
     progress: &dyn SyncProgress,
 ) -> Result<Vec<SyncResult>> {
-    let tables_to_sync = match tables {
-        Some(t) => t,
-        None => get_tables_to_sync(local, remote, config).await?,
-    };
-
-    let batch_config = BatchConfig::from_sync_config(&config.sync);
-    let mut results = Vec::new();
-
-    for table in &tables_to_sync {
-        let diff = diff_table(
-            local,
-            remote,
-            table,
-            &config.sync.timestamp_column,
-            &config.sync.exclude_columns,
-        )
-        .await?;
-        diff.warn_unresolved_conflicts(config.sync.conflict_resolution);
-
-        let (stats, detail) = if dry_run {
-            (Some(diff.stats()), Some(DiffDetail::from_diff(&diff)))
-        } else {
-            (None, None)
-        };
-
-        if !diff.has_changes() {
-            info!("Table {} is in sync", table);
-            let mut r = SyncResult::new(table);
-            r.diff_stats = stats;
-            r.diff_detail = detail;
-            results.push(r);
-            continue;
-        }
-
-        let mut result = pull_table(
-            local,
-            remote,
-            table,
-            &diff,
-            config.sync.conflict_resolution,
-            &batch_config,
-            &config.sync.exclude_columns,
-            dry_run,
-            progress,
-        )
-        .await?;
-        result.diff_stats = stats;
-        result.diff_detail = detail;
-        results.push(result);
-    }
-
-    Ok(results)
+    run_directional(
+        local,
+        remote,
+        config,
+        tables,
+        dry_run,
+        progress,
+        Direction::Pull,
+    )
+    .await
 }
 
 /// Bidirectional sync of all tables.
@@ -932,6 +963,110 @@ mod tests {
                 "progress batch sum must equal the reported total"
             );
             assert_eq!(progress.finish_total.load(Ordering::SeqCst), total);
+        }
+    }
+
+    // Drive both push_all and pull_all through the shared `run_directional`
+    // driver over two real LocalDb sources, pinning the observable contract the
+    // refactor must preserve: same rows selected per direction, dry-run
+    // stats/detail populated, and in-sync tables skipped with stats still
+    // attached (the `finalize_in_sync` path). Uses LocalDb, so native-only.
+    #[cfg(feature = "native")]
+    mod directional {
+        use super::super::{pull_all, push_all, NoProgress};
+        use crate::config::Config;
+        use crate::local::LocalDb;
+        use rusqlite::Connection;
+        use tempfile::TempDir;
+
+        /// Create `items` and `insync` tables and seed `items` with the given rows.
+        /// `insync` is seeded identically on both sides by the caller.
+        fn seed(path: &std::path::Path, items: &[(i64, &str, &str)], insync: &[(i64, &str, &str)]) {
+            let conn = Connection::open(path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL, updated_at TEXT);
+                 CREATE TABLE insync (id INTEGER PRIMARY KEY, name TEXT NOT NULL, updated_at TEXT);",
+            )
+            .unwrap();
+            for (id, name, ts) in items {
+                conn.execute(
+                    "INSERT INTO items (id, name, updated_at) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![id, name, ts],
+                )
+                .unwrap();
+            }
+            for (id, name, ts) in insync {
+                conn.execute(
+                    "INSERT INTO insync (id, name, updated_at) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![id, name, ts],
+                )
+                .unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn push_and_pull_share_one_driver() {
+            let dir = TempDir::new().unwrap();
+            let local_path = dir.path().join("local.sqlite");
+            let remote_path = dir.path().join("remote.sqlite");
+
+            // items: local-only {1}, remote-only {3}, identical {2}.
+            // insync: byte-identical on both sides -> no changes.
+            let insync = [(1i64, "same", "100")];
+            seed(
+                &local_path,
+                &[(1, "a", "100"), (2, "shared", "100")],
+                &insync,
+            );
+            seed(
+                &remote_path,
+                &[(2, "shared", "100"), (3, "c", "100")],
+                &insync,
+            );
+
+            let local = LocalDb::open(&local_path).unwrap();
+            let remote = LocalDb::open(&remote_path).unwrap();
+            let config = Config::from_toml_str("").unwrap();
+            let tables = Some(vec!["items".to_string(), "insync".to_string()]);
+
+            // Dry-run keeps the fixtures fixed so both directions observe the
+            // same diff; it also exercises the stats/detail-population branch.
+            let push = push_all(&local, &remote, &config, tables.clone(), true, &NoProgress)
+                .await
+                .unwrap();
+            let pull = pull_all(&local, &remote, &config, tables, true, &NoProgress)
+                .await
+                .unwrap();
+
+            let push_items = push.iter().find(|r| r.table == "items").unwrap();
+            let pull_items = pull.iter().find(|r| r.table == "items").unwrap();
+
+            // Direction picks the rows: push moves the local-only row (1),
+            // pull moves the remote-only row (3). One row each.
+            assert_eq!(push_items.rows_pushed, 1, "push selects local_only row");
+            assert_eq!(push_items.rows_pulled, 0);
+            assert_eq!(pull_items.rows_pulled, 1, "pull selects remote_only row");
+            assert_eq!(pull_items.rows_pushed, 0);
+
+            // Dry-run stats/detail are populated and identical in both
+            // directions (the diff is computed the same way regardless).
+            let stats = push_items.diff_stats.as_ref().unwrap();
+            assert_eq!(stats.local_only, 1);
+            assert_eq!(stats.remote_only, 1);
+            assert_eq!(stats.identical, 1);
+            let detail = push_items.diff_detail.as_ref().unwrap();
+            assert_eq!(detail.local_only, vec!["1".to_string()]);
+            assert_eq!(detail.remote_only, vec!["3".to_string()]);
+
+            // In-sync table: skipped with zero transfer, but stats still attached
+            // (the finalize_in_sync path shared across the sync loops).
+            let push_insync = push.iter().find(|r| r.table == "insync").unwrap();
+            assert_eq!(push_insync.rows_pushed, 0);
+            assert_eq!(push_insync.rows_pulled, 0);
+            let insync_stats = push_insync.diff_stats.as_ref().unwrap();
+            assert_eq!(insync_stats.identical, 1);
+            assert_eq!(insync_stats.local_only, 0);
+            assert_eq!(insync_stats.remote_only, 0);
         }
     }
 }
