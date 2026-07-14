@@ -326,13 +326,12 @@ async fn get_stash_tables(
             Ok(info) if !info.primary_key.is_empty() => {
                 syncable.push(table.clone());
             }
-            Ok(_) => {
-                warn!(
-                    "Skipping table '{}': no primary key (required for change detection)",
-                    table
-                );
-            }
-            Err(SyncError::NoPrimaryKey(_)) => {
+            // An `Ok` with an empty primary key and `Err(NoPrimaryKey)` are two
+            // encodings of the same "no PK" state (the former is exhaustiveness
+            // coverage for the `Result` match; `LocalDb::table_info` itself only
+            // ever returns `Err(NoPrimaryKey)` for a missing PK). Both route
+            // through one warn+skip so the message can't drift between them.
+            Ok(_) | Err(SyncError::NoPrimaryKey(_)) => {
                 warn!(
                     "Skipping table '{}': no primary key (required for change detection)",
                     table
@@ -1228,6 +1227,48 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].table, "items");
         assert_eq!(results[0].rows_pulled, 1); // only "beta" is new
+    }
+
+    // Invariant for #216: get_stash_tables must skip a table with no primary
+    // key and warn exactly once, no matter which of the two "no PK" shapes
+    // `table_info` reports it through (an `Ok(TableInfo)` with an empty
+    // `primary_key`, or `Err(SyncError::NoPrimaryKey)`). `LocalDb::table_info`
+    // only ever produces the `Err` shape (see `table_info_inner` in local.rs),
+    // so this pins the behavior for the live path; the `Ok(_)` arm exists
+    // purely for match exhaustiveness over other `DataSource` impls.
+    #[tokio::test]
+    async fn test_get_stash_tables_skips_table_without_primary_key() {
+        let dir = TempDir::new().unwrap();
+        let source_path = dir.path().join("source.sqlite");
+        let dest_path = dir.path().join("dest.sqlite");
+
+        // Source has one table with a primary key and one without.
+        let conn = Connection::open(&source_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, updated_at TEXT);
+             CREATE TABLE logs (message TEXT, updated_at TEXT);",
+        )
+        .unwrap();
+        drop(conn);
+
+        // Dest must have both tables too, or they would be skipped for a
+        // different reason ("exists only in source").
+        let conn = Connection::open(&dest_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, updated_at TEXT);
+             CREATE TABLE logs (message TEXT, updated_at TEXT);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source = LocalDb::open(&source_path).unwrap();
+        let dest = LocalDb::open(&dest_path).unwrap();
+
+        let tables = get_stash_tables(&source, &dest, None, &[]).await.unwrap();
+
+        // "logs" has no primary key and must be excluded; "items" is the only
+        // syncable table.
+        assert_eq!(tables, vec!["items".to_string()]);
     }
 
     // Regression for #185: a first upload (etag == None) must not blindly
