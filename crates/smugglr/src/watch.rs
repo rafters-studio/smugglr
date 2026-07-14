@@ -142,9 +142,8 @@ pub async fn run_watch(
 ///
 /// In dry-run, `sync_all` never reaches a writer -- `push_table`/`pull_table`
 /// both return before `transfer_rows`, the sole caller of `upsert_rows` -- so
-/// a read-write connection is unnecessary: it asks for write access dry-run
-/// never uses, can spuriously fail on a read-only filesystem or a locked DB,
-/// and it diverges from the dry-run-readonly convention `run_sync`/`run_pull`
+/// a read-write connection asks for write access dry-run never uses, and it
+/// diverges from the dry-run-readonly convention `run_sync`/`run_pull`
 /// establish (#217).
 fn open_local(config: &Config, dry_run: bool) -> Result<LocalDb> {
     if dry_run {
