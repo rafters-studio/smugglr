@@ -10,20 +10,28 @@ use tracing::{debug, info, warn};
 
 /// Order two `updated_at` timestamps for conflict resolution.
 ///
-/// Integer Unix timestamps render as decimal strings ("999", "1000"); comparing
-/// those lexicographically is wrong across a digit-count boundary ("999" sorts
-/// after "1000"), so parse and compare numerically when BOTH sides are integers.
-/// ISO-8601 text timestamps are fixed-width, where lexical order == chronological,
-/// so fall back to string comparison when NEITHER side is an integer. A mixed
-/// pair (one integer, one non-integer) has no meaningful ordering -- return
-/// `None` so the caller routes it to `content_differs` rather than inventing a
-/// confident (and likely wrong) winner from a lexical compare of unlike
-/// representations.
+/// Timestamps arrive as strings in three shapes: integer Unix time ("999",
+/// "1000"), float Unix time ("2.5", "10.5" -- a REAL column rendered through
+/// `f64::to_string` by `extract_updated_at`), and fixed-width ISO-8601 text.
+/// Comparing any numeric form lexically is wrong across a digit-count boundary
+/// ("1000" sorts before "999"; "10.5" before "2.5"), so parse numerically
+/// first: an exact `i64` compare when BOTH sides are integers (preserving
+/// precision for large millisecond/nanosecond timestamps that `f64` would
+/// round), else an `f64` compare when BOTH sides parse as floats (covering
+/// float/float and integer/float pairs). ISO-8601 text is fixed-width, so
+/// lexical order == chronological -- fall back to string comparison when
+/// NEITHER side is numeric. A numeric-vs-text pair (integer or float on one
+/// side, ISO on the other) has no meaningful ordering -- return `None` so the
+/// caller routes it to `content_differs` rather than inventing a confident
+/// winner from a lexical compare of unlike representations.
 fn compare_ts(a: &str, b: &str) -> Option<Ordering> {
     match (a.parse::<i64>(), b.parse::<i64>()) {
         (Ok(x), Ok(y)) => Some(x.cmp(&y)),
-        (Err(_), Err(_)) => Some(a.cmp(b)),
-        _ => None,
+        _ => match (a.parse::<f64>(), b.parse::<f64>()) {
+            (Ok(x), Ok(y)) => x.partial_cmp(&y),
+            (Err(_), Err(_)) => Some(a.cmp(b)),
+            _ => None,
+        },
     }
 }
 
@@ -226,7 +234,7 @@ pub fn classify_diff(
             (Some(local_ts), Some(remote_ts)) => match compare_ts(local_ts, remote_ts) {
                 Some(Ordering::Greater) => diff.local_newer.push((*pk).clone()),
                 Some(Ordering::Less) => diff.remote_newer.push((*pk).clone()),
-                // Equal timestamps or unlike representations (one integer, one
+                // Equal timestamps or unlike representations (one numeric, one
                 // text): no safe tiebreaker, so treat as a content conflict.
                 Some(Ordering::Equal) | None => diff.content_differs.push((*pk).clone()),
             },
@@ -454,5 +462,43 @@ mod tests {
         let remote = one("B", Some("1700000000"));
         let diff = classify_diff(&local, &remote, "t");
         assert_eq!(diff.content_differs, vec!["r".to_string()]);
+    }
+
+    // --- Float-serialized timestamps (#241) ---
+
+    // A REAL/float timestamp column renders through f64::to_string ("2.5",
+    // "10.5"). Pre-fix compare_ts fell straight to lexical for any non-i64 pair,
+    // so "10.5" sorted BEFORE "2.5" (byte '1' < '2') -- the reverse of the true
+    // chronological order. Pin the numeric ordering directly.
+    #[test]
+    fn compare_ts_orders_float_timestamps_numerically() {
+        assert_eq!(compare_ts("2.5", "10.5"), Some(Ordering::Less));
+        assert_eq!(compare_ts("10.5", "2.5"), Some(Ordering::Greater));
+        assert_eq!(compare_ts("2.5", "2.5"), Some(Ordering::Equal));
+    }
+
+    // Schema skew: one row's column reads as INTEGER, the other as REAL for the
+    // same logical timestamp. Both are numeric, so they compare numerically
+    // (this pair returned None pre-fix -- now an honest ordering, not a conflict).
+    #[test]
+    fn compare_ts_orders_integer_against_float_numerically() {
+        assert_eq!(compare_ts("1000", "1000.5"), Some(Ordering::Less));
+        assert_eq!(compare_ts("1001", "1000.5"), Some(Ordering::Greater));
+    }
+
+    // classify_diff over float timestamps: the larger float is newer and must be
+    // classified by direction (and actually sync), not dropped to content_differs.
+    // Pre-fix the lexical compare put the newer "10.5" row in remote_newer.
+    #[test]
+    fn float_timestamp_newer_row_syncs_not_skipped() {
+        let local = one("A", Some("10.5")); // newer
+        let remote = one("B", Some("2.5")); // older
+        let diff = classify_diff(&local, &remote, "t");
+        assert_eq!(diff.local_newer, vec!["r".to_string()]);
+        assert!(diff.remote_newer.is_empty());
+        assert!(diff.content_differs.is_empty());
+        assert!(diff
+            .rows_to_push(ConflictResolution::NewerWins)
+            .contains(&"r".to_string()));
     }
 }
