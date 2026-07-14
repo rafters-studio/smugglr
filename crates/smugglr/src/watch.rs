@@ -88,8 +88,9 @@ pub async fn run_watch(
                             println!("{}", serde_json::to_string(&out).expect("WatchTickOutput is always serializable"));
                         } else if total_pushed > 0 || total_pulled > 0 {
                             info!(
-                                "Tick #{}: {} pushed, {} pulled across {} tables",
-                                tick_count, total_pushed, total_pulled, results.len()
+                                "Tick #{}: {}",
+                                tick_count,
+                                format_tick_summary(total_pushed, total_pulled, results.len(), dry_run)
                             );
                         } else {
                             info!("Tick #{}: no changes", tick_count);
@@ -135,6 +136,28 @@ pub async fn run_watch(
 
     info!("Watch daemon stopped after {} ticks", tick_count);
     Ok(())
+}
+
+/// Format the text-mode "N pushed, M pulled" summary for a watch tick.
+///
+/// When `dry_run` is true, appends the same `(dry run - no actual changes
+/// made)` marker `print_summary` and `run_sync` print in main.rs, so a user
+/// watching with `--dry-run` doesn't mistake would-push/would-pull counts
+/// for an applied sync (#218). The leading space (rather than main.rs's
+/// leading `\n  `) matches this being a single-line `info!` log record, not
+/// a multi-line `println!` block. Like `print_summary`, the marker only
+/// applies to this counts branch -- the separate "no changes" tick log
+/// (below) carries no counts to be mistaken for an applied sync, so it is
+/// left unmarked in both modes.
+fn format_tick_summary(pushed: usize, pulled: usize, tables: usize, dry_run: bool) -> String {
+    let mut summary = format!(
+        "{} pushed, {} pulled across {} tables",
+        pushed, pulled, tables
+    );
+    if dry_run {
+        summary.push_str(" (dry run - no actual changes made)");
+    }
+    summary
 }
 
 /// Open the local DB in the same dry-run-readonly mode `run_sync`/`run_pull`
@@ -258,6 +281,39 @@ mod tests {
         assert!(
             write.is_err(),
             "dry-run's target connection must reject writes, but a write succeeded"
+        );
+    }
+
+    /// Regression for #218: the text-mode tick summary must tell the user
+    /// when a tick was a dry run, matching the `(dry run - no actual
+    /// changes made)` wording `print_summary`/`run_sync` use in main.rs.
+    /// Before the fix, `format_tick_summary` did not exist and the tick log
+    /// line never varied on `dry_run` -- a real sync and a dry run produced
+    /// identical text. This asserts the marker is present iff `dry_run` is
+    /// true, and that non-dry-run text is unchanged (no marker, same
+    /// counts/wording).
+    #[test]
+    fn format_tick_summary_marks_dry_run() {
+        let dry = format_tick_summary(3, 5, 2, true);
+        assert!(
+            dry.contains("(dry run - no actual changes made)"),
+            "dry-run tick summary must contain the dry-run marker, got: {:?}",
+            dry
+        );
+        assert_eq!(
+            dry, "3 pushed, 5 pulled across 2 tables (dry run - no actual changes made)",
+            "dry-run tick summary text changed unexpectedly"
+        );
+
+        let real = format_tick_summary(3, 5, 2, false);
+        assert!(
+            !real.contains("dry run"),
+            "non-dry-run tick summary must not mention dry run, got: {:?}",
+            real
+        );
+        assert_eq!(
+            real, "3 pushed, 5 pulled across 2 tables",
+            "non-dry-run tick summary text must stay exactly as before"
         );
     }
 }
