@@ -9,7 +9,6 @@
 //! reached through `PluginDataSource`. Without `native`, only the diff/sync
 //! engine and trait definitions are available.
 
-pub mod batch;
 pub mod config;
 pub mod datasource;
 pub mod diff;
