@@ -160,7 +160,14 @@ async function isLocalEmpty(
   return true;
 }
 
-function quoteIdent(name: string): string {
+/**
+ * Quote a SQL identifier, refusing anything that is not a plain
+ * `[A-Za-z_][A-Za-z0-9_]*` name. Shared by autoSync's empty-table probe and
+ * the persist-binding core (`persistBinding.ts`) -- both build table-name
+ * SQL from caller-supplied strings and need the same guard against
+ * injection via a crafted `table` option.
+ */
+export function quoteIdent(name: string): string {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
     throw new Error(`autoSync: refusing unsafe table identifier "${name}"`);
   }

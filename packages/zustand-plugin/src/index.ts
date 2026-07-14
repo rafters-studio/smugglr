@@ -8,7 +8,8 @@
 //     updated_at TEXT
 //   );
 
-import type { Smugglr, SqlExecutor, TableChangedEvent } from "smugglr";
+import type { Smugglr, SqlExecutor } from "smugglr";
+import { createPersistBinding } from "smugglr";
 import type { StateCreator, StoreMutatorIdentifier } from "zustand";
 
 export interface SmugglOptions<T, U = T> {
@@ -49,13 +50,6 @@ export type Smuggl = <
   options: SmugglOptions<T, U>,
 ) => StateCreator<T, Mps, Mcs>;
 
-const HYDRATE_SQL = (table: string) =>
-  `SELECT value FROM "${table}" WHERE key = ? LIMIT 1`;
-
-const UPSERT_SQL = (table: string) =>
-  `INSERT INTO "${table}" (key, value, updated_at) VALUES (?, ?, ?)
-   ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`;
-
 /**
  * Zustand middleware that persists a store slice to a smugglr-managed table
  * and rehydrates whenever a sync event touches the same row.
@@ -83,66 +77,25 @@ export const smuggl: Smuggl = (initializer, options) => (set, get, api) => {
   const include = options.include ?? ((s: unknown) => s as never);
   const serialize = options.serialize ?? JSON.stringify;
   const deserialize = options.deserialize ?? JSON.parse;
-  const upsertSql = UPSERT_SQL(options.table);
-  const hydrateSql = HYDRATE_SQL(options.table);
-
-  let suppressNextWrite = false;
-  let lastSerialized: string | null = null;
 
   // Build the underlying store first; subscribe + hydrate after.
   const state = initializer(set, get, api);
 
-  const persist = async (raw: unknown) => {
-    const slice = include(raw as never);
-    const next = serialize(slice);
-    if (next === lastSerialized) return;
-    lastSerialized = next;
-    try {
-      await options.executor.run(upsertSql, [options.key, next, new Date().toISOString()]);
-    } catch (err) {
-      console.warn("[@smugglr/zustand] persist failed:", err);
-    }
-  };
-
-  const hydrate = async () => {
-    try {
-      const result = await options.executor.run(hydrateSql, [options.key]);
-      if (result.rows.length === 0) {
-        options.onHydrate?.(null);
-        return;
-      }
-      const raw = result.rows[0][0];
-      if (typeof raw !== "string") {
-        options.onHydrate?.(null);
-        return;
-      }
-      const parsed = deserialize(raw);
-      lastSerialized = raw;
-      suppressNextWrite = true;
-      // Merge the hydrated slice into the live store.
-      set(parsed as never, false);
-      options.onHydrate?.(parsed);
-    } catch (err) {
-      console.warn("[@smugglr/zustand] hydrate failed:", err);
-      options.onHydrate?.(null);
-    }
-  };
-
-  api.subscribe((next) => {
-    if (suppressNextWrite) {
-      suppressNextWrite = false;
-      return;
-    }
-    void persist(next);
+  createPersistBinding({
+    smugglr: options.smugglr,
+    executor: options.executor,
+    table: options.table,
+    key: options.key,
+    serialize,
+    deserialize,
+    // Merge the hydrated slice into the live store.
+    applyHydrated: (parsed) => set(parsed as never, false),
+    onHydrate: options.onHydrate,
+    // include() is zustand's projection: persist include(state), not the
+    // full state.
+    subscribe: (notify) => api.subscribe((next) => notify(include(next as never))),
+    logPrefix: "[@smugglr/zustand]",
   });
-
-  options.smugglr.on("table-changed", (event: TableChangedEvent) => {
-    if (event.table !== options.table) return;
-    if (!event.changedPks.includes(options.key)) return;
-    void hydrate();
-  });
-
-  void hydrate();
 
   return state;
 };

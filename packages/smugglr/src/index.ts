@@ -41,6 +41,12 @@ export type {
 export { SmugglrError };
 export { createWaSqliteExecutor } from "./opfs.js";
 export type { WaSqlite3 } from "./opfs.js";
+export { createPersistBinding } from "./persistBinding.js";
+export type {
+  CreatePersistBindingOptions,
+  PersistBinding,
+  PersistBindingSource,
+} from "./persistBinding.js";
 
 // WASM module state -- loaded lazily or set explicitly via setWasm().
 let wasmModule: WasmModule | null = null;
