@@ -48,6 +48,21 @@ fn is_zero(n: &usize) -> bool {
     *n == 0
 }
 
+/// Build the per-table output rows shared by [`CommandOutput::from_sync_results`]
+/// and [`WatchTickOutput::from_results`]: tables with no pushed/pulled rows are
+/// dropped so JSON output only reports what actually changed.
+fn table_outputs(results: &[SyncResult]) -> Vec<TableOutput> {
+    results
+        .iter()
+        .filter(|r| r.has_changes())
+        .map(|r| TableOutput {
+            name: r.table.clone(),
+            rows_pushed: r.rows_pushed,
+            rows_pulled: r.rows_pulled,
+        })
+        .collect()
+}
+
 #[derive(Serialize)]
 pub struct DiffOutput {
     pub command: &'static str,
@@ -163,15 +178,7 @@ impl CommandOutput {
         Self {
             command,
             status: Status::Ok,
-            tables: results
-                .iter()
-                .filter(|r| r.has_changes())
-                .map(|r| TableOutput {
-                    name: r.table.clone(),
-                    rows_pushed: r.rows_pushed,
-                    rows_pulled: r.rows_pulled,
-                })
-                .collect(),
+            tables: table_outputs(results),
             error: None,
         }
     }
@@ -314,15 +321,7 @@ impl WatchTickOutput {
             command: "watch",
             tick,
             status: if dry_run { Status::DryRun } else { Status::Ok },
-            tables: results
-                .iter()
-                .filter(|r| r.has_changes())
-                .map(|r| TableOutput {
-                    name: r.table.clone(),
-                    rows_pushed: r.rows_pushed,
-                    rows_pulled: r.rows_pulled,
-                })
-                .collect(),
+            tables: table_outputs(results),
             error: None,
         }
     }
