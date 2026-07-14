@@ -204,15 +204,68 @@ pub fn epoch_days_to_date(days: u64) -> (u64, u64, u64) {
 }
 
 /// Check if an error is transient (should retry on next tick) vs fatal (should exit).
+///
+/// This delegates to [`SyncError::is_retryable`], the canonical retry policy also
+/// used by the native one-shot retry loop (see `sync::upsert_with_retry`), so the
+/// same error is never "retry" in the daemon and "fatal" in the CLI (issue #226).
+/// Delegating narrows two cases that this function previously matched more
+/// broadly on its own: `SyncError::Http(_)` is now transient only for the
+/// timeout/connect subset `is_retryable` recognizes (a decode, builder, or
+/// other non-transport HTTP failure is now fatal instead of looping forever),
+/// and `SyncError::ServerError { status, .. }` is transient only for `status
+/// >= 500`, matching the variant's documented "5xx" contract instead of
+/// treating every `ServerError` as transient regardless of status.
+///
+/// One documented daemon-specific delta: `ConcurrentWrite` is additionally treated
+/// as transient here, even though `is_retryable` reports it as non-retryable. In
+/// the native path a concurrent-write conflict is surfaced directly to the
+/// operator, who must manually re-run the stash command to pull the latest relay
+/// and merge -- there's no automatic "next attempt" within a single invocation.
+/// The daemon, by contrast, already has a wait-and-try-again tick loop: skipping to
+/// the next tick after a backoff will re-download the latest relay and can resolve
+/// the conflict without operator intervention, so retrying on `ConcurrentWrite` is
+/// the right call for this loop specifically, and only this loop.
 pub fn is_transient_error(err: &SyncError) -> bool {
-    matches!(
-        err,
-        SyncError::RateLimited { .. }
-            | SyncError::ServerError { .. }
-            | SyncError::ConnectionTimeout
-            | SyncError::Http(_)
-            | SyncError::ConcurrentWrite
-    )
+    err.is_retryable() || matches!(err, SyncError::ConcurrentWrite)
+}
+
+/// Compile-time guard: an exhaustive, non-wildcard match over every
+/// `SyncError` variant. This function is never called -- its only purpose is
+/// that adding a new `SyncError` variant makes it fail to compile, forcing
+/// whoever adds the variant to also add a case to
+/// `test_retry_verdict_enumerates_every_variant` below rather than letting it
+/// silently fall on the wrong side of the retry policy (issue #226).
+#[allow(dead_code, clippy::match_same_arms)]
+fn _assert_every_variant_is_enumerated_in_retry_verdict_test(err: &SyncError) {
+    match err {
+        SyncError::Config(_) => {}
+        SyncError::ConfigEnvVar(_) => {}
+        SyncError::LocalDb(_) => {}
+        SyncError::Remote(_) => {}
+        SyncError::Http(_) => {}
+        SyncError::Json(_) => {}
+        SyncError::Io(_) => {}
+        SyncError::TableNotFound(_) => {}
+        SyncError::NoPrimaryKey(_) => {}
+        SyncError::D1Api { .. } => {}
+        SyncError::ConfigNotFound(_) => {}
+        SyncError::RateLimited { .. } => {}
+        SyncError::ServerError { .. } => {}
+        SyncError::ConnectionTimeout => {}
+        SyncError::BadRequest { .. } => {}
+        SyncError::RetryExhausted { .. } => {}
+        SyncError::InvalidTableName { .. } => {}
+        SyncError::ObjectStore(_) => {}
+        SyncError::Stash(_) => {}
+        SyncError::InvalidUrl(_) => {}
+        SyncError::RelayNotFound(_) => {}
+        SyncError::ConcurrentWrite => {}
+        SyncError::ParamLimitExceeded { .. } => {}
+        SyncError::Broadcast(_) => {}
+        SyncError::Plugin(_) => {}
+    }
+    // No `_` arm above: a new SyncError variant must be added to the match
+    // (and to the enumeration test) or this file fails to compile.
 }
 
 #[cfg(test)]
@@ -398,5 +451,180 @@ database = "backup.db""#
 
         assert!(!is_transient_error(&SyncError::Config("bad".into())));
         assert!(!is_transient_error(&SyncError::TableNotFound("x".into())));
+    }
+
+    /// Build a `reqwest::Error` that is neither `is_timeout()` nor `is_connect()`.
+    ///
+    /// Requesting an unsupported URL scheme fails at request-build time inside
+    /// `send()`, before any socket is touched, so this is deterministic and
+    /// works fully offline -- it never performs network I/O.
+    async fn non_network_http_error() -> reqwest::Error {
+        let err = reqwest::Client::new()
+            .get("not-a-real-scheme://host")
+            .send()
+            .await
+            .expect_err("unsupported scheme must fail request construction");
+        assert!(
+            !err.is_timeout() && !err.is_connect(),
+            "test fixture must produce a non-timeout, non-connect HTTP error"
+        );
+        err
+    }
+
+    /// Regression guard for #226.
+    ///
+    /// Before the fix, `is_transient_error` matched `SyncError::Http(_)`
+    /// unconditionally, while `is_retryable` only treated timeout/connect
+    /// `reqwest::Error`s as retryable. That meant a non-network HTTP failure
+    /// (bad scheme, decode error, builder error, etc.) was "retry forever" in
+    /// the daemon but "fatal" in the native retry loop. Confirmed this test
+    /// fails on the pre-change `is_transient_error` (see PR description for
+    /// the observed failure).
+    #[tokio::test]
+    async fn test_is_transient_error_matches_is_retryable_for_non_network_http_error() {
+        let err = SyncError::Http(non_network_http_error().await);
+
+        assert!(
+            !err.is_retryable(),
+            "fixture must be non-retryable per is_retryable's timeout/connect-only policy"
+        );
+        assert_eq!(
+            is_transient_error(&err),
+            err.is_retryable(),
+            "is_transient_error must delegate to is_retryable for Http errors"
+        );
+    }
+
+    /// Enumerates every `SyncError` variant and pins both classifiers' verdicts,
+    /// so a newly added variant -- or a change to either function -- cannot
+    /// silently fall on the wrong side of the retry policy (issue #226).
+    ///
+    /// `is_transient_error` is defined as `is_retryable() || ConcurrentWrite`,
+    /// so every variant here must agree between the two functions except
+    /// `ConcurrentWrite`, which is the one documented daemon-specific delta.
+    #[tokio::test]
+    async fn test_retry_verdict_enumerates_every_variant() {
+        let db_err = {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            conn.execute("SELECT * FROM no_such_table_226", [])
+                .unwrap_err()
+        };
+        let store_err = object_store::parse_url(&url::Url::parse("bogus-scheme://bucket").unwrap())
+            .expect_err("unsupported object store scheme must fail to parse");
+        let http_err = non_network_http_error().await;
+
+        // (name, error, expected is_retryable() verdict)
+        let cases: Vec<(&str, SyncError, bool)> = vec![
+            ("Config", SyncError::Config("x".into()), false),
+            ("ConfigEnvVar", SyncError::ConfigEnvVar("x".into()), false),
+            ("LocalDb", SyncError::LocalDb(db_err), false),
+            ("Remote", SyncError::Remote("x".into()), false),
+            ("Http (non-network)", SyncError::Http(http_err), false),
+            (
+                "Json",
+                SyncError::Json(serde_json::from_str::<i32>("not json").unwrap_err()),
+                false,
+            ),
+            ("Io", SyncError::Io(std::io::Error::other("x")), false),
+            ("TableNotFound", SyncError::TableNotFound("t".into()), false),
+            ("NoPrimaryKey", SyncError::NoPrimaryKey("t".into()), false),
+            (
+                "D1Api",
+                SyncError::D1Api {
+                    message: "x".into(),
+                    code: Some(1),
+                },
+                false,
+            ),
+            (
+                "ConfigNotFound",
+                SyncError::ConfigNotFound("x".into()),
+                false,
+            ),
+            (
+                "RateLimited",
+                SyncError::RateLimited { retry_after: None },
+                true,
+            ),
+            (
+                "ServerError 5xx",
+                SyncError::ServerError {
+                    status: 503,
+                    message: "down".into(),
+                },
+                true,
+            ),
+            (
+                // is_retryable's status >= 500 guard is the canonical policy;
+                // a mislabeled ServerError below 500 must not be retried.
+                "ServerError below 500",
+                SyncError::ServerError {
+                    status: 404,
+                    message: "not actually a server error".into(),
+                },
+                false,
+            ),
+            ("ConnectionTimeout", SyncError::ConnectionTimeout, true),
+            (
+                "BadRequest",
+                SyncError::BadRequest {
+                    status: 400,
+                    message: "x".into(),
+                },
+                false,
+            ),
+            (
+                "RetryExhausted",
+                SyncError::RetryExhausted {
+                    attempts: 3,
+                    last_error: "x".into(),
+                },
+                false,
+            ),
+            (
+                "InvalidTableName",
+                SyncError::InvalidTableName {
+                    name: "x".into(),
+                    available: "a, b".into(),
+                },
+                false,
+            ),
+            ("ObjectStore", SyncError::ObjectStore(store_err), false),
+            ("Stash", SyncError::Stash("x".into()), false),
+            ("InvalidUrl", SyncError::InvalidUrl("x".into()), false),
+            ("RelayNotFound", SyncError::RelayNotFound("x".into()), false),
+            (
+                "ParamLimitExceeded",
+                SyncError::ParamLimitExceeded {
+                    table: "t".into(),
+                    row_count: 1,
+                    col_count: 1,
+                    limit: 1,
+                },
+                false,
+            ),
+            ("Broadcast", SyncError::Broadcast("x".into()), false),
+            ("Plugin", SyncError::Plugin("x".into()), false),
+        ];
+
+        for (name, err, expected_retryable) in cases {
+            assert_eq!(
+                err.is_retryable(),
+                expected_retryable,
+                "is_retryable() verdict changed for {name}"
+            );
+            assert_eq!(
+                is_transient_error(&err),
+                expected_retryable,
+                "is_transient_error() diverged from is_retryable() for {name} \
+                 with no documented delta"
+            );
+        }
+
+        // The one documented delta: ConcurrentWrite is fatal per is_retryable
+        // (the native path can't retry within a single invocation) but
+        // transient per is_transient_error (the daemon's tick loop can).
+        assert!(!SyncError::ConcurrentWrite.is_retryable());
+        assert!(is_transient_error(&SyncError::ConcurrentWrite));
     }
 }
