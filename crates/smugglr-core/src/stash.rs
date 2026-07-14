@@ -220,9 +220,6 @@ async fn upload_relay(
 
 /// Sync rows from source DataSource to destination DataSource for a single table.
 ///
-/// This is a generic version that works with any two DataSource implementations,
-/// unlike the D1-specific push_table/pull_table in sync.rs.
-///
 /// `label` is used for logging (e.g. "stash" or "retrieve").
 /// `set_count` receives the number of synced rows and records it in the result.
 #[allow(clippy::too_many_arguments)]
@@ -255,42 +252,34 @@ async fn sync_table<S: DataSource, D: DataSource>(
         return Ok(crate::sync::finalize_in_sync(table, stats, detail));
     }
 
+    info!("{}: syncing table {} (dry_run={})", label, table, dry_run);
+
+    // Both stash and retrieve use "push" semantics: source-only + source-newer
+    // rows go to dest. Route through the generic engine's push_table so stash
+    // shares the transfer/batch/retry logic with every other DataSource pair
+    // instead of re-fetching and re-upserting rows by hand.
+    let push_result = crate::sync::push_table(
+        source,
+        dest,
+        table,
+        &diff,
+        conflict_resolution,
+        &crate::config::BatchConfig::default(),
+        &[],
+        dry_run,
+        &crate::sync::NoProgress,
+    )
+    .await?;
+
     let mut result = SyncResult::new(table);
     result.diff_stats = stats;
     result.diff_detail = detail;
-
-    // Both stash and retrieve use "push" semantics: source-only + source-newer rows go to dest.
-    let rows_to_sync = diff.rows_to_push(conflict_resolution);
-
-    if rows_to_sync.is_empty() {
-        info!("No changes to sync for table: {}", table);
-        return Ok(result);
-    }
+    set_count(&mut result, push_result.rows_pushed);
 
     info!(
-        "{}: {} rows for table {} (dry_run={})",
-        label,
-        rows_to_sync.len(),
-        table,
-        dry_run
+        "{}: synced {} rows for table {}",
+        label, push_result.rows_pushed, table
     );
-
-    if dry_run {
-        set_count(&mut result, rows_to_sync.len());
-        return Ok(result);
-    }
-
-    let rows = source.get_rows(table, &rows_to_sync).await?;
-
-    if rows.is_empty() {
-        warn!("No rows found in source for sync");
-        return Ok(result);
-    }
-
-    let count = dest.upsert_rows(table, &rows).await?;
-    set_count(&mut result, count);
-
-    info!("{}: synced {} rows for table {}", label, count, table);
     Ok(result)
 }
 
