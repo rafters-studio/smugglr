@@ -46,7 +46,7 @@ Plan → Issue → Build → Simplify → Review → Fix → PR. **Simplify AND 
 
 ## Git & quality gates
 
-Branch first; never commit or push to `main`. The full pipeline before merge: build → simplify gate → pr-write gate → independent review → verify. Gates are HEAD-keyed and real — a clean gate means an accepted per-file articulation exists, not that someone typed "clean." (Moving to `legion push` over `git push` once legion #795 lands.)
+Branch first; never commit to `main`. **Use `legion push`, never `git push`** — legion 0.21.0 retires raw `git push` from agent doctrine: it pushes from the branch's own checkout, refuses `main`/force by construction, and audit-logs every attempt. The full pipeline before merge: build → simplify gate → pr-write gate → independent review → verify. Gates are HEAD-keyed and real — a clean gate means an accepted per-file articulation exists, not that someone typed "clean."
 
 ## Coordination (legion)
 
