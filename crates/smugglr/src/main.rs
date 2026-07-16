@@ -219,6 +219,17 @@ fn emit_command_output(
 #[derive(Parser)]
 #[command(name = "smugglr")]
 #[command(author, version, about = "Smuggle data between SQLite-shaped things")]
+#[command(after_help = "\
+EXIT CODES:
+  0  success
+  1  general error
+  2  configuration error (fix the config, do not retry)
+  3  connection/network error (transient, safe to retry)
+  4  conflict (needs a human decision -- pick a conflict_resolution)
+  5  target not found (database missing or API unreachable)
+
+Config is read from config.toml (override with --config). Use --output json \
+for machine-readable output; the exit code is the scripting contract.")]
 struct Cli {
     /// Path to config file
     #[arg(short, long, default_value = "config.toml")]
