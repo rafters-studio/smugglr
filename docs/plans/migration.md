@@ -110,10 +110,18 @@ A locally-sequential key (`AUTOINCREMENT`, or a bare `INTEGER PRIMARY KEY` rowid
 machines both mint `id = 5` for different rows, and the fabric silently overwrites one with the
 other. Guaranteed data loss -- so smugglr does not merely warn, it **refuses**:
 
-- **First-run sanity check.** smugglr inspects the schema on first run and refuses an
-  incompatible one. A globally-unique BIGINT (snowflake / k-sortable) passes; `AUTOINCREMENT` /
-  rowid does not. (BIGINT is not the crime; *locally-sequential assignment* is, and it is
-  detectable from the schema.)
+- **First-run sanity check (keyed on the _declared_ PK, per rd2 consensus).** smugglr
+  inspects the schema on first run and refuses an incompatible one. The check keys on the
+  **declared primary-key type** and rejects exactly three shapes: `INTEGER PRIMARY KEY` (the
+  rowid alias -- per-node sequential), `AUTOINCREMENT`, and no-declared-PK
+  (identity-by-implicit-rowid). It **accepts** a TEXT/BLOB globally-unique PK and a
+  globally-unique BIGINT (snowflake). Two traps all four reviewers flagged: (1) *never reject
+  rowid existence* -- every SQLite table has an implicit rowid unless `WITHOUT ROWID`, so
+  rejecting on rowid false-rejects every well-formed schema (mail, platform, huttspawn all
+  pass with hidden rowids); (2) *never require a SQL-side `DEFAULT`* -- UUIDv7 is typically
+  app-minted and invisible to DDL, so the pass criterion is *declared PK type is not
+  rowid-shaped*; global-uniqueness of the value is the app's contract, not verifiable from the
+  schema.
 - **migrate does not allow old ideas.** It will not create locally-sequential keys, and it
   blocks a schema that keeps them. The sanctioned path forward is the **`int -> UUIDv7`
   conversion migration** -- the flagship onboarding case, and the hairiest migration class
@@ -271,12 +279,17 @@ transactionless target. Forward-only and "carries-reverse" (decision 3) are one 
 not two: rollback is a compensating forward step (the inverse applied as a new version),
 never a transactional undo.
 
-**Concurrent-writer race (huttspawn, from lived D1 pain).** skip-if-applied covers
-*re-run* -- the same node applying vN twice, a no-op. It does NOT by itself cover two
-*different* writers racing the ledger insert against a transactionless D1, which can
-double-apply (huttspawn hit exactly this: parallel `wrangler migrate apply` corrupts the
-journal, and runs a wrangler-apply mutex today -- platform 2026-04-22). Needs a lease /
-mutex / compare-and-swap on the ledger row. Open item -- see open-Q7.
+**Concurrent-writer race + crash window (RESOLVED, rd2).** skip-if-applied covers *re-run*
+(the same node applying vN twice, a no-op) but not two *different* writers racing the insert
+against a transactionless D1, nor a crash mid-apply. Transaction-free resolution: a
+`UNIQUE(version)` ledger row elects a single apply-winner; the winner runs the idempotent DDL,
+then marks `success = TRUE`. **The skip-gate keys on `success = TRUE`, never on
+row-existence** -- otherwise a crash between insert-pending and mark-success leaves a
+*poison-pending* row that every node skips, marching to vN+1 against a half-applied vN
+(fabric-wide corruption -- platform's catch). Pending rows carry a **lease/timeout** and are
+idempotently re-driven. No transaction needed; survives D1. migrate's ledger is its own and
+never wraps `wrangler`'s tracker, so wrangler's parallel-apply journal corruption (huttspawn's
+scar) does not transfer.
 
 ### 7. The ledger is the load-bearing artifact (gate + tamper-evidence)
 
@@ -321,9 +334,10 @@ hand-editing drizzle's journal into silent desync. A plain hand-editable ledger
 resurrects that exact reflex; chain-hashing turns a silent out-of-band edit into a loud,
 detected failure. Tamper-evidence on an artifact we already have -- no new subsystem.
 
-**Trade-off:** the ledger is now the critical path -- ordered, reliable, tamper-evident,
-and concurrency-safe (open-Q7). Stricter than the unordered row fabric it sits above, and
-the right place to spend the strictness.
+**Trade-off:** the ledger is now the critical path -- ordered, reliable, tamper-evident, and
+concurrency-safe (decision 6: `UNIQUE(version)`, `success`-gated skip, leased re-drive).
+Stricter than the unordered row fabric it sits above, and the right place to spend the
+strictness. It is *migrate's own* ledger, never a wrapper over `wrangler`'s tracker.
 
 ### 8. Per-target apply strategies
 
@@ -389,31 +403,90 @@ dry-run preview  ->  destructive-lint  ->  [capture pre-image if destructive]
 rollback:  apply envelope.down (restoring pre-image where destructive)  ->  pop ledger
 ```
 
-## Migrate x sync: ordered migrations on a masterless fabric (the central open problem)
+## Migrate x sync: ordered migrations on a masterless fabric (resolved)
 
-The crux of the whole feature, and the thing to resolve before any code. The LAN fabric
-is masterless, idempotent, last-received-wins -- deliberately *unordered* for rows (no
-vector clocks, no CRDTs, no leader). Global ordered schema change is exactly the
-coordination the fabric refuses to provide.
+The crux of the feature. The LAN fabric is masterless, idempotent, last-received-wins --
+deliberately *unordered* for rows (no vector clocks, no CRDTs, no leader). Ordered schema
+change looks like it needs the coordination the fabric refuses to provide.
 
-Decision 7 proposes the answer for the **masterless-multicast path**: the ledger gates
-row-sync on version equality, and a rollout partitions the fabric by version until it
-propagates. That works but owes a proof of convergence under concurrent writes during a
-rollout.
+**Resolution (consensus rd2): ride the masterless path; no coordinator.** The unlock is
+that the *order is authored, not runtime-elected* -- it lives in each migration's monotonic
+version (v1 -> v2 -> v3), decided when the migration is written, not by a runtime leader. So
+every node independently applies the authored chain in version order, idempotently. A
+coordinator would violate masterlessness (smugglr's core identity) for nothing.
 
-The genuine fork (open-Q4, blocking):
+**The claim, corrected** (mail + platform + huttspawn converged; the first draft's
+"determinism => convergence" was wrong):
 
-- **Ride the masterless-multicast path** -- cheap, no coordinator, but you inherit the
-  version-gating invariant, the rollout-partition behavior, and the concurrent-writer
-  race (open-Q7), and you must prove convergence under concurrent writes.
-- **A coordinated apply path** -- a designated applier drives migrations in order
-  (deterministic, tractable) at the cost of adding coordination the LAN fabric
-  deliberately lacks (the cross-process TCP shape, #90, could carry it).
+> **Idempotence + version-gating => _safe_ convergence. Liveness is a deployment assumption
+> the protocol cannot discharge.**
 
-Sharpest question for the RFC, specifically platform and huttspawn: does
-schema-skew-during-rollout match a real multi-node deployment, and is the
-partition-until-converged window acceptable? huttspawn's lived D1 apply-mutex experience
-is direct evidence it bites.
+- *Idempotence, not determinism, is load-bearing.* Apply is transaction-free with crash
+  re-drive (decision 6), so the delivery model is **at-least-once**, and under at-least-once
+  only idempotent steps converge. `UPDATE SET v = v*2` is deterministic and per-row-closed
+  yet *diverges* on re-apply; `SET email = lower(email)` is idempotent and converges.
+  Determinism is necessary, not sufficient.
+- *Version-gating is the mechanism.* It partitions the fabric by version so concurrent
+  writes reduce to a per-version deterministic replay (confluence). Drop the gate and a
+  v(N-1) node and a vN node hold different content-hashes for the same row -> unguarded LWW
+  flaps -> the version-skew storm.
+- *Safety, not liveness.* Convergence is eventual and conditional on every node reaching
+  vN. A node down through the whole rollout converges only within its partition; masterless
+  has no coordinator to force universal catch-up. Safe (no corruption), but "converges" must
+  not read as "always heals" -- universal catch-up is a deployment property, not a protocol
+  guarantee.
+
+The convergence *discipline* that makes this real is the next section. The concurrent-writer
+race and crash window are handled in decisions 6-7 (a `UNIQUE(version)` ledger keyed on
+`success = TRUE`, with a lease + idempotent re-drive). migrate owns *its own* ledger and
+never wraps `wrangler`'s migration tracker -- so wrangler's journal-corruption-under-parallel-
+apply failure (huttspawn's D1 scar) does not transfer.
+
+## Convergence discipline (what makes a migration safe to run everywhere)
+
+Idempotence is not machine-checkable in general, so migrate hands the author a **checkable
+discipline** and ships the determinism contract as *code, not prose*.
+
+**Authoring discipline (enforced).** A backfill writes its target column as either a pure
+function of *other* source columns, or a **fixed-point** function of its own value (`lower`,
+`trim`, `coalesce`, `clamp` -- applying twice equals applying once). Forbidden, because they
+break at-least-once convergence: non-fixed-point self-reference (`x = x + k`, `x = x * k`,
+append); **cross-row / aggregate reads** (snapshot-dependent -- two nodes see different
+neighbor state mid-replication and diverge, which is why a denormalized-aggregate recompute
+is *not* a safe migration); `rowid`; node-identity; `random()`; `now()`. In short:
+**per-row-closed and fixed-point.**
+
+**The determinism contract is a shared typed canonicalizer, not a spec** (huttspawn's
+"function not formula"). A content-derived value converges across nodes only if every node
+canonicalizes byte-identically; prose drifts (`join('|')` vs `join('\0')`) and the drift is
+silent data loss. The canonicalizer ships in the shared crate -- exactly as `rowhash.rs` is
+already the one canonical home for the content hash -- so the function *is* the contract.
+
+**Identity-minting fills are run-once, not per-node.** A migration that mints *new* PKs on a
+live multi-node table is the dual of the autoincrement collision: two partitioned nodes both
+reach vN, both "assign a new UUIDv7," and mint *different* keys for the same logical entity
+-> one entity fissions into two rows LWW cannot dedupe. `UNIQUE(version)` elects a DDL-apply
+winner but not a data-fill-*output* winner. So an identity-minting fill binds its runner to
+the `UNIQUE(version)` winner and propagates the *output* (the minted rows) as
+content-addressed deltas on the ledger entry; late/partitioned nodes **adopt** the winner's
+output, never re-mint. (The `int -> UUIDv7` onboarding conversion is exempt -- it runs
+single-node, before the table joins the fabric, so there is no concurrent minter.)
+
+**Scope fence: migrate is a one-shot state transform, not ongoing invariant maintenance.**
+Convergence covers the N nodes *applying the migration*. It does **not** promise that an open
+application write-stream during a backfill stays conformant to the migration's intent -- a
+one-shot transform is not a constraint. Post-migration invariants belong to the app layer
+(`CHECK` / trigger / a later constraint-add with writes quiesced). Constraint-tightening
+(adding a `UNIQUE`) is the same shape: it can succeed on one node and fail on another under
+live concurrent data, so it runs with writes quiesced on the affected table during the gate.
+
+**Not a gap.** A non-injective transform (lowercasing an email, truncating a timestamp) does
+*not* lose data -- it collapses content *hashes*, not PKs. Sync keys on the minted PK;
+`rowhash` is a separate value-reconciliation key, so two distinct-PK rows stay two rows. Only
+a migration whose *purpose* is to merge rows bites, and row-merge (delete + merge) is out of
+masterless v0.1 scope.
+
+## Convergent-declarative vs authored-delta (the second open fork)
 
 ## Convergent-declarative vs authored-delta (the second open fork)
 
@@ -462,19 +535,17 @@ permission surface in SQLite to mis-grant.
 2. **Reverse location.** Reverse carried *in* the envelope vs derived from the ledger +
    a content-addressed snapshot store.
 3. **Manifest field set.** The sketch above needs to become normative.
-4. **[BLOCKING -- central] Ordered apply on the masterless fabric.** Masterless-multicast
-   (with decision-7 version-gating + rollout partition) vs a coordinated applier. Prove
-   convergence under concurrent writes during a rollout before implementation. Plus:
-   interaction with `defer_foreign_keys` and per-target apply strategies mid-convergence.
-   This is the question the RFC exists to answer (advisor; platform + huttspawn agree it
-   is the real design risk).
+4. **[RESOLVED, rd2] Ordered apply on the masterless fabric.** Ride the masterless path, no
+   coordinator; the order is authored, not runtime-elected. **Idempotence + version-gating =>
+   safe convergence** (see "Migrate x sync" and "Convergence discipline"); liveness stays a
+   deployment assumption. Residual engineering detail: interaction of the version-gate with
+   `defer_foreign_keys` and the per-target apply strategies mid-convergence.
 5. **Author-signature provenance.** AEAD proves un-tampered + key-holder; non-repudiable
    "which agent authored this" needs an asymmetric signature -- a later layer.
 6. **WASM crypto gating.** Un-gate `chacha20poly1305` for `wasm32` (decision 2 note).
-7. **Concurrent-writer race on txn-less targets (huttspawn).** skip-if-applied covers
-   re-run, not two *different* writers racing the ledger insert against D1 (double-apply).
-   Needs a lease / mutex / compare-and-swap on the ledger row (huttspawn runs a
-   wrangler-apply mutex today).
+7. **[RESOLVED, rd2] Concurrent-writer race + crash window.** `UNIQUE(version)` elects one
+   apply-winner; skip-gate keys on `success = TRUE` (not row-existence, or a poison-pending
+   row deadlocks the rollout); pending rows leased + idempotently re-driven. See decision 6.
 8. **[BLOCKING -- library path] Convergent-declarative vs authored-delta (mail).** Does
    migrate ingest a whole-schema convergent artifact or require a delta chain? Decides
    whether surgical rollback serves library shippers at all. See the fork section above.
