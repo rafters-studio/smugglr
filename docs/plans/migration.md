@@ -122,6 +122,15 @@ other. Guaranteed data loss -- so smugglr does not merely warn, it **refuses**:
   app-minted and invisible to DDL, so the pass criterion is *declared PK type is not
   rowid-shaped*; global-uniqueness of the value is the app's contract, not verifiable from the
   schema.
+- **Uniqueness is necessary but not sufficient -- the PK must also be STABLE (kessel; spike E).**
+  A content-derived PK that is unique per-extraction but *shifts* across versions (kessel's
+  `game_id = sha256(fqn:guid)`, which moves every game patch) passes the uniqueness check yet
+  reads as 100% churn -- every row a delete + re-insert -- because content-hash sync assumes a
+  logical row keeps its PK for its lifetime (UUIDv7 does; a re-derived hash does not). Spike E
+  reproduced it: 2 unchanged rows under shifted PKs = 2 deletes + 2 inserts (a false
+  mass-data-loss). So the precondition targets within-lifetime uniqueness **and** stability, and
+  convergence keys on the stable identity. "Globally-unique-by-construction" also has an entropy
+  floor -- a 64-bit truncated hash is a birthday bet, not a proof.
 - **migrate does not allow old ideas.** It will not create locally-sequential keys, and it
   blocks a schema that keeps them. The sanctioned path forward is the **`int -> UUIDv7`
   conversion migration** -- the flagship onboarding case, and the hairiest migration class
@@ -291,6 +300,14 @@ idempotently re-driven. No transaction needed; survives D1. migrate's ledger is 
 never wraps `wrangler`'s tracker, so wrangler's parallel-apply journal corruption (huttspawn's
 scar) does not transfer.
 
+**Idempotency is per-op, not blanket (spikes A/I/J).** `IF NOT EXISTS` covers `CREATE TABLE`
+and `CREATE INDEX`, but there is **no `ADD COLUMN IF NOT EXISTS`** -- re-running `ADD COLUMN`
+raises "duplicate column name". Idempotent `ADD COLUMN` must check `pragma_table_info` first
+(or treat the duplicate-column error as success); the 12-step rebuild is not naturally
+idempotent and must be guarded; `DROP COLUMN` cannot drop an indexed or PK column (drop the
+index first / rebuild). So "idempotent forward-only" is a per-op authoring + apply-engine
+obligation, not a free property of `IF NOT EXISTS`.
+
 ### 7. The ledger is the load-bearing artifact (gate + tamper-evidence)
 
 A ledger records each migration: version, checksum, applied-at, success, in a
@@ -403,6 +420,26 @@ dry-run preview  ->  destructive-lint  ->  [capture pre-image if destructive]
 rollback:  apply envelope.down (restoring pre-image where destructive)  ->  pop ledger
 ```
 
+## Recovery: surgical log (primary) + `--paranoid` snapshot (fallback)
+
+The eavesdrop corpus's sharpest lesson: coarse *restore-from-backup* is itself the footgun --
+"restore from backup reverted my project to an 8-month-old state." smugglr's differentiator is
+**surgical** recovery: undo *exactly* the migration's delta, nothing else. So recovery is two
+layers:
+
+- **Surgical operation log (primary).** A write-ahead, per-step, chain-hashed log of each op
+  with its redo (the op) and undo (the pre-image decision 4 already captures). On failure, roll
+  forward (redo the remaining) or roll back (undo the applied) to a consistent state,
+  *preserving concurrent data*. Spike C validated it: after a lossy migration that truncated one
+  row and "crashed" before the next, restoring from the pre-image reconstructed both rows
+  exactly, untouched elsewhere.
+- **`--paranoid` snapshot (coarse fallback).** An opt-in setting: snapshot the DB *before* the
+  migration; on total failure (DB/log too corrupt for surgical replay), restore the fresh
+  pre-migration snapshot. Spike T validated `VACUUM INTO` snapshot + restore round-trips
+  exactly; the caveat is coarseness -- it loses any write made *during* the migration, which is
+  exactly why it is the parachute and the surgical log is the flying. Enable it for high-stakes
+  / destructive runs; per-target (local `VACUUM INTO`, D1 time-travel, Turso branching).
+
 ## Migrate x sync: ordered migrations on a masterless fabric (resolved)
 
 The crux of the feature. The LAN fabric is masterless, idempotent, last-received-wins --
@@ -434,7 +471,11 @@ coordinator would violate masterlessness (smugglr's core identity) for nothing.
   vN. A node down through the whole rollout converges only within its partition; masterless
   has no coordinator to force universal catch-up. Safe (no corruption), but "converges" must
   not read as "always heals" -- universal catch-up is a deployment property, not a protocol
-  guarantee.
+  guarantee. Because a rollout partitions the fabric by version, that deployment assumption
+  needs an *instrument*: the ledger already stores each node's applied version, so migrate
+  **exposes per-node applied version** -- a queryable signal and a distinct sync outcome, never
+  a silent quiet no-op -- so an operator can *detect* a laggard even though the protocol cannot
+  force it to catch up. Can't force catch-up, but can see it (platform + legion).
 
 The convergence *discipline* that makes this real is the next section. The concurrent-writer
 race and crash window are handled in decisions 6-7 (a `UNIQUE(version)` ledger keyed on
@@ -485,8 +526,6 @@ live concurrent data, so it runs with writes quiesced on the affected table duri
 `rowhash` is a separate value-reconciliation key, so two distinct-PK rows stay two rows. Only
 a migration whose *purpose* is to merge rows bites, and row-merge (delete + merge) is out of
 masterless v0.1 scope.
-
-## Convergent-declarative vs authored-delta (the second open fork)
 
 ## Convergent-declarative vs authored-delta (the second open fork)
 
@@ -552,6 +591,33 @@ permission surface in SQLite to mis-grant.
 9. **Parser fidelity (mail).** If the manifest diffs/introspects SQL, preserve quoted
    identifiers (mail's `inbox_message."references"`, a reserved word). Test against mail's
    actual `migrationSQL`; a normalizing diff must not mangle quoting.
+
+## Adversarial spike findings (sqlite3 toys, folded into the issues)
+
+A `:memory:` adversarial sweep stress-tested the design. The surgical-undo core, chain-hash
+tamper-evidence, and `--paranoid` snapshot/restore all held; the following gotchas were
+reproduced and folded into the issues, with a live shipped bug at the top:
+
+- **SHIPPED BUG -- `pk_text_expr` `|`-delimiter collision.** `(a='x|', b='y')` and
+  `(a='x', b='|y')` both render `__pk = 'x||y'` -> silent row loss on any composite-PK table
+  with a `|` in a text component (`rowhash.rs`). The content-hash is safe (its per-value type
+  tags disambiguate); the fix is `pk_text_expr` only (escape / NUL / length-prefix). Its own
+  core bug-fix issue, independent of migrate.
+- **pii-excluded edit is invisible to sync -- and the diff must honor a newer `updated_at` on a
+  hash-*match*** (spike C/N). An app-side timestamp bump is necessary but not sufficient;
+  `classify_diff` must not skip a newer-timestamp row when a column is excluded from the hash.
+- **Constraint-ADD (`CHECK` / `:range` / `NOT NULL` / `UNIQUE`) is data-dependent** (spike L) --
+  the rebuild fails on violating rows; clean the data first (extends the constraint-tightening
+  write-quiesce).
+- **Type-narrowing does not enforce** (spike Q) -- SQLite's flexible typing keeps `'hello'` as
+  TEXT in an `INTEGER` column; type-change migrations need `STRICT` tables or a `CHECK(typeof)`.
+- **`int -> UUIDv7` retypes FK columns** (spike H) -- updating an `INTEGER` FK to a TEXT UUID
+  errors (`datatype mismatch`); the conversion rebuilds every child FK column, not just values.
+- **Blob hex-vs-base64 across targets diverges** (spike S) -- a blob column converges only if
+  every backend renders lowercase-hex; else exclude it or pin the encoding.
+
+Full catalog: `legion recall --repo smugglr --context "adversarial spike sweep"`
+(reflections `019f7258..019f7269`).
 
 ## Rejected alternatives
 
