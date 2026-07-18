@@ -132,9 +132,24 @@ pub fn content_hash(
 /// type-agnostically, so the cast is harmless there -- making this the one form
 /// that is correct everywhere.
 pub fn pk_text_expr(primary_key: &[String]) -> String {
+    // Single-column PK: no delimiter, so no collision is possible -- render it
+    // unchanged. This preserves the `__pk` wire contract for the overwhelmingly
+    // common single-PK case; only composite-PK tables re-render (and re-sync once).
+    if primary_key.len() == 1 {
+        return format!("CAST(\"{}\" AS TEXT)", primary_key[0]);
+    }
+    // Composite PK: a bare `|` join is NOT injective. `{a:'x|', b:'y'}` and
+    // `{a:'x', b:'|y'}` both render `x||y`, collapsing two distinct rows onto one
+    // `__pk` -- silent row loss in the pk-keyed metadata map. Escape the escape
+    // char first, then the delimiter, in each part so the join is unambiguous.
     primary_key
         .iter()
-        .map(|k| format!("CAST(\"{}\" AS TEXT)", k))
+        .map(|k| {
+            format!(
+                "REPLACE(REPLACE(CAST(\"{}\" AS TEXT), '\\', '\\\\'), '|', '\\|')",
+                k
+            )
+        })
         .collect::<Vec<_>>()
         .join(" || '|' || ")
 }
@@ -306,11 +321,34 @@ mod tests {
 
     #[test]
     fn pk_text_expr_single_and_composite() {
+        // Single PK renders unchanged (no delimiter, no collision possible).
         assert_eq!(pk_text_expr(&["id".to_string()]), "CAST(\"id\" AS TEXT)");
+        // Composite PK escapes '\' then '|' in each part before the '|' join.
         assert_eq!(
             pk_text_expr(&["a".to_string(), "b".to_string()]),
-            "CAST(\"a\" AS TEXT) || '|' || CAST(\"b\" AS TEXT)"
+            "REPLACE(REPLACE(CAST(\"a\" AS TEXT), '\\', '\\\\'), '|', '\\|') \
+             || '|' || \
+             REPLACE(REPLACE(CAST(\"b\" AS TEXT), '\\', '\\\\'), '|', '\\|')"
         );
+    }
+
+    #[test]
+    fn pk_text_expr_composite_is_injective() {
+        // Regression for the delimiter-collision bug: `{a:'x|', b:'y'}` and
+        // `{a:'x', b:'|y'}` both rendered `x||y` under a bare `|` join, collapsing
+        // two rows onto one `__pk`. This helper mirrors the SQL escaping (REPLACE
+        // '\' -> '\\' then '|' -> '\|', join with '|') so we can assert the two
+        // distinct composite keys now render distinctly without a database.
+        fn render(parts: &[&str]) -> String {
+            parts
+                .iter()
+                .map(|p| p.replace('\\', "\\\\").replace('|', "\\|"))
+                .collect::<Vec<_>>()
+                .join("|")
+        }
+        assert_ne!(render(&["x|", "y"]), render(&["x", "|y"]));
+        assert_eq!(render(&["x|", "y"]), "x\\||y");
+        assert_eq!(render(&["x", "|y"]), "x|\\|y");
     }
 
     #[test]
