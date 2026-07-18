@@ -252,6 +252,9 @@ fn default_exclude_tables() -> Vec<String> {
         "sqlite_sequence".to_string(),
         "_cf_KV".to_string(),
         "__drizzle_migrations".to_string(),
+        // migrate's own ledger (`migrate::ledger::LEDGER_TABLE`) -- control-plane
+        // apply-state, invisible to `validate` and app introspection/reset.
+        "_smugglr_migrations".to_string(),
     ]
 }
 
@@ -726,6 +729,8 @@ mod tests {
 
         assert!(!config.should_sync_table("sqlite_sequence"));
         assert!(!config.should_sync_table("_cf_KV"));
+        // migrate's own ledger is control-plane -- never synced or validated.
+        assert!(!config.should_sync_table("_smugglr_migrations"));
         assert!(config.should_sync_table("abilities"));
     }
 
