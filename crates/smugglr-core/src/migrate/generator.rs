@@ -55,6 +55,17 @@ pub enum GeneratorError {
     /// A modifier token is not part of the grammar.
     #[error("unknown modifier '{modifier}' on column '{column}'")]
     UnknownModifier { column: String, modifier: String },
+    /// A no-argument modifier (`pk`/`fk`/`unique`/`notnull`/`index`/`pii`) was
+    /// given an `=value` suffix, which it does not accept.
+    #[error("modifier '{modifier}' on column '{column}' does not take a value")]
+    UnexpectedModifierValue { column: String, modifier: String },
+    /// A column name is not a safe SQL identifier and so cannot be interpolated
+    /// into a generated `CHECK` expression.
+    #[error(
+        "column name '{0}' is not a safe SQL identifier (expected \
+         [A-Za-z_][A-Za-z0-9_]*)"
+    )]
+    UnsafeColumnName(String),
     /// An `fk` modifier could not infer its target table from the column name.
     #[error(
         "cannot infer foreign-key target for column '{0}': the name must end in \
@@ -191,28 +202,59 @@ fn parse_column(spec: &str) -> Result<ParsedColumn, GeneratorError> {
     let mut constraints = Vec::new();
     let mut tags = Vec::new();
     let mut index = false;
-    for token in modifiers {
+    for (i, token) in modifiers.iter().enumerate() {
         let (key, arg) = match token.split_once('=') {
             Some((k, v)) => (k, Some(v)),
             None => (*token, None),
         };
         match key {
-            "pk" => constraints.push(Constraint::Pk),
-            "fk" => constraints.push(Constraint::Fk {
-                table: infer_fk_table(name)?,
-                col: "id".to_string(),
-            }),
-            "unique" => constraints.push(Constraint::Unique),
-            "notnull" => constraints.push(Constraint::NotNull),
-            "index" => index = true,
-            "pii" => tags.push("pii".to_string()),
+            "pk" => {
+                reject_value(name, key, arg)?;
+                constraints.push(Constraint::Pk);
+            }
+            "fk" => {
+                reject_value(name, key, arg)?;
+                constraints.push(Constraint::Fk {
+                    table: infer_fk_table(name)?,
+                    col: "id".to_string(),
+                });
+            }
+            "unique" => {
+                reject_value(name, key, arg)?;
+                constraints.push(Constraint::Unique);
+            }
+            "notnull" => {
+                reject_value(name, key, arg)?;
+                constraints.push(Constraint::NotNull);
+            }
+            "index" => {
+                reject_value(name, key, arg)?;
+                index = true;
+            }
+            "pii" => {
+                reject_value(name, key, arg)?;
+                tags.push("pii".to_string());
+            }
             "default" => {
+                // The default value is opaque: it may itself contain ':' (a URL,
+                // a timestamp), which the column-level `split(':')` would
+                // otherwise treat as a modifier separator. Rejoin this token's
+                // value with every following token so `default=a:b` keeps its
+                // colon. As a consequence the value is greedy -- `default=` must
+                // be the final modifier in a spec.
+                let head =
+                    arg.ok_or_else(|| GeneratorError::DefaultMissingValue(name.to_string()))?;
+                let value: String = std::iter::once(head)
+                    .chain(modifiers[i + 1..].iter().copied())
+                    .collect::<Vec<&str>>()
+                    .join(":");
                 // Both `default` (no `=`) and `default=` (empty value) are
                 // rejected -- an empty default would emit malformed SQL later.
-                let value = arg
-                    .filter(|v| !v.is_empty())
-                    .ok_or_else(|| GeneratorError::DefaultMissingValue(name.to_string()))?;
-                constraints.push(Constraint::Default(value.to_string()));
+                if value.is_empty() {
+                    return Err(GeneratorError::DefaultMissingValue(name.to_string()));
+                }
+                constraints.push(Constraint::Default(value));
+                break;
             }
             "range" => constraints.push(range_check(name, kind, arg)?),
             _ => {
@@ -233,6 +275,34 @@ fn parse_column(spec: &str) -> Result<ParsedColumn, GeneratorError> {
         },
         index,
     })
+}
+
+/// Reject an `=value` suffix on a no-argument modifier.
+///
+/// The no-arg modifiers (`pk`/`fk`/`unique`/`notnull`/`index`/`pii`) take no
+/// value; a suffix like `pk=foo` is an author mistake and must fail loudly
+/// rather than be silently swallowed.
+fn reject_value(column: &str, modifier: &str, arg: Option<&str>) -> Result<(), GeneratorError> {
+    match arg {
+        None => Ok(()),
+        Some(_) => Err(GeneratorError::UnexpectedModifierValue {
+            column: column.to_string(),
+            modifier: modifier.to_string(),
+        }),
+    }
+}
+
+/// Whether `name` is a safe SQL identifier: `[A-Za-z_][A-Za-z0-9_]*`.
+///
+/// Author-controlled column names flow into generated `CHECK` expressions, so
+/// they are gated to this conservative shape before interpolation.
+fn is_safe_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Map a type token to its [`ColumnKind`], or `None` if it is not a type.
@@ -269,6 +339,12 @@ fn range_check(
             column: column.to_string(),
             kind: kind_name(kind),
         });
+    }
+    // The column name is interpolated verbatim into the emitted CHECK
+    // expression, so it must be a safe SQL identifier -- reject anything else
+    // rather than carry arbitrary text into the generated SQL.
+    if !is_safe_identifier(column) {
+        return Err(GeneratorError::UnsafeColumnName(column.to_string()));
     }
     let expr = match arg {
         None => format!("{column} >= 0"),
@@ -444,6 +520,50 @@ mod tests {
             cols[0].constraints,
             vec![Constraint::Default("active".to_string())]
         );
+    }
+
+    #[test]
+    fn default_value_may_contain_colons() {
+        // Finding 1: a colon in the default value must survive parsing -- the
+        // top-level `split(':')` would otherwise drop or misparse `:b`.
+        let m = generate("create_t", &["col:text:default=a:b".into()]).unwrap();
+        let (_, cols, _) = create_table(&m);
+        assert_eq!(
+            cols[0].constraints,
+            vec![Constraint::Default("a:b".to_string())]
+        );
+    }
+
+    #[test]
+    fn no_arg_modifier_with_value_is_rejected() {
+        // Finding 2: a no-arg modifier must reject an `=value` suffix rather
+        // than silently swallow it.
+        let err = generate("create_t", &["id:pk=oops".into()]).unwrap_err();
+        assert_eq!(
+            err,
+            GeneratorError::UnexpectedModifierValue {
+                column: "id".to_string(),
+                modifier: "pk".to_string(),
+            }
+        );
+        // The same guard covers fk, whose target is inferred, not supplied.
+        let err = generate("create_t", &["address_id:fk=oops".into()]).unwrap_err();
+        assert_eq!(
+            err,
+            GeneratorError::UnexpectedModifierValue {
+                column: "address_id".to_string(),
+                modifier: "fk".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn unsafe_column_name_in_check_is_rejected() {
+        // Finding 3: an unsafe column name must not be interpolated into the
+        // generated CHECK expression. A leading digit is not a valid SQL
+        // identifier.
+        let err = generate("create_t", &["1col:int:range".into()]).unwrap_err();
+        assert_eq!(err, GeneratorError::UnsafeColumnName("1col".to_string()));
     }
 
     #[test]
