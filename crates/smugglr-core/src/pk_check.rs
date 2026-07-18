@@ -358,13 +358,42 @@ impl ParsedTable {
             .collect()
     }
 
-    /// The rowid-alias column, if any: a single-column, column-level
-    /// `INTEGER PRIMARY KEY`, type token exactly `INTEGER`, not `DESC`, in a
-    /// rowid table. A table-level `PRIMARY KEY(...)` is never a rowid alias.
+    /// The rowid-alias column, if any: a single-column `INTEGER PRIMARY KEY` in
+    /// a rowid table, type token exactly `INTEGER` (case-insensitive).
+    ///
+    /// SQLite has a genuine asymmetry between the two ways to declare a
+    /// single-INTEGER PK:
+    /// - Column-level `x INTEGER PRIMARY KEY` is a rowid alias **only when not
+    ///   `DESC`** -- `x INTEGER PRIMARY KEY DESC` is a real index, not an alias.
+    /// - Table-level `PRIMARY KEY(x)` naming a single `INTEGER` column is a rowid
+    ///   alias **regardless of ASC/DESC** -- the DESC trap does not apply to the
+    ///   table-level form.
+    ///
+    /// A composite table-level `PRIMARY KEY(a, b)` is never a rowid alias.
     fn rowid_alias_column(&self) -> Option<String> {
-        if self.without_rowid || !self.table_pk.is_empty() {
+        if self.without_rowid {
             return None;
         }
+        // Table-level `PRIMARY KEY(col)`: a single INTEGER column is a rowid
+        // alias regardless of ASC/DESC. Resolve the referenced column name
+        // case-insensitively (SQLite identifiers are case-insensitive).
+        if !self.table_pk.is_empty() {
+            if self.table_pk.len() != 1 {
+                return None;
+            }
+            let name = &self.table_pk[0];
+            let col = self
+                .columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(name))?;
+            return if col.type_name.eq_ignore_ascii_case("INTEGER") {
+                Some(col.name.clone())
+            } else {
+                None
+            };
+        }
+        // Column-level `INTEGER PRIMARY KEY`: exactly `INTEGER`, not `DESC`,
+        // single PK column.
         let pk_cols: Vec<&ParsedColumn> = self.columns.iter().filter(|c| c.column_pk).collect();
         if pk_cols.len() != 1 {
             return None;
@@ -390,18 +419,26 @@ impl ParsedTable {
     ///
     /// True when the column is explicitly `NOT NULL`, when the table is
     /// `WITHOUT ROWID` (PK columns are implicitly `NOT NULL` there), or when the
-    /// column is the integer rowid alias (implicitly `NOT NULL`).
+    /// column is the integer rowid alias (implicitly `NOT NULL`, whether the
+    /// alias is declared column-level or table-level). The column name is
+    /// resolved case-insensitively, since SQLite identifiers are.
     fn pk_column_is_not_null(&self, name: &str) -> bool {
         if self.without_rowid {
             return true;
         }
-        match self.columns.iter().find(|c| c.name == name) {
-            Some(col) => {
-                col.not_null
-                    || (col.column_pk
-                        && col.type_name.eq_ignore_ascii_case("INTEGER")
-                        && !col.pk_desc)
+        // The integer rowid alias is implicitly NOT NULL; suppress L2 so it does
+        // not double-fire on a column L1 already flagged as IntegerPrimaryKey.
+        if let Some(alias) = self.rowid_alias_column() {
+            if alias.eq_ignore_ascii_case(name) {
+                return true;
             }
+        }
+        match self
+            .columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(name))
+        {
+            Some(col) => col.not_null,
             // A table-level PK naming a column we did not parse: treat as not
             // guaranteed (surface the L2 finding rather than assume safety).
             None => false,
@@ -780,6 +817,46 @@ mod tests {
             findings.is_empty(),
             "INTEGER PRIMARY KEY DESC should pass (DESC trap): {findings:?}"
         );
+    }
+
+    // --- table-level single-INTEGER PK is a rowid alias ---------------------
+
+    #[test]
+    fn table_level_integer_pk_is_flagged() {
+        // `PRIMARY KEY(x)` on an INTEGER column (no NOT NULL) IS a rowid alias
+        // (mints per-node 1,2,3, implicitly NOT NULL) -- must flag
+        // IntegerPrimaryKey only, not pass and not double-fire NullablePrimaryKey.
+        let findings = classify_table_ddl("t", "CREATE TABLE t (x INTEGER, PRIMARY KEY(x))");
+        assert_eq!(issues(&findings), vec![PkIssue::IntegerPrimaryKey]);
+    }
+
+    #[test]
+    fn table_level_integer_pk_asc_is_flagged() {
+        // ASC does not change rowid-alias status for the table-level form.
+        let findings = classify_table_ddl("t", "CREATE TABLE t (x INTEGER, PRIMARY KEY(x ASC))");
+        assert_eq!(issues(&findings), vec![PkIssue::IntegerPrimaryKey]);
+    }
+
+    #[test]
+    fn table_level_integer_pk_desc_is_flagged() {
+        // The DESC-disqualifies quirk applies ONLY to the column-level
+        // `INTEGER PRIMARY KEY DESC` form. The table-level `PRIMARY KEY(x DESC)`
+        // is still a rowid alias -- a genuine SQLite asymmetry.
+        let findings = classify_table_ddl("t", "CREATE TABLE t (x INTEGER, PRIMARY KEY(x DESC))");
+        assert_eq!(issues(&findings), vec![PkIssue::IntegerPrimaryKey]);
+    }
+
+    #[test]
+    fn table_level_integer_pk_case_insensitive_is_flagged() {
+        // `PRIMARY KEY(ID)` references column `id` -- SQLite identifiers are
+        // case-insensitive. This is a dangerous per-node-sequential PK that must
+        // flag IntegerPrimaryKey, and must NOT double-fire NullablePrimaryKey
+        // (the integer alias is implicitly NOT NULL).
+        let findings = classify_table_ddl(
+            "t",
+            "CREATE TABLE t (id INTEGER NOT NULL, v, PRIMARY KEY(ID))",
+        );
+        assert_eq!(issues(&findings), vec![PkIssue::IntegerPrimaryKey]);
     }
 
     // --- L2 realness --------------------------------------------------------
