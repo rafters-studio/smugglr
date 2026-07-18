@@ -48,28 +48,74 @@ pub enum MigrateError {
     Envelope(String),
 }
 
+/// The typed kind of a column -- a closed set, never an opaque type string.
+///
+/// This maps to SQLite's storage classes. Keeping it a closed enum (rather than a
+/// free-text type token) is what lets the lint (#275) and reverse (#274) reason
+/// about a column structurally instead of parsing SQL text. The concrete dialect
+/// type keyword (`TEXT`, `INTEGER`, ...) is generated from the kind at apply time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ColumnKind {
+    /// Text / string storage class (`TEXT`).
+    Text,
+    /// Integer storage class (`INTEGER`).
+    Int,
+    /// Floating-point storage class (`REAL`).
+    Real,
+    /// Opaque binary storage class (`BLOB`).
+    Blob,
+}
+
+/// A single column-level constraint.
+///
+/// Adjacently tagged (`{"constraint": <name>, "value": <payload>}`) rather than
+/// internally tagged, because the `Default`/`Check` tuple variants carry a bare
+/// string payload that an internally-tagged representation cannot encode. The
+/// structural variants (`Fk`, `Unique`) are what let reverse (#274) derive the
+/// inverse and convert (#280) cascade foreign keys; `Check` is what lets the
+/// generator (#270) lower a `range` modifier to a `CHECK`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "constraint", content = "value", rename_all = "snake_case")]
+pub enum Constraint {
+    /// Column participates in the primary key.
+    Pk,
+    /// Column is a foreign key onto `table(col)`.
+    Fk {
+        /// Referenced table.
+        table: String,
+        /// Referenced column.
+        col: String,
+    },
+    /// Column is unique (a column-level `UNIQUE`).
+    Unique,
+    /// Column is `NOT NULL`.
+    NotNull,
+    /// Column has a SQL-side default expression, carried verbatim.
+    Default(String),
+    /// Column carries a `CHECK(expr)`; the generator lowers `range` to this.
+    Check(String),
+}
+
 /// A structured column definition, used by table-shaping ops.
 ///
-/// The type is an opaque SQLite type token; the manifest never interprets it
-/// (that is `apply`/`schema_projection`'s job). Keeping it structured -- rather
-/// than a raw column-clause string -- is what lets the lint and reverse layers
-/// reason about a change (settled decision: structured ops, not raw SQL).
+/// A column is a typed [`ColumnKind`] plus an explicit set of [`Constraint`]s and
+/// author-declared [`tags`](Column::tags). Keeping it structured -- rather than a
+/// raw column-clause string -- is what lets the lint and reverse layers reason
+/// about a change (settled decision: structured ops, not raw SQL).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Column {
     /// Column name.
     pub name: String,
-    /// Declared SQLite type token, opaque to the manifest (e.g. `TEXT`,
-    /// `INTEGER`, `BLOB`).
-    pub column_type: String,
-    /// Whether the column is `NOT NULL`.
-    #[serde(default)]
-    pub not_null: bool,
-    /// Whether the column participates in the primary key.
-    #[serde(default)]
-    pub primary_key: bool,
-    /// An optional SQL-side default expression, carried verbatim.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default: Option<String>,
+    /// The typed storage class of the column.
+    pub kind: ColumnKind,
+    /// Column-level constraints, in declared order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub constraints: Vec<Constraint>,
+    /// Author-declared classification tags (e.g. `pii`). smugglr never infers
+    /// these -- they are carried verbatim from the author's declaration.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 /// A single structured migration operation.
@@ -150,6 +196,46 @@ impl Op {
     }
 }
 
+/// An op paired with its author-declared [`OpClass`].
+///
+/// The declared class is **serialized** and travels with the op: the generator
+/// (#270) sets it, and the lint (#275) validates it against the canonical
+/// [`Op::class`] derive. The declared value is authoritative on the wire (a
+/// hand-authored manifest may, for instance, declare [`OpClass::HashRewriting`]
+/// on an op whose structural derive is [`OpClass::Additive`] -- the lint is what
+/// flags a dishonest declaration), so it is kept as an explicit field rather than
+/// recomputed on read.
+///
+/// The op is nested under `op` (not flattened) so the internally-tagged [`Op`]
+/// round-trips unambiguously; `op_class` sits beside it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClassifiedOp {
+    /// The structured operation.
+    pub op: Op,
+    /// The author-declared reversibility/safety class of `op`.
+    pub op_class: OpClass,
+}
+
+impl ClassifiedOp {
+    /// Pair an op with the honest class derived from [`Op::class`].
+    ///
+    /// This is the correct constructor for machine-generated ops (#270): the
+    /// declared class equals the canonical derive by construction.
+    pub fn new(op: Op) -> Self {
+        let op_class = op.class();
+        Self { op, op_class }
+    }
+
+    /// Pair an op with an explicitly declared class.
+    ///
+    /// Used where the declared class may intentionally differ from the structural
+    /// derive (e.g. declaring [`OpClass::HashRewriting`]); the lint (#275)
+    /// validates the declaration against [`Op::class`].
+    pub fn declared(op: Op, op_class: OpClass) -> Self {
+        Self { op, op_class }
+    }
+}
+
 /// Reversibility flags for the whole manifest (mirrors the design sketch).
 ///
 /// Derivable from the ops, but carried explicitly so a reader (and the ledger)
@@ -183,6 +269,12 @@ pub enum Preimage {
 /// This is the manifest *body* -- the thing the checksum is computed over. Seal
 /// it into a [`ChecksummedManifest`] to get a stable content identity, and
 /// optionally into an [`Envelope`] for confidentiality.
+///
+/// **Checksum canonicalization is versioned by struct-field declaration order.**
+/// The canonical bytes are `serde_json` of this struct (and its nested types),
+/// which emits fields in declaration order; reordering any field here -- or in
+/// [`Column`], [`ClassifiedOp`], or any nested type -- changes every checksum and
+/// therefore every ledger identity. Treat field order as part of the format.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
     /// Monotonic migration version (authored order; see "Migrate x sync").
@@ -195,11 +287,11 @@ pub struct Manifest {
     /// `String` now avoids baking in the raw-`sqlite_master`-text hash the
     /// reconcile finding warns against.
     pub target_schema: String,
-    /// Forward ops, in order.
-    pub up: Vec<Op>,
+    /// Forward ops, in order, each carrying its declared class.
+    pub up: Vec<ClassifiedOp>,
     /// Reverse ops, in order (structural inverse for additive migrations).
     #[serde(default)]
-    pub down: Vec<Op>,
+    pub down: Vec<ClassifiedOp>,
     /// Pre-image for destructive ops, if captured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preimage: Option<Preimage>,
@@ -317,24 +409,28 @@ impl Envelope {
 mod tests {
     use super::*;
 
+    /// A minimal typed column with no constraints or tags.
+    fn col(name: &str, kind: ColumnKind) -> Column {
+        Column {
+            name: name.to_string(),
+            kind,
+            constraints: Vec::new(),
+            tags: Vec::new(),
+        }
+    }
+
     fn sample_manifest() -> Manifest {
         Manifest {
             version: 1,
             target_schema: "opaque-schema-id".to_string(),
-            up: vec![Op::AddColumn {
+            up: vec![ClassifiedOp::new(Op::AddColumn {
                 table: "users".to_string(),
-                column: Column {
-                    name: "email".to_string(),
-                    column_type: "TEXT".to_string(),
-                    not_null: false,
-                    primary_key: false,
-                    default: None,
-                },
-            }],
-            down: vec![Op::DropColumn {
+                column: col("email", ColumnKind::Text),
+            })],
+            down: vec![ClassifiedOp::new(Op::DropColumn {
                 table: "users".to_string(),
                 column: "email".to_string(),
-            }],
+            })],
             preimage: None,
             flags: Flags::default(),
             author: Some("agent-x".to_string()),
@@ -346,13 +442,7 @@ mod tests {
         assert_eq!(
             Op::AddColumn {
                 table: "t".into(),
-                column: Column {
-                    name: "c".into(),
-                    column_type: "TEXT".into(),
-                    not_null: false,
-                    primary_key: false,
-                    default: None,
-                },
+                column: col("c", ColumnKind::Text),
             }
             .class(),
             OpClass::Additive
@@ -379,6 +469,100 @@ mod tests {
             .class(),
             OpClass::Additive
         );
+    }
+
+    #[test]
+    fn op_class_covers_remaining_structural_ops() {
+        assert_eq!(
+            Op::CreateTable {
+                table: "t".into(),
+                columns: vec![col("id", ColumnKind::Int)],
+                without_rowid: false,
+            }
+            .class(),
+            OpClass::Additive
+        );
+        assert_eq!(
+            Op::DropIndex { name: "i".into() }.class(),
+            OpClass::Additive
+        );
+        assert_eq!(
+            Op::RenameTable {
+                from: "a".into(),
+                to: "b".into(),
+            }
+            .class(),
+            OpClass::Additive
+        );
+        assert_eq!(
+            Op::RenameColumn {
+                table: "t".into(),
+                from: "a".into(),
+                to: "b".into(),
+            }
+            .class(),
+            OpClass::Additive
+        );
+    }
+
+    #[test]
+    fn column_full_vocabulary_round_trips() {
+        // Regression guard for the structured Column: every constraint kind plus
+        // typed kind plus author tags must survive serde untouched.
+        let column = Column {
+            name: "owner_id".into(),
+            kind: ColumnKind::Blob,
+            constraints: vec![
+                Constraint::Pk,
+                Constraint::Fk {
+                    table: "users".into(),
+                    col: "id".into(),
+                },
+                Constraint::Unique,
+                Constraint::NotNull,
+                Constraint::Default("x'00'".into()),
+                Constraint::Check("length(owner_id) = 16".into()),
+            ],
+            tags: vec!["pii".into(), "fk".into()],
+        };
+        let json = serde_json::to_vec(&column).unwrap();
+        let back: Column = serde_json::from_slice(&json).unwrap();
+        assert_eq!(column, back);
+    }
+
+    #[test]
+    fn column_kind_serializes_snake_case() {
+        assert_eq!(serde_json::to_string(&ColumnKind::Int).unwrap(), "\"int\"");
+    }
+
+    #[test]
+    fn classified_op_new_uses_derived_class() {
+        let co = ClassifiedOp::new(Op::DropTable { table: "t".into() });
+        assert_eq!(co.op_class, OpClass::Destructive);
+        assert_eq!(co.op_class, co.op.class());
+    }
+
+    #[test]
+    fn classified_op_preserves_declared_class_over_derive() {
+        // The declared class is authoritative on the wire and may intentionally
+        // differ from Op::class() -- HashRewriting is expressible even though no
+        // structural op derives it. The lint (#275) is what flags the mismatch.
+        let co = ClassifiedOp::declared(
+            Op::AddColumn {
+                table: "t".into(),
+                column: col("c", ColumnKind::Text),
+            },
+            OpClass::HashRewriting,
+        );
+        assert_eq!(co.op_class, OpClass::HashRewriting);
+        assert_eq!(co.op.class(), OpClass::Additive);
+
+        let json = serde_json::to_vec(&co).unwrap();
+        let back: ClassifiedOp = serde_json::from_slice(&json).unwrap();
+        assert_eq!(back, co);
+        // Declared value round-trips independently of the derive.
+        assert_eq!(back.op_class, OpClass::HashRewriting);
+        assert_eq!(back.op.class(), OpClass::Additive);
     }
 
     #[test]

@@ -30,5 +30,6 @@ pub mod schema_projection; // #290 pragma-derived semantic schema projection
 pub mod driver;
 
 pub use manifest::{
-    ChecksummedManifest, Column, Flags, Manifest, MigrateError, Op, OpClass, Preimage,
+    ChecksummedManifest, ClassifiedOp, Column, ColumnKind, Constraint, Flags, Manifest,
+    MigrateError, Op, OpClass, Preimage,
 };
