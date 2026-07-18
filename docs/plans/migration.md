@@ -1,7 +1,7 @@
 # smugglr migrate (v0.1 design)
 
 **Status:** draft, in design
-**Crate:** `@smugglr/safehouse` (houses migrate now; the parked GDPR crypto-shred layer when we return to it). `migrate` is the feature/command; the migration-tracking table keeps the name "ledger" (`@smugglr/ledger`).
+**Crate:** migrate lives in `smugglr-core` (`crates/smugglr-core/src/migrate/`). `@smugglr/safehouse` is reserved for the **crypto / field-protection** layer (the parked GDPR crypto-shred thesis), not migrate itself. `migrate` is the feature/command; the migration-tracking table keeps the name "ledger" (`@smugglr/ledger`).
 **Author:** smugglr
 **Research:** legion reflection chain `019f684a..019f698e`
 (`legion recall --repo smugglr --context "smugglr migrate design"`)
@@ -109,6 +109,13 @@ smugglr's identity **is** the primary key -- masterless last-received-wins match
 A locally-sequential key (`AUTOINCREMENT`, or a bare `INTEGER PRIMARY KEY` rowid) means two
 machines both mint `id = 5` for different rows, and the fabric silently overwrites one with the
 other. Guaranteed data loss -- so smugglr does not merely warn, it **refuses**:
+
+> **0.5.0 exception (Sean, 2026-07-18):** the sanctioned remedy -- the in-tool `int -> UUIDv7`
+> conversion -- is deferred to 0.5.x, so hard-refusing the onboarding user with no in-tool fix
+> is worse than warning. 0.5.0 therefore emits a loud, unmissable **warning** (carrying the
+> manual UUIDv7 recipe) rather than refusing; the hard refusal below flips on in 0.5.x once the
+> conversion exists. A warned user who proceeds can still hit the cross-node data loss this
+> check exists to prevent -- accepted tradeoff for the onboarding window only.
 
 - **First-run sanity check (keyed on the _declared_ PK, per rd2 consensus).** smugglr
   inspects the schema on first run and refuses an incompatible one. The check keys on the
@@ -638,7 +645,8 @@ Full catalog: `legion recall --repo smugglr --context "adversarial spike sweep"`
 ## Parked: GDPR crypto-shred (future layer)
 
 Explored with platform + mail; **parked, not built** -- migrate ships without it, and it is a
-separable additive layer. The idea: combine `@rafters/ledger`'s subject-accounting with
+separable additive layer. This is the layer the `@smugglr/safehouse` crate is reserved for
+(not migrate, which lives in `smugglr-core`). The idea: combine `@rafters/ledger`'s subject-accounting with
 smugglr's crypto substrate to make *replicated SQLite GDPR-erasure-compatible* via
 **crypto-shredding** (encrypt subject data under a key; erase = destroy the key; ciphertext
 stays everywhere but irrecoverable -- solving the resurrection problem physical delete cannot on

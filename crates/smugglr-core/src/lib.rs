@@ -15,6 +15,7 @@ pub mod datasource;
 pub mod diff;
 pub mod error;
 pub mod migrate;
+pub mod pk_check;
 pub mod profile;
 pub mod rowhash;
 pub mod sync;
