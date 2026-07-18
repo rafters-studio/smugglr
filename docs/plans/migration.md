@@ -1,7 +1,7 @@
 # smugglr migrate (v0.1 design)
 
 **Status:** draft, in design
-**Crate:** `@smugglr/safehouse` (houses migrate now; the parked GDPR crypto-shred layer when we return to it). `migrate` is the feature/command; the migration-tracking table keeps the name "ledger" (`@smugglr/ledger`).
+**Crate:** migrate lives in `smugglr-core` (`crates/smugglr-core/src/migrate/`). `@smugglr/safehouse` is reserved for the **crypto / field-protection** layer (the parked GDPR crypto-shred thesis), not migrate itself. `migrate` is the feature/command; the migration-tracking table keeps the name "ledger" (`@smugglr/ledger`).
 **Author:** smugglr
 **Research:** legion reflection chain `019f684a..019f698e`
 (`legion recall --repo smugglr --context "smugglr migrate design"`)
@@ -638,7 +638,8 @@ Full catalog: `legion recall --repo smugglr --context "adversarial spike sweep"`
 ## Parked: GDPR crypto-shred (future layer)
 
 Explored with platform + mail; **parked, not built** -- migrate ships without it, and it is a
-separable additive layer. The idea: combine `@rafters/ledger`'s subject-accounting with
+separable additive layer. This is the layer the `@smugglr/safehouse` crate is reserved for
+(not migrate, which lives in `smugglr-core`). The idea: combine `@rafters/ledger`'s subject-accounting with
 smugglr's crypto substrate to make *replicated SQLite GDPR-erasure-compatible* via
 **crypto-shredding** (encrypt subject data under a key; erase = destroy the key; ciphertext
 stays everywhere but irrecoverable -- solving the resurrection problem physical delete cannot on
