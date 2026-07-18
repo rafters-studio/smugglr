@@ -1,6 +1,6 @@
 {
   "name": "@smugglr/zustand",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "Zustand middleware that auto-persists store slices to a smugglr-managed SQLite table.",
   "type": "module",
   "main": "dist/index.js",

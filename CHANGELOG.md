@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.4.3 (2026-07-17)
+
+The last 0.4.x release before the 0.5.0 `smugglr migrate` work. One real correctness fix in the sync path -- composite primary keys with a `|` in a value no longer collide -- plus a numeric float-timestamp ordering fix, a large internal structural-debt sweep from the code audit, and the design groundwork for `smugglr migrate` landed as a doc.
+
+### Fixed
+
+- **Composite-primary-key `__pk` collision.** `pk_text_expr` joined composite key parts with a bare `|`, so two distinct keys could render to the same `__pk` (`{a:'x|', b:'y'}` and `{a:'x', b:'|y'}` both -> `x||y`) and silently collapse onto one entry in the change-metadata map -- lost rows and spurious deletes on any composite-PK table with a `|` in a text component. Each composite part is now delimiter-escaped before the join. Single-column PKs are unchanged; composite-PK tables re-render their `__pk` once and re-sync. (#285)
+- **Float-serialized timestamps order numerically.** `compare_ts` gained a numeric tier so float-rendered `updated_at` values resolve conflicts in the right direction instead of by string order. (#241)
+- **`watch --dry-run` labels its text output as a dry run** so a dry-run pass is not mistaken for an applied sync. (#218)
+
+### Changed
+
+- Internal structural-debt sweep from the code audit -- fourteen refactors, no API or behavior change: wire types unified into a no-tokio `smugglr-wire` crate (#228), `push_all`/`pull_all` behind one directional driver (#224), a shared `createPersistBinding` for the zustand and nanostores plugins (#227), `generate_batch_sql`/`rows_to_maps` hoisted into core (#222), dry-run watch opens the local DB read-only (#217), `is_transient_error` unified onto `is_retryable` (#226), SDK param extractors collapsed (#225), one home for the no-primary-key skip warning (#216), `cached_table_info` hoisted into `adapter_common` (#219), the recv buffer reused across datagrams (#211), the dead `batch.rs` removed (#212), the unreachable `column_glob_match` arm dropped (#214), and CI clippy gated on the wasm32 target (#155).
+
+### Docs
+
+- **Exit codes** are now surfaced in `smugglr --help` (0-5), matching `SyncError::exit_code`. (#266)
+- **`AGENTS.md`** tool-neutral agent contract for the repo. (#264)
+- **`smugglr migrate` design doc** (`docs/plans/migration.md`) -- envelope-based, self-reversing, SQLite-family migrations with the globally-unique-primary-key precondition; the foundation for the 0.5.0 migrate work. (#284)
+
 ## 0.4.2 (2026-07-14)
 
 Release-versioning alignment. The `@smugglr/zustand` and `@smugglr/nanostores` bridge packages had drifted to an independent `0.1.0` and are now versioned in lockstep with the rest of the release, so every published artifact -- the crates, the `smugglr` npm package, and the two bridge packages -- shares one version. No functional change from 0.4.1.
