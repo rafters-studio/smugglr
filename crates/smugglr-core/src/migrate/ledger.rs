@@ -35,7 +35,7 @@
 #![cfg(feature = "native")]
 
 use crate::error::{Result, SyncError};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
 /// The namespaced ledger table. App introspection/reset ignores it, and it is
@@ -210,7 +210,13 @@ impl Ledger {
         for _ in 0..MAX_ATTEMPTS {
             match Self::entry(conn, version)? {
                 None => match Self::insert_pending(conn, version, checksum, lease_secs) {
-                    Ok(()) => return Ok(Election::Won),
+                    Ok(true) => return Ok(Election::Won),
+                    Ok(false) => {
+                        // The tail moved between our read and the guarded insert
+                        // (a concurrent distinct-version append). Nothing was
+                        // written; re-read and re-derive against the new tail.
+                        continue;
+                    }
                     Err(SyncError::LocalDb(e)) if is_unique_violation(&e) => {
                         // Race lost: another node inserted first. Re-read and
                         // re-decide (it is now pending/success).
@@ -343,36 +349,75 @@ impl Ledger {
 
     /// Insert a fresh pending, leased row, chaining onto the current tail.
     ///
-    /// A `UNIQUE(version)` violation here means a concurrent node won the race;
-    /// the error propagates so [`Self::try_elect`] can re-read and re-decide.
+    /// Returns `Ok(true)` when the row was inserted, `Ok(false)` when the tail
+    /// moved under us between the read and the write (a concurrent *distinct*
+    /// version won the append) so [`Self::try_elect`] must re-read and retry. A
+    /// `UNIQUE(version)` violation still surfaces as `Err` so the same-version
+    /// race-loser path in [`Self::try_elect`] is unchanged.
+    ///
+    /// MED 2 -- atomic, fork-safe chaining. The tail is read here to compute the
+    /// chain-hash, then [`Self::insert_pending_chained`] re-validates that read
+    /// against `MAX(version)`'s live chain-hash *inside the single INSERT* (a
+    /// compare-and-set). `UNIQUE(version)` only serializes the *same* version, so
+    /// without this guard two concurrent inserts for `vN` and `vN+1` could both
+    /// read the same tail and fork the chain. A SQL-side hash (a scalar function)
+    /// would let a lone INSERT...SELECT do it with no Rust read at all, but that
+    /// is not D1-portable (D1 has no user-defined functions and SQLite has no
+    /// built-in SHA-256), so the linkage is enforced with a pure-SQL guard
+    /// instead: a stale tail read yields a guarded no-op (0 rows) and a retry,
+    /// so no forked row is ever committed.
     fn insert_pending(
         conn: &Connection,
         version: u64,
         checksum: &str,
         lease_secs: i64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         // Chain onto the highest existing version (the tail). Gaps are fine: the
         // chain links ascending, whatever versions are present.
         let prev_hash = Self::tail_chain_hash(conn)?;
-        let chain_hash = chain_hash(version, checksum, &prev_hash);
+        Self::insert_pending_chained(conn, version, checksum, lease_secs, &prev_hash)
+    }
+
+    /// Single-statement guarded insert: chain `version` onto `expected_prev`, but
+    /// only if `expected_prev` still equals the live tail's chain-hash. The
+    /// `WHERE` compares `expected_prev` against `MAX(version)`'s `chain_hash`
+    /// (genesis-guarded via `COALESCE`) atomically with the write, so there is no
+    /// exploitable read-then-write window: if a concurrent distinct-version insert
+    /// advanced the tail after our read, the guard fails, `0` rows are written,
+    /// and we return `Ok(false)` for the caller to retry against the new tail.
+    /// Transaction-free and standard SQL, so it is D1-portable.
+    fn insert_pending_chained(
+        conn: &Connection,
+        version: u64,
+        checksum: &str,
+        lease_secs: i64,
+        expected_prev: &str,
+    ) -> Result<bool> {
+        let chain_hash = chain_hash(version, checksum, expected_prev);
         let now = now_unix();
-        conn.execute(
+        let affected = conn.execute(
             &format!(
                 "INSERT INTO \"{LEDGER_TABLE}\"
                      (version, checksum, status, applied_at, lease_expires_at,
                       prev_hash, chain_hash)
-                 VALUES (?1, ?2, 'pending', ?3, ?4, ?5, ?6)"
+                 SELECT ?1, ?2, 'pending', ?3, ?4, ?5, ?6
+                 WHERE COALESCE(
+                     (SELECT chain_hash FROM \"{LEDGER_TABLE}\"
+                      ORDER BY version DESC LIMIT 1),
+                     ?7
+                 ) = ?5"
             ),
             rusqlite::params![
                 version as i64,
                 checksum,
                 now,
                 now + lease_secs,
-                prev_hash,
+                expected_prev,
                 chain_hash,
+                GENESIS_PREV_HASH,
             ],
         )?;
-        Ok(())
+        Ok(affected == 1)
     }
 
     /// Compare-and-set reclaim of an expired pending row. Returns whether this
@@ -409,6 +454,11 @@ impl Ledger {
 
     /// The chain-hash of the highest-versioned existing entry, or the genesis
     /// hash when the ledger is empty.
+    ///
+    /// Uses [`OptionalExtension::optional`] so that `None` means **only** "no rows
+    /// yet" (a legitimate genesis) while a real query error propagates as `Err`.
+    /// A tamper-evidence chain must never `.ok()`-swallow a DB error into a silent
+    /// "empty chain" (MED 1): that would mask corruption as a fresh genesis.
     fn tail_chain_hash(conn: &Connection) -> Result<String> {
         let tail: Option<String> = conn
             .query_row(
@@ -419,7 +469,7 @@ impl Ledger {
                 [],
                 |row| row.get(0),
             )
-            .ok();
+            .optional()?;
         Ok(tail.unwrap_or_else(|| GENESIS_PREV_HASH.to_string()))
     }
 }
@@ -725,5 +775,79 @@ mod tests {
             Ledger::entry(&conn, 1).unwrap().unwrap().status,
             MigrationStatus::Failed
         );
+    }
+
+    #[test]
+    fn insert_pending_derives_prev_from_live_tail() {
+        // MED 2: the guarded single-statement insert chains onto the *current*
+        // tail derived at write time, not a stale value, and verify_chain passes.
+        let conn = conn();
+        for v in 1..=2 {
+            Ledger::try_elect(&conn, v, &format!("c{v}"), 300).unwrap();
+            Ledger::mark_success(&conn, v).unwrap();
+        }
+        let tail = Ledger::entry(&conn, 2).unwrap().unwrap().chain_hash;
+        // Direct insert of a fresh version chains off the live tail (v2).
+        assert!(Ledger::insert_pending(&conn, 3, "c3", 300).unwrap());
+        let v3 = Ledger::entry(&conn, 3).unwrap().unwrap();
+        assert_eq!(v3.prev_hash, tail);
+        assert_eq!(v3.chain_hash, chain_hash(3, "c3", &tail));
+        Ledger::verify_chain(&conn).unwrap();
+    }
+
+    #[test]
+    fn stale_tail_insert_is_rejected_by_cas() {
+        // MED 2 (the core guard): an insert that chains off a prev-hash that no
+        // longer matches the live tail is a no-op (0 rows), never a forked commit.
+        let conn = conn();
+        Ledger::try_elect(&conn, 1, "c1", 300).unwrap();
+        Ledger::mark_success(&conn, 1).unwrap();
+        let live_tail = Ledger::entry(&conn, 1).unwrap().unwrap().chain_hash;
+
+        // A racer holding a stale/forged predecessor is rejected atomically.
+        let stale = "0000000000000000000000000000000000000000000000000000000000000000";
+        assert!(!Ledger::insert_pending_chained(&conn, 2, "c2", 300, stale).unwrap());
+        assert!(Ledger::entry(&conn, 2).unwrap().is_none());
+
+        // Chaining off the true tail succeeds.
+        assert!(Ledger::insert_pending_chained(&conn, 2, "c2", 300, &live_tail).unwrap());
+        assert_eq!(
+            Ledger::entry(&conn, 2).unwrap().unwrap().prev_hash,
+            live_tail
+        );
+        Ledger::verify_chain(&conn).unwrap();
+    }
+
+    #[test]
+    fn concurrent_distinct_version_inserts_yield_consistent_chain() {
+        // MED 2 end-to-end: two racers (vN and vN+1) both read the same tail, then
+        // both try to append. The lower version wins the append first; the higher
+        // version's stale-tail insert is rejected and re-derives against the new
+        // tail, so the chain never forks. Ascending commit order mirrors migrate's
+        // apply order (vN+1 is attempted only after vN lands).
+        let conn = conn();
+        Ledger::try_elect(&conn, 1, "c1", 300).unwrap();
+        Ledger::mark_success(&conn, 1).unwrap();
+
+        // Both racers captured the same stale tail (v1's chain-hash).
+        let stale_tail = Ledger::tail_chain_hash(&conn).unwrap();
+
+        // Racer for v2 wins the append first (chains off the shared tail).
+        assert!(Ledger::insert_pending_chained(&conn, 2, "c2", 300, &stale_tail).unwrap());
+
+        // Racer for v3 tries to chain off the now-stale tail: guard rejects it.
+        assert!(!Ledger::insert_pending_chained(&conn, 3, "c3", 300, &stale_tail).unwrap());
+        assert!(Ledger::entry(&conn, 3).unwrap().is_none());
+
+        // Retry re-derives against the live tail (v2) and succeeds -- no fork.
+        let fresh_tail = Ledger::tail_chain_hash(&conn).unwrap();
+        assert!(Ledger::insert_pending_chained(&conn, 3, "c3", 300, &fresh_tail).unwrap());
+
+        let entries = Ledger::entries(&conn).unwrap();
+        assert_eq!(entries[1].prev_hash, entries[0].chain_hash);
+        assert_eq!(entries[2].prev_hash, entries[1].chain_hash);
+        // v3 chains off v2, NOT the shared stale tail -- the fork is prevented.
+        assert_ne!(entries[2].prev_hash, stale_tail);
+        Ledger::verify_chain(&conn).unwrap();
     }
 }
