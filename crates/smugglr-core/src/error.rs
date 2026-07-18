@@ -100,6 +100,13 @@ pub enum SyncError {
 
     #[error("Plugin error: {0}")]
     Plugin(String),
+
+    /// A migrate-subsystem failure (manifest checksum mismatch, envelope
+    /// open/seal failure, serialization). Bridges `migrate::MigrateError` into
+    /// the crate's one error type. `MigrateError` is always compiled (no
+    /// `native` gate), so this bridge exists on every target.
+    #[error("Migrate error: {0}")]
+    Migrate(#[from] crate::migrate::MigrateError),
 }
 
 impl SyncError {
@@ -165,7 +172,10 @@ impl SyncError {
             | SyncError::ConnectionTimeout
             | SyncError::RetryExhausted { .. } => 3,
 
-            SyncError::ConcurrentWrite => 4,
+            // Migrate failures (checksum mismatch / tamper, envelope open
+            // failure) need a human decision -- classify as conflict (4), the
+            // same bucket the sequencing doc reserves for the migrate bridge.
+            SyncError::ConcurrentWrite | SyncError::Migrate(_) => 4,
 
             SyncError::TableNotFound(_)
             | SyncError::RelayNotFound(_)

@@ -263,6 +263,7 @@ fn _assert_every_variant_is_enumerated_in_retry_verdict_test(err: &SyncError) {
         SyncError::ParamLimitExceeded { .. } => {}
         SyncError::Broadcast(_) => {}
         SyncError::Plugin(_) => {}
+        SyncError::Migrate(_) => {}
     }
     // No `_` arm above: a new SyncError variant must be added to the match
     // (and to the enumeration test) or this file fails to compile.
@@ -605,6 +606,14 @@ database = "backup.db""#
             ),
             ("Broadcast", SyncError::Broadcast("x".into()), false),
             ("Plugin", SyncError::Plugin("x".into()), false),
+            (
+                "Migrate",
+                SyncError::Migrate(crate::migrate::MigrateError::Checksum {
+                    expected: "a".into(),
+                    actual: "b".into(),
+                }),
+                false,
+            ),
         ];
 
         for (name, err, expected_retryable) in cases {
