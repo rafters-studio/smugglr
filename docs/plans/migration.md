@@ -110,6 +110,13 @@ A locally-sequential key (`AUTOINCREMENT`, or a bare `INTEGER PRIMARY KEY` rowid
 machines both mint `id = 5` for different rows, and the fabric silently overwrites one with the
 other. Guaranteed data loss -- so smugglr does not merely warn, it **refuses**:
 
+> **0.5.0 exception (Sean, 2026-07-18):** the sanctioned remedy -- the in-tool `int -> UUIDv7`
+> conversion -- is deferred to 0.5.x, so hard-refusing the onboarding user with no in-tool fix
+> is worse than warning. 0.5.0 therefore emits a loud, unmissable **warning** (carrying the
+> manual UUIDv7 recipe) rather than refusing; the hard refusal below flips on in 0.5.x once the
+> conversion exists. A warned user who proceeds can still hit the cross-node data loss this
+> check exists to prevent -- accepted tradeoff for the onboarding window only.
+
 - **First-run sanity check (keyed on the _declared_ PK, per rd2 consensus).** smugglr
   inspects the schema on first run and refuses an incompatible one. The check keys on the
   **declared primary-key type** and rejects exactly three shapes: `INTEGER PRIMARY KEY` (the
