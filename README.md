@@ -8,6 +8,8 @@
 
 Smuggle data between SQLite databases, Cloudflare D1, and S3-compatible stores. Fast. Stateless. Encrypted. Questionable life choices.
 
+> **Requirement — globally-unique primary keys.** smugglr's identity *is* the primary key. If your tables use `AUTOINCREMENT` or a bare `INTEGER PRIMARY KEY` rowid, two machines will both mint `id = 5` for different rows and last-received-wins silently eats one of them — guaranteed data loss, not an edge case. Use **UUIDv7**, or any globally-unique, k-sortable key. No GUID-ish keys, no smugglr: get into the 2020s or use a different tool. smugglr sanity-checks your schema on first run and refuses an incompatible one; `smugglr migrate` won't create old-style keys or let you keep them, and ships an `int → UUIDv7` conversion for existing databases.
+
 ## Status: Beta (Kessel Run Certified)
 
 Running in production at [huttspawn.com](https://huttspawn.com) since early 2026. Pluggable data source architecture. CI across Linux, macOS, and Windows. Checksummed releases with a one-line installer.
