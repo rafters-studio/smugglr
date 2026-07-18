@@ -271,7 +271,10 @@ impl PluginAdapter for HttpSqlAdapter {
         let response = self.execute(&sql, &[]).await?;
         let columns = self.extract_columns(&response)?;
         let rows = self.extract_rows(&response, &columns)?;
-        let maps = smugglr_core::batch_sql::rows_to_maps(&columns, &rows);
+        let mut maps = smugglr_core::batch_sql::rows_to_maps(&columns, &rows);
+        // Canonicalize BLOB columns (base64 on the wire) to the lowercase hex the
+        // content hash pins, so blob columns converge with the native path (#292).
+        canonicalize_row_blobs(&mut maps, &info);
         Ok(build_row_metadata(
             &maps,
             &column_order,
@@ -356,6 +359,42 @@ impl PluginAdapter for HttpSqlAdapter {
 /// it to "" would collapse every such row onto one entry -- silently dropping
 /// rows and provoking spurious deletes. Skip and warn; likewise surface a
 /// duplicate PK-text that overwrites an existing entry.
+/// Canonicalize every declared BLOB column across `maps` from the backend's
+/// base64 rendering to the lowercase hex the content hash pins, so a blob column
+/// converges with the native (hex) reference instead of reading `content_differs`
+/// forever (#292). BLOB columns are detected from `info` via the shared
+/// `rowhash::is_blob_column` so this crate and the wasm/native paths cannot drift
+/// on what counts as a blob. A value that fails to decode is left untouched and
+/// warned about -- it hashes divergently and the operator should `exclude` it.
+///
+/// NOTE: base64 is assumed as the wire encoding (per spike S). A remote that
+/// renders blobs as hex instead would be corrupted by this decode; per-endpoint
+/// encoding belongs in `Profile` (future work).
+fn canonicalize_row_blobs(maps: &mut [HashMap<String, Value>], info: &TableInfo) {
+    let blob_columns: Vec<String> = info
+        .columns
+        .iter()
+        .filter(|c| smugglr_core::rowhash::is_blob_column(&c.col_type))
+        .map(|c| c.name.clone())
+        .collect();
+    if blob_columns.is_empty() {
+        return;
+    }
+    for row in maps.iter_mut() {
+        for col in smugglr_core::rowhash::canonicalize_blob_columns(
+            row,
+            &blob_columns,
+            smugglr_core::rowhash::BlobEncoding::Base64,
+        ) {
+            eprintln!(
+                "smugglr-http-sql: blob column '{}' in {} did not decode as base64 -- it hashes \
+                 divergently across backends; add it to exclude_columns",
+                col, info.name
+            );
+        }
+    }
+}
+
 fn build_row_metadata(
     maps: &[HashMap<String, Value>],
     column_order: &[String],
@@ -423,6 +462,64 @@ mod tests {
             meta.is_empty(),
             "NULL-__pk rows must be skipped, not collapsed onto one key; got {} entries",
             meta.len()
+        );
+    }
+
+    #[test]
+    fn canonicalize_row_blobs_converges_with_native_hex() {
+        // #292: a JSON backend renders a BLOB column as base64 ("SGU="); the
+        // native rusqlite path renders lowercase hex ("4865"). Before the fix the
+        // two content hashes diverge and the row reads content_differs forever.
+        // After canonicalizing the base64 blob to hex, the plugin's content hash
+        // for the row equals the native (hex) rendering's hash -- they converge.
+        // Exercises is_blob_column detection (BLOB canonicalized, INTEGER left).
+        let info = TableInfo {
+            name: "t".to_string(),
+            columns: vec![
+                ColumnInfo {
+                    name: "id".into(),
+                    col_type: "INTEGER".into(),
+                    notnull: true,
+                    pk: true,
+                },
+                ColumnInfo {
+                    name: "data".into(),
+                    col_type: "BLOB".into(),
+                    notnull: false,
+                    pk: false,
+                },
+            ],
+            primary_key: vec!["id".into()],
+        };
+        let column_order = vec!["id".to_string(), "data".to_string()];
+
+        // Native (hex) reference row hash.
+        let mut native = HashMap::new();
+        native.insert("__pk".to_string(), Value::from("1"));
+        native.insert("id".to_string(), Value::from(1));
+        native.insert("data".to_string(), Value::from("4865"));
+        let native_meta = build_row_metadata(&[native], &column_order, "updated_at", &[], "t");
+
+        // JSON backend (base64) row: diverges until canonicalized.
+        let mut json = HashMap::new();
+        json.insert("__pk".to_string(), Value::from("1"));
+        json.insert("id".to_string(), Value::from(1));
+        json.insert("data".to_string(), Value::from("SGU="));
+        let mut maps = vec![json];
+
+        let raw_meta = build_row_metadata(&maps, &column_order, "updated_at", &[], "t");
+        assert_ne!(
+            native_meta.get("1").unwrap().content_hash,
+            raw_meta.get("1").unwrap().content_hash,
+            "raw base64 vs native hex must diverge before canonicalization"
+        );
+
+        canonicalize_row_blobs(&mut maps, &info);
+        let json_meta = build_row_metadata(&maps, &column_order, "updated_at", &[], "t");
+        assert_eq!(
+            native_meta.get("1").unwrap().content_hash,
+            json_meta.get("1").unwrap().content_hash,
+            "blob column must converge after base64->hex canonicalization"
         );
     }
 

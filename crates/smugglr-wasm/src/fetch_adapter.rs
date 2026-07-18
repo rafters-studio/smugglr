@@ -217,7 +217,8 @@ impl FetchDataSource {
         let response = self.execute(&sql, &params).await?;
         let columns = self.extract_columns(&response)?;
         let rows = self.extract_rows(&response, &columns)?;
-        let maps = adapter_common::rows_to_maps(&columns, &rows);
+        let mut maps = adapter_common::rows_to_maps(&columns, &rows);
+        adapter_common::canonicalize_json_blobs(&mut maps, &info);
 
         Ok(adapter_common::row_maps_to_metadata(
             &maps,
@@ -291,7 +292,8 @@ impl DataSource for FetchDataSource {
         let response = self.execute(&sql, &[]).await?;
         let columns = self.extract_columns(&response)?;
         let rows = self.extract_rows(&response, &columns)?;
-        let maps = adapter_common::rows_to_maps(&columns, &rows);
+        let mut maps = adapter_common::rows_to_maps(&columns, &rows);
+        adapter_common::canonicalize_json_blobs(&mut maps, &info);
 
         Ok(adapter_common::row_maps_to_metadata(
             &maps,

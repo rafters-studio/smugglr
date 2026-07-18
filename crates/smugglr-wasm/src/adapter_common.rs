@@ -122,6 +122,45 @@ pub(crate) fn row_maps_to_metadata(
     result
 }
 
+/// Canonicalize every declared BLOB column across `maps` from the backend's
+/// base64 rendering to the lowercase hex the content hash pins, so a blob column
+/// converges with the native (hex) reference instead of reading `content_differs`
+/// forever (#292). BLOB columns are detected from `info` via the shared
+/// `rowhash::is_blob_column`, so the wasm, plugin, and native paths cannot drift
+/// on what counts as a blob. Call this on the row maps BEFORE
+/// [`row_maps_to_metadata`]. A value that fails to decode is left untouched and
+/// warned about -- it hashes divergently and the operator should `exclude` it.
+///
+/// NOTE: base64 is assumed as the wire encoding (per spike S). A backend that
+/// renders blobs as hex instead would be corrupted by this decode; per-endpoint
+/// encoding belongs in the profile (future work).
+pub(crate) fn canonicalize_json_blobs(maps: &mut [HashMap<String, Value>], info: &TableInfo) {
+    let blob_columns: Vec<String> = info
+        .columns
+        .iter()
+        .filter(|c| smugglr_core::rowhash::is_blob_column(&c.col_type))
+        .map(|c| c.name.clone())
+        .collect();
+    if blob_columns.is_empty() {
+        return;
+    }
+    for row in maps.iter_mut() {
+        for col in smugglr_core::rowhash::canonicalize_blob_columns(
+            row,
+            &blob_columns,
+            smugglr_core::rowhash::BlobEncoding::Base64,
+        ) {
+            web_sys::console::warn_1(
+                &format!(
+                    "smugglr: blob column {} in {} did not decode as base64 -- it hashes divergently across backends; add it to exclude_columns",
+                    col, info.name
+                )
+                .into(),
+            );
+        }
+    }
+}
+
 /// Build the incremental-metadata query: every row whose `timestamp_column`
 /// is at or after the cursor, with a synthetic `__pk` text column.
 ///

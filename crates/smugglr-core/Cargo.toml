@@ -48,6 +48,11 @@ anyhow = "1"
 sha2 = "0.10"
 hex = "0.4"
 
+# Blob canonicalization for the content hash: a JSON backend renders BLOB
+# columns as base64, native renders lowercase hex; the hash pins hex, so the
+# base64 rendering is decoded here before folding. Always-on, WASM-compatible. (#292)
+base64 = "0.22"
+
 # Timestamps
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 

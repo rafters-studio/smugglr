@@ -1775,6 +1775,7 @@ name = "smugglr-core"
 version = "0.4.3"
 dependencies = [
  "anyhow",
+ "base64",
  "chacha20poly1305",
  "chrono",
  "hex",
