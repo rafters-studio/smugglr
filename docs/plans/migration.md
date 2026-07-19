@@ -420,12 +420,21 @@ alongside `Digest` / `Want` / `Delta`, or a dedicated migration flow -- open que
 ## Apply lifecycle
 
 ```
-dry-run preview  ->  destructive-lint  ->  [capture pre-image if destructive]
-      ->  apply forward (idempotent, IF NOT EXISTS, per-target strategy)
-      ->  record ledger (version, checksum, applied-at, success)
+resolve version (ledger.current_version + 1)  ->  ledger.try_elect(version, checksum)
+      ->  [only if Won] destructive-lint  ->  [capture pre-image if destructive]
+      ->  apply forward (idempotent, per-op, per-target strategy)
+      ->  ledger.mark_success   (ledger.mark_failed on error; the pending/leased
+                                 row is re-driven idempotently, never skipped)
 
-rollback:  apply envelope.down (restoring pre-image where destructive)  ->  pop ledger
+rollback:  apply the `down` ops as a NEW ledgered compensating vN+1 step
+           (restoring pre-image where destructive). The reversed vN row stays
+           byte-unchanged -- the ledger is append-only + chain-hashed, so a
+           `pop`/edit would trip tamper detection (verify_chain -> LedgerTampered).
 ```
+
+Note the ledger write is **two-phase**: election (`try_elect`) runs BEFORE apply, and
+`mark_success`/`mark_failed` after -- there is no single terminal "record" step. The
+composition lives in the apply-driver (#296); `apply.rs` itself is ledger-free.
 
 ## Recovery: surgical log (primary) + `--paranoid` snapshot (fallback)
 

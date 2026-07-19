@@ -46,7 +46,7 @@ Files in **bold** are new (no collision). Deps are issue numbers that must merge
 | Issue | What | Files | Deps |
 |-------|------|-------|------|
 | #275 | destructive-lint | **`migrate/lint.rs`** | #271 only |
-| #273 | forward apply engine -- **LOCAL only** (remote = pure generators) | **`migrate/apply.rs`** (ledger-free; exposes `apply_ops`) | #271, #272 |
+| #273 | forward apply engine -- **LOCAL only** (remote = pure generators) | **`migrate/apply.rs`** (ledger-free; exposes `apply_ops`) + `manifest.rs` (2 new `MigrateError` variants: `Apply`, `RemoteTransportUnsupported`) | #271 (code); #272 is a phase convenience -- apply is ledger-free |
 | #270 | rails-style CLI generator | **`migrate/generator.rs`**, **`migrate_cli.rs`**, `main.rs` | #271 |
 | #274 | reverse/rollback (append-only vN+1; delta-scoped pre-image via `stash`) | **`migrate/reverse.rs`** | #271, #272, #273, #275 |
 
@@ -86,11 +86,12 @@ Never let two in a lane co-queue; land them in the listed order.
 
 | Shared file | Issues | Rule |
 |-------------|--------|------|
-| the 3 metadata builders (`local.rs`, `adapter_common.rs`, `adapter.rs`) | #292, #269 | serialize; #292 first, #269 flips all three to `Result` in lockstep |
+| the metadata builders | #292, #269 | serialize; #292 first (merged: it touched `rowhash.rs` + wasm `adapter_common.rs`/`fetch_adapter.rs`/`local_adapter.rs` + http-sql `adapter.rs` -- NOT native `local.rs`, which is the hex reference). #269 flips native `local.rs` + `adapter_common.rs` + `adapter.rs` to `Result`, rebasing on the merged #292 |
 | `config.rs` `SyncConfig`+`Default` | #269 (`duplicate_pk`), #293 (`converge_columns`), #272 (`default_exclude_tables`) | serialize the two field-adders (#269, #293); #272 rebases |
 | `diff.rs`/`sync.rs`/`multicast.rs` | #293, #278(deferred) | #293 in spine; #278 later |
 | `rowhash.rs` | #292, #277(deferred) | #292 first; #277 freezes the hash version #292 mutates -- never invert |
-| `error.rs` `SyncError`+`exit_code()` | #269, #271(Migrate bridge), #272, #290 | append-only; **land the Migrate bridge in #271**; one owner reconciles the exit-code numbers (multiple want 4) |
+| `error.rs` `SyncError`+`exit_code()` | #269, #271(Migrate bridge), #272, #290 | append-only; **land the Migrate bridge in #271**; one owner reconciles the exit-code numbers (multiple want 4). **Every `SyncError`-variant adder ALSO edits `daemon.rs:~264`** -- the no-`_` exhaustiveness guard + its retry-verdict enumeration test -- so `daemon.rs` shares this lane (verified: #271, #272 both touched it). |
+| `migrate/manifest.rs` `MigrateError` | #271 (authored), #273 (adds `Apply`, `RemoteTransportUnsupported`), #289 (log variant) | append-only enum; each adds a variant -- serialize if two are ever in flight together |
 | `lib.rs` mod block | #268 (`pk_check`, top-level), #271 (`migrate`) | serialize #268 before #271; see mitigation |
 | `migrate_cli.rs` MigrateCommand enum | #270, #296, #274, #289, #290 | #270 first (creates it); route ALL migrate commands here, never `main.rs` |
 | `migrate/driver.rs` success path | #296, #289 (write-ahead hook), #290 (baseline write) | #296 first; serialize #289/#290 |
