@@ -16,10 +16,15 @@
 //!   **delta-scoped pre-image** (rows-INTERSECT-columns, OQ1) captured *during*
 //!   the forward apply, before the op mutates. The capture rides the `pre_op`
 //!   write-ahead hook [`apply_ops`](crate::migrate::apply::apply_ops) already
-//!   exposes ([`PreimageCapturer::capture_before`]); restore reconstructs the
-//!   structure ([`crate::migrate::apply::rebuild_to_schema`] for a re-added
-//!   column, verbatim DDL for a re-created table) and refills the lost cells with
-//!   an idempotent PK-keyed UPSERT ([`restore_payload`], spike C).
+//!   exposes ([`PreimageCapturer::capture_before`]). Both restores reconstruct the
+//!   structure from the **verbatim pre-mutation DDL** captured from
+//!   `sqlite_master` -- a re-created table runs the captured `CREATE TABLE`
+//!   directly, a re-added column rebuilds through
+//!   [`crate::migrate::apply::rebuild_to_schema`] with a
+//!   [`RebuildTarget::Verbatim`](crate::migrate::apply::RebuildTarget) target --
+//!   so every surviving `CHECK` / `UNIQUE` / `COLLATE` / generated column and
+//!   table-level constraint survives the round-trip. The lost cells are refilled
+//!   with an idempotent PK-keyed UPSERT ([`restore_payload`], spike C).
 //!
 //! # Two compilation surfaces
 //!
@@ -40,17 +45,17 @@
 //! column ([`preimage_ref_of`], OQ2 "read-only"); **writing** that column is the
 //! driver's job (#296), out of scope here.
 
-use crate::migrate::{ClassifiedOp, Column, MigrateError, Op};
+use crate::migrate::{ClassifiedOp, MigrateError, Op};
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "native")]
 use crate::config::StashConfig;
 #[cfg(feature = "native")]
-use crate::migrate::apply::{apply_ops, rebuild_to_schema, render_column_def, RebuildSpec};
+use crate::migrate::apply::{apply_ops, rebuild_to_schema, RebuildSpec, RebuildTarget};
 #[cfg(feature = "native")]
 use crate::migrate::ledger::{Election, Ledger, LedgerEntry};
 #[cfg(feature = "native")]
-use crate::migrate::{ColumnKind, Constraint, Preimage};
+use crate::migrate::Preimage;
 #[cfg(feature = "native")]
 use object_store::{path::Path as ObjectPath, ObjectStore, PutPayload};
 #[cfg(feature = "native")]
@@ -149,21 +154,29 @@ pub enum CapturedValue {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "loss", rename_all = "snake_case")]
 pub enum TablePreimage {
-    /// A dropped column. Restore rebuilds the table to the pre-drop schema
-    /// ([`Column`] set), then refills the one lost column by PK-keyed UPSERT.
+    /// A dropped column. Restore rebuilds the table from the verbatim pre-drop
+    /// `CREATE TABLE` (so every surviving constraint is intact), copying the
+    /// surviving columns and leaving the re-added column to its default/NULL, then
+    /// refills the one lost column by PK-keyed UPSERT.
     Column {
         /// The table the column was dropped from.
         table: String,
         /// The dropped column's name.
         dropped: String,
-        /// The full pre-drop column set (the explicit rebuild target). The
-        /// primary key is carried separately in `pk`, so no column here declares
-        /// an inline `PRIMARY KEY`.
-        columns: Vec<Column>,
+        /// The verbatim pre-drop `CREATE TABLE` DDL (all constraints intact). The
+        /// rebuild splices in the temp-table name, so the re-added column and
+        /// every surviving `CHECK` / `UNIQUE` / `COLLATE` / generated column and
+        /// table-level constraint are carried byte-for-byte.
+        create_sql: String,
+        /// Verbatim pre-drop index / trigger DDL to replay after the rebuild
+        /// (including any index that referenced the dropped column).
+        aux_ddl: Vec<String>,
+        /// Whether the dropped column was `NOT NULL` with no default. Such a
+        /// column cannot survive the rebuild-then-fill gap (it is null between the
+        /// copy and the UPSERT), so restore rejects it with a clear error.
+        dropped_requires_value: bool,
         /// The primary-key column names, in key order.
         pk: Vec<String>,
-        /// Whether the pre-drop table was `WITHOUT ROWID`.
-        without_rowid: bool,
         /// The columns present in each captured row (`pk` ++ `dropped`).
         captured_columns: Vec<String>,
         /// Captured rows, each aligned to `captured_columns`.
@@ -213,30 +226,10 @@ fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-/// Map a SQLite declared column type to a structured [`ColumnKind`] by affinity.
-///
-/// SQLite's type affinity rules (a substring scan of the declared type) decide
-/// storage class; an empty / unknown declared type falls to `Blob` (NUMERIC/none
-/// affinity), matching the `apply` rebuild's typeless-column handling.
-#[cfg(feature = "native")]
-fn kind_from_decl(decl: &str) -> ColumnKind {
-    let up = decl.to_ascii_uppercase();
-    if up.contains("INT") {
-        ColumnKind::Int
-    } else if up.contains("CHAR") || up.contains("CLOB") || up.contains("TEXT") {
-        ColumnKind::Text
-    } else if up.contains("REAL") || up.contains("FLOA") || up.contains("DOUB") {
-        ColumnKind::Real
-    } else {
-        ColumnKind::Blob
-    }
-}
-
 /// One `PRAGMA table_info` row, tolerant of absent tables.
 #[cfg(feature = "native")]
 struct ColRow {
     name: String,
-    decl: String,
     notnull: bool,
     dflt: Option<String>,
     /// 1-based PK position, `0` if not part of the primary key.
@@ -251,7 +244,6 @@ fn table_info(conn: &Connection, table: &str) -> Result<Vec<ColRow>, MigrateErro
         .query_map([], |r| {
             Ok(ColRow {
                 name: r.get::<_, String>(1)?,
-                decl: r.get::<_, String>(2)?,
                 notnull: r.get::<_, i64>(3)? != 0,
                 dflt: r.get::<_, Option<String>>(4)?,
                 pk: r.get::<_, i64>(5)?,
@@ -269,23 +261,25 @@ fn primary_key(info: &[ColRow]) -> Vec<String> {
     pk.into_iter().map(|c| c.name.clone()).collect()
 }
 
-/// Reconstruct a structured [`Column`] from a pragma row. The primary key is
-/// emitted table-level by the caller, so no `Constraint::Pk` is attached here.
+/// The generated (`GENERATED ALWAYS AS`) column names of a table, via
+/// `PRAGMA table_xinfo`'s `hidden` flag (`2` = virtual, `3` = stored). A rebuild
+/// must never project into these -- inserting a value into a generated column is
+/// an error; they self-populate from the copied base columns.
 #[cfg(feature = "native")]
-fn column_from_row(row: &ColRow) -> Column {
-    let mut constraints = Vec::new();
-    if row.notnull {
-        constraints.push(Constraint::NotNull);
-    }
-    if let Some(d) = &row.dflt {
-        constraints.push(Constraint::Default(d.clone()));
-    }
-    Column {
-        name: row.name.clone(),
-        kind: kind_from_decl(&row.decl),
-        constraints,
-        tags: Vec::new(),
-    }
+fn generated_columns(conn: &Connection, table: &str) -> Result<Vec<String>, MigrateError> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_xinfo({})", quote_ident(table)))?;
+    let rows = stmt
+        .query_map([], |r| {
+            let name: String = r.get(1)?;
+            let hidden: i64 = r.get(6)?;
+            Ok((name, hidden))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows
+        .into_iter()
+        .filter(|(_, hidden)| *hidden == 2 || *hidden == 3)
+        .map(|(name, _)| name)
+        .collect())
 }
 
 /// The verbatim `CREATE` DDL of a `sqlite_master` object, if present.
@@ -445,9 +439,26 @@ impl PreimageCapturer {
                  surgical pre-image"
             )));
         }
-        let columns: Vec<Column> = info.iter().map(column_from_row).collect();
-        let without_rowid = object_sql(conn, "table", table)?
-            .map(|s| s.to_ascii_uppercase().contains("WITHOUT ROWID"))
+
+        // Capture the VERBATIM pre-drop DDL: the column still exists here (capture
+        // runs before the drop), so every surviving constraint -- CHECK, UNIQUE,
+        // COLLATE, generated columns, table-level constraints, WITHOUT ROWID -- is
+        // carried faithfully, exactly as the DropTable path does. Rebuilding from
+        // inferred columns would strip them silently.
+        let create_sql = object_sql(conn, "table", table)?.ok_or_else(|| {
+            MigrateError::Apply(format!(
+                "cannot capture pre-image: no DDL for table {table:?}"
+            ))
+        })?;
+        let aux_ddl = aux_object_ddl(conn, table)?;
+
+        // A NOT NULL column with no default cannot survive the rebuild-then-fill
+        // gap (it is null between the copy and the UPSERT); record that now so the
+        // restore fails with a clear message rather than a raw SQL error.
+        let dropped_requires_value = info
+            .iter()
+            .find(|c| c.name == *column)
+            .map(|c| c.notnull && c.dflt.is_none())
             .unwrap_or(false);
 
         let mut captured_columns = pk.clone();
@@ -457,9 +468,10 @@ impl PreimageCapturer {
         Ok(TablePreimage::Column {
             table: table.to_string(),
             dropped: column.to_string(),
-            columns,
+            create_sql,
+            aux_ddl,
+            dropped_requires_value,
             pk,
-            without_rowid,
             captured_columns,
             rows,
         })
@@ -515,18 +527,20 @@ pub fn restore_payload(conn: &Connection, payload: &PreimagePayload) -> Result<(
             TablePreimage::Column {
                 table,
                 dropped,
-                columns,
+                create_sql,
+                aux_ddl,
+                dropped_requires_value,
                 pk,
-                without_rowid,
                 captured_columns,
                 rows,
             } => restore_column(
                 conn,
                 table,
                 dropped,
-                columns,
+                create_sql,
+                aux_ddl,
+                *dropped_requires_value,
                 pk,
-                *without_rowid,
                 captured_columns,
                 rows,
             )?,
@@ -543,39 +557,27 @@ pub fn restore_payload(conn: &Connection, payload: &PreimagePayload) -> Result<(
     Ok(())
 }
 
-/// Restore a dropped column: rebuild the table to the explicit pre-drop schema
-/// (re-adding the column, structurally faithful via
-/// [`rebuild_to_schema`](crate::migrate::apply::rebuild_to_schema)), then UPSERT
-/// the captured values back into it.
+/// Restore a dropped column: rebuild the table from the verbatim pre-drop
+/// `CREATE TABLE` (re-adding the column and carrying every surviving constraint
+/// byte-for-byte via a [`RebuildTarget::Verbatim`] rebuild), then UPSERT the
+/// captured values back into it.
 #[cfg(feature = "native")]
 #[allow(clippy::too_many_arguments)]
 fn restore_column(
     conn: &Connection,
     table: &str,
     dropped: &str,
-    columns: &[Column],
+    create_sql: &str,
+    aux_ddl: &[String],
+    dropped_requires_value: bool,
     pk: &[String],
-    without_rowid: bool,
     captured_columns: &[String],
     rows: &[Vec<CapturedValue>],
 ) -> Result<(), MigrateError> {
-    let dropped_col = columns.iter().find(|c| c.name == dropped).ok_or_else(|| {
-        MigrateError::Apply(format!(
-            "pre-image for {table:?} is missing the dropped column {dropped:?}"
-        ))
-    })?;
     // The rebuild copies the surviving columns and leaves the re-added column
     // empty until the UPSERT fills it. A NOT NULL column with no default cannot
     // survive that gap -- fail with a clear message, not a raw SQL error.
-    let not_null = dropped_col
-        .constraints
-        .iter()
-        .any(|c| matches!(c, Constraint::NotNull));
-    let has_default = dropped_col
-        .constraints
-        .iter()
-        .any(|c| matches!(c, Constraint::Default(_)));
-    if not_null && !has_default {
+    if dropped_requires_value {
         return Err(MigrateError::Apply(format!(
             "cannot restore NOT NULL column {dropped:?} on {table:?} without a default \
              (rebuild-then-fill leaves it null until the row-level UPSERT)"
@@ -589,30 +591,22 @@ fn restore_column(
         .map(|c| c.name)
         .collect();
     if !present.iter().any(|c| c == dropped) {
-        let mut body: Vec<String> = columns.iter().map(render_column_def).collect();
-        if !pk.is_empty() {
-            body.push(format!(
-                "PRIMARY KEY ({})",
-                pk.iter()
-                    .map(|c| quote_ident(c))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-        // Copy every surviving column identity-wise; the re-added column is left
-        // out of the projection so it defaults to null/its default.
-        let projection: Vec<(String, String)> = columns
+        // Copy every surviving, non-generated column identity-wise; the re-added
+        // column is left out of the projection so it takes its default/NULL, and
+        // generated columns self-populate (inserting into them is an error).
+        let generated = generated_columns(conn, table)?;
+        let projection: Vec<(String, String)> = present
             .iter()
-            .filter(|c| c.name != dropped)
-            .map(|c| (c.name.clone(), quote_ident(&c.name)))
+            .filter(|c| !generated.iter().any(|g| g == *c))
+            .map(|c| (c.clone(), quote_ident(c)))
             .collect();
-        let post_ddl = aux_object_ddl(conn, table)?;
         let spec = RebuildSpec {
             table: table.to_string(),
-            body,
-            without_rowid,
+            target: RebuildTarget::Verbatim {
+                create_sql: create_sql.to_string(),
+            },
             projection,
-            post_ddl,
+            post_ddl: aux_ddl.to_vec(),
         };
         rebuild_to_schema(conn, &spec)?;
     }
@@ -741,7 +735,9 @@ pub async fn store_preimage(
     let bytes =
         serde_json::to_vec(payload).map_err(|e| MigrateError::Serialization(e.to_string()))?;
     if bytes.len() <= INLINE_MAX_BYTES {
-        let rows = serde_json::to_value(payload)
+        // Fold the inline branch onto the already-serialized bytes: parse them
+        // back into a `Value` rather than serializing the payload a second time.
+        let rows = serde_json::from_slice(&bytes)
             .map_err(|e| MigrateError::Serialization(e.to_string()))?;
         return Ok(Preimage::Inline { rows });
     }
@@ -874,6 +870,7 @@ pub fn apply_compensating(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::migrate::{Column, ColumnKind};
 
     fn col(name: &str, kind: ColumnKind) -> Column {
         Column {
@@ -1003,9 +1000,10 @@ mod tests {
             tables: vec![TablePreimage::Column {
                 table: "t".into(),
                 dropped: "c".into(),
-                columns: vec![col("id", ColumnKind::Text), col("c", ColumnKind::Blob)],
+                create_sql: "CREATE TABLE t (id TEXT PRIMARY KEY, c BLOB)".into(),
+                aux_ddl: vec![],
+                dropped_requires_value: false,
                 pk: vec!["id".into()],
-                without_rowid: false,
                 captured_columns: vec!["id".into(), "c".into()],
                 rows: vec![
                     vec![CapturedValue::Text("k1".into()), CapturedValue::Null],
@@ -1295,6 +1293,253 @@ mod tests {
             assert!(matches!(err, MigrateError::Apply(m) if m.contains("NOT NULL")));
         }
 
+        #[test]
+        fn drop_column_reverse_preserves_surviving_and_table_constraints() {
+            // HIGH-1: dropping an UNCONSTRAINED column then reversing must not
+            // silently strip the surviving-column UNIQUE / COLLATE or the
+            // table-level CHECK. The verbatim-DDL rebuild carries them all.
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE t (
+                     id TEXT PRIMARY KEY,
+                     handle TEXT UNIQUE COLLATE NOCASE,
+                     score INTEGER,
+                     doomed TEXT,
+                     CHECK (score >= 0)
+                 );
+                 INSERT INTO t (id, handle, score, doomed) VALUES ('u1','alice',5,'x');",
+            )
+            .unwrap();
+
+            let drop = ClassifiedOp::new(Op::DropColumn {
+                table: "t".into(),
+                column: "doomed".into(),
+            });
+            let mut cap = PreimageCapturer::new();
+            apply_ops(&conn, std::slice::from_ref(&drop), &mut |op| {
+                cap.capture_before(&conn, op)
+            })
+            .unwrap();
+            let payload = cap.into_payload();
+            assert!(table_info(&conn, "t")
+                .unwrap()
+                .iter()
+                .all(|c| c.name != "doomed"));
+
+            restore_payload(&conn, &payload).unwrap();
+
+            // Surviving-column UNIQUE + COLLATE NOCASE survived: a case-
+            // insensitive duplicate is REJECTED.
+            let dup = conn.execute(
+                "INSERT INTO t (id, handle, score) VALUES ('u2','ALICE',1)",
+                [],
+            );
+            assert!(
+                dup.is_err(),
+                "UNIQUE + COLLATE NOCASE must reject a case-insensitive duplicate"
+            );
+
+            // Table-level CHECK survived: a CHECK-violating row is REJECTED.
+            let bad = conn.execute(
+                "INSERT INTO t (id, handle, score) VALUES ('u3','bob',-5)",
+                [],
+            );
+            assert!(
+                bad.is_err(),
+                "table-level CHECK(score >= 0) must reject a negative score"
+            );
+
+            // The dropped column's data round-tripped.
+            let doomed: Option<String> = conn
+                .query_row("SELECT doomed FROM t WHERE id = 'u1'", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(doomed.as_deref(), Some("x"));
+        }
+
+        #[test]
+        fn drop_column_reverse_with_surviving_generated_column() {
+            // A surviving GENERATED column must not be projected into during the
+            // rebuild (inserting into a generated column errors); it self-populates
+            // from the copied base columns. Exercises the generated_columns filter.
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE t (
+                     id TEXT PRIMARY KEY,
+                     n INTEGER,
+                     n2 INTEGER GENERATED ALWAYS AS (n * 2) STORED,
+                     doomed TEXT
+                 );
+                 INSERT INTO t (id, n, doomed) VALUES ('u1', 21, 'x');",
+            )
+            .unwrap();
+
+            let drop = ClassifiedOp::new(Op::DropColumn {
+                table: "t".into(),
+                column: "doomed".into(),
+            });
+            let mut cap = PreimageCapturer::new();
+            apply_ops(&conn, std::slice::from_ref(&drop), &mut |op| {
+                cap.capture_before(&conn, op)
+            })
+            .unwrap();
+            let payload = cap.into_payload();
+
+            restore_payload(&conn, &payload).unwrap();
+
+            // The generated column survives and recomputes correctly...
+            let n2: i64 = conn
+                .query_row("SELECT n2 FROM t WHERE id = 'u1'", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n2, 42, "generated column must recompute as n*2");
+            // ...and the dropped column round-tripped.
+            let doomed: Option<String> = conn
+                .query_row("SELECT doomed FROM t WHERE id = 'u1'", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(doomed.as_deref(), Some("x"));
+        }
+
+        #[test]
+        fn drop_table_reverse_restores_index_and_without_rowid() {
+            // MED-2: restoring a dropped table must replay its aux DDL (an
+            // explicit index) and recreate it WITHOUT ROWID from the verbatim DDL.
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE gone (id TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID;
+                 CREATE INDEX gone_v ON gone(v);
+                 INSERT INTO gone VALUES ('g1','one'),('g2','two');",
+            )
+            .unwrap();
+
+            let drop = ClassifiedOp::new(Op::DropTable {
+                table: "gone".into(),
+            });
+            let mut cap = PreimageCapturer::new();
+            apply_ops(&conn, std::slice::from_ref(&drop), &mut |op| {
+                cap.capture_before(&conn, op)
+            })
+            .unwrap();
+            let payload = cap.into_payload();
+            assert!(!table_exists(&conn, "gone"));
+
+            restore_payload(&conn, &payload).unwrap();
+
+            // The explicit index is back.
+            let idx: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='gone_v'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(idx, 1, "the dropped table's index must be restored");
+
+            // The table is WITHOUT ROWID again.
+            let ddl: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='gone'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                ddl.to_ascii_uppercase().contains("WITHOUT ROWID"),
+                "table must be restored WITHOUT ROWID: {ddl}"
+            );
+
+            // And the rows came back.
+            let v1: String = conn
+                .query_row("SELECT v FROM gone WHERE id='g1'", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(v1, "one");
+        }
+
+        #[test]
+        fn compensating_step_marks_failed_and_reelectable_on_error() {
+            // MED-3: a compensating step whose restore ERRORS mid-apply must
+            // propagate the Err, mark the vN+1 ledger row Failed, and leave it
+            // re-electable (mark_failed recovery path).
+            let conn = Connection::open_in_memory().unwrap();
+            Ledger::ensure_schema(&conn).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE t (id TEXT PRIMARY KEY, needed TEXT NOT NULL);
+                 INSERT INTO t VALUES ('a','x');",
+            )
+            .unwrap();
+
+            let drop = ClassifiedOp::new(Op::DropColumn {
+                table: "t".into(),
+                column: "needed".into(),
+            });
+            let mut cap = PreimageCapturer::new();
+            apply_ops(&conn, std::slice::from_ref(&drop), &mut |op| {
+                cap.capture_before(&conn, op)
+            })
+            .unwrap();
+            let payload = cap.into_payload();
+
+            // Restoring a NOT NULL column with no default errors mid-apply.
+            let res = apply_compensating(&conn, 7, "c7", &[], Some(&payload), 300);
+            assert!(res.is_err(), "the mid-apply error must propagate");
+
+            // The vN+1 row is Failed...
+            let v7 = Ledger::entry(&conn, 7).unwrap().unwrap();
+            assert_eq!(v7.status, MigrationStatus::Failed);
+            // ...and immediately re-electable (a fresh election wins the slot).
+            assert_eq!(
+                Ledger::try_elect(&conn, 7, "c7", 300).unwrap(),
+                Election::Won
+            );
+        }
+
+        #[test]
+        fn additive_reverse_removes_added_column_from_live_schema() {
+            // MED-4: an AddColumn down-op (its inverse, DropColumn) must leave the
+            // live schema without the added column.
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch("CREATE TABLE t (id TEXT PRIMARY KEY, extra TEXT);")
+                .unwrap();
+            let up = vec![ClassifiedOp::new(Op::AddColumn {
+                table: "t".into(),
+                column: col("extra", ColumnKind::Text),
+            })];
+            let down = additive_down_ops(&up).unwrap();
+            apply_ops(&conn, &down, &mut noop).unwrap();
+            let cols: Vec<String> = table_info(&conn, "t")
+                .unwrap()
+                .into_iter()
+                .map(|c| c.name)
+                .collect();
+            assert_eq!(cols, vec!["id".to_string()]);
+        }
+
+        #[test]
+        fn additive_reverse_drops_created_index_from_live_schema() {
+            // MED-4: a CreateIndex down-op (its inverse, DropIndex) must remove
+            // the index from the live schema.
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE t (id TEXT PRIMARY KEY, v TEXT);
+                 CREATE INDEX t_v ON t(v);",
+            )
+            .unwrap();
+            let up = vec![ClassifiedOp::new(Op::CreateIndex {
+                name: "t_v".into(),
+                table: "t".into(),
+                columns: vec!["v".into()],
+                unique: false,
+            })];
+            let down = additive_down_ops(&up).unwrap();
+            apply_ops(&conn, &down, &mut noop).unwrap();
+            let n: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='t_v'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 0);
+        }
+
         fn table_exists(conn: &Connection, table: &str) -> bool {
             let n: i64 = conn
                 .query_row(
@@ -1402,9 +1647,10 @@ mod tests {
                 tables: vec![TablePreimage::Column {
                     table: "t".into(),
                     dropped: "c".into(),
-                    columns: vec![col("id", ColumnKind::Text), col("c", ColumnKind::Text)],
+                    create_sql: "CREATE TABLE t (id TEXT PRIMARY KEY, c TEXT)".into(),
+                    aux_ddl: vec![],
+                    dropped_requires_value: false,
                     pk: vec!["id".into()],
-                    without_rowid: false,
                     captured_columns: vec!["id".into(), "c".into()],
                     rows: data,
                 }],
@@ -1418,6 +1664,47 @@ mod tests {
             assert!(matches!(stored, Preimage::Inline { .. }));
             let back = load_preimage(&stored, None).await.unwrap();
             assert_eq!(back, payload);
+        }
+
+        #[tokio::test]
+        async fn inline_boundary_is_pinned_behaviorally() {
+            // MED-1: pin the boundary by BEHAVIOR, not just the const. A payload
+            // serializing to exactly INLINE_MAX_BYTES rides inline; one byte over
+            // is refused. Pad a single ASCII text value (1 JSON byte per char, no
+            // escaping) so the serialized length lands precisely on the boundary.
+            let mk = |pad: usize| PreimagePayload {
+                tables: vec![TablePreimage::Table {
+                    table: "t".into(),
+                    create_sql: "CREATE TABLE t (id TEXT PRIMARY KEY)".into(),
+                    aux_ddl: vec![],
+                    pk: vec!["id".into()],
+                    columns: vec!["id".into()],
+                    rows: vec![vec![CapturedValue::Text("a".repeat(pad))]],
+                }],
+            };
+            let base = serde_json::to_vec(&mk(0)).unwrap().len();
+            let pad = INLINE_MAX_BYTES - base;
+
+            let at = mk(pad);
+            assert_eq!(serde_json::to_vec(&at).unwrap().len(), INLINE_MAX_BYTES);
+            assert!(
+                matches!(
+                    store_preimage(&at, None).await.unwrap(),
+                    Preimage::Inline { .. }
+                ),
+                "a payload exactly at the boundary must ride inline"
+            );
+
+            let over = mk(pad + 1);
+            assert_eq!(
+                serde_json::to_vec(&over).unwrap().len(),
+                INLINE_MAX_BYTES + 1
+            );
+            let err = store_preimage(&over, None).await.unwrap_err();
+            assert!(
+                matches!(err, MigrateError::Apply(m) if m.contains("inline limit")),
+                "one byte over the boundary must be refused without a relay"
+            );
         }
 
         #[tokio::test]
