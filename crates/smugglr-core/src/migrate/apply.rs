@@ -85,7 +85,10 @@ fn column_kind_keyword(kind: ColumnKind) -> &'static str {
 ///
 /// Constraints are emitted in declared order. `DEFAULT` and `CHECK` payloads are
 /// carried verbatim (they are author-supplied SQL expressions).
-fn render_column_def(col: &Column) -> String {
+///
+/// Exposed `pub(crate)` so callers assembling a [`RebuildTarget::Fragments`] body
+/// (convert #280) can reuse the column-DDL lowering without duplicating it.
+pub(crate) fn render_column_def(col: &Column) -> String {
     let mut s = format!(
         "{} {}",
         quote_ident(&col.name),
@@ -540,8 +543,10 @@ fn rebuild_dropping_column(
 
     let spec = RebuildSpec {
         table: table.to_string(),
-        body,
-        without_rowid: false, // reconstruction does not recover WITHOUT ROWID
+        target: RebuildTarget::Fragments {
+            body,
+            without_rowid: false, // reconstruction does not recover WITHOUT ROWID
+        },
         projection,
         post_ddl,
     };
@@ -550,28 +555,219 @@ fn rebuild_dropping_column(
 
 // --- The guarded 12-step rebuild -------------------------------------------
 
-/// A fully-formed rebuild plan: the caller (`rebuild_dropping_column`) has
-/// already resolved the primary key, foreign keys, and post-rebuild DDL into
-/// `body` / `post_ddl`.
+/// The target schema for a rebuild: either reassembled DDL fragments or a
+/// verbatim `CREATE TABLE` captured from `sqlite_master`.
+///
+/// The distinction is load bearing for constraint fidelity:
+///
+/// - [`RebuildTarget::Fragments`] is only as faithful as the caller's assembly.
+///   `rebuild_dropping_column` builds it from `PRAGMA table_info` /
+///   `foreign_key_list`, which cannot recover `CHECK` / surviving-column `UNIQUE`
+///   / `COLLATE` / generated columns, so that path warns on the loss.
+/// - [`RebuildTarget::Verbatim`] carries the exact pre-mutation DDL, so every
+///   constraint survives byte-for-byte. Reverse (#274) uses it to re-add a dropped
+///   column without re-deriving (and thus stripping) the surviving schema.
 #[cfg(feature = "native")]
-struct RebuildSpec {
+pub(crate) enum RebuildTarget {
+    /// Reassembled `CREATE TABLE` body fragments (column defs + table-level
+    /// constraints), joined by `, `, plus the `WITHOUT ROWID` flag.
+    Fragments {
+        /// The full body fragments (column defs + table-level constraints).
+        body: Vec<String>,
+        /// Whether the rebuilt table is `WITHOUT ROWID`.
+        without_rowid: bool,
+    },
+    /// A verbatim `CREATE TABLE` (as stored in `sqlite_master`); the rebuild
+    /// splices the temp-table name in place of the original before executing it,
+    /// so no constraint is inferred or lost.
+    Verbatim {
+        /// The verbatim `CREATE TABLE` DDL for the target schema.
+        create_sql: String,
+    },
+}
+
+/// A fully-formed rebuild plan: the caller (`rebuild_dropping_column`, or reverse
+/// #274 via [`rebuild_to_schema`]) has already resolved the target schema,
+/// projection, and post-rebuild DDL.
+///
+/// `target` is the *explicit target schema*: [`rebuild_to_schema`] renders exactly
+/// what it carries, inferring nothing from pragmas, so a caller that supplies a
+/// verbatim capture (reverse's pre-image; convert #280) has none of the
+/// `DROP COLUMN` reconstruction limits documented on this module.
+#[cfg(feature = "native")]
+pub(crate) struct RebuildSpec {
     /// The table being rebuilt (dropped and recreated under this final name).
-    table: String,
-    /// The full `CREATE TABLE` body fragments (column defs + table-level
-    /// constraints), joined by `, `.
-    body: Vec<String>,
-    /// Whether the rebuilt table is `WITHOUT ROWID`.
-    without_rowid: bool,
+    pub table: String,
+    /// The target schema (reassembled fragments or a verbatim capture).
+    pub target: RebuildTarget,
     /// `(dest_column, source_expr)` pairs for the `INSERT ... SELECT` copy.
-    projection: Vec<(String, String)>,
+    pub projection: Vec<(String, String)>,
     /// Extra statements to run after the rename (e.g. recreate indexes).
-    post_ddl: Vec<String>,
+    pub post_ddl: Vec<String>,
 }
 
 /// The temp table name used mid-rebuild. A single connection rebuilds one table
 /// at a time, and it is dropped-if-exists first, so a fixed name is safe.
 #[cfg(feature = "native")]
 const REBUILD_TMP: &str = "_smugglr_rebuild_tmp";
+
+/// A byte that can appear inside a bare SQL identifier.
+#[cfg(feature = "native")]
+fn is_ident_byte(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_' || c == b'$'
+}
+
+/// Advance past ASCII whitespace from `i`.
+#[cfg(feature = "native")]
+fn skip_ws(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+/// Match `word` case-insensitively at `i`, requiring a trailing word boundary.
+/// Returns the index just past the keyword, or `None` if it does not match.
+#[cfg(feature = "native")]
+fn match_kw(b: &[u8], i: usize, word: &str) -> Option<usize> {
+    let w = word.as_bytes();
+    let end = i.checked_add(w.len())?;
+    if end > b.len() || !b[i..end].eq_ignore_ascii_case(w) {
+        return None;
+    }
+    if end < b.len() && is_ident_byte(b[end]) {
+        return None;
+    }
+    Some(end)
+}
+
+/// The end index (exclusive) of one SQL identifier starting at `i`, honouring
+/// `"..."`, `` `...` ``, `[...]`, and bare forms. `None` if `i` is not an
+/// identifier start.
+#[cfg(feature = "native")]
+fn ident_end(b: &[u8], i: usize) -> Option<usize> {
+    if i >= b.len() {
+        return None;
+    }
+    match b[i] {
+        q @ (b'"' | b'`') => {
+            let mut j = i + 1;
+            while j < b.len() {
+                if b[j] == q {
+                    // A doubled quote is an escaped literal, not the terminator.
+                    if j + 1 < b.len() && b[j + 1] == q {
+                        j += 2;
+                    } else {
+                        return Some(j + 1);
+                    }
+                } else {
+                    j += 1;
+                }
+            }
+            None
+        }
+        b'[' => {
+            let mut j = i + 1;
+            while j < b.len() {
+                if b[j] == b']' {
+                    return Some(j + 1);
+                }
+                j += 1;
+            }
+            None
+        }
+        c if is_ident_byte(c) && !c.is_ascii_digit() => {
+            let mut j = i;
+            while j < b.len() && is_ident_byte(b[j]) {
+                j += 1;
+            }
+            Some(j)
+        }
+        _ => None,
+    }
+}
+
+/// Splice `new_name` (quoted) in for the table name of a verbatim
+/// `CREATE TABLE` statement, leaving the rest of the DDL byte-for-byte intact.
+///
+/// Reverse (#274) builds the mid-rebuild temp table this way: the captured
+/// pre-drop DDL keeps every constraint, and only the name is retargeted so it can
+/// coexist with the still-present original during the swap. Scans past
+/// `CREATE [TEMP|TEMPORARY] TABLE [IF NOT EXISTS]` and any `schema.` qualifier to
+/// the name identifier, then replaces just that span.
+#[cfg(feature = "native")]
+fn splice_create_table_name(create_sql: &str, new_name: &str) -> Result<String, MigrateError> {
+    let b = create_sql.as_bytes();
+    let not_create = || {
+        MigrateError::Apply(format!(
+            "captured DDL is not a CREATE TABLE statement: {create_sql:?}"
+        ))
+    };
+
+    let mut i = skip_ws(b, 0);
+    i = match_kw(b, i, "CREATE").ok_or_else(not_create)?;
+    i = skip_ws(b, i);
+    if let Some(j) = match_kw(b, i, "TEMPORARY").or_else(|| match_kw(b, i, "TEMP")) {
+        i = skip_ws(b, j);
+    }
+    i = match_kw(b, i, "TABLE").ok_or_else(not_create)?;
+    i = skip_ws(b, i);
+    // Optional IF NOT EXISTS.
+    if let Some(j) = match_kw(b, i, "IF") {
+        let j = skip_ws(b, j);
+        let j = match_kw(b, j, "NOT").ok_or_else(not_create)?;
+        let j = skip_ws(b, j);
+        let j = match_kw(b, j, "EXISTS").ok_or_else(not_create)?;
+        i = skip_ws(b, j);
+    }
+
+    let name_start = i;
+    let mut name_end = ident_end(b, i).ok_or_else(|| {
+        MigrateError::Apply(format!(
+            "could not locate table name in captured DDL: {create_sql:?}"
+        ))
+    })?;
+    // A `schema.name` qualifier: the replaced span runs through the second ident.
+    let after = skip_ws(b, name_end);
+    if after < b.len() && b[after] == b'.' {
+        let k = skip_ws(b, after + 1);
+        name_end = ident_end(b, k).ok_or_else(|| {
+            MigrateError::Apply(format!(
+                "malformed qualified table name in captured DDL: {create_sql:?}"
+            ))
+        })?;
+    }
+
+    Ok(format!(
+        "{}{}{}",
+        &create_sql[..name_start],
+        quote_ident(new_name),
+        &create_sql[name_end..]
+    ))
+}
+
+/// Rebuild a table to an **explicit target schema** (the crate entry for reverse
+/// #274 / convert #280).
+///
+/// Unlike the `DROP COLUMN` path -- which *infers* the surviving schema from
+/// `PRAGMA table_info` / `foreign_key_list` and therefore cannot recover `CHECK` /
+/// `UNIQUE` / `COLLATE` / generated columns / `WITHOUT ROWID` -- this takes the
+/// schema as a fully-formed [`RebuildSpec`]: the caller supplies the
+/// [`RebuildTarget`] (reassembled fragments *or* a verbatim capture), a
+/// `projection` (the `INSERT ... SELECT` copy from the *current* table into the
+/// target), and `post_ddl` (indexes to recreate). With a
+/// [`RebuildTarget::Verbatim`] capture the reconstruction limits above do not
+/// apply at all -- every constraint is carried byte-for-byte. The table being
+/// rebuilt must already exist (the copy reads from it); recreating a *dropped*
+/// table is a `CREATE TABLE`, not a rebuild.
+///
+/// The guarantees of the 12-step rebuild still hold: `foreign_keys` is toggled
+/// outside the transaction, `sqlite_sequence` is preserved, and
+/// `foreign_key_check` + `integrity_check` gate the commit.
+#[cfg(feature = "native")]
+pub(crate) fn rebuild_to_schema(conn: &Connection, spec: &RebuildSpec) -> Result<(), MigrateError> {
+    rebuild_table(conn, spec)
+}
 
 /// Run the guarded 12-step table rebuild.
 ///
@@ -613,14 +809,25 @@ fn rebuild_inner(conn: &Connection, spec: &RebuildSpec) -> Result<(), MigrateErr
         "DROP TABLE IF EXISTS {}",
         quote_ident(REBUILD_TMP)
     ))?;
-    let mut create = format!(
-        "CREATE TABLE {} ({})",
-        quote_ident(REBUILD_TMP),
-        spec.body.join(", ")
-    );
-    if spec.without_rowid {
-        create.push_str(" WITHOUT ROWID");
-    }
+    let create = match &spec.target {
+        RebuildTarget::Fragments {
+            body,
+            without_rowid,
+        } => {
+            let mut c = format!(
+                "CREATE TABLE {} ({})",
+                quote_ident(REBUILD_TMP),
+                body.join(", ")
+            );
+            if *without_rowid {
+                c.push_str(" WITHOUT ROWID");
+            }
+            c
+        }
+        RebuildTarget::Verbatim { create_sql } => {
+            splice_create_table_name(create_sql, REBUILD_TMP)?
+        }
+    };
     tx.execute_batch(&create)?;
 
     // Copy the data across the projection.
@@ -1282,6 +1489,72 @@ mod tests {
             raw_table_columns(conn, table).unwrap()
         }
 
+        /// The verbatim `CREATE TABLE` sqlite stored for `table`.
+        fn stored_ddl(conn: &Connection, table: &str) -> String {
+            conn.query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                params![table],
+                |r| r.get(0),
+            )
+            .unwrap()
+        }
+
+        #[test]
+        fn splice_retargets_real_sqlite_master_ddl_verbatim() {
+            // The splice input that matters is the DDL sqlite ACTUALLY stores, not
+            // hand-written DDL. Round-trip several real forms: the spliced create
+            // must execute, land under the temp name, and preserve constraints.
+            let cases = [
+                // Quoted name (with a space) + WITHOUT ROWID + inline UNIQUE + COLLATE.
+                ("quo ted", "CREATE TABLE \"quo ted\" (id TEXT PRIMARY KEY, h TEXT UNIQUE COLLATE NOCASE) WITHOUT ROWID"),
+                // Bare name + table-level CHECK.
+                ("bare", "CREATE TABLE bare (id TEXT PRIMARY KEY, score INTEGER, CHECK (score >= 0))"),
+                // Composite primary key.
+                ("comp", "CREATE TABLE comp (a TEXT, b TEXT, v TEXT, PRIMARY KEY (a, b))"),
+                // Foreign key to another table.
+                ("child", "CREATE TABLE child (id TEXT PRIMARY KEY, pid TEXT REFERENCES bare(id))"),
+                // Generated (stored) column.
+                ("gen", "CREATE TABLE gen (id TEXT PRIMARY KEY, n INTEGER, n2 INTEGER GENERATED ALWAYS AS (n * 2) STORED)"),
+            ];
+            for (name, original) in cases {
+                let conn = mem();
+                // `child` references `bare`; create the parent first so the FK case
+                // has a target.
+                conn.execute_batch(
+                    "CREATE TABLE bare (id TEXT PRIMARY KEY, score INTEGER, CHECK (score >= 0))",
+                )
+                .ok();
+                if name != "bare" {
+                    conn.execute_batch(original).unwrap();
+                }
+                let stored = stored_ddl(&conn, name);
+                let spliced = splice_create_table_name(&stored, REBUILD_TMP).unwrap();
+                // The spliced DDL executes and creates the temp table.
+                conn.execute_batch(&format!(
+                    "DROP TABLE IF EXISTS {}",
+                    quote_ident(REBUILD_TMP)
+                ))
+                .unwrap();
+                conn.execute_batch(&spliced).unwrap();
+                let tmp_ddl = stored_ddl(&conn, REBUILD_TMP);
+                // The temp DDL is the original body with only the name retargeted:
+                // everything after the spliced name is byte-identical.
+                let orig_after = &stored[stored.find('(').unwrap()..];
+                let tmp_after = &tmp_ddl[tmp_ddl.find('(').unwrap()..];
+                assert_eq!(orig_after, tmp_after, "body must be preserved verbatim");
+                assert!(
+                    tmp_ddl.contains(REBUILD_TMP),
+                    "temp name spliced: {tmp_ddl}"
+                );
+            }
+        }
+
+        #[test]
+        fn splice_rejects_non_create_table() {
+            assert!(splice_create_table_name("SELECT 1", REBUILD_TMP).is_err());
+            assert!(splice_create_table_name("CREATE INDEX i ON t(a)", REBUILD_TMP).is_err());
+        }
+
         #[test]
         fn pre_op_hook_runs_before_each_op_and_can_abort() {
             let conn = mem();
@@ -1851,8 +2124,10 @@ mod tests {
             // Rebuild parent dropping `junk`.
             let spec = RebuildSpec {
                 table: "parent".into(),
-                body: vec!["\"id\" INTEGER PRIMARY KEY".into(), "\"label\" TEXT".into()],
-                without_rowid: false,
+                target: RebuildTarget::Fragments {
+                    body: vec!["\"id\" INTEGER PRIMARY KEY".into(), "\"label\" TEXT".into()],
+                    without_rowid: false,
+                },
                 projection: vec![
                     ("id".into(), "\"id\"".into()),
                     ("label".into(), "\"label\"".into()),
@@ -1896,12 +2171,14 @@ mod tests {
             // (user_id=999) violates it.
             let spec = RebuildSpec {
                 table: "orders".into(),
-                body: vec![
-                    "\"id\" INTEGER PRIMARY KEY".into(),
-                    "\"user_id\" INTEGER".into(),
-                    "FOREIGN KEY (\"user_id\") REFERENCES \"users\"(\"id\")".into(),
-                ],
-                without_rowid: false,
+                target: RebuildTarget::Fragments {
+                    body: vec![
+                        "\"id\" INTEGER PRIMARY KEY".into(),
+                        "\"user_id\" INTEGER".into(),
+                        "FOREIGN KEY (\"user_id\") REFERENCES \"users\"(\"id\")".into(),
+                    ],
+                    without_rowid: false,
+                },
                 projection: vec![
                     ("id".into(), "\"id\"".into()),
                     ("user_id".into(), "\"user_id\"".into()),
