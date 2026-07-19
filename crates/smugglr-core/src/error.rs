@@ -107,6 +107,13 @@ pub enum SyncError {
     /// `native` gate), so this bridge exists on every target.
     #[error("Migrate error: {0}")]
     Migrate(#[from] crate::migrate::MigrateError),
+
+    /// The migration ledger's chain-hash is broken -- an out-of-band
+    /// `UPDATE`/`DELETE` altered or removed a `_smugglr_migrations` row. This is
+    /// the resurrected `_journal.json` hand-edit failure the ledger exists to
+    /// catch; it needs a human decision, so it shares the conflict exit code (4).
+    #[error("Migration ledger tamper detected: {0}")]
+    LedgerTampered(String),
 }
 
 impl SyncError {
@@ -175,7 +182,7 @@ impl SyncError {
             // Migrate failures (checksum mismatch / tamper, envelope open
             // failure) need a human decision -- classify as conflict (4), the
             // same bucket the sequencing doc reserves for the migrate bridge.
-            SyncError::ConcurrentWrite | SyncError::Migrate(_) => 4,
+            SyncError::ConcurrentWrite | SyncError::Migrate(_) | SyncError::LedgerTampered(_) => 4,
 
             SyncError::TableNotFound(_)
             | SyncError::RelayNotFound(_)
@@ -337,6 +344,15 @@ mod tests {
     #[test]
     fn test_exit_code_conflict() {
         assert_eq!(SyncError::ConcurrentWrite.exit_code(), 4);
+        assert_eq!(
+            SyncError::LedgerTampered("broken chain".into()).exit_code(),
+            4
+        );
+    }
+
+    #[test]
+    fn test_ledger_tampered_not_retryable() {
+        assert!(!SyncError::LedgerTampered("x".into()).is_retryable());
     }
 
     #[test]
