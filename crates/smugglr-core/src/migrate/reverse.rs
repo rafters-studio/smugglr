@@ -1,3 +1,1498 @@
-//! Reverse / rollback (pre-stub). Body lands in #274 -- rollback as an
-//! append-only compensating forward step (vN+1) restoring the delta-scoped
-//! pre-image via `stash`. Empty until then.
+//! Reverse / rollback (#274).
+//!
+//! Rollback is a **compensating forward step**, never a transactional undo
+//! (design decisions 3/4, "Recovery"). Reversing `vN` assembles the inverse of
+//! its `up` ops and applies them as a *new* ledgered `vN+1` step; the reversed
+//! `vN` ledger row stays byte-unchanged, because the ledger is append-only and
+//! chain-hashed and an edit would trip [`crate::migrate::ledger::Ledger::verify_chain`]
+//! ([`crate::error::SyncError::LedgerTampered`]).
+//!
+//! Two reverse classes (decision 4):
+//!
+//! - **Additive** (`CreateTable` / `AddColumn` / `CreateIndex` / rename): the
+//!   reverse is the *structural inverse* -- drop what was added, swap a rename --
+//!   carrying no data. [`structural_inverse`] / [`additive_down_ops`].
+//! - **Destructive** (`DropTable` / `DropColumn`): reversible only from a
+//!   **delta-scoped pre-image** (rows-INTERSECT-columns, OQ1) captured *during*
+//!   the forward apply, before the op mutates. The capture rides the `pre_op`
+//!   write-ahead hook [`apply_ops`](crate::migrate::apply::apply_ops) already
+//!   exposes ([`PreimageCapturer::capture_before`]); restore reconstructs the
+//!   structure ([`crate::migrate::apply::rebuild_to_schema`] for a re-added
+//!   column, verbatim DDL for a re-created table) and refills the lost cells with
+//!   an idempotent PK-keyed UPSERT ([`restore_payload`], spike C).
+//!
+//! # Two compilation surfaces
+//!
+//! Like `apply`, this module is declared `pub mod reverse;` with no `native`
+//! gate, so the pure inverse ([`structural_inverse`]) and the serializable
+//! pre-image types compile on `wasm32`. Everything touching `rusqlite`,
+//! `object_store`, or the ledger is internally `#[cfg(feature = "native")]`.
+//!
+//! # Pre-image storage (resolved)
+//!
+//! The captured pre-image serializes to JSON and is carried as a
+//! [`Preimage`](crate::migrate::Preimage): **small payloads inline**
+//! ([`Preimage::Inline`], no relay) and **large payloads in a content-addressed
+//! store** ([`Preimage::Ref`], keyed by the SHA-256 of the payload, written
+//! through [`crate::stash::build_store`]). [`INLINE_MAX_BYTES`] pins the boundary
+//! where inline refuses and a relay becomes mandatory ([`store_preimage`]). A
+//! large payload's key is *read* from the ledger's forward-compat `preimage_ref`
+//! column ([`preimage_ref_of`], OQ2 "read-only"); **writing** that column is the
+//! driver's job (#296), out of scope here.
+
+use crate::migrate::{ClassifiedOp, Column, MigrateError, Op};
+use serde::{Deserialize, Serialize};
+
+#[cfg(feature = "native")]
+use crate::config::StashConfig;
+#[cfg(feature = "native")]
+use crate::migrate::apply::{apply_ops, rebuild_to_schema, render_column_def, RebuildSpec};
+#[cfg(feature = "native")]
+use crate::migrate::ledger::{Election, Ledger, LedgerEntry};
+#[cfg(feature = "native")]
+use crate::migrate::{ColumnKind, Constraint, Preimage};
+#[cfg(feature = "native")]
+use object_store::{path::Path as ObjectPath, ObjectStore, PutPayload};
+#[cfg(feature = "native")]
+use rusqlite::{params_from_iter, types::Value as SqlValue, Connection};
+#[cfg(feature = "native")]
+use sha2::{Digest, Sha256};
+
+// ===========================================================================
+// Structural inverse (always compiled -- no rusqlite)
+// ===========================================================================
+
+/// The structural inverse of an **additive** op (decision 4): drop what was
+/// added, swap a rename. Carries no data.
+///
+/// Returns [`MigrateError::Apply`] for an op whose reverse needs a captured
+/// pre-image (`DropTable`, `DropColumn`) or is not structurally recoverable in
+/// 0.5.0 (`DropIndex` -- the index definition is not carried by the op). Those
+/// reverse through the pre-image path, not this pure inverse.
+pub fn structural_inverse(op: &Op) -> Result<Op, MigrateError> {
+    match op {
+        Op::CreateTable { table, .. } => Ok(Op::DropTable {
+            table: table.clone(),
+        }),
+        Op::AddColumn { table, column } => Ok(Op::DropColumn {
+            table: table.clone(),
+            column: column.name.clone(),
+        }),
+        Op::CreateIndex { name, .. } => Ok(Op::DropIndex { name: name.clone() }),
+        Op::RenameTable { from, to } => Ok(Op::RenameTable {
+            from: to.clone(),
+            to: from.clone(),
+        }),
+        Op::RenameColumn { table, from, to } => Ok(Op::RenameColumn {
+            table: table.clone(),
+            from: to.clone(),
+            to: from.clone(),
+        }),
+        Op::DropTable { table } => Err(MigrateError::Apply(format!(
+            "reverse of DROP TABLE {table:?} needs a captured pre-image, not a structural inverse"
+        ))),
+        Op::DropColumn { table, column } => Err(MigrateError::Apply(format!(
+            "reverse of DROP COLUMN {column:?} on {table:?} needs a captured pre-image, \
+             not a structural inverse"
+        ))),
+        Op::DropIndex { name } => Err(MigrateError::Apply(format!(
+            "reverse of DROP INDEX {name:?} is not structurally recoverable in 0.5.0 \
+             (the op does not carry the index definition)"
+        ))),
+    }
+}
+
+/// The additive `down` ops for a manifest's `up`: the [`structural_inverse`] of
+/// each op, in **reverse order** (the last thing applied is the first thing
+/// undone). Errors if any op is destructive -- those need the pre-image path.
+pub fn additive_down_ops(up: &[ClassifiedOp]) -> Result<Vec<ClassifiedOp>, MigrateError> {
+    up.iter()
+        .rev()
+        .map(|c| structural_inverse(&c.op).map(ClassifiedOp::new))
+        .collect()
+}
+
+// ===========================================================================
+// Pre-image payload (serializable; always compiled)
+// ===========================================================================
+
+/// The inline-vs-relay boundary (64 KiB of serialized payload).
+///
+/// At or under this, a pre-image rides inline in the manifest
+/// ([`Preimage::Inline`]); over it, inline **refuses** and a content-addressed
+/// relay store becomes mandatory ([`Preimage::Ref`]) -- otherwise a large
+/// `DROP COLUMN` pre-image would silently fail to travel. Pinned in
+/// [`store_preimage`].
+pub const INLINE_MAX_BYTES: usize = 64 * 1024;
+
+/// A single captured SQLite cell value, losslessly serializable.
+///
+/// Mirrors [`rusqlite::types::Value`]'s five storage classes; `Blob` round-trips
+/// as a byte array so binary keys/columns survive JSON.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "t", content = "v", rename_all = "snake_case")]
+pub enum CapturedValue {
+    /// SQL `NULL`.
+    Null,
+    /// A 64-bit integer.
+    Int(i64),
+    /// A floating-point value.
+    Real(f64),
+    /// UTF-8 text.
+    Text(String),
+    /// Opaque bytes.
+    Blob(Vec<u8>),
+}
+
+/// One table's delta-scoped pre-image: exactly the rows-INTERSECT-columns a
+/// destructive op is about to lose, plus the structure needed to put them back.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "loss", rename_all = "snake_case")]
+pub enum TablePreimage {
+    /// A dropped column. Restore rebuilds the table to the pre-drop schema
+    /// ([`Column`] set), then refills the one lost column by PK-keyed UPSERT.
+    Column {
+        /// The table the column was dropped from.
+        table: String,
+        /// The dropped column's name.
+        dropped: String,
+        /// The full pre-drop column set (the explicit rebuild target). The
+        /// primary key is carried separately in `pk`, so no column here declares
+        /// an inline `PRIMARY KEY`.
+        columns: Vec<Column>,
+        /// The primary-key column names, in key order.
+        pk: Vec<String>,
+        /// Whether the pre-drop table was `WITHOUT ROWID`.
+        without_rowid: bool,
+        /// The columns present in each captured row (`pk` ++ `dropped`).
+        captured_columns: Vec<String>,
+        /// Captured rows, each aligned to `captured_columns`.
+        rows: Vec<Vec<CapturedValue>>,
+    },
+    /// A dropped table. Restore re-creates it from the captured DDL (verbatim, so
+    /// indexes / triggers / `CHECK` / `WITHOUT ROWID` survive), then re-inserts
+    /// every row by PK-keyed UPSERT.
+    Table {
+        /// The dropped table's name.
+        table: String,
+        /// The verbatim `CREATE TABLE` DDL captured from `sqlite_master`.
+        create_sql: String,
+        /// Verbatim index / trigger DDL to replay after the table is recreated.
+        aux_ddl: Vec<String>,
+        /// The primary-key column names, in key order.
+        pk: Vec<String>,
+        /// Every column name, in table order (the row layout).
+        columns: Vec<String>,
+        /// Captured rows, each aligned to `columns`.
+        rows: Vec<Vec<CapturedValue>>,
+    },
+}
+
+/// The whole captured pre-image for one destructive migration: one
+/// [`TablePreimage`] per destructive op, in apply order.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct PreimagePayload {
+    /// Per-op captures, in the order the destructive ops were applied.
+    pub tables: Vec<TablePreimage>,
+}
+
+impl PreimagePayload {
+    /// Whether nothing was captured (no destructive op ran).
+    pub fn is_empty(&self) -> bool {
+        self.tables.is_empty()
+    }
+}
+
+// ===========================================================================
+// Native: capture, restore, storage, rollback
+// ===========================================================================
+
+/// Quote a SQL identifier, escaping embedded double-quotes by doubling.
+#[cfg(feature = "native")]
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Map a SQLite declared column type to a structured [`ColumnKind`] by affinity.
+///
+/// SQLite's type affinity rules (a substring scan of the declared type) decide
+/// storage class; an empty / unknown declared type falls to `Blob` (NUMERIC/none
+/// affinity), matching the `apply` rebuild's typeless-column handling.
+#[cfg(feature = "native")]
+fn kind_from_decl(decl: &str) -> ColumnKind {
+    let up = decl.to_ascii_uppercase();
+    if up.contains("INT") {
+        ColumnKind::Int
+    } else if up.contains("CHAR") || up.contains("CLOB") || up.contains("TEXT") {
+        ColumnKind::Text
+    } else if up.contains("REAL") || up.contains("FLOA") || up.contains("DOUB") {
+        ColumnKind::Real
+    } else {
+        ColumnKind::Blob
+    }
+}
+
+/// One `PRAGMA table_info` row, tolerant of absent tables.
+#[cfg(feature = "native")]
+struct ColRow {
+    name: String,
+    decl: String,
+    notnull: bool,
+    dflt: Option<String>,
+    /// 1-based PK position, `0` if not part of the primary key.
+    pk: i64,
+}
+
+/// Read `PRAGMA table_info` for a table (empty if absent).
+#[cfg(feature = "native")]
+fn table_info(conn: &Connection, table: &str) -> Result<Vec<ColRow>, MigrateError> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", quote_ident(table)))?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(ColRow {
+                name: r.get::<_, String>(1)?,
+                decl: r.get::<_, String>(2)?,
+                notnull: r.get::<_, i64>(3)? != 0,
+                dflt: r.get::<_, Option<String>>(4)?,
+                pk: r.get::<_, i64>(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// The primary-key column names of a table, in key order.
+#[cfg(feature = "native")]
+fn primary_key(info: &[ColRow]) -> Vec<String> {
+    let mut pk: Vec<&ColRow> = info.iter().filter(|c| c.pk > 0).collect();
+    pk.sort_by_key(|c| c.pk);
+    pk.into_iter().map(|c| c.name.clone()).collect()
+}
+
+/// Reconstruct a structured [`Column`] from a pragma row. The primary key is
+/// emitted table-level by the caller, so no `Constraint::Pk` is attached here.
+#[cfg(feature = "native")]
+fn column_from_row(row: &ColRow) -> Column {
+    let mut constraints = Vec::new();
+    if row.notnull {
+        constraints.push(Constraint::NotNull);
+    }
+    if let Some(d) = &row.dflt {
+        constraints.push(Constraint::Default(d.clone()));
+    }
+    Column {
+        name: row.name.clone(),
+        kind: kind_from_decl(&row.decl),
+        constraints,
+        tags: Vec::new(),
+    }
+}
+
+/// The verbatim `CREATE` DDL of a `sqlite_master` object, if present.
+#[cfg(feature = "native")]
+fn object_sql(conn: &Connection, kind: &str, name: &str) -> Result<Option<String>, MigrateError> {
+    use rusqlite::OptionalExtension;
+    let sql = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = ?1 AND name = ?2",
+            rusqlite::params![kind, name],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?;
+    Ok(sql.flatten())
+}
+
+/// Verbatim `CREATE INDEX` / `CREATE TRIGGER` DDL attached to a table.
+#[cfg(feature = "native")]
+fn aux_object_ddl(conn: &Connection, table: &str) -> Result<Vec<String>, MigrateError> {
+    let mut stmt = conn.prepare(
+        "SELECT sql FROM sqlite_master \
+         WHERE tbl_name = ?1 AND type IN ('index', 'trigger') AND sql IS NOT NULL \
+         ORDER BY type, name",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![table], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Read the captured rows for `columns` from `table`, in table order.
+#[cfg(feature = "native")]
+fn capture_rows(
+    conn: &Connection,
+    table: &str,
+    columns: &[String],
+) -> Result<Vec<Vec<CapturedValue>>, MigrateError> {
+    let list = columns
+        .iter()
+        .map(|c| quote_ident(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut stmt = conn.prepare(&format!("SELECT {} FROM {}", list, quote_ident(table)))?;
+    let n = columns.len();
+    let rows = stmt
+        .query_map([], |r| {
+            let mut out = Vec::with_capacity(n);
+            for i in 0..n {
+                out.push(captured_from_sql(r.get::<_, SqlValue>(i)?));
+            }
+            Ok(out)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Lower a rusqlite value into the serializable [`CapturedValue`].
+#[cfg(feature = "native")]
+fn captured_from_sql(v: SqlValue) -> CapturedValue {
+    match v {
+        SqlValue::Null => CapturedValue::Null,
+        SqlValue::Integer(i) => CapturedValue::Int(i),
+        SqlValue::Real(r) => CapturedValue::Real(r),
+        SqlValue::Text(s) => CapturedValue::Text(s),
+        SqlValue::Blob(b) => CapturedValue::Blob(b),
+    }
+}
+
+/// Raise a serializable [`CapturedValue`] back into a bindable rusqlite value.
+#[cfg(feature = "native")]
+fn captured_to_sql(v: &CapturedValue) -> SqlValue {
+    match v {
+        CapturedValue::Null => SqlValue::Null,
+        CapturedValue::Int(i) => SqlValue::Integer(*i),
+        CapturedValue::Real(r) => SqlValue::Real(*r),
+        CapturedValue::Text(s) => SqlValue::Text(s.clone()),
+        CapturedValue::Blob(b) => SqlValue::Blob(b.clone()),
+    }
+}
+
+/// Accumulates the delta-scoped pre-image while a destructive forward apply runs.
+///
+/// Drive it as the `pre_op` write-ahead hook of
+/// [`apply_ops`](crate::migrate::apply::apply_ops): the hook fires *before* each
+/// op's own transaction, so [`Self::capture_before`] snapshots committed,
+/// pre-mutation state. Additive ops are ignored (their reverse carries no data).
+///
+/// ```ignore
+/// let mut cap = PreimageCapturer::new();
+/// apply_ops(conn, &up, &mut |op| cap.capture_before(conn, op))?;
+/// let payload = cap.into_payload();
+/// ```
+#[cfg(feature = "native")]
+#[derive(Debug, Default)]
+pub struct PreimageCapturer {
+    payload: PreimagePayload,
+}
+
+#[cfg(feature = "native")]
+impl PreimageCapturer {
+    /// A fresh, empty capturer.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Snapshot the pre-image of `op` if it is destructive; no-op otherwise.
+    ///
+    /// Must run **before** `op` mutates (it reads the current table). Additive
+    /// ops carry no data, so they are skipped.
+    pub fn capture_before(
+        &mut self,
+        conn: &Connection,
+        op: &ClassifiedOp,
+    ) -> Result<(), MigrateError> {
+        match &op.op {
+            Op::DropColumn { table, column } => {
+                let capture = self.capture_drop_column(conn, table, column)?;
+                self.payload.tables.push(capture);
+            }
+            Op::DropTable { table } => {
+                let capture = self.capture_drop_table(conn, table)?;
+                self.payload.tables.push(capture);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Consume the capturer, yielding the accumulated pre-image.
+    pub fn into_payload(self) -> PreimagePayload {
+        self.payload
+    }
+
+    #[cfg(feature = "native")]
+    fn capture_drop_column(
+        &self,
+        conn: &Connection,
+        table: &str,
+        column: &str,
+    ) -> Result<TablePreimage, MigrateError> {
+        let info = table_info(conn, table)?;
+        if info.is_empty() {
+            return Err(MigrateError::Apply(format!(
+                "cannot capture pre-image: table {table:?} does not exist"
+            )));
+        }
+        let pk = primary_key(&info);
+        if pk.is_empty() {
+            return Err(MigrateError::Apply(format!(
+                "cannot capture pre-image for {table:?}: no primary key (needed to key the \
+                 surgical restore)"
+            )));
+        }
+        if pk.iter().any(|k| k == column) {
+            return Err(MigrateError::Apply(format!(
+                "cannot reverse dropping primary-key column {column:?} on {table:?} via a \
+                 surgical pre-image"
+            )));
+        }
+        let columns: Vec<Column> = info.iter().map(column_from_row).collect();
+        let without_rowid = object_sql(conn, "table", table)?
+            .map(|s| s.to_ascii_uppercase().contains("WITHOUT ROWID"))
+            .unwrap_or(false);
+
+        let mut captured_columns = pk.clone();
+        captured_columns.push(column.to_string());
+        let rows = capture_rows(conn, table, &captured_columns)?;
+
+        Ok(TablePreimage::Column {
+            table: table.to_string(),
+            dropped: column.to_string(),
+            columns,
+            pk,
+            without_rowid,
+            captured_columns,
+            rows,
+        })
+    }
+
+    #[cfg(feature = "native")]
+    fn capture_drop_table(
+        &self,
+        conn: &Connection,
+        table: &str,
+    ) -> Result<TablePreimage, MigrateError> {
+        let info = table_info(conn, table)?;
+        if info.is_empty() {
+            return Err(MigrateError::Apply(format!(
+                "cannot capture pre-image: table {table:?} does not exist"
+            )));
+        }
+        let create_sql = object_sql(conn, "table", table)?.ok_or_else(|| {
+            MigrateError::Apply(format!(
+                "cannot capture pre-image: no DDL for table {table:?}"
+            ))
+        })?;
+        let pk = primary_key(&info);
+        let columns: Vec<String> = info.iter().map(|c| c.name.clone()).collect();
+        let rows = capture_rows(conn, table, &columns)?;
+        let aux_ddl = aux_object_ddl(conn, table)?;
+
+        Ok(TablePreimage::Table {
+            table: table.to_string(),
+            create_sql,
+            aux_ddl,
+            pk,
+            columns,
+            rows,
+        })
+    }
+}
+
+/// Restore a captured pre-image: reconstruct the lost structure, then refill the
+/// lost cells with an idempotent PK-keyed UPSERT (surgical, re-runnable -- spike
+/// C). Concurrent rows not in the pre-image are never touched.
+///
+/// Captures are undone in **reverse capture order** (last dropped, first
+/// restored). Two ops on one table must unwind LIFO: restoring an earlier
+/// capture whose schema still references a column a later drop removed would try
+/// to copy a column the current table no longer has. Reverse order restores the
+/// later (narrower) capture first, so each rebuild's projection matches the live
+/// table.
+#[cfg(feature = "native")]
+pub fn restore_payload(conn: &Connection, payload: &PreimagePayload) -> Result<(), MigrateError> {
+    for table in payload.tables.iter().rev() {
+        match table {
+            TablePreimage::Column {
+                table,
+                dropped,
+                columns,
+                pk,
+                without_rowid,
+                captured_columns,
+                rows,
+            } => restore_column(
+                conn,
+                table,
+                dropped,
+                columns,
+                pk,
+                *without_rowid,
+                captured_columns,
+                rows,
+            )?,
+            TablePreimage::Table {
+                table,
+                create_sql,
+                aux_ddl,
+                pk,
+                columns,
+                rows,
+            } => restore_table(conn, table, create_sql, aux_ddl, pk, columns, rows)?,
+        }
+    }
+    Ok(())
+}
+
+/// Restore a dropped column: rebuild the table to the explicit pre-drop schema
+/// (re-adding the column, structurally faithful via
+/// [`rebuild_to_schema`](crate::migrate::apply::rebuild_to_schema)), then UPSERT
+/// the captured values back into it.
+#[cfg(feature = "native")]
+#[allow(clippy::too_many_arguments)]
+fn restore_column(
+    conn: &Connection,
+    table: &str,
+    dropped: &str,
+    columns: &[Column],
+    pk: &[String],
+    without_rowid: bool,
+    captured_columns: &[String],
+    rows: &[Vec<CapturedValue>],
+) -> Result<(), MigrateError> {
+    let dropped_col = columns.iter().find(|c| c.name == dropped).ok_or_else(|| {
+        MigrateError::Apply(format!(
+            "pre-image for {table:?} is missing the dropped column {dropped:?}"
+        ))
+    })?;
+    // The rebuild copies the surviving columns and leaves the re-added column
+    // empty until the UPSERT fills it. A NOT NULL column with no default cannot
+    // survive that gap -- fail with a clear message, not a raw SQL error.
+    let not_null = dropped_col
+        .constraints
+        .iter()
+        .any(|c| matches!(c, Constraint::NotNull));
+    let has_default = dropped_col
+        .constraints
+        .iter()
+        .any(|c| matches!(c, Constraint::Default(_)));
+    if not_null && !has_default {
+        return Err(MigrateError::Apply(format!(
+            "cannot restore NOT NULL column {dropped:?} on {table:?} without a default \
+             (rebuild-then-fill leaves it null until the row-level UPSERT)"
+        )));
+    }
+
+    // Only rebuild if the column is actually gone (idempotent re-run: a second
+    // restore finds the column present and skips straight to the UPSERT).
+    let present: Vec<String> = table_info(conn, table)?
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
+    if !present.iter().any(|c| c == dropped) {
+        let mut body: Vec<String> = columns.iter().map(render_column_def).collect();
+        if !pk.is_empty() {
+            body.push(format!(
+                "PRIMARY KEY ({})",
+                pk.iter()
+                    .map(|c| quote_ident(c))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        // Copy every surviving column identity-wise; the re-added column is left
+        // out of the projection so it defaults to null/its default.
+        let projection: Vec<(String, String)> = columns
+            .iter()
+            .filter(|c| c.name != dropped)
+            .map(|c| (c.name.clone(), quote_ident(&c.name)))
+            .collect();
+        let post_ddl = aux_object_ddl(conn, table)?;
+        let spec = RebuildSpec {
+            table: table.to_string(),
+            body,
+            without_rowid,
+            projection,
+            post_ddl,
+        };
+        rebuild_to_schema(conn, &spec)?;
+    }
+
+    upsert_rows(
+        conn,
+        table,
+        captured_columns,
+        pk,
+        &[dropped.to_string()],
+        rows,
+    )
+}
+
+/// Restore a dropped table: recreate it from the verbatim captured DDL if it is
+/// absent, then UPSERT every captured row back in.
+#[cfg(feature = "native")]
+fn restore_table(
+    conn: &Connection,
+    table: &str,
+    create_sql: &str,
+    aux_ddl: &[String],
+    pk: &[String],
+    columns: &[String],
+    rows: &[Vec<CapturedValue>],
+) -> Result<(), MigrateError> {
+    let exists: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        rusqlite::params![table],
+        |r| r.get(0),
+    )?;
+    if exists == 0 {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(create_sql)?;
+        for ddl in aux_ddl {
+            tx.execute_batch(ddl)?;
+        }
+        tx.commit()?;
+    }
+    let non_pk: Vec<String> = columns
+        .iter()
+        .filter(|c| !pk.contains(c))
+        .cloned()
+        .collect();
+    upsert_rows(conn, table, columns, pk, &non_pk, rows)
+}
+
+/// Idempotent PK-keyed UPSERT: insert each row, and on a PK conflict update only
+/// `update_columns` from the incoming row (`excluded`). Surgical -- an untouched
+/// column of a matched row, and any row not in `rows`, is left exactly as it was.
+#[cfg(feature = "native")]
+fn upsert_rows(
+    conn: &Connection,
+    table: &str,
+    insert_columns: &[String],
+    pk: &[String],
+    update_columns: &[String],
+    rows: &[Vec<CapturedValue>],
+) -> Result<(), MigrateError> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let cols = insert_columns
+        .iter()
+        .map(|c| quote_ident(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let placeholders = (0..insert_columns.len())
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(", ");
+    let conflict = pk
+        .iter()
+        .map(|c| quote_ident(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let action = if update_columns.is_empty() {
+        "DO NOTHING".to_string()
+    } else {
+        let sets = update_columns
+            .iter()
+            .map(|c| format!("{q} = excluded.{q}", q = quote_ident(c)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("DO UPDATE SET {sets}")
+    };
+    let sql = format!(
+        "INSERT INTO {t} ({cols}) VALUES ({placeholders}) ON CONFLICT ({conflict}) {action}",
+        t = quote_ident(table)
+    );
+
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut stmt = tx.prepare(&sql)?;
+        for row in rows {
+            if row.len() != insert_columns.len() {
+                return Err(MigrateError::Apply(format!(
+                    "pre-image row width {} does not match {} captured columns for {table:?}",
+                    row.len(),
+                    insert_columns.len()
+                )));
+            }
+            stmt.execute(params_from_iter(row.iter().map(captured_to_sql)))?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+// ===========================================================================
+// Native: content-addressed pre-image storage (inline vs relay)
+// ===========================================================================
+
+/// Persist a captured pre-image as a [`Preimage`].
+///
+/// Small payloads (serialized `<= `[`INLINE_MAX_BYTES`]) ride inline; larger ones
+/// **require** a relay -- the pre-image is written to the content-addressed store
+/// (`config`) keyed by its SHA-256 and returned as [`Preimage::Ref`]. A payload
+/// over the boundary with no `config` is a hard error (a large pre-image must not
+/// silently fail to travel).
+#[cfg(feature = "native")]
+pub async fn store_preimage(
+    payload: &PreimagePayload,
+    config: Option<&StashConfig>,
+) -> Result<Preimage, MigrateError> {
+    let bytes =
+        serde_json::to_vec(payload).map_err(|e| MigrateError::Serialization(e.to_string()))?;
+    if bytes.len() <= INLINE_MAX_BYTES {
+        let rows = serde_json::to_value(payload)
+            .map_err(|e| MigrateError::Serialization(e.to_string()))?;
+        return Ok(Preimage::Inline { rows });
+    }
+    let config = config.ok_or_else(|| {
+        MigrateError::Apply(format!(
+            "pre-image is {} bytes, over the {} byte inline limit; a relay store (StashConfig) \
+             is required to carry it",
+            bytes.len(),
+            INLINE_MAX_BYTES
+        ))
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let key = hex::encode(hasher.finalize());
+    let (store, _) =
+        crate::stash::build_store(config).map_err(|e| MigrateError::Apply(e.to_string()))?;
+    let path = ObjectPath::from(format!("{key}.preimage"));
+    store
+        .put(&path, PutPayload::from(bytes))
+        .await
+        .map_err(|e| MigrateError::Apply(format!("pre-image store put failed: {e}")))?;
+    Ok(Preimage::Ref { key })
+}
+
+/// Load a pre-image back from its [`Preimage`] reference. An inline payload
+/// deserializes directly; a [`Preimage::Ref`] is fetched from the content-
+/// addressed store (`config` required).
+#[cfg(feature = "native")]
+pub async fn load_preimage(
+    preimage: &Preimage,
+    config: Option<&StashConfig>,
+) -> Result<PreimagePayload, MigrateError> {
+    match preimage {
+        Preimage::Inline { rows } => serde_json::from_value(rows.clone())
+            .map_err(|e| MigrateError::Serialization(e.to_string())),
+        Preimage::Ref { key } => {
+            let config = config.ok_or_else(|| {
+                MigrateError::Apply(
+                    "pre-image is a store reference but no StashConfig was provided".to_string(),
+                )
+            })?;
+            let (store, _) = crate::stash::build_store(config)
+                .map_err(|e| MigrateError::Apply(e.to_string()))?;
+            let path = ObjectPath::from(format!("{key}.preimage"));
+            let got = store
+                .get(&path)
+                .await
+                .map_err(|e| MigrateError::Apply(format!("pre-image store get failed: {e}")))?;
+            let bytes = got
+                .bytes()
+                .await
+                .map_err(|e| MigrateError::Apply(format!("pre-image store read failed: {e}")))?;
+            serde_json::from_slice(&bytes).map_err(|e| MigrateError::Serialization(e.to_string()))
+        }
+    }
+}
+
+/// The pre-image reference recorded on a ledger row, if any (OQ2, read-only).
+///
+/// The forward driver (#296) *writes* `preimage_ref` when it stashes a large
+/// destructive pre-image; reverse only *reads* it here, resolving the stored key
+/// to a [`Preimage::Ref`] to feed [`load_preimage`]. `None` means the reverse's
+/// pre-image (if any) travels inline in the manifest instead.
+#[cfg(feature = "native")]
+pub fn preimage_ref_of(entry: &LedgerEntry) -> Option<Preimage> {
+    entry
+        .preimage_ref
+        .as_ref()
+        .map(|key| Preimage::Ref { key: key.clone() })
+}
+
+// ===========================================================================
+// Native: append-only compensating rollback step
+// ===========================================================================
+
+/// Apply a reverse as a **new, append-only compensating `version` step**.
+///
+/// Elects `version` (`vN+1`) through the ledger's normal two-phase flow
+/// ([`Ledger::try_elect`] -> apply -> [`Ledger::mark_success`]); the reversed
+/// `vN` row is never popped, marked, or edited (that would trip the chain-hash
+/// tamper check). Additive reverses ride `down_ops` through
+/// [`apply_ops`](crate::migrate::apply::apply_ops); a destructive reverse's
+/// structural + data restore rides `payload` through [`restore_payload`]. On a
+/// mid-apply failure the row is marked failed so it is immediately reclaimable.
+///
+/// Scope: this composes a **pure-additive** reverse (`down_ops`, empty `payload`)
+/// or a **pure-destructive** one (empty `down_ops`, `payload`). A reverse that
+/// interleaves the two -- dropping a column whose data a later restore's captured
+/// schema still references -- cannot be expressed as "all `down_ops`, then all
+/// restores" and is the composing driver's concern (#296). The seam already
+/// enforces this: [`additive_down_ops`] errors on any destructive op, so a caller
+/// cannot assemble a mixed `down_ops` from a mixed `up` here.
+///
+/// Returns the [`Election`] outcome: `Won` means the step applied, anything else
+/// means it was already applied or is held by another node (the caller backs off).
+#[cfg(feature = "native")]
+pub fn apply_compensating(
+    conn: &Connection,
+    version: u64,
+    checksum: &str,
+    down_ops: &[ClassifiedOp],
+    payload: Option<&PreimagePayload>,
+    lease_secs: i64,
+) -> crate::error::Result<Election> {
+    let election = Ledger::try_elect(conn, version, checksum, lease_secs)?;
+    if election != Election::Won {
+        return Ok(election);
+    }
+    let outcome = (|| -> crate::error::Result<()> {
+        let mut noop = |_: &ClassifiedOp| -> Result<(), MigrateError> { Ok(()) };
+        apply_ops(conn, down_ops, &mut noop)?;
+        if let Some(p) = payload {
+            restore_payload(conn, p)?;
+        }
+        Ok(())
+    })();
+    match outcome {
+        Ok(()) => {
+            Ledger::mark_success(conn, version)?;
+            Ok(Election::Won)
+        }
+        Err(e) => {
+            // Best-effort: leave the row reclaimable. The original error wins.
+            let _ = Ledger::mark_failed(conn, version);
+            Err(e)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn col(name: &str, kind: ColumnKind) -> Column {
+        Column {
+            name: name.to_string(),
+            kind,
+            constraints: Vec::new(),
+            tags: Vec::new(),
+        }
+    }
+
+    // -- Structural inverse (pure, both feature sets) -----------------------
+
+    #[test]
+    fn create_table_inverts_to_drop_table() {
+        let inv = structural_inverse(&Op::CreateTable {
+            table: "t".into(),
+            columns: vec![col("id", ColumnKind::Text)],
+            without_rowid: false,
+        })
+        .unwrap();
+        assert_eq!(inv, Op::DropTable { table: "t".into() });
+    }
+
+    #[test]
+    fn add_column_inverts_to_drop_column() {
+        let inv = structural_inverse(&Op::AddColumn {
+            table: "t".into(),
+            column: col("email", ColumnKind::Text),
+        })
+        .unwrap();
+        assert_eq!(
+            inv,
+            Op::DropColumn {
+                table: "t".into(),
+                column: "email".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn create_index_inverts_to_drop_index() {
+        let inv = structural_inverse(&Op::CreateIndex {
+            name: "idx".into(),
+            table: "t".into(),
+            columns: vec!["a".into()],
+            unique: false,
+        })
+        .unwrap();
+        assert_eq!(inv, Op::DropIndex { name: "idx".into() });
+    }
+
+    #[test]
+    fn renames_invert_by_swapping() {
+        assert_eq!(
+            structural_inverse(&Op::RenameTable {
+                from: "a".into(),
+                to: "b".into(),
+            })
+            .unwrap(),
+            Op::RenameTable {
+                from: "b".into(),
+                to: "a".into(),
+            }
+        );
+        assert_eq!(
+            structural_inverse(&Op::RenameColumn {
+                table: "t".into(),
+                from: "a".into(),
+                to: "b".into(),
+            })
+            .unwrap(),
+            Op::RenameColumn {
+                table: "t".into(),
+                from: "b".into(),
+                to: "a".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn destructive_ops_have_no_structural_inverse() {
+        assert!(structural_inverse(&Op::DropTable { table: "t".into() }).is_err());
+        assert!(structural_inverse(&Op::DropColumn {
+            table: "t".into(),
+            column: "c".into(),
+        })
+        .is_err());
+        assert!(structural_inverse(&Op::DropIndex { name: "i".into() }).is_err());
+    }
+
+    #[test]
+    fn additive_down_ops_reverses_order() {
+        let up = vec![
+            ClassifiedOp::new(Op::CreateTable {
+                table: "a".into(),
+                columns: vec![col("id", ColumnKind::Text)],
+                without_rowid: false,
+            }),
+            ClassifiedOp::new(Op::AddColumn {
+                table: "a".into(),
+                column: col("email", ColumnKind::Text),
+            }),
+        ];
+        let down = additive_down_ops(&up).unwrap();
+        // Last applied (AddColumn) is undone first.
+        assert_eq!(
+            down[0].op,
+            Op::DropColumn {
+                table: "a".into(),
+                column: "email".into(),
+            }
+        );
+        assert_eq!(down[1].op, Op::DropTable { table: "a".into() });
+    }
+
+    #[test]
+    fn additive_down_ops_rejects_destructive() {
+        let up = vec![ClassifiedOp::new(Op::DropTable { table: "t".into() })];
+        assert!(additive_down_ops(&up).is_err());
+    }
+
+    // -- Pre-image payload serde (pure, both feature sets) -------------------
+
+    #[test]
+    fn captured_value_round_trips_every_class() {
+        let payload = PreimagePayload {
+            tables: vec![TablePreimage::Column {
+                table: "t".into(),
+                dropped: "c".into(),
+                columns: vec![col("id", ColumnKind::Text), col("c", ColumnKind::Blob)],
+                pk: vec!["id".into()],
+                without_rowid: false,
+                captured_columns: vec!["id".into(), "c".into()],
+                rows: vec![
+                    vec![CapturedValue::Text("k1".into()), CapturedValue::Null],
+                    vec![
+                        CapturedValue::Text("k2".into()),
+                        CapturedValue::Blob(vec![0, 1, 2, 255]),
+                    ],
+                    vec![CapturedValue::Int(7), CapturedValue::Real(1.5)],
+                ],
+            }],
+        };
+        let json = serde_json::to_vec(&payload).unwrap();
+        let back: PreimagePayload = serde_json::from_slice(&json).unwrap();
+        assert_eq!(payload, back);
+    }
+
+    #[test]
+    fn inline_boundary_is_pinned() {
+        assert_eq!(INLINE_MAX_BYTES, 64 * 1024);
+    }
+
+    // -- Native round trips -------------------------------------------------
+    #[cfg(feature = "native")]
+    mod native {
+        use super::*;
+        use crate::migrate::apply::apply_ops;
+        use crate::migrate::ledger::{Ledger, MigrationStatus};
+        use rusqlite::Connection;
+
+        fn noop(_: &ClassifiedOp) -> Result<(), MigrateError> {
+            Ok(())
+        }
+
+        fn apply(conn: &Connection, op: Op) {
+            apply_ops(conn, &[ClassifiedOp::new(op)], &mut noop).unwrap();
+        }
+
+        fn seed_users(conn: &Connection) {
+            conn.execute_batch(
+                "CREATE TABLE users (id TEXT PRIMARY KEY, email TEXT, keep TEXT);
+                 INSERT INTO users VALUES ('u1', 'a@x', 'ka');
+                 INSERT INTO users VALUES ('u2', 'b@x', 'kb');",
+            )
+            .unwrap();
+        }
+
+        fn email_of(conn: &Connection, id: &str) -> Option<String> {
+            conn.query_row(
+                "SELECT email FROM users WHERE id = ?1",
+                rusqlite::params![id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+        }
+
+        fn keep_of(conn: &Connection, id: &str) -> Option<String> {
+            conn.query_row(
+                "SELECT keep FROM users WHERE id = ?1",
+                rusqlite::params![id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+        }
+
+        #[test]
+        fn additive_reverse_drops_created_table() {
+            let conn = Connection::open_in_memory().unwrap();
+            apply(
+                &conn,
+                Op::CreateTable {
+                    table: "t".into(),
+                    columns: vec![col("id", ColumnKind::Text)],
+                    without_rowid: false,
+                },
+            );
+            let up = vec![ClassifiedOp::new(Op::CreateTable {
+                table: "t".into(),
+                columns: vec![col("id", ColumnKind::Text)],
+                without_rowid: false,
+            })];
+            let down = additive_down_ops(&up).unwrap();
+            apply_ops(&conn, &down, &mut noop).unwrap();
+            let n: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='t'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 0);
+        }
+
+        #[test]
+        fn drop_column_reverse_restores_data_surgically() {
+            let conn = Connection::open_in_memory().unwrap();
+            seed_users(&conn);
+
+            // Capture the delta-scoped pre-image DURING the destructive apply.
+            let drop = ClassifiedOp::new(Op::DropColumn {
+                table: "users".into(),
+                column: "email".into(),
+            });
+            let mut cap = PreimageCapturer::new();
+            apply_ops(&conn, std::slice::from_ref(&drop), &mut |op| {
+                cap.capture_before(&conn, op)
+            })
+            .unwrap();
+            let payload = cap.into_payload();
+
+            // The column really is gone.
+            assert!(table_info(&conn, "users")
+                .unwrap()
+                .iter()
+                .all(|c| c.name != "email"));
+
+            // A concurrent write lands after the drop: a new row, and an edit to
+            // a surviving column of an existing row. Neither is in the pre-image.
+            conn.execute_batch(
+                "INSERT INTO users (id, keep) VALUES ('u3', 'kc');
+                 UPDATE users SET keep = 'kb-edited' WHERE id = 'u2';",
+            )
+            .unwrap();
+
+            restore_payload(&conn, &payload).unwrap();
+
+            // Lost column restored for captured rows...
+            assert_eq!(email_of(&conn, "u1").as_deref(), Some("a@x"));
+            assert_eq!(email_of(&conn, "u2").as_deref(), Some("b@x"));
+            // ...the concurrent edit to a surviving column survives untouched...
+            assert_eq!(keep_of(&conn, "u2").as_deref(), Some("kb-edited"));
+            assert_eq!(keep_of(&conn, "u1").as_deref(), Some("ka"));
+            // ...and the concurrent row keeps its data with a null restored column.
+            assert_eq!(keep_of(&conn, "u3").as_deref(), Some("kc"));
+            assert_eq!(email_of(&conn, "u3"), None);
+        }
+
+        #[test]
+        fn restore_is_idempotent_on_rerun() {
+            let conn = Connection::open_in_memory().unwrap();
+            seed_users(&conn);
+            let drop = ClassifiedOp::new(Op::DropColumn {
+                table: "users".into(),
+                column: "email".into(),
+            });
+            let mut cap = PreimageCapturer::new();
+            apply_ops(&conn, std::slice::from_ref(&drop), &mut |op| {
+                cap.capture_before(&conn, op)
+            })
+            .unwrap();
+            let payload = cap.into_payload();
+
+            restore_payload(&conn, &payload).unwrap();
+            // Re-running the restore (rebuild is skipped, UPSERT re-keys) is a no-op.
+            restore_payload(&conn, &payload).unwrap();
+
+            assert_eq!(email_of(&conn, "u1").as_deref(), Some("a@x"));
+            assert_eq!(email_of(&conn, "u2").as_deref(), Some("b@x"));
+            let n: i64 = conn
+                .query_row("SELECT count(*) FROM users", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 2);
+        }
+
+        #[test]
+        fn drop_column_reverse_preserves_primary_key() {
+            // The faithful rebuild must re-add the column AND keep the PK, so the
+            // idempotent UPSERT has a conflict target to key on.
+            let conn = Connection::open_in_memory().unwrap();
+            seed_users(&conn);
+            let drop = ClassifiedOp::new(Op::DropColumn {
+                table: "users".into(),
+                column: "email".into(),
+            });
+            let mut cap = PreimageCapturer::new();
+            apply_ops(&conn, std::slice::from_ref(&drop), &mut |op| {
+                cap.capture_before(&conn, op)
+            })
+            .unwrap();
+            let payload = cap.into_payload();
+            restore_payload(&conn, &payload).unwrap();
+
+            let pk_cols: Vec<String> = table_info(&conn, "users")
+                .unwrap()
+                .into_iter()
+                .filter(|c| c.pk > 0)
+                .map(|c| c.name)
+                .collect();
+            assert_eq!(pk_cols, vec!["id".to_string()]);
+        }
+
+        #[test]
+        fn two_drops_on_one_table_restore_lifo() {
+            // Two DropColumns on the same table capture progressively narrower
+            // schemas. restore_payload must unwind them LIFO (last dropped first),
+            // or the earlier capture's rebuild would copy a column already gone.
+            let conn = Connection::open_in_memory().unwrap();
+            seed_users(&conn); // (id PK, email, keep)
+            let drops = vec![
+                ClassifiedOp::new(Op::DropColumn {
+                    table: "users".into(),
+                    column: "email".into(),
+                }),
+                ClassifiedOp::new(Op::DropColumn {
+                    table: "users".into(),
+                    column: "keep".into(),
+                }),
+            ];
+            let mut cap = PreimageCapturer::new();
+            apply_ops(&conn, &drops, &mut |op| cap.capture_before(&conn, op)).unwrap();
+            let payload = cap.into_payload();
+            assert_eq!(payload.tables.len(), 2);
+
+            // Both columns are gone.
+            let cols: Vec<String> = table_info(&conn, "users")
+                .unwrap()
+                .into_iter()
+                .map(|c| c.name)
+                .collect();
+            assert_eq!(cols, vec!["id".to_string()]);
+
+            restore_payload(&conn, &payload).unwrap();
+
+            assert_eq!(email_of(&conn, "u1").as_deref(), Some("a@x"));
+            assert_eq!(email_of(&conn, "u2").as_deref(), Some("b@x"));
+            assert_eq!(keep_of(&conn, "u1").as_deref(), Some("ka"));
+            assert_eq!(keep_of(&conn, "u2").as_deref(), Some("kb"));
+        }
+
+        #[test]
+        fn drop_table_reverse_restores_rows_and_leaves_others_untouched() {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE gone (id TEXT PRIMARY KEY, v TEXT);
+                 INSERT INTO gone VALUES ('g1', 'one'), ('g2', 'two');
+                 CREATE TABLE other (id TEXT PRIMARY KEY, v TEXT);
+                 INSERT INTO other VALUES ('o1', 'keep');",
+            )
+            .unwrap();
+
+            let drop = ClassifiedOp::new(Op::DropTable {
+                table: "gone".into(),
+            });
+            let mut cap = PreimageCapturer::new();
+            apply_ops(&conn, std::slice::from_ref(&drop), &mut |op| {
+                cap.capture_before(&conn, op)
+            })
+            .unwrap();
+            let payload = cap.into_payload();
+            assert!(!table_exists(&conn, "gone"));
+
+            restore_payload(&conn, &payload).unwrap();
+
+            let v1: String = conn
+                .query_row("SELECT v FROM gone WHERE id = 'g1'", [], |r| r.get(0))
+                .unwrap();
+            let v2: String = conn
+                .query_row("SELECT v FROM gone WHERE id = 'g2'", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(v1, "one");
+            assert_eq!(v2, "two");
+            // The untouched table is exactly as it was.
+            let other: String = conn
+                .query_row("SELECT v FROM other WHERE id = 'o1'", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(other, "keep");
+        }
+
+        #[test]
+        fn not_null_column_without_default_is_a_clear_error() {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE t (id TEXT PRIMARY KEY, needed TEXT NOT NULL);
+                 INSERT INTO t VALUES ('a', 'x');",
+            )
+            .unwrap();
+            let drop = ClassifiedOp::new(Op::DropColumn {
+                table: "t".into(),
+                column: "needed".into(),
+            });
+            let mut cap = PreimageCapturer::new();
+            apply_ops(&conn, std::slice::from_ref(&drop), &mut |op| {
+                cap.capture_before(&conn, op)
+            })
+            .unwrap();
+            let payload = cap.into_payload();
+            let err = restore_payload(&conn, &payload).unwrap_err();
+            assert!(matches!(err, MigrateError::Apply(m) if m.contains("NOT NULL")));
+        }
+
+        fn table_exists(conn: &Connection, table: &str) -> bool {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    rusqlite::params![table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            n > 0
+        }
+
+        // -- Compensating vN+1 ledger step ----------------------------------
+
+        #[test]
+        fn compensating_step_is_append_only() {
+            let conn = Connection::open_in_memory().unwrap();
+            Ledger::ensure_schema(&conn).unwrap();
+            // v1 lands: create a table.
+            apply(
+                &conn,
+                Op::CreateTable {
+                    table: "t".into(),
+                    columns: vec![col("id", ColumnKind::Text)],
+                    without_rowid: false,
+                },
+            );
+            assert_eq!(
+                Ledger::try_elect(&conn, 1, "c1", 300).unwrap(),
+                Election::Won
+            );
+            Ledger::mark_success(&conn, 1).unwrap();
+            let v1_before = Ledger::entry(&conn, 1).unwrap().unwrap();
+
+            // Reverse v1 as an append-only compensating v2 (drop the table).
+            let down = additive_down_ops(&[ClassifiedOp::new(Op::CreateTable {
+                table: "t".into(),
+                columns: vec![col("id", ColumnKind::Text)],
+                without_rowid: false,
+            })])
+            .unwrap();
+            let outcome =
+                apply_compensating(&conn, 2, "c2-compensating", &down, None, 300).unwrap();
+            assert_eq!(outcome, Election::Won);
+
+            // The reversed v1 row is byte-for-byte unchanged...
+            let v1_after = Ledger::entry(&conn, 1).unwrap().unwrap();
+            assert_eq!(v1_before, v1_after);
+            // ...a v2 row exists and succeeded...
+            let v2 = Ledger::entry(&conn, 2).unwrap().unwrap();
+            assert_eq!(v2.status, MigrationStatus::Success);
+            // ...the chain is intact...
+            Ledger::verify_chain(&conn).unwrap();
+            // ...and the table is gone.
+            assert!(!table_exists(&conn, "t"));
+        }
+
+        #[test]
+        fn compensating_step_skips_when_already_applied() {
+            let conn = Connection::open_in_memory().unwrap();
+            Ledger::ensure_schema(&conn).unwrap();
+            Ledger::try_elect(&conn, 2, "c2", 300).unwrap();
+            Ledger::mark_success(&conn, 2).unwrap();
+            let outcome = apply_compensating(&conn, 2, "c2", &[], None, 300).unwrap();
+            assert_eq!(outcome, Election::AlreadyApplied);
+        }
+
+        #[test]
+        fn destructive_compensating_step_restores_via_payload() {
+            let conn = Connection::open_in_memory().unwrap();
+            Ledger::ensure_schema(&conn).unwrap();
+            seed_users(&conn);
+
+            let drop = ClassifiedOp::new(Op::DropColumn {
+                table: "users".into(),
+                column: "email".into(),
+            });
+            let mut cap = PreimageCapturer::new();
+            apply_ops(&conn, std::slice::from_ref(&drop), &mut |op| {
+                cap.capture_before(&conn, op)
+            })
+            .unwrap();
+            let payload = cap.into_payload();
+
+            // The compensating step's structural restore rides the payload (there
+            // is no simple `down` op that faithfully re-adds a constrained column).
+            let outcome = apply_compensating(&conn, 5, "c5", &[], Some(&payload), 300).unwrap();
+            assert_eq!(outcome, Election::Won);
+            assert_eq!(email_of(&conn, "u1").as_deref(), Some("a@x"));
+            let v5 = Ledger::entry(&conn, 5).unwrap().unwrap();
+            assert_eq!(v5.status, MigrationStatus::Success);
+        }
+
+        // -- Inline vs Ref storage boundary ---------------------------------
+
+        fn big_payload(rows: usize) -> PreimagePayload {
+            let data: Vec<Vec<CapturedValue>> = (0..rows)
+                .map(|i| {
+                    vec![
+                        CapturedValue::Text(format!("key-{i:08}")),
+                        CapturedValue::Text("x".repeat(64)),
+                    ]
+                })
+                .collect();
+            PreimagePayload {
+                tables: vec![TablePreimage::Column {
+                    table: "t".into(),
+                    dropped: "c".into(),
+                    columns: vec![col("id", ColumnKind::Text), col("c", ColumnKind::Text)],
+                    pk: vec!["id".into()],
+                    without_rowid: false,
+                    captured_columns: vec!["id".into(), "c".into()],
+                    rows: data,
+                }],
+            }
+        }
+
+        #[tokio::test]
+        async fn small_payload_stores_inline() {
+            let payload = big_payload(1);
+            let stored = store_preimage(&payload, None).await.unwrap();
+            assert!(matches!(stored, Preimage::Inline { .. }));
+            let back = load_preimage(&stored, None).await.unwrap();
+            assert_eq!(back, payload);
+        }
+
+        #[tokio::test]
+        async fn large_payload_without_relay_is_refused() {
+            let payload = big_payload(2000);
+            let bytes = serde_json::to_vec(&payload).unwrap();
+            assert!(
+                bytes.len() > INLINE_MAX_BYTES,
+                "payload must exceed the boundary"
+            );
+            let err = store_preimage(&payload, None).await.unwrap_err();
+            assert!(matches!(err, MigrateError::Apply(m) if m.contains("inline limit")));
+        }
+
+        #[tokio::test]
+        async fn large_payload_round_trips_through_relay() {
+            let dir = tempfile::TempDir::new().unwrap();
+            std::fs::create_dir_all(dir.path()).unwrap();
+            let config = StashConfig {
+                url: format!("file://{}/manifest.json", dir.path().display()),
+                access_key_id: None,
+                secret_access_key: None,
+                region: None,
+                endpoint: None,
+            };
+            let payload = big_payload(2000);
+            let stored = store_preimage(&payload, Some(&config)).await.unwrap();
+            let key = match &stored {
+                Preimage::Ref { key } => key.clone(),
+                other => panic!("expected a Ref, got {other:?}"),
+            };
+            // The reference is the content hash of the payload.
+            assert_eq!(key.len(), 64);
+            let back = load_preimage(&stored, Some(&config)).await.unwrap();
+            assert_eq!(back, payload);
+        }
+
+        #[tokio::test]
+        async fn large_ref_without_config_is_refused() {
+            let stored = Preimage::Ref {
+                key: "deadbeef".into(),
+            };
+            let err = load_preimage(&stored, None).await.unwrap_err();
+            assert!(matches!(err, MigrateError::Apply(_)));
+        }
+
+        // -- Ledger preimage_ref is read-only for reverse -------------------
+
+        #[test]
+        fn preimage_ref_reads_from_the_ledger_row() {
+            let conn = Connection::open_in_memory().unwrap();
+            Ledger::ensure_schema(&conn).unwrap();
+            Ledger::try_elect(&conn, 1, "c1", 300).unwrap();
+            Ledger::mark_success(&conn, 1).unwrap();
+            // No ref yet.
+            let entry = Ledger::entry(&conn, 1).unwrap().unwrap();
+            assert!(preimage_ref_of(&entry).is_none());
+            // The driver (#296) writes the forward-compat column out of band.
+            conn.execute(
+                &format!(
+                    "UPDATE \"{}\" SET preimage_ref = 'abc123' WHERE version = 1",
+                    crate::migrate::ledger::LEDGER_TABLE
+                ),
+                [],
+            )
+            .unwrap();
+            let entry = Ledger::entry(&conn, 1).unwrap().unwrap();
+            assert_eq!(
+                preimage_ref_of(&entry),
+                Some(Preimage::Ref {
+                    key: "abc123".into()
+                })
+            );
+            // Writing the column did not break the chain.
+            Ledger::verify_chain(&conn).unwrap();
+        }
+    }
+}

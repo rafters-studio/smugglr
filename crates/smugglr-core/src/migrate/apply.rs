@@ -85,7 +85,10 @@ fn column_kind_keyword(kind: ColumnKind) -> &'static str {
 ///
 /// Constraints are emitted in declared order. `DEFAULT` and `CHECK` payloads are
 /// carried verbatim (they are author-supplied SQL expressions).
-fn render_column_def(col: &Column) -> String {
+///
+/// Exposed `pub(crate)` so reverse (#274) can render an explicit target schema
+/// into a [`RebuildSpec`] body without duplicating the column-DDL lowering.
+pub(crate) fn render_column_def(col: &Column) -> String {
     let mut s = format!(
         "{} {}",
         quote_ident(&col.name),
@@ -550,28 +553,55 @@ fn rebuild_dropping_column(
 
 // --- The guarded 12-step rebuild -------------------------------------------
 
-/// A fully-formed rebuild plan: the caller (`rebuild_dropping_column`) has
-/// already resolved the primary key, foreign keys, and post-rebuild DDL into
-/// `body` / `post_ddl`.
+/// A fully-formed rebuild plan: the caller (`rebuild_dropping_column`, or reverse
+/// #274 via [`rebuild_to_schema`]) has already resolved the primary key, foreign
+/// keys, and post-rebuild DDL into `body` / `post_ddl`.
+///
+/// The spec is the *explicit target schema*: [`rebuild_to_schema`] renders exactly
+/// these fragments, inferring nothing from pragmas, so a caller that supplies the
+/// full schema (reverse's captured pre-image; convert #280) has none of the
+/// `DROP COLUMN` reconstruction limits documented on this module.
 #[cfg(feature = "native")]
-struct RebuildSpec {
+pub struct RebuildSpec {
     /// The table being rebuilt (dropped and recreated under this final name).
-    table: String,
+    pub table: String,
     /// The full `CREATE TABLE` body fragments (column defs + table-level
     /// constraints), joined by `, `.
-    body: Vec<String>,
+    pub body: Vec<String>,
     /// Whether the rebuilt table is `WITHOUT ROWID`.
-    without_rowid: bool,
+    pub without_rowid: bool,
     /// `(dest_column, source_expr)` pairs for the `INSERT ... SELECT` copy.
-    projection: Vec<(String, String)>,
+    pub projection: Vec<(String, String)>,
     /// Extra statements to run after the rename (e.g. recreate indexes).
-    post_ddl: Vec<String>,
+    pub post_ddl: Vec<String>,
 }
 
 /// The temp table name used mid-rebuild. A single connection rebuilds one table
 /// at a time, and it is dropped-if-exists first, so a fixed name is safe.
 #[cfg(feature = "native")]
 const REBUILD_TMP: &str = "_smugglr_rebuild_tmp";
+
+/// Rebuild a table to an **explicit target schema** (the public entry for reverse
+/// #274 / convert #280).
+///
+/// Unlike the `DROP COLUMN` path -- which *infers* the surviving schema from
+/// `PRAGMA table_info` / `foreign_key_list` and therefore cannot recover `CHECK` /
+/// `UNIQUE` / `COLLATE` / generated columns / `WITHOUT ROWID` -- this takes the
+/// schema as a fully-formed [`RebuildSpec`]: the caller supplies `body` (column
+/// defs + table-level constraints), `projection` (the `INSERT ... SELECT` copy
+/// from the *current* table into the target), and `post_ddl` (indexes to
+/// recreate). Whatever the caller renders is what the rebuilt table gets, so the
+/// reconstruction limits above do not apply. The table being rebuilt must already
+/// exist (the copy reads from it); recreating a *dropped* table is a
+/// `CREATE TABLE`, not a rebuild.
+///
+/// The guarantees of the 12-step rebuild still hold: `foreign_keys` is toggled
+/// outside the transaction, `sqlite_sequence` is preserved, and
+/// `foreign_key_check` + `integrity_check` gate the commit.
+#[cfg(feature = "native")]
+pub fn rebuild_to_schema(conn: &Connection, spec: &RebuildSpec) -> Result<(), MigrateError> {
+    rebuild_table(conn, spec)
+}
 
 /// Run the guarded 12-step table rebuild.
 ///
