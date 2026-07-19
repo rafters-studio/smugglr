@@ -18,6 +18,7 @@
 
 use std::collections::HashMap;
 
+use base64::Engine as _;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -78,11 +79,13 @@ fn canonical_number(n: &serde_json::Number) -> String {
 /// sources. An absent column is treated as NULL (a missing JSON field and an
 /// explicit null are the same row).
 ///
-/// BLOB wire contract: the native path renders blobs as lowercase hex (via
-/// `local.rs::get_json_value`). For a remote (JSON) source to converge, its
-/// endpoint MUST also transport blob columns as lowercase-hex strings; a backend
-/// that returns base64 or a byte array will hash differently. Backends that
-/// cannot meet this should `exclude` their blob columns. (Residual of #202.)
+/// BLOB wire contract: blobs fold as lowercase hex on EVERY path. The native
+/// path emits hex directly (`local.rs::get_json_value`); a JSON backend that
+/// renders base64 (or another encoding) MUST canonicalize its blob columns to
+/// hex via [`canonicalize_blob_columns`] before calling this, so the same bytes
+/// hash identically everywhere. A value that cannot be canonicalized should be
+/// `exclude`d on both peers -- one-sided exclusion does not converge, since the
+/// hex-rendering native side still folds it. (#292, residual of #202.)
 pub fn content_hash(
     row: &HashMap<String, Value>,
     columns_in_order: &[String],
@@ -121,6 +124,85 @@ pub fn content_hash(
         hasher.update(b"|");
     }
     hex::encode(hasher.finalize())
+}
+
+/// How a backend renders a BLOB column's bytes into the JSON string that
+/// reaches [`content_hash`].
+///
+/// The native rusqlite path renders lowercase hex (`local.rs::get_json_value`);
+/// JSON SQL endpoints (Turso/rqlite/D1 and the wasm executors) commonly render
+/// standard base64. Two peers that fold different renderings of the SAME bytes
+/// never converge -- the row reads `content_differs` forever. The content hash
+/// pins ONE canonical form (lowercase hex), so a non-hex backend must declare
+/// its encoding and canonicalize before hashing. (#292, residual of #202.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlobEncoding {
+    /// Lowercase hexadecimal -- the canonical form; the native path already
+    /// emits this, so canonicalizing it only validates and normalizes case.
+    Hex,
+    /// Standard (padded) base64 -- what the JSON SQL backends emit.
+    Base64,
+}
+
+/// True when a declared SQLite column type denotes a BLOB, so its rendered
+/// string value must be canonicalized to hex before hashing.
+///
+/// Match is on the declared type containing `BLOB` (case-insensitive), the
+/// affinity rule SQLite itself uses. An EMPTY declared type is deliberately NOT
+/// treated as a blob: although SQLite gives it BLOB affinity, such columns hold
+/// arbitrary dynamically-typed values, and base64-decoding a genuine text value
+/// would corrupt it. Only explicitly-declared BLOB columns are canonicalized --
+/// the unambiguous, common case that the divergence bug concerns.
+pub fn is_blob_column(col_type: &str) -> bool {
+    col_type.to_ascii_uppercase().contains("BLOB")
+}
+
+/// Re-encode a backend's rendered BLOB string to the canonical lowercase-hex
+/// form the content hash folds.
+///
+/// Returns `None` when `value` does not decode under `encoding`. The caller must
+/// then leave the value untouched and warn -- a value we cannot canonicalize is
+/// never silently re-folded in its divergent encoding (that is the original bug)
+/// and never silently corrupted by a mis-guessed decode.
+pub fn canonical_blob_hex(value: &str, encoding: BlobEncoding) -> Option<String> {
+    let bytes = match encoding {
+        // Already canonical; decode+encode validates and lowercases.
+        BlobEncoding::Hex => hex::decode(value).ok()?,
+        BlobEncoding::Base64 => base64::engine::general_purpose::STANDARD
+            .decode(value)
+            .ok()?,
+    };
+    Some(hex::encode(bytes))
+}
+
+/// Rewrite every listed blob column in `row` from `encoding` to canonical
+/// lowercase hex in place, so a JSON backend's [`content_hash`] converges with
+/// the native (hex) reference.
+///
+/// Absent, NULL, or non-string values are left untouched (a NULL blob folds as
+/// NULL on every path; a byte-array rendering is out of scope). Returns the
+/// names of any columns whose string value could not be decoded under
+/// `encoding`: the caller MUST warn on these -- their raw rendering would hash
+/// divergently and the operator should `exclude` the column. (#292)
+pub fn canonicalize_blob_columns(
+    row: &mut HashMap<String, Value>,
+    blob_columns: &[String],
+    encoding: BlobEncoding,
+) -> Vec<String> {
+    let mut undecodable = Vec::new();
+    for col in blob_columns {
+        let raw = match row.get(col) {
+            Some(Value::String(s)) => s.clone(),
+            _ => continue,
+        };
+        match canonical_blob_hex(&raw, encoding) {
+            Some(hexed) => {
+                row.insert(col.clone(), Value::String(hexed));
+            }
+            None => undecodable.push(col.clone()),
+        }
+    }
+    undecodable
 }
 
 /// Build a SQLite expression that renders the primary key as stable text.
@@ -317,6 +399,112 @@ mod tests {
             content_hash(&with_null, &cols, &[], "updated_at"),
             content_hash(&absent, &cols, &[], "updated_at")
         );
+    }
+
+    #[test]
+    fn blob_converges_across_hex_and_base64_backends() {
+        // Spike S (#292): the blob "He" is rendered as lowercase hex "4865" by the
+        // native rusqlite path and as standard base64 "SGU=" by a JSON backend.
+        // Folding the raw renderings diverges, so the row reads content_differs
+        // forever and the two nodes NEVER converge. Canonicalizing the JSON
+        // backend's blob column to hex before hashing makes them agree.
+        let cols = ["id".to_string(), "data".to_string()];
+        let native = row(&[("id", json!(1)), ("data", json!("4865"))]); // hex reference
+        let json_raw = row(&[("id", json!(1)), ("data", json!("SGU="))]); // base64
+
+        // Pre-fix: the raw renderings hash differently.
+        assert_ne!(
+            content_hash(&native, &cols, &[], "updated_at"),
+            content_hash(&json_raw, &cols, &[], "updated_at"),
+            "raw hex vs base64 renderings must diverge -- this is the bug"
+        );
+
+        // Fix: canonicalize the JSON backend's blob column, then hash.
+        let mut json_canon = json_raw.clone();
+        let undecodable =
+            canonicalize_blob_columns(&mut json_canon, &["data".to_string()], BlobEncoding::Base64);
+        assert!(undecodable.is_empty(), "SGU= must decode as base64");
+        assert_eq!(
+            json_canon.get("data"),
+            Some(&json!("4865")),
+            "base64 SGU= must canonicalize to hex 4865"
+        );
+        assert_eq!(
+            content_hash(&native, &cols, &[], "updated_at"),
+            content_hash(&json_canon, &cols, &[], "updated_at"),
+            "after canonicalization the blob column must converge across backends"
+        );
+    }
+
+    #[test]
+    fn canonical_blob_hex_round_trips_and_lowercases() {
+        // Base64 decodes to the same bytes hex encodes; hex input is normalized
+        // to lowercase so a backend rendering uppercase hex still converges.
+        assert_eq!(
+            canonical_blob_hex("SGU=", BlobEncoding::Base64).as_deref(),
+            Some("4865")
+        );
+        assert_eq!(
+            canonical_blob_hex("4865", BlobEncoding::Hex).as_deref(),
+            Some("4865")
+        );
+        // The ambiguity that forces a caller-supplied encoding: "4865" is valid
+        // base64 too, decoding to DIFFERENT bytes than as hex -- so a blind decode
+        // without knowing the source encoding would corrupt the value.
+        assert_ne!(
+            canonical_blob_hex("4865", BlobEncoding::Base64).as_deref(),
+            Some("4865")
+        );
+        assert_eq!(
+            canonical_blob_hex("DEADBEEF", BlobEncoding::Hex).as_deref(),
+            Some("deadbeef")
+        );
+    }
+
+    #[test]
+    fn canonical_blob_hex_reports_undecodable() {
+        // A value that is not valid under the declared encoding is rejected (None)
+        // rather than silently folded in its divergent form.
+        assert_eq!(
+            canonical_blob_hex("!!!not-base64!!!", BlobEncoding::Base64),
+            None
+        );
+        assert_eq!(canonical_blob_hex("xyz", BlobEncoding::Hex), None);
+    }
+
+    #[test]
+    fn canonicalize_blob_columns_skips_null_absent_and_flags_bad() {
+        // NULL / absent / non-string blob values are left untouched; an
+        // undecodable string is reported for the caller to warn on.
+        let mut r = row(&[
+            ("id", json!(1)),
+            ("good", json!("SGU=")),
+            ("null_blob", Value::Null),
+            ("bad", json!("%%%")),
+        ]);
+        let cols = [
+            "good".to_string(),
+            "null_blob".to_string(),
+            "absent".to_string(),
+            "bad".to_string(),
+        ];
+        let undecodable = canonicalize_blob_columns(&mut r, &cols, BlobEncoding::Base64);
+        assert_eq!(r.get("good"), Some(&json!("4865")));
+        assert_eq!(r.get("null_blob"), Some(&Value::Null));
+        assert_eq!(undecodable, vec!["bad".to_string()]);
+    }
+
+    #[test]
+    fn is_blob_column_matches_declared_blob_only() {
+        assert!(is_blob_column("BLOB"));
+        assert!(is_blob_column("blob"));
+        assert!(is_blob_column("MEDIUMBLOB"));
+        assert!(!is_blob_column("TEXT"));
+        assert!(!is_blob_column("INTEGER"));
+        // Empty declared type has BLOB affinity in SQLite but is deliberately NOT
+        // canonicalized -- it holds dynamically-typed values a base64-decode could
+        // corrupt.
+        assert!(!is_blob_column(""));
     }
 
     #[test]

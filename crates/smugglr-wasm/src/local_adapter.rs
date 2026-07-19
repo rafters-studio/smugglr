@@ -110,7 +110,8 @@ impl LocalSqlDataSource {
             adapter_common::incremental_metadata_sql(table, &info.primary_key, timestamp_column);
         let params = vec![Value::String(since_timestamp.to_string())];
         let result = self.run(&sql, &params).await?;
-        let maps = adapter_common::rows_to_maps(&result.columns, &result.rows);
+        let mut maps = adapter_common::rows_to_maps(&result.columns, &result.rows);
+        adapter_common::canonicalize_json_blobs(&mut maps, &info);
 
         Ok(adapter_common::row_maps_to_metadata(
             &maps,
@@ -181,7 +182,8 @@ impl DataSource for LocalSqlDataSource {
         let column_order: Vec<String> = info.columns.iter().map(|c| c.name.clone()).collect();
         let sql = format!("SELECT *, {} AS __pk FROM \"{}\"", pk_expr, table);
         let result = self.run(&sql, &[]).await?;
-        let maps = adapter_common::rows_to_maps(&result.columns, &result.rows);
+        let mut maps = adapter_common::rows_to_maps(&result.columns, &result.rows);
+        adapter_common::canonicalize_json_blobs(&mut maps, &info);
 
         Ok(adapter_common::row_maps_to_metadata(
             &maps,
