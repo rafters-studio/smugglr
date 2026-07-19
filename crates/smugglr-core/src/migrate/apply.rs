@@ -40,20 +40,22 @@
 //! with foreign-key enforcement off. The rebuild therefore toggles the pragma
 //! *outside* any transaction -- `foreign_keys=OFF` (autocommit) -> `BEGIN` ->
 //! rebuild + `sqlite_sequence` preserve -> `foreign_key_check` /
-//! `integrity_check` -> `COMMIT` -> `foreign_keys=ON` -- and simple ops each get
-//! their own short transaction.
+//! `integrity_check` -> `COMMIT` -> restore the caller's prior `foreign_keys`
+//! state -- and simple ops each get their own short transaction.
 //!
-//! # Rebuild reconstruction is deliberately not exhaustive
+//! # Rebuild reconstruction is faithful for keys, warned-on for the rest
 //!
 //! The `DROP COLUMN` rebuild reconstructs the surviving schema from
-//! `PRAGMA table_info` / `foreign_key_list`, which recovers column types,
-//! `NOT NULL`, defaults, the primary key, and foreign keys -- but **cannot**
-//! recover `CHECK` constraints, table-level `UNIQUE`, column collation,
-//! `AUTOINCREMENT`, generated columns, or `WITHOUT ROWID`. Those are silently
-//! dropped on a `DROP COLUMN`-triggered rebuild. This is an accepted #273 limit
-//! (the alternative -- parsing `sqlite_master.sql` -- fights the structured-ops
-//! grain). A rebuild driven by an *explicit* target schema (as reverse #274 /
-//! convert #280 will pass) does not have this gap.
+//! `PRAGMA table_info` / `foreign_key_list` plus the original
+//! `sqlite_master.sql`, which recovers column types, `NOT NULL`, defaults, the
+//! primary key (single-column rowid-alias **and** composite), foreign keys
+//! (**including composite**), and `AUTOINCREMENT`. It still **cannot** recover
+//! `CHECK` constraints, table-level / surviving-column `UNIQUE`, column
+//! `COLLATE`, generated columns, or `WITHOUT ROWID`. Rather than drop those
+//! silently, the rebuild emits a `tracing::warn!` when the table being rebuilt
+//! carries such constructs, so the loss is visible. A rebuild driven by an
+//! *explicit* target schema (as reverse #274 / convert #280 will pass) does not
+//! have this gap.
 
 use crate::migrate::{ClassifiedOp, Column, ColumnKind, Constraint, MigrateError, Op};
 
@@ -421,17 +423,23 @@ fn drop_column(conn: &Connection, table: &str, column: &str) -> Result<(), Migra
         return Ok(());
     }
 
-    // Drop explicit indexes that reference the column so the direct ALTER can
-    // proceed (SQLite refuses to drop an indexed column).
+    // Drop explicit indexes that reference the column INSIDE the same
+    // transaction as the direct ALTER (SQLite refuses to drop an indexed
+    // column). Keeping the index drops in-transaction makes the attempt atomic:
+    // if the ALTER is refused (PK / UNIQUE / otherwise constrained), `drop(tx)`
+    // rolls the index drops back so the rebuild path takes over from an intact
+    // table -- an explicit index is never lost to a failed attempt (#273
+    // LOW-MED#5).
+    let mut sql = String::new();
     for idx in explicit_indexes_referencing(conn, table, column)? {
-        conn.execute_batch(&format!("DROP INDEX IF EXISTS {}", quote_ident(&idx)))?;
+        sql.push_str(&format!("DROP INDEX IF EXISTS {};\n", quote_ident(&idx)));
     }
-
-    let sql = format!(
+    sql.push_str(&format!(
         "ALTER TABLE {} DROP COLUMN {}",
         quote_ident(table),
         quote_ident(column)
-    );
+    ));
+
     let tx = conn.unchecked_transaction()?;
     match tx.execute_batch(&sql) {
         Ok(()) => {
@@ -440,7 +448,7 @@ fn drop_column(conn: &Connection, table: &str, column: &str) -> Result<(), Migra
         }
         Err(_) => {
             // Direct drop refused (PK / UNIQUE / constrained). Roll back the
-            // attempt and rebuild the table without the column.
+            // attempt (restoring any dropped indexes) and rebuild the table.
             drop(tx);
             rebuild_dropping_column(conn, table, column)
         }
@@ -455,6 +463,9 @@ fn rebuild_dropping_column(
     column: &str,
 ) -> Result<(), MigrateError> {
     let info = raw_table_info(conn, table)?;
+    let orig_sql = table_sql(conn, table)?;
+    let has_autoincrement = orig_sql.as_deref().is_some_and(sql_has_autoincrement);
+
     let kept: Vec<&ColInfo> = info.iter().filter(|c| c.name != column).collect();
     if kept.is_empty() {
         return Err(MigrateError::Apply(format!(
@@ -462,15 +473,35 @@ fn rebuild_dropping_column(
         )));
     }
 
-    let mut body: Vec<String> = kept.iter().map(|c| c.render_def()).collect();
-
-    // Composite primary key -> a table-level constraint (a single-column PK is
-    // inlined by `ColInfo::render_def`).
-    let pk: Vec<&&ColInfo> = {
-        let mut v: Vec<&&ColInfo> = kept.iter().filter(|c| c.pk > 0).collect();
-        v.sort_by_key(|c| c.pk);
-        v
+    // Derive the primary key from the SURVIVING pk>0 columns -- never from the
+    // pre-filter key width. Dropping one member of a composite key must leave a
+    // real key on the survivors, not silently discard the whole PK (#273 HIGH#1).
+    // A single survivor is inlined (preserving rowid-alias / AUTOINCREMENT
+    // semantics for a single INTEGER column); two or more become a table-level
+    // constraint.
+    let mut pk: Vec<&&ColInfo> = kept.iter().filter(|c| c.pk > 0).collect();
+    pk.sort_by_key(|c| c.pk);
+    let inline_pk: Option<&str> = if pk.len() == 1 {
+        Some(pk[0].name.as_str())
+    } else {
+        None
     };
+
+    let mut body: Vec<String> = kept
+        .iter()
+        .map(|c| {
+            let mut def = c.render_def();
+            if Some(c.name.as_str()) == inline_pk {
+                def.push_str(" PRIMARY KEY");
+                // AUTOINCREMENT is only legal on a single INTEGER rowid-alias PK.
+                if has_autoincrement && c.ty.eq_ignore_ascii_case("INTEGER") {
+                    def.push_str(" AUTOINCREMENT");
+                }
+            }
+            def
+        })
+        .collect();
+
     if pk.len() > 1 {
         let cols = pk
             .iter()
@@ -480,11 +511,24 @@ fn rebuild_dropping_column(
         body.push(format!("PRIMARY KEY ({cols})"));
     }
 
-    // Preserve foreign keys whose local column is not the one being dropped.
+    // Preserve foreign keys whose column set does not include the dropped one.
+    // Composite FKs are reconstructed as a single grouped constraint; the whole
+    // FK is dropped if ANY member column is the one being removed (#273 HIGH#2).
     for fk in reconstruct_foreign_keys(conn, table)? {
-        if fk.from != column {
+        if !fk.references_column(column) {
             body.push(fk.render());
         }
+    }
+
+    // Constructs the pragma/DDL reconstruction cannot recover are lost on this
+    // rebuild; make the loss loud rather than silent (#273 MED#4).
+    let lost = lost_constructs(conn, table, column, orig_sql.as_deref())?;
+    if !lost.is_empty() {
+        tracing::warn!(
+            "DROP COLUMN rebuild of {table:?} (dropping {column:?}) cannot reconstruct \
+             these surviving constructs; they are dropped: {}",
+            lost.join(", ")
+        );
     }
 
     let projection: Vec<(String, String)> = kept
@@ -506,7 +550,9 @@ fn rebuild_dropping_column(
 
 // --- The guarded 12-step rebuild -------------------------------------------
 
-/// A single-column primary-key inline flag is derived; see [`ColInfo`].
+/// A fully-formed rebuild plan: the caller (`rebuild_dropping_column`) has
+/// already resolved the primary key, foreign keys, and post-rebuild DDL into
+/// `body` / `post_ddl`.
 #[cfg(feature = "native")]
 struct RebuildSpec {
     /// The table being rebuilt (dropped and recreated under this final name).
@@ -537,11 +583,20 @@ const REBUILD_TMP: &str = "_smugglr_rebuild_tmp";
 /// back and reports the offending rows (spike L).
 #[cfg(feature = "native")]
 fn rebuild_table(conn: &Connection, spec: &RebuildSpec) -> Result<(), MigrateError> {
+    // Capture the caller's prior foreign_keys state so it is *restored*, not
+    // forced ON: a caller that ran with enforcement off must not silently gain
+    // it from a rebuild (#273 LOW). Read it in autocommit, before the toggle.
+    let prior_fk: i64 = conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0))?;
     // foreign_keys OFF must happen in autocommit, before BEGIN.
     conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
     let result = rebuild_inner(conn, spec);
-    // Restore enforcement regardless of outcome. Surface an inner error first.
-    let restore = conn.execute_batch("PRAGMA foreign_keys = ON;");
+    // Restore the prior enforcement state regardless of outcome. Surface an
+    // inner error first.
+    let restore = conn.execute_batch(if prior_fk != 0 {
+        "PRAGMA foreign_keys = ON;"
+    } else {
+        "PRAGMA foreign_keys = OFF;"
+    });
     result?;
     restore?;
     Ok(())
@@ -712,8 +767,10 @@ struct ColInfo {
 
 #[cfg(feature = "native")]
 impl ColInfo {
-    /// Reconstruct a column definition. A single-column PK is inlined; a
-    /// composite PK is emitted as a table-level constraint by the caller.
+    /// Reconstruct a column definition's type / `NOT NULL` / `DEFAULT`. The
+    /// primary key is emitted by the caller (`rebuild_dropping_column`), which
+    /// decides inline vs table-level from the *surviving* key columns -- so this
+    /// never bakes in a `PRIMARY KEY` tag.
     fn render_def(&self) -> String {
         let mut s = format!("{} {}", quote_ident(&self.name), self.ty);
         if self.notnull {
@@ -762,57 +819,187 @@ fn raw_table_info(conn: &Connection, table: &str) -> Result<Vec<ColInfo>, Migrat
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-
-    // A single-column PK is inlined; adjust render by tagging inline where safe.
-    let pk_count = rows.iter().filter(|c| c.pk > 0).count();
-    let rows = rows
-        .into_iter()
-        .map(|mut c| {
-            if pk_count == 1 && c.pk > 0 {
-                c.ty = format!("{} PRIMARY KEY", c.ty);
-            }
-            c
-        })
-        .collect();
+    // The primary key is *not* tagged here: `rebuild_dropping_column` derives it
+    // from the surviving key columns (a pre-filter `pk_count` would mis-handle a
+    // composite key one member of which is being dropped -- #273 HIGH#1).
     Ok(rows)
 }
 
-/// A reconstructed foreign key from `PRAGMA foreign_key_list`.
+/// The original `CREATE TABLE` DDL for a table (`None` if absent).
+///
+/// Used to recover facts the structured pragmas cannot expose -- notably
+/// `AUTOINCREMENT` and the presence of `CHECK` / `COLLATE` / `WITHOUT ROWID`.
+#[cfg(feature = "native")]
+fn table_sql(conn: &Connection, table: &str) -> Result<Option<String>, MigrateError> {
+    let sql = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![table],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?;
+    Ok(sql.flatten())
+}
+
+/// Whether a `CREATE TABLE` statement declares `AUTOINCREMENT`. The keyword is
+/// only legal on the single `INTEGER PRIMARY KEY` rowid alias, so its presence
+/// anywhere in the DDL identifies an autoincrement table.
+#[cfg(feature = "native")]
+fn sql_has_autoincrement(sql: &str) -> bool {
+    sql.to_ascii_uppercase().contains("AUTOINCREMENT")
+}
+
+/// Surviving constructs the `DROP COLUMN` reconstruction cannot recover, as
+/// human-readable labels for a warning (#273 MED#4).
+///
+/// `UNIQUE` is detected precisely from `PRAGMA index_list` (origin `'u'`
+/// auto-indexes): a unique index all of whose columns survive is lost, while one
+/// that references the dropped column goes away with the column anyway.
+/// `CHECK` / `COLLATE` / `WITHOUT ROWID` are not exposed by any pragma, so they
+/// are found by a keyword scan of the original DDL -- an over-approximation (it
+/// can fire when the construct referenced only the dropped column), but a
+/// spurious warning is safer than a silent drop.
+#[cfg(feature = "native")]
+fn lost_constructs(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    orig_sql: Option<&str>,
+) -> Result<Vec<String>, MigrateError> {
+    let mut lost = Vec::new();
+    for name in unique_constraint_indexes(conn, table)? {
+        let cols = index_columns(conn, &name)?;
+        if !cols.is_empty() && !cols.iter().any(|c| c == column) {
+            lost.push(format!("UNIQUE({})", cols.join(", ")));
+        }
+    }
+    if let Some(sql) = orig_sql {
+        let up = sql.to_ascii_uppercase();
+        if up.contains("CHECK") {
+            lost.push("CHECK constraint(s)".to_string());
+        }
+        if up.contains("COLLATE") {
+            lost.push("COLLATE clause(s)".to_string());
+        }
+        if up.contains("WITHOUT ROWID") {
+            lost.push("WITHOUT ROWID".to_string());
+        }
+    }
+    Ok(lost)
+}
+
+/// Names of the `UNIQUE`-constraint auto-indexes (origin `'u'`) on a table.
+/// These are the column-level and table-level `UNIQUE` declarations, distinct
+/// from primary-key (`'pk'`) and explicit `CREATE UNIQUE INDEX` (`'c'`) indexes.
+#[cfg(feature = "native")]
+fn unique_constraint_indexes(conn: &Connection, table: &str) -> Result<Vec<String>, MigrateError> {
+    let mut stmt = conn.prepare(&format!("PRAGMA index_list({})", quote_ident(table)))?;
+    let rows = stmt
+        .query_map([], |r| {
+            // cols: seq, name, unique, origin, partial
+            Ok((r.get::<_, String>(1)?, r.get::<_, String>(3)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows
+        .into_iter()
+        .filter(|(_, origin)| origin == "u")
+        .map(|(name, _)| name)
+        .collect())
+}
+
+/// A reconstructed foreign key from `PRAGMA foreign_key_list`, possibly
+/// composite (multiple `(from, to)` column pairs sharing one FK `id`).
 #[cfg(feature = "native")]
 struct FkInfo {
-    from: String,
     parent_table: String,
-    parent_col: String,
+    /// `(from, to)` column pairs in `seq` order. `to` is `None` when the FK
+    /// references the parent's primary key implicitly (`REFERENCES parent`).
+    cols: Vec<(String, Option<String>)>,
 }
 
 #[cfg(feature = "native")]
 impl FkInfo {
     fn render(&self) -> String {
-        format!(
-            "FOREIGN KEY ({}) REFERENCES {}({})",
-            quote_ident(&self.from),
-            quote_ident(&self.parent_table),
-            quote_ident(&self.parent_col)
-        )
+        let froms = self
+            .cols
+            .iter()
+            .map(|(f, _)| quote_ident(f))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // Emit the parent column list only when every target column is known; an
+        // implicit reference (any NULL `to`) targets the parent's primary key.
+        if self.cols.iter().all(|(_, t)| t.is_some()) {
+            let tos = self
+                .cols
+                .iter()
+                .filter_map(|(_, t)| t.as_ref())
+                .map(|t| quote_ident(t))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "FOREIGN KEY ({}) REFERENCES {}({})",
+                froms,
+                quote_ident(&self.parent_table),
+                tos
+            )
+        } else {
+            format!(
+                "FOREIGN KEY ({}) REFERENCES {}",
+                froms,
+                quote_ident(&self.parent_table)
+            )
+        }
+    }
+
+    /// Whether any member column of this FK is `column` -- in which case the
+    /// whole FK is dropped (a composite FK cannot survive losing a member).
+    fn references_column(&self, column: &str) -> bool {
+        self.cols.iter().any(|(f, _)| f == column)
     }
 }
 
-/// Reconstruct single-column foreign keys of a table. Composite FKs are rare in
-/// the smugglr schema shape and are not reconstructed here (documented limit).
+/// Reconstruct the foreign keys of a table, grouping the per-column rows of
+/// `PRAGMA foreign_key_list` back into whole (possibly composite) constraints.
+///
+/// `foreign_key_list` returns one row *per column* of a composite FK, sharing an
+/// `id` with an increasing `seq`; grouping by `id` and ordering members by `seq`
+/// rebuilds one `FOREIGN KEY(a, b) REFERENCES p(x, y)` per constraint instead of
+/// N independent single-column FKs (#273 HIGH#2).
 #[cfg(feature = "native")]
 fn reconstruct_foreign_keys(conn: &Connection, table: &str) -> Result<Vec<FkInfo>, MigrateError> {
     let mut stmt = conn.prepare(&format!("PRAGMA foreign_key_list({})", quote_ident(table)))?;
     let rows = stmt
         .query_map([], |r| {
             // cols: id, seq, table, from, to, on_update, on_delete, match
-            Ok(FkInfo {
-                parent_table: r.get::<_, String>(2)?,
-                from: r.get::<_, String>(3)?,
-                parent_col: r.get::<_, String>(4)?,
-            })
+            Ok((
+                r.get::<_, i64>(0)?,            // id
+                r.get::<_, i64>(1)?,            // seq
+                r.get::<_, String>(2)?,         // parent table
+                r.get::<_, String>(3)?,         // from (local column)
+                r.get::<_, Option<String>>(4)?, // to (parent column; NULL => PK)
+            ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
+
+    // Group by FK id, preserving a deterministic id order with a BTreeMap.
+    use std::collections::BTreeMap;
+    #[allow(clippy::type_complexity)]
+    let mut groups: BTreeMap<i64, (String, Vec<(i64, String, Option<String>)>)> = BTreeMap::new();
+    for (id, seq, parent_table, from, to) in rows {
+        groups
+            .entry(id)
+            .or_insert_with(|| (parent_table, Vec::new()))
+            .1
+            .push((seq, from, to));
+    }
+
+    let mut fks = Vec::with_capacity(groups.len());
+    for (_, (parent_table, mut members)) in groups {
+        members.sort_by_key(|(seq, _, _)| *seq);
+        let cols = members.into_iter().map(|(_, f, t)| (f, t)).collect();
+        fks.push(FkInfo { parent_table, cols });
+    }
+    Ok(fks)
 }
 
 /// Names of explicit (`CREATE INDEX`, origin `'c'`) indexes on `table` that
@@ -1186,6 +1373,7 @@ mod tests {
             // explicit CREATE INDEX), so this exercises the rebuild fallback --
             // the non-test caller of `rebuild_table`.
             let conn = mem();
+            conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
             conn.execute_batch(
                 "CREATE TABLE t (id INTEGER PRIMARY KEY, code TEXT UNIQUE, name TEXT);
                  INSERT INTO t VALUES (1, 'c1', 'n1'), (2, 'c2', 'n2');",
@@ -1208,11 +1396,219 @@ mod tests {
                     .unwrap()
             };
             assert_eq!(names, vec!["n1", "n2"]);
-            // Foreign-key enforcement was restored after the rebuild.
+            // The caller's prior foreign-key state (ON) was restored after the
+            // rebuild -- not merely forced ON.
             let fk: i64 = conn
                 .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
                 .unwrap();
             assert_eq!(fk, 1);
+        }
+
+        #[test]
+        fn rebuild_restores_prior_foreign_keys_off() {
+            // #273 LOW: a caller running with enforcement OFF must not silently
+            // gain it from a DROP COLUMN rebuild. (rusqlite defaults foreign_keys
+            // ON, so set it OFF explicitly to model that caller.)
+            let conn = mem();
+            conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+            let before: i64 = conn
+                .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(before, 0, "enforcement is OFF before the rebuild");
+            conn.execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, code TEXT UNIQUE, name TEXT);
+                 INSERT INTO t VALUES (1, 'c1', 'n1');",
+            )
+            .unwrap();
+            apply(
+                &conn,
+                Op::DropColumn {
+                    table: "t".into(),
+                    column: "code".into(),
+                },
+            )
+            .unwrap();
+            let after: i64 = conn
+                .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(after, 0, "prior OFF state restored, not forced ON");
+        }
+
+        #[test]
+        fn drop_column_member_of_composite_pk_keeps_key() {
+            // #273 HIGH#1, through the PUBLIC apply_ops path: dropping one member
+            // of PRIMARY KEY(a, b) must leave a real key on the survivor, not
+            // silently discard the whole PK. `b` is a PK member, so the direct
+            // ALTER is refused and the rebuild runs. NOT NULL columns make the
+            // NULL-key rejection faithful (a plain PK column allows NULL).
+            let conn = mem();
+            conn.execute_batch(
+                "CREATE TABLE t (a TEXT NOT NULL, b TEXT NOT NULL, c TEXT, PRIMARY KEY(a, b));
+                 INSERT INTO t VALUES ('a1','b1','x'), ('a2','b2','y');",
+            )
+            .unwrap();
+            apply(
+                &conn,
+                Op::DropColumn {
+                    table: "t".into(),
+                    column: "b".into(),
+                },
+            )
+            .unwrap();
+            assert_eq!(columns(&conn, "t"), vec!["a", "c"]);
+
+            // The rebuilt table still has a primary key (the bug produced none).
+            let pk_cols: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM pragma_table_info('t') WHERE pk > 0",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                pk_cols > 0,
+                "surviving PK must exist, not be silently dropped"
+            );
+
+            // ...and it is enforced: a duplicate key value is rejected.
+            let dup = conn.execute("INSERT INTO t (a, c) VALUES ('a1', 'z')", []);
+            assert!(dup.is_err(), "duplicate primary key must be rejected");
+            // A NULL key is rejected too (NOT NULL survived the rebuild).
+            let null_key = conn.execute("INSERT INTO t (a, c) VALUES (NULL, 'w')", []);
+            assert!(null_key.is_err(), "NULL primary key must be rejected");
+        }
+
+        #[test]
+        fn drop_column_preserves_composite_fk() {
+            // #273 HIGH#2, through the PUBLIC apply_ops path: a composite FK
+            // (one foreign_key_list row per column) must be reconstructed as ONE
+            // FOREIGN KEY(a, b) REFERENCES p(x, y), or the rebuild fails with
+            // "foreign key mismatch" / installs wrong single-column FKs. `code`
+            // is UNIQUE, forcing the rebuild.
+            let conn = mem();
+            conn.execute_batch(
+                "CREATE TABLE p (x, y, PRIMARY KEY(x, y));
+                 CREATE TABLE c (
+                     id INTEGER PRIMARY KEY,
+                     a, b,
+                     code TEXT UNIQUE,
+                     FOREIGN KEY(a, b) REFERENCES p(x, y)
+                 );
+                 INSERT INTO p VALUES (1, 1), (2, 2);
+                 INSERT INTO c (id, a, b, code) VALUES (10, 1, 1, 'k1'), (20, 2, 2, 'k2');",
+            )
+            .unwrap();
+
+            // The op must SUCCEED (the mis-reconstruction made it fail).
+            apply(
+                &conn,
+                Op::DropColumn {
+                    table: "c".into(),
+                    column: "code".into(),
+                },
+            )
+            .unwrap();
+            assert_eq!(columns(&conn, "c"), vec!["id", "a", "b"]);
+
+            // Exactly one composite FK survived, intact: two member rows sharing
+            // one id, referencing p.
+            let fk_rows: Vec<(i64, String, Option<String>, Option<String>)> = {
+                let mut stmt = conn
+                    .prepare("SELECT id, \"table\", \"from\", \"to\" FROM pragma_foreign_key_list('c') ORDER BY id, seq")
+                    .unwrap();
+                stmt.query_map([], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+            };
+            assert_eq!(fk_rows.len(), 2, "composite FK is two member rows");
+            assert_eq!(fk_rows[0].0, fk_rows[1].0, "members share one FK id");
+            assert!(fk_rows.iter().all(|r| r.1 == "p"), "both reference p");
+
+            // Referential integrity holds under enforcement.
+            let violations = foreign_key_violations(&conn, "c").unwrap();
+            assert!(violations.is_empty(), "composite FK intact: {violations:?}");
+        }
+
+        #[test]
+        fn drop_column_preserves_fk_on_surviving_column() {
+            // Breadth: a single-column FK on a SURVIVING column must be carried
+            // through a rebuild. `code` is UNIQUE (forces rebuild); the FK is on
+            // `parent_id`, which survives.
+            let conn = mem();
+            conn.execute_batch(
+                "CREATE TABLE parent (id INTEGER PRIMARY KEY);
+                 CREATE TABLE child (
+                     id INTEGER PRIMARY KEY,
+                     parent_id INTEGER REFERENCES parent(id),
+                     code TEXT UNIQUE
+                 );
+                 INSERT INTO parent (id) VALUES (1), (2);
+                 INSERT INTO child (id, parent_id, code) VALUES (10, 1, 'k1'), (20, 2, 'k2');",
+            )
+            .unwrap();
+            apply(
+                &conn,
+                Op::DropColumn {
+                    table: "child".into(),
+                    column: "code".into(),
+                },
+            )
+            .unwrap();
+            assert_eq!(columns(&conn, "child"), vec!["id", "parent_id"]);
+
+            // The FK survived...
+            let fk_parent: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM pragma_foreign_key_list('child') WHERE \"table\" = 'parent'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(fk_parent, 1, "surviving-column FK must be preserved");
+            // ...and is enforced: a dangling reference is now rejected.
+            conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+            let bad = conn.execute("INSERT INTO child (id, parent_id) VALUES (30, 999)", []);
+            assert!(bad.is_err(), "preserved FK must reject a dangling parent");
+        }
+
+        #[test]
+        fn drop_column_recreates_surviving_indexes() {
+            // Breadth: an explicit index on a SURVIVING column must be recreated
+            // after the rebuild. Force the rebuild by dropping the UNIQUE `code`
+            // column; the index under test is on `name` (a survivor).
+            let conn = mem();
+            conn.execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, code TEXT UNIQUE);
+                 CREATE INDEX idx_name ON t(name);
+                 INSERT INTO t VALUES (1, 'n1', 'c1'), (2, 'n2', 'c2');",
+            )
+            .unwrap();
+            apply(
+                &conn,
+                Op::DropColumn {
+                    table: "t".into(),
+                    column: "code".into(),
+                },
+            )
+            .unwrap();
+            assert_eq!(columns(&conn, "t"), vec!["id", "name"]);
+            // The survivor's index is back after the swap.
+            let idx: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='idx_name'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(idx, 1, "index on the surviving column must be recreated");
         }
 
         #[test]
@@ -1247,12 +1643,17 @@ mod tests {
 
         #[test]
         fn rebuild_preserves_sqlite_sequence_high_water() {
-            // spike B: an AUTOINCREMENT rebuild must carry the high-water mark,
-            // or future inserts reuse IDs.
+            // spike B, driven through the PUBLIC apply_ops(DropColumn) path: an
+            // AUTOINCREMENT table rebuilt by DROP COLUMN must re-emit
+            // AUTOINCREMENT and carry the sqlite_sequence high-water, or a retired
+            // id is reused. `code` is UNIQUE so the direct ALTER is refused and
+            // the reconstruction (which must reconstruct AUTOINCREMENT from the
+            // original DDL) runs -- dropping a plain column would ALTER-drop
+            // directly and never exercise the fix.
             let conn = mem();
             conn.execute_batch(
-                "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, junk TEXT);
-                 INSERT INTO t (name, junk) VALUES ('a','x'),('b','y'),('c','z');
+                "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, code TEXT UNIQUE);
+                 INSERT INTO t (name, code) VALUES ('a','c1'),('b','c2'),('c','c3');
                  DELETE FROM t WHERE id = 3;",
             )
             .unwrap();
@@ -1264,21 +1665,15 @@ mod tests {
                 .unwrap();
             assert_eq!(before, 3);
 
-            // Rebuild dropping `junk`, keeping the AUTOINCREMENT PK explicitly.
-            let spec = RebuildSpec {
-                table: "t".into(),
-                body: vec![
-                    "\"id\" INTEGER PRIMARY KEY AUTOINCREMENT".into(),
-                    "\"name\" TEXT".into(),
-                ],
-                without_rowid: false,
-                projection: vec![
-                    ("id".into(), "\"id\"".into()),
-                    ("name".into(), "\"name\"".into()),
-                ],
-                post_ddl: vec![],
-            };
-            rebuild_table(&conn, &spec).unwrap();
+            apply(
+                &conn,
+                Op::DropColumn {
+                    table: "t".into(),
+                    column: "code".into(),
+                },
+            )
+            .unwrap();
+            assert_eq!(columns(&conn, "t"), vec!["id", "name"]);
 
             let after: i64 = conn
                 .query_row("SELECT seq FROM sqlite_sequence WHERE name='t'", [], |r| {
@@ -1286,7 +1681,17 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(after, 3, "high-water preserved across rebuild");
-            assert_eq!(columns(&conn, "t"), vec!["id", "name"]);
+
+            // The decisive check: the next insert must NOT reuse retired id 3.
+            conn.execute("INSERT INTO t (name) VALUES ('d')", [])
+                .unwrap();
+            let new_id: i64 = conn
+                .query_row("SELECT id FROM t WHERE name = 'd'", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                new_id, 4,
+                "AUTOINCREMENT high-water honored; id 3 not reused"
+            );
         }
 
         #[test]
@@ -1342,6 +1747,7 @@ mod tests {
             // schema adds an FK the live data violates must report the offending
             // rows and leave the table untouched.
             let conn = mem();
+            conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
             conn.execute_batch(
                 "CREATE TABLE users (id INTEGER PRIMARY KEY);
                  CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER);
@@ -1370,6 +1776,9 @@ mod tests {
             match err {
                 MigrateError::Apply(msg) => {
                     assert!(msg.contains("foreign keys"), "message: {msg}");
+                    // MED#2: the offending row must be named, not just "foreign
+                    // keys" -- row 2 (user_id=999) is the violator.
+                    assert!(msg.contains("row 2"), "violator rowid must be named: {msg}");
                 }
                 other => panic!("expected Apply error, got {other:?}"),
             }
