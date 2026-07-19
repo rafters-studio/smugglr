@@ -5,8 +5,11 @@
 //! progress display, and human/JSON output formatting.
 
 mod broadcast;
+mod migrate_cli;
 mod output;
 mod watch;
+
+use migrate_cli::MigrateCommand;
 
 use output::{
     CommandOutput, DiffOutput, DryRunOutput, DryRunTableOutput, DryRunVerboseTableOutput,
@@ -363,6 +366,12 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Schema-and-data migrations (scaffold, apply, ...)
+    Migrate {
+        #[command(subcommand)]
+        command: MigrateCommand,
+    },
 }
 
 /// Print a JSON error and exit with the appropriate code.
@@ -415,7 +424,23 @@ async fn main() {
         Commands::Restore { .. } => "restore",
         Commands::Watch { .. } => "watch",
         Commands::Broadcast { .. } => "broadcast",
+        Commands::Migrate { .. } => "migrate",
     };
+
+    // Migrate commands scaffold and inspect migration manifests; they need
+    // neither the sync config nor a resolved target, so they dispatch here --
+    // before the config load every sync command requires (scaffolding a
+    // migration must work in a fresh project with no config.toml yet).
+    if let Commands::Migrate { command } = &cli.command {
+        if let Err(e) = migrate_cli::run(command, fmt) {
+            match fmt {
+                OutputFormat::Json => exit_json_error(command_name, &e),
+                OutputFormat::Text => error!("Error: {}", e),
+            }
+            std::process::exit(e.exit_code());
+        }
+        return;
+    }
 
     // Load config
     let config = match Config::load(&cli.config) {
@@ -528,6 +553,9 @@ async fn main() {
             }
             broadcast::run_broadcast(&config, &config_path, &bc, once, dry_run).await
         }
+        // Migrate is dispatched above, before config load, since it needs no
+        // config or resolved target; it never reaches this match.
+        Commands::Migrate { .. } => unreachable!("migrate dispatched before config load"),
     };
 
     if let Err(e) = result {
@@ -1203,6 +1231,33 @@ mod tests {
         match cli.command {
             Commands::Watch { interval, .. } => assert_eq!(interval, 30),
             _ => panic!("expected watch command"),
+        }
+    }
+
+    /// #270: `migrate new <name> <col...>` parses the migration name and the
+    /// trailing column specs so the generator receives them verbatim.
+    #[test]
+    fn migrate_new_parses_name_and_columns() {
+        let cli = Cli::try_parse_from([
+            "smugglr",
+            "migrate",
+            "new",
+            "create_contacts",
+            "id:pk",
+            "email:text:pii",
+        ])
+        .unwrap_or_else(|e| panic!("migrate new should parse: {e}"));
+        match cli.command {
+            Commands::Migrate {
+                command: MigrateCommand::New { name, columns },
+            } => {
+                assert_eq!(name, "create_contacts");
+                assert_eq!(
+                    columns,
+                    vec!["id:pk".to_string(), "email:text:pii".to_string()]
+                );
+            }
+            _ => panic!("expected migrate new command"),
         }
     }
 
