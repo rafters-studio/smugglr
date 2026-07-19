@@ -841,12 +841,74 @@ fn table_sql(conn: &Connection, table: &str) -> Result<Option<String>, MigrateEr
     Ok(sql.flatten())
 }
 
+/// Blank out SQL string literals (`'...'`), quoted identifiers (`"..."`,
+/// `` `...` ``, `[...]`), and comments (`-- ...`, `/* ... */`) so a keyword scan
+/// sees only code. Each removed span becomes a single space; the rest is copied
+/// verbatim. Char-based (UTF-8 safe); doubled quotes escape.
+#[cfg(feature = "native")]
+fn strip_sql_literals_and_comments(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' | '"' | '`' => {
+                while let Some(n) = chars.next() {
+                    if n == c {
+                        if chars.peek() == Some(&c) {
+                            chars.next(); // doubled quote escapes
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                out.push(' ');
+            }
+            '[' => {
+                for n in chars.by_ref() {
+                    if n == ']' {
+                        break;
+                    }
+                }
+                out.push(' ');
+            }
+            '-' if chars.peek() == Some(&'-') => {
+                chars.next();
+                for n in chars.by_ref() {
+                    if n == '\n' {
+                        break;
+                    }
+                }
+                out.push(' ');
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                let mut prev = '\0';
+                for n in chars.by_ref() {
+                    if prev == '*' && n == '/' {
+                        break;
+                    }
+                    prev = n;
+                }
+                out.push(' ');
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Whether a `CREATE TABLE` statement declares `AUTOINCREMENT`. The keyword is
-/// only legal on the single `INTEGER PRIMARY KEY` rowid alias, so its presence
-/// anywhere in the DDL identifies an autoincrement table.
+/// only legal on the single `INTEGER PRIMARY KEY` rowid alias. It is matched as a
+/// bare token *outside* string literals, quoted identifiers, and comments, so a
+/// `DEFAULT 'autoincrement'`, a column named `autoincrement_flag`, or a
+/// `/* autoincrement */` comment does not spuriously mark the table -- which would
+/// wrongly synthesize a `sqlite_sequence` row and change schema semantics on a
+/// drop-column rebuild.
 #[cfg(feature = "native")]
 fn sql_has_autoincrement(sql: &str) -> bool {
-    sql.to_ascii_uppercase().contains("AUTOINCREMENT")
+    strip_sql_literals_and_comments(sql)
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(|tok| tok.eq_ignore_ascii_case("AUTOINCREMENT"))
 }
 
 /// Surviving constructs the `DROP COLUMN` reconstruction cannot recover, as
@@ -1691,6 +1753,80 @@ mod tests {
             assert_eq!(
                 new_id, 4,
                 "AUTOINCREMENT high-water honored; id 3 not reused"
+            );
+        }
+
+        #[test]
+        fn sql_has_autoincrement_ignores_literals_comments_and_identifiers() {
+            // Real AUTOINCREMENT declarations are detected.
+            assert!(sql_has_autoincrement(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT)"
+            ));
+            assert!(sql_has_autoincrement(
+                "create table t(\n id integer primary key autoincrement\n)"
+            ));
+            // The false positives the old blind substring match got wrong: the
+            // keyword inside a DEFAULT literal, a block/line comment, a quoted
+            // identifier, or as a substring of an unquoted identifier.
+            assert!(!sql_has_autoincrement(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, note TEXT DEFAULT 'autoincrement')"
+            ));
+            assert!(!sql_has_autoincrement(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY /* autoincrement */)"
+            ));
+            assert!(!sql_has_autoincrement(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY -- autoincrement\n)"
+            ));
+            assert!(!sql_has_autoincrement(
+                "CREATE TABLE t (\"autoincrement\" TEXT, id INTEGER PRIMARY KEY)"
+            ));
+            assert!(!sql_has_autoincrement(
+                "CREATE TABLE t (autoincrement_flag TEXT, id INTEGER PRIMARY KEY)"
+            ));
+            assert!(!sql_has_autoincrement(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY)"
+            ));
+        }
+
+        #[test]
+        fn drop_column_rebuild_does_not_spuriously_add_autoincrement() {
+            // Regression (found by re-verify): a DROP COLUMN rebuild whose single
+            // INTEGER-PK survivor is the alias must NOT gain AUTOINCREMENT just
+            // because the word appears in a comment or a DEFAULT literal. `code`
+            // is UNIQUE so dropping it forces the DDL-reconstructing rebuild.
+            let conn = mem();
+            conn.execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, /* not autoincrement */ \
+                 note TEXT DEFAULT 'autoincrement', code TEXT UNIQUE);
+                 INSERT INTO t (note, code) VALUES ('x','c1');",
+            )
+            .unwrap();
+            apply(
+                &conn,
+                Op::DropColumn {
+                    table: "t".into(),
+                    column: "code".into(),
+                },
+            )
+            .unwrap();
+            assert_eq!(columns(&conn, "t"), vec!["id", "note"]);
+            // Independent of the detector: a real AUTOINCREMENT table materializes
+            // a `sqlite_sequence` row on its first insert. The rebuilt table keeps
+            // `note TEXT DEFAULT 'autoincrement'` (so its raw DDL still contains
+            // the word), but it must NOT behave as autoincrement.
+            conn.execute("INSERT INTO t (note) VALUES ('y')", [])
+                .unwrap();
+            let seq_tables: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master \
+                     WHERE type='table' AND name='sqlite_sequence'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                seq_tables, 0,
+                "no AUTOINCREMENT wrongly synthesized on the drop-column rebuild"
             );
         }
 
