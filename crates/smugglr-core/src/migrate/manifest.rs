@@ -46,6 +46,32 @@ pub enum MigrateError {
     /// too-short/garbage ciphertext).
     #[error("migration envelope error: {0}")]
     Envelope(String),
+
+    /// A local forward-apply operation failed: a DDL statement errored, or a
+    /// guarded table rebuild hit a constraint the live data violates (spike L
+    /// -- constraint-ADD is data-dependent). Carries a human-readable
+    /// description (a rusqlite error, or a list of violating rows). Bridges to
+    /// [`crate::error::SyncError::Migrate`] -> exit code 4.
+    #[error("migration apply failed: {0}")]
+    Apply(String),
+
+    /// Remote apply (D1 / Turso / rqlite) generated its statements but cannot
+    /// execute them: the host->target DDL transport does not exist in 0.5.0 and
+    /// is deferred to #291. The statement *generators*
+    /// ([`crate::migrate::apply::d1_statements`] and siblings) are usable;
+    /// only execution is unsupported.
+    ///
+    /// NOTE (deliberate, named -- not a silent default): this bridges through
+    /// `SyncError::Migrate` to exit code 4 ("conflict / needs human"). Exit 4 is
+    /// a semantic stretch for "transport not built yet" -- it is not a conflict
+    /// -- but every `MigrateError` shares that one bridge and #273 does not
+    /// reshape `SyncError::exit_code`. Called out here so the choice is explicit;
+    /// revisit when #291 lands real transport.
+    #[error(
+        "remote migration transport is not implemented for target '{0}' \
+         (deferred to #291); statements can be generated but not executed"
+    )]
+    RemoteTransportUnsupported(String),
 }
 
 /// The typed kind of a column -- a closed set, never an opaque type string.
