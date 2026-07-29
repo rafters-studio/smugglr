@@ -96,7 +96,7 @@ only per-target variance is **how a migration lands**, not **what SQL it is**:
 | Target        | Apply quirk                                                      |
 |---------------|-----------------------------------------------------------------|
 | local SQLite  | `BEGIN..COMMIT`, transactional DDL, `PRAGMA foreign_keys=OFF`    |
-| Cloudflare D1 | no explicit transactions -- batch API, `defer_foreign_keys=ON`  |
+| Cloudflare D1 | no interactive `BEGIN..COMMIT` -- the batch API is the txn unit, `defer_foreign_keys=ON` |
 | Turso/libSQL  | extended `ALTER TABLE` -> fewer 12-step rebuilds; embedded replicas |
 | rqlite        | Raft leader apply; bulk-transaction request                     |
 
@@ -280,14 +280,34 @@ explicit override. Better a loud false positive than a silent prod-nuke.
 
 ### 6. Safety without transactions
 
-Design as if **no transaction exists**. D1 (a major target) has none, and the http-sql
-spec's `atomic: true` is optional and server-rejectable (SPEC.md S4.2). So the primary
-safety mechanism is **expand-contract + idempotent forward-only + `IF NOT EXISTS` +
-ledger skip-if-applied**: every step is additive and re-runnable, so a half-applied
-migration is safe to re-run.
+Design as if **no transaction exists** -- because migrate cannot *detect* whether a
+remote target gave it one. The primary safety mechanism is therefore **expand-contract +
+idempotent forward-only + `IF NOT EXISTS` + ledger skip-if-applied**: every step is
+additive and re-runnable, so a half-applied migration is safe to re-run.
 
-**Why:** we cannot make correctness depend on a primitive half our targets lack. Local
-SQLite's transactional DDL is a free bonus we use where present -- never the foundation.
+**Why (corrected 2026-07-28; the first draft's reason was wrong).** This doc previously
+said the http-sql spec's `atomic: true` is "optional and server-rejectable." That misread
+S4.2. `OPTIONAL` at SPEC.md:64 governs whether the *field appears in the request*, not the
+server's obligation once it is there -- the same sentence puts a **MUST** on the server
+("when `true`, the server MUST execute all statements in a single transaction"). Both
+reference servers honor it: the D1 worker via `db.batch()`
+(`examples/cloudflare-worker-to-d1/src/index.ts:86-93`), the Durable Object via
+`ctx.storage.transactionSync` (`examples/cloudflare-durable-object/src/index.ts:123-125`).
+
+The conclusion stands and the corrected reason is stronger. The spec gives a server no
+conforming way to **decline** atomicity: S10.1 item 5 (SPEC.md:206) qualifies the
+obligation with "when not rejected," but no rejection mechanism exists -- there is no
+`not_supported` code in the S7 table, and S4.2's only rejection clause is statement-count
+overflow to `413`. A server that cannot do transactions must either lie or misuse an error
+code, and **the client cannot tell which**. There is no negotiation and no signal, so
+migrate can never confirm a given target honored `atomic`. Correctness must not rest on a
+primitive whose presence is unobservable -- which holds even if every server honors it
+perfectly. Local SQLite's transactional DDL stays a free bonus we use where present, never
+the foundation.
+
+Note the related premise: D1 has no *interactive* `BEGIN..COMMIT`, but its batch API is a
+transaction unit (see the quirk table above). "D1 has no transactions" overstated it; the
+baseline does not depend on that claim.
 
 **Trade-off:** expand-contract means some changes take two migrations (expand, then a
 later contract) instead of one in-place edit. That is the accepted cost of surviving a
@@ -297,7 +317,7 @@ never a transactional undo.
 
 **Concurrent-writer race + crash window (RESOLVED, rd2).** skip-if-applied covers *re-run*
 (the same node applying vN twice, a no-op) but not two *different* writers racing the insert
-against a transactionless D1, nor a crash mid-apply. Transaction-free resolution: a
+across D1's non-interactive apply, nor a crash mid-apply. Transaction-free resolution: a
 `UNIQUE(version)` ledger row elects a single apply-winner; the winner runs the idempotent DDL,
 then marks `success = TRUE`. **The skip-gate keys on `success = TRUE`, never on
 row-existence** -- otherwise a crash between insert-pending and mark-success leaves a
