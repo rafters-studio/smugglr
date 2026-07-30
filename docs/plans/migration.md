@@ -287,15 +287,19 @@ additive and re-runnable, so a half-applied migration is safe to re-run.
 
 **Why (corrected 2026-07-28; the first draft's reason was wrong).** This doc previously
 said the http-sql spec's `atomic: true` is "optional and server-rejectable." That misread
-S4.2. `OPTIONAL` at SPEC.md:64 governs whether the *field appears in the request*, not the
-server's obligation once it is there -- the same sentence puts a **MUST** on the server
-("when `true`, the server MUST execute all statements in a single transaction"). Both
-reference servers honor it: the D1 worker via `db.batch()`
-(`examples/cloudflare-worker-to-d1/src/index.ts:86-93`), the Durable Object via
-`ctx.storage.transactionSync` (`examples/cloudflare-durable-object/src/index.ts:123-125`).
+S4.2. The `OPTIONAL` on S4.2's `atomic` field governs whether the *field appears in the
+request*, not the server's obligation once it is there -- the same sentence puts a **MUST**
+on the server ("when `true`, the server MUST execute all statements in a single
+transaction"). Both reference servers honor it: the D1 worker via `db.batch()`
+(`examples/cloudflare-worker-to-d1/src/index.ts`), the Durable Object via
+`ctx.storage.transactionSync` (`examples/cloudflare-durable-object/src/index.ts`).
+
+Citations into http-sql name **sections and constructs, never line numbers** -- that repo
+is edited independently, so a line number here rots silently and a stale citation is the
+exact defect this correction exists to fix.
 
 The conclusion stands and the corrected reason is stronger. The spec gives a server no
-conforming way to **decline** atomicity: S10.1 item 5 (SPEC.md:206) qualifies the
+conforming way to **decline** atomicity: S10.1 item 5 qualifies the
 obligation with "when not rejected," but no rejection mechanism exists -- there is no
 `not_supported` code in the S7 table, and S4.2's only rejection clause is statement-count
 overflow to `413`. A server that cannot do transactions must either lie or misuse an error
