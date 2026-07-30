@@ -280,7 +280,7 @@ explicit override. Better a loud false positive than a silent prod-nuke.
 
 ### 6. Safety without transactions
 
-Design as if **no transaction exists** -- because migrate cannot *detect* whether a
+Design as if **no transaction exists** -- because migrate cannot *confirm* whether a
 remote target gave it one. The primary safety mechanism is therefore **expand-contract +
 idempotent forward-only + `IF NOT EXISTS` + ledger skip-if-applied**: every step is
 additive and re-runnable, so a half-applied migration is safe to re-run.
@@ -296,18 +296,21 @@ transaction"). Both reference servers honor it: the D1 worker via `db.batch()`
 
 Citations into http-sql name **sections and constructs, never line numbers** -- that repo
 is edited independently, so a line number here rots silently and a stale citation is the
-exact defect this correction exists to fix.
+exact defect this correction exists to fix. A claim that rests on what the spec does *not*
+have has no section to anchor to at all; pin those to a **spec version**, which no edit of
+theirs can move. And where two true premises are available, take the one that survives
+their *pending* changes over the one that reads stronger.
 
-The conclusion stands and the corrected reason is stronger. The spec gives a server no
-conforming way to **decline** atomicity: S10.1 item 5 qualifies the
-obligation with "when not rejected," but no rejection mechanism exists -- there is no
-`not_supported` code in the S7 table, and S4.2's only rejection clause is statement-count
-overflow to `413`. A server that cannot do transactions must either lie or misuse an error
-code, and **the client cannot tell which**. There is no negotiation and no signal, so
-migrate can never confirm a given target honored `atomic`. Correctness must not rest on a
-primitive whose presence is unobservable -- which holds even if every server honors it
-perfectly. Local SQLite's transactional DDL stays a free bonus we use where present, never
-the foundation.
+The conclusion stands and the corrected reason is stronger. In **http-sql v0.1** a
+successful batch response carries no atomicity signal: S6.2's batch envelope has a single
+field (`results`) and S9 defines no atomicity response header, so a `200` is
+shape-identical whether or not a transaction ran. Migrate can therefore never *confirm*
+that a target honored `atomic`. That holds even if every server honors it perfectly, and
+it is indifferent to how a server **declines**: S7's `vendor:` namespace already lets one
+reject a batch it cannot transact, and a decline still only says a server refuses, never
+that one delivered. Correctness must not rest on a primitive whose presence is
+unobservable. Local SQLite's transactional DDL stays a free bonus we use where present,
+never the foundation.
 
 Note the related premise: D1 has no *interactive* `BEGIN..COMMIT`, but its batch API is a
 transaction unit (see the quirk table above). "D1 has no transactions" overstated it; the
