@@ -219,9 +219,10 @@ impl RemoteTarget {
 
 /// Statements for a Cloudflare **D1** apply.
 ///
-/// D1 has no explicit transactions; it applies a batch, and cross-table DDL
-/// wants `defer_foreign_keys` so an out-of-order reference does not trip mid
-/// batch. The first statement enables it; the rest are the ops in order.
+/// D1 has no interactive `BEGIN..COMMIT`; a batch *is* its transaction unit, so
+/// this lowers to one batch. Cross-table DDL wants `defer_foreign_keys` so an
+/// out-of-order reference does not trip mid batch. The first statement enables
+/// it; the rest are the ops in order.
 pub fn d1_statements(ops: &[ClassifiedOp]) -> Vec<String> {
     let mut out = Vec::with_capacity(ops.len() + 1);
     out.push("PRAGMA defer_foreign_keys = ON".to_string());
