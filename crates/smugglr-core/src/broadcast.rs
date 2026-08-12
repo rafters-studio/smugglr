@@ -18,6 +18,7 @@
 //! When a pre-shared key is configured, multicast traffic is encrypted with
 //! XChaCha20-Poly1305 AEAD. Plaintext and encrypted modes are mutually exclusive.
 
+use crate::config::ConflictResolution;
 use crate::error::{Result, SyncError};
 use chacha20poly1305::aead::{Aead, NewAead};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
@@ -77,6 +78,37 @@ pub struct BroadcastConfig {
     /// (decoded via [`BroadcastConfig::encryption_key`] and consumed by
     /// [`crate::multicast`]).
     pub secret: Option<String>,
+
+    /// How a received row resolves against an existing local row with the same
+    /// primary key. Default: `remote_wins`.
+    ///
+    /// Deliberately scoped to `[broadcast]` and NOT read from
+    /// `[sync].conflict_resolution`. That field defaults to
+    /// [`ConflictResolution::LocalWins`], while multicast has always behaved as
+    /// `remote_wins`; honoring the sync-scoped value would silently flip every
+    /// existing multicast deployment to never-accept-a-peer-row -- a
+    /// convergence break shipped as a bugfix. `remote_wins` here preserves the
+    /// historical semantics exactly; `newer_wins` is an explicit opt-in.
+    ///
+    /// `uuid_v7_wins` degenerates to `newer_wins` on this path: a same-PK
+    /// collision means the two rows carry the *same* UUID, so the PK cannot
+    /// break the tie.
+    #[serde(default = "default_broadcast_conflict_resolution")]
+    pub conflict_resolution: ConflictResolution,
+
+    /// Columns forming the ordering signal for `newer_wins`, compared as the
+    /// `max` across whichever of them the table actually has.
+    ///
+    /// A LIST, not a single column, because an ordering key is frequently a
+    /// max over several: legion's is `max(created_at, updated_at, deleted_at)`,
+    /// and a tombstone that sets `deleted_at` without bumping `updated_at`
+    /// would lose every comparison under a single-column compare. One entry is
+    /// exactly the single-column behavior.
+    ///
+    /// Empty (the default) falls back to `[sync].timestamp_column`, so the
+    /// ordering signal has one source of truth until an embedder needs more.
+    #[serde(default)]
+    pub ordering_columns: Vec<String>,
 }
 
 fn default_port() -> u16 {
@@ -87,6 +119,10 @@ fn default_interval_secs() -> u64 {
     DEFAULT_INTERVAL_SECS
 }
 
+fn default_broadcast_conflict_resolution() -> ConflictResolution {
+    ConflictResolution::RemoteWins
+}
+
 impl Default for BroadcastConfig {
     fn default() -> Self {
         Self {
@@ -94,6 +130,8 @@ impl Default for BroadcastConfig {
             interval_secs: DEFAULT_INTERVAL_SECS,
             instance_id: None,
             secret: None,
+            conflict_resolution: default_broadcast_conflict_resolution(),
+            ordering_columns: Vec::new(),
         }
     }
 }
@@ -824,6 +862,46 @@ pub fn broadcast_pid_lock_path(config_path: &std::path::Path) -> std::path::Path
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two default paths must agree. `BroadcastConfig` carries a
+    /// hand-written `impl Default` AND per-field `#[serde(default = ...)]`; a
+    /// config file that omits a key takes the serde path, while an embedder
+    /// constructing the struct takes the other. A disagreement would mean the
+    /// same deployment resolves conflicts differently depending on whether the
+    /// key was written down.
+    #[test]
+    fn omitted_conflict_keys_deserialize_to_the_struct_defaults() {
+        let from_toml: BroadcastConfig = toml::from_str("").expect("empty [broadcast] table");
+        let from_struct = BroadcastConfig::default();
+
+        assert_eq!(
+            from_toml.conflict_resolution, from_struct.conflict_resolution,
+            "serde default and impl Default disagree on conflict_resolution"
+        );
+        assert_eq!(from_toml.ordering_columns, from_struct.ordering_columns);
+        assert_eq!(
+            from_toml.conflict_resolution,
+            ConflictResolution::RemoteWins,
+            "an existing deployment must keep last-received-wins"
+        );
+    }
+
+    /// The opt-in path: legion's shape, spelled the way an operator writes it.
+    #[test]
+    fn newer_wins_and_an_ordering_list_parse_from_toml() {
+        let bc: BroadcastConfig = toml::from_str(
+            r#"
+            conflict_resolution = "newer_wins"
+            ordering_columns = ["created_at", "updated_at", "deleted_at"]
+            "#,
+        )
+        .expect("parse");
+        assert_eq!(bc.conflict_resolution, ConflictResolution::NewerWins);
+        assert_eq!(
+            bc.ordering_columns,
+            vec!["created_at", "updated_at", "deleted_at"]
+        );
+    }
 
     #[test]
     fn test_announcement_roundtrip() {

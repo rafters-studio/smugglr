@@ -83,8 +83,23 @@ pub async fn run_broadcast(
             let mut recv_buf = vec![0u8; RECV_BUF];
             loop {
                 match gossip.recv_and_handle(&mut recv_buf, &local, &config).await {
-                    Ok(GossipEvent::Applied { table, rows }) if rows > 0 => {
-                        info!("Applied {} row(s) to '{}'", rows, table)
+                    // A rejected row is the conflict guard doing its job, not an
+                    // error -- but a run where every peer row is turned away is
+                    // indistinguishable from a run where none arrived unless the
+                    // count is said out loud.
+                    Ok(GossipEvent::Applied {
+                        table,
+                        rows,
+                        rejected,
+                    }) if rows > 0 || rejected > 0 => {
+                        if rejected > 0 {
+                            info!(
+                                "Applied {} row(s) to '{}' ({} turned away as not newer)",
+                                rows, table, rejected
+                            )
+                        } else {
+                            info!("Applied {} row(s) to '{}'", rows, table)
+                        }
                     }
                     Ok(GossipEvent::Served { table, rows }) if rows > 0 => {
                         debug!("Served {} row(s) of '{}'", rows, table)

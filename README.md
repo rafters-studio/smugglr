@@ -267,7 +267,7 @@ Machine A           multicast group 239.255.43.21 (encrypted)          Machine B
 
 1. `smugglr broadcast` joins the multicast group and, each interval, multicasts a `primary_key -> content_hash` digest of every synced table -- the heartbeat.
 2. A node that hears a digest covering rows it lacks (or hashes differently) multicasts a request for exactly those rows.
-3. Whoever holds them multicasts the rows; every listener applies idempotently, so one answer converges the whole group. Last-received-wins on divergence -- UUIDv7 keys make concurrent divergence rare, no CRDTs.
+3. Whoever holds them multicasts the rows; every listener applies idempotently, so one answer converges the whole group. Which side wins a same-key collision is `[broadcast].conflict_resolution` -- `remote_wins` (the default, last-received-wins) or `newer_wins`, which orders by timestamp. No CRDTs; UUIDv7 keys make concurrent divergence rare.
 4. Late joiners and partition rejoins converge through the same heartbeat -- no special case.
 5. All traffic is XChaCha20-Poly1305 encrypted with the pre-shared key. Lost packets are safe: applying a row twice is a no-op and the next heartbeat re-reconciles.
 
@@ -284,6 +284,21 @@ interval_secs = 30
 # ALL broadcast traffic is encrypted when this is set.
 secret = "your-256-bit-hex-key"
 
+# How a received row resolves against a local row with the same primary key.
+#   remote_wins (default) - the received row wins; last-received-wins
+#   newer_wins            - the row with the greater ordering value wins
+#   local_wins            - new rows arrive, existing rows are never overwritten
+# Scoped to [broadcast] on purpose: [sync].conflict_resolution defaults to
+# local_wins, and inheriting it here would silently stop every existing LAN
+# deployment from accepting peer rows.
+conflict_resolution = "newer_wins"
+
+# The ordering signal for newer_wins: max() across whichever of these columns
+# the table has. A LIST, because an ordering key is often a max over several --
+# a tombstone that stamps deleted_at without touching updated_at must still win.
+# Defaults to [ sync.timestamp_column ].
+ordering_columns = ["created_at", "updated_at", "deleted_at"]
+
 [sync]
 # Skip large columns (embeddings, vectors) from broadcast
 exclude_columns = ["*_embedding", "vector"]
@@ -291,6 +306,10 @@ exclude_columns = ["*_embedding", "vector"]
 # UUIDv7 required for master-master sync
 conflict_resolution = "uuid_v7_wins"
 ```
+
+Both peers must opt into `newer_wins`; the policy is apply-side and is not
+negotiated on the wire, so a mesh with mixed settings converges toward the
+permissive node.
 
 ### Security model
 
