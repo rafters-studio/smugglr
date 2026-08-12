@@ -52,6 +52,47 @@ impl LocalDb {
         let tables = list_tables_inner(&conn)?;
         Ok(TableSchema::new(tables))
     }
+
+    /// The SQLite storage class actually stored in `table`.`column` -- one of
+    /// `integer`, `real`, `text`, `blob` -- or `None` when the column does not
+    /// exist or holds only NULLs.
+    ///
+    /// Bounded: the first non-NULL value decides. Used to detect two peers
+    /// disagreeing about how a timestamp is represented, which SQLite will order
+    /// confidently (its cross-class ordering is total) but not chronologically.
+    pub fn stored_storage_class(&self, table: &str, column: &str) -> Result<Option<String>> {
+        let conn = self.conn();
+        let sql = format!(
+            "SELECT typeof(\"{}\") FROM \"{}\" WHERE \"{}\" IS NOT NULL LIMIT 1",
+            column, table, column
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query([])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get::<_, String>(0)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Upsert rows under an explicit same-PK conflict [`UpsertGuard`].
+    ///
+    /// The unguarded [`DataSource::upsert_rows`] is `INSERT OR REPLACE` -- the
+    /// received row always wins. This is the same batch write with the
+    /// resolution policy compiled into the statement, so a peer's stale row can
+    /// be turned away without a read-modify-write.
+    ///
+    /// Inherent to `LocalDb` rather than added to [`DataSource`]: a guarded
+    /// write needs SQLite's `ON CONFLICT` and has no general remote analogue, so
+    /// plugin-SDK implementors are unaffected.
+    pub fn upsert_rows_guarded(
+        &self,
+        table: &str,
+        rows: &[HashMap<String, JsonValue>],
+        guard: UpsertGuard<'_>,
+    ) -> Result<UpsertOutcome> {
+        let conn = self.conn();
+        upsert_rows_guarded_inner(&conn, table, rows, guard)
+    }
 }
 
 impl DataSource for LocalDb {
@@ -304,14 +345,96 @@ fn upsert_rows_inner(
     table: &str,
     rows: &[HashMap<String, JsonValue>],
 ) -> Result<usize> {
+    Ok(upsert_rows_guarded_inner(conn, table, rows, UpsertGuard::Replace)?.applied)
+}
+
+/// How a received row resolves against an existing local row with the same
+/// primary key.
+///
+/// The variant selects the SQL shape; every shape is a single statement per row
+/// so the resolution rides *inside* the write and is atomic against a concurrent
+/// local writer. A read-then-write predicate would be racy and would cost a
+/// round trip per row on the hot apply path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpsertGuard<'a> {
+    /// Overwrite unconditionally -- `INSERT OR REPLACE`. The historical
+    /// multicast behavior, and what `remote_wins` means on the apply side.
+    Replace,
+    /// Keep the local row -- `ON CONFLICT DO NOTHING`. Rows absent locally are
+    /// still inserted; an existing row is never touched. `local_wins`.
+    KeepLocal,
+    /// Accept only when the incoming row's ordering value is strictly greater
+    /// than the stored row's -- `ON CONFLICT DO UPDATE ... WHERE`. `newer_wins`.
+    ///
+    /// The ordering value is `max` across the listed columns that actually exist
+    /// on the table, computed identically for both sides of the comparison.
+    NewerBy(&'a [String]),
+}
+
+/// Result of a guarded upsert batch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UpsertOutcome {
+    /// Rows the guard admitted (inserted or updated).
+    pub applied: usize,
+    /// Rows the guard turned away -- an older or equally-ordered incoming row
+    /// under [`UpsertGuard::NewerBy`], or any colliding row under
+    /// [`UpsertGuard::KeepLocal`]. Not an error: a rejection is the guard doing
+    /// its job. Surfaced so an embedder can see that peer rows are losing.
+    pub rejected: usize,
+    /// The ordering columns requested were all absent from the table, so the
+    /// batch fell back to [`UpsertGuard::Replace`]. The caller should say so
+    /// once per table: the configuration claims an ordering that the schema
+    /// cannot supply, and silently applying blind is how "I believe I am
+    /// ordered and I am not" happens.
+    pub ordering_unavailable: bool,
+}
+
+/// A null-tolerant `max` over `cols`, each qualified by `qualifier`.
+///
+/// SQLite's scalar `max(a, b, c)` returns NULL if *any* argument is NULL, which
+/// would be fatal here: a live row with `deleted_at IS NULL` would produce a
+/// NULL ordering value and lose every comparison. Rotating the column list
+/// through `coalesce` gives each position a non-NULL fallback, so the `max` sees
+/// NULLs only when *every* column is NULL -- which is exactly when the row has
+/// no ordering signal at all.
+///
+/// One column degenerates to a bare column reference, which is the
+/// single-`timestamp_column` behavior.
+fn ordering_max_expr(qualifier: &str, cols: &[String]) -> String {
+    let qualified: Vec<String> = cols
+        .iter()
+        .map(|c| format!("{}.\"{}\"", qualifier, c))
+        .collect();
+
+    if qualified.len() == 1 {
+        return qualified[0].clone();
+    }
+
+    let args: Vec<String> = (0..qualified.len())
+        .map(|i| {
+            let rotated: Vec<&str> = (0..qualified.len())
+                .map(|j| qualified[(i + j) % qualified.len()].as_str())
+                .collect();
+            format!("coalesce({})", rotated.join(", "))
+        })
+        .collect();
+
+    format!("max({})", args.join(", "))
+}
+
+fn upsert_rows_guarded_inner(
+    conn: &Connection,
+    table: &str,
+    rows: &[HashMap<String, JsonValue>],
+    guard: UpsertGuard<'_>,
+) -> Result<UpsertOutcome> {
     if rows.is_empty() {
-        return Ok(0);
+        return Ok(UpsertOutcome::default());
     }
 
     let info = table_info_inner(conn, table)?;
     let cols: Vec<&str> = info.columns.iter().map(|c| c.name.as_str()).collect();
 
-    // Build INSERT OR REPLACE statement
     let col_list = cols
         .iter()
         .map(|c| format!("\"{}\"", c))
@@ -319,15 +442,77 @@ fn upsert_rows_inner(
         .join(", ");
     let placeholders = cols.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
 
-    let sql = format!(
-        "INSERT OR REPLACE INTO \"{}\" ({}) VALUES ({})",
-        table, col_list, placeholders
-    );
+    // The conflict target must be the table's declared PRIMARY KEY columns.
+    // `table_info_inner` already rejects a table without one (`NoPrimaryKey`),
+    // so every table that reaches here has a target `ON CONFLICT` can bind to.
+    let pk_target = info
+        .primary_key
+        .iter()
+        .map(|c| format!("\"{}\"", c))
+        .collect::<Vec<_>>()
+        .join(", ");
 
-    debug!("Upserting {} rows into {}", rows.len(), table);
+    // Ordering columns the table does not have cannot participate. If none of
+    // them exist, there is no ordering signal and the guard degrades to
+    // Replace -- reported, never silent.
+    let mut ordering_unavailable = false;
+    let present: Vec<String> = match guard {
+        UpsertGuard::NewerBy(want) => {
+            let present: Vec<String> = want
+                .iter()
+                .filter(|c| info.columns.iter().any(|ci| &&ci.name == c))
+                .cloned()
+                .collect();
+            if present.is_empty() {
+                ordering_unavailable = true;
+            }
+            present
+        }
+        _ => Vec::new(),
+    };
+
+    let sql = match guard {
+        UpsertGuard::Replace => format!(
+            "INSERT OR REPLACE INTO \"{}\" ({}) VALUES ({})",
+            table, col_list, placeholders
+        ),
+        UpsertGuard::KeepLocal => format!(
+            "INSERT INTO \"{}\" ({}) VALUES ({}) ON CONFLICT({}) DO NOTHING",
+            table, col_list, placeholders, pk_target
+        ),
+        UpsertGuard::NewerBy(_) if ordering_unavailable => format!(
+            "INSERT OR REPLACE INTO \"{}\" ({}) VALUES ({})",
+            table, col_list, placeholders
+        ),
+        UpsertGuard::NewerBy(_) => {
+            // Only non-PK columns are assigned: the PK columns are equal by
+            // definition of the conflict.
+            let assignments = cols
+                .iter()
+                .filter(|c| !info.primary_key.iter().any(|pk| pk == *c))
+                .map(|c| format!("\"{0}\" = excluded.\"{0}\"", c))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let incoming = ordering_max_expr("excluded", &present);
+            let stored = ordering_max_expr(&format!("\"{}\"", table), &present);
+            // An incoming row with no ordering value never displaces a stored
+            // row; a stored row with no ordering value never blocks one. Both
+            // arms are needed and both are symmetric across peers, so exactly
+            // one side of any pair accepts and the mesh quiesces.
+            format!(
+                "INSERT INTO \"{table}\" ({col_list}) VALUES ({placeholders}) \
+                 ON CONFLICT({pk_target}) DO UPDATE SET {assignments} \
+                 WHERE {incoming} IS NOT NULL \
+                 AND ({stored} IS NULL OR {incoming} > {stored})"
+            )
+        }
+    };
+
+    debug!("Upserting {} rows into {}: {}", rows.len(), table, sql);
 
     let tx = conn.unchecked_transaction()?;
-    let mut count = 0;
+    let mut applied = 0;
+    let mut rejected = 0;
 
     {
         let mut stmt = tx.prepare(&sql)?;
@@ -340,14 +525,31 @@ fn upsert_rows_inner(
             let param_refs: Vec<&dyn rusqlite::ToSql> =
                 params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
 
-            stmt.execute(param_refs.as_slice())?;
-            count += 1;
+            // A guard that turns a row away reports 0 changed rows, so the
+            // statement's own count -- not the batch length -- is the truth
+            // about what landed.
+            if stmt.execute(param_refs.as_slice())? > 0 {
+                applied += 1;
+            } else {
+                rejected += 1;
+            }
         }
     }
 
     tx.commit()?;
-    info!("Upserted {} rows into {}", count, table);
-    Ok(count)
+    if rejected > 0 {
+        info!(
+            "Upserted {} rows into {} ({} turned away by the conflict guard)",
+            applied, table, rejected
+        );
+    } else {
+        info!("Upserted {} rows into {}", applied, table);
+    }
+    Ok(UpsertOutcome {
+        applied,
+        rejected,
+        ordering_unavailable,
+    })
 }
 
 /// Convert a row value to JSON by its SQLite storage class.
@@ -446,6 +648,611 @@ mod tests {
         // not an error -- the fix does not conflate empty with unreadable.
         let conn = one_row_conn("NULL");
         assert_eq!(get_col0(&conn).unwrap(), JsonValue::Null);
+    }
+
+    // -- Guarded upsert (#310) --
+
+    /// A table shaped like legion's: an ordering key that is the max over three
+    /// columns, one of which (`deleted_at`) is NULL on every live row.
+    fn ordered_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE rows_t (
+                 id TEXT PRIMARY KEY,
+                 v TEXT,
+                 created_at TEXT,
+                 updated_at TEXT,
+                 deleted_at TEXT
+             );",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn row(
+        id: &str,
+        v: &str,
+        created: Option<&str>,
+        updated: Option<&str>,
+        deleted: Option<&str>,
+    ) -> HashMap<String, JsonValue> {
+        let j = |o: Option<&str>| o.map(JsonValue::from).unwrap_or(JsonValue::Null);
+        HashMap::from([
+            ("id".to_string(), JsonValue::from(id)),
+            ("v".to_string(), JsonValue::from(v)),
+            ("created_at".to_string(), j(created)),
+            ("updated_at".to_string(), j(updated)),
+            ("deleted_at".to_string(), j(deleted)),
+        ])
+    }
+
+    fn read_v(conn: &Connection, id: &str) -> String {
+        conn.query_row("SELECT v FROM rows_t WHERE id = ?1", [id], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn legion_ordering() -> Vec<String> {
+        vec![
+            "created_at".to_string(),
+            "updated_at".to_string(),
+            "deleted_at".to_string(),
+        ]
+    }
+
+    #[test]
+    fn ordering_max_expr_single_column_is_a_bare_reference() {
+        // One entry must degenerate to exactly the single-timestamp_column
+        // behavior -- no coalesce/max wrapper to change its meaning.
+        assert_eq!(
+            ordering_max_expr("excluded", &["updated_at".to_string()]),
+            "excluded.\"updated_at\""
+        );
+    }
+
+    #[test]
+    fn ordering_max_expr_tolerates_nulls_via_rotation() {
+        // The rotation exists because SQLite's scalar max() returns NULL if ANY
+        // argument is NULL. Every position must appear first in some coalesce,
+        // or a NULL in that position would poison the result.
+        let e = ordering_max_expr("excluded", &legion_ordering());
+        for c in ["created_at", "updated_at", "deleted_at"] {
+            assert!(
+                e.contains(&format!("coalesce(excluded.\"{}\"", c)),
+                "{} never leads a coalesce in {}",
+                c,
+                e
+            );
+        }
+    }
+
+    #[test]
+    fn newer_by_rejects_an_older_row_and_accepts_a_newer_one() {
+        let conn = ordered_conn();
+        let ordering = legion_ordering();
+        upsert_rows_guarded_inner(
+            &conn,
+            "rows_t",
+            &[row(
+                "a",
+                "local",
+                Some("2026-01-01"),
+                Some("2026-05-01"),
+                None,
+            )],
+            UpsertGuard::NewerBy(&ordering),
+        )
+        .unwrap();
+
+        // Older peer row: turned away, counted, local content intact.
+        let older = upsert_rows_guarded_inner(
+            &conn,
+            "rows_t",
+            &[row(
+                "a",
+                "stale",
+                Some("2026-01-01"),
+                Some("2026-04-01"),
+                None,
+            )],
+            UpsertGuard::NewerBy(&ordering),
+        )
+        .unwrap();
+        assert_eq!((older.applied, older.rejected), (0, 1));
+        assert_eq!(read_v(&conn, "a"), "local");
+
+        // Newer peer row: accepted.
+        let newer = upsert_rows_guarded_inner(
+            &conn,
+            "rows_t",
+            &[row(
+                "a",
+                "fresh",
+                Some("2026-01-01"),
+                Some("2026-06-01"),
+                None,
+            )],
+            UpsertGuard::NewerBy(&ordering),
+        )
+        .unwrap();
+        assert_eq!((newer.applied, newer.rejected), (1, 0));
+        assert_eq!(read_v(&conn, "a"), "fresh");
+    }
+
+    #[test]
+    fn newer_by_keeps_the_local_row_on_an_exact_tie() {
+        // Strict greater-than: two writes at the identical instant stay
+        // divergent rather than flapping. Matches the remote path's tie rule.
+        let conn = ordered_conn();
+        let ordering = legion_ordering();
+        let base = row("a", "local", Some("2026-01-01"), Some("2026-05-01"), None);
+        upsert_rows_guarded_inner(&conn, "rows_t", &[base], UpsertGuard::NewerBy(&ordering))
+            .unwrap();
+
+        let tie = upsert_rows_guarded_inner(
+            &conn,
+            "rows_t",
+            &[row(
+                "a",
+                "peer",
+                Some("2026-01-01"),
+                Some("2026-05-01"),
+                None,
+            )],
+            UpsertGuard::NewerBy(&ordering),
+        )
+        .unwrap();
+        assert_eq!((tie.applied, tie.rejected), (0, 1));
+        assert_eq!(read_v(&conn, "a"), "local");
+    }
+
+    #[test]
+    fn tombstone_setting_only_deleted_at_wins() {
+        // legion's exact shape, and the reason the ordering signal is a LIST:
+        // the tombstone stamps deleted_at and leaves updated_at alone. Under a
+        // single-column compare on updated_at this is a tie and the delete is
+        // rejected -- the row resurrects.
+        let conn = ordered_conn();
+        let ordering = legion_ordering();
+        upsert_rows_guarded_inner(
+            &conn,
+            "rows_t",
+            &[row(
+                "a",
+                "live",
+                Some("2026-01-01"),
+                Some("2026-05-01"),
+                None,
+            )],
+            UpsertGuard::NewerBy(&ordering),
+        )
+        .unwrap();
+
+        let tombstone = upsert_rows_guarded_inner(
+            &conn,
+            "rows_t",
+            &[row(
+                "a",
+                "gone",
+                Some("2026-01-01"),
+                Some("2026-05-01"),
+                Some("2026-06-01"),
+            )],
+            UpsertGuard::NewerBy(&ordering),
+        )
+        .unwrap();
+        assert_eq!((tombstone.applied, tombstone.rejected), (1, 0));
+        assert_eq!(read_v(&conn, "a"), "gone");
+
+        // And the same tombstone must not be undone by a later live row whose
+        // max is lower.
+        let resurrect = upsert_rows_guarded_inner(
+            &conn,
+            "rows_t",
+            &[row(
+                "a",
+                "back",
+                Some("2026-01-01"),
+                Some("2026-05-02"),
+                None,
+            )],
+            UpsertGuard::NewerBy(&ordering),
+        )
+        .unwrap();
+        assert_eq!((resurrect.applied, resurrect.rejected), (0, 1));
+        assert_eq!(read_v(&conn, "a"), "gone");
+    }
+
+    #[test]
+    fn newer_by_handles_a_missing_ordering_value_on_either_side() {
+        let conn = ordered_conn();
+        let ordering = legion_ordering();
+
+        // Stored row has no ordering signal at all -> it cannot block anything.
+        upsert_rows_guarded_inner(
+            &conn,
+            "rows_t",
+            &[row("a", "unstamped", None, None, None)],
+            UpsertGuard::NewerBy(&ordering),
+        )
+        .unwrap();
+        let over = upsert_rows_guarded_inner(
+            &conn,
+            "rows_t",
+            &[row("a", "stamped", None, Some("2026-01-01"), None)],
+            UpsertGuard::NewerBy(&ordering),
+        )
+        .unwrap();
+        assert_eq!((over.applied, over.rejected), (1, 0));
+        assert_eq!(read_v(&conn, "a"), "stamped");
+
+        // Incoming row has no ordering signal -> it never displaces one that
+        // does. The two arms are symmetric, so across a pair of peers exactly
+        // one side accepts and the exchange terminates.
+        let blind = upsert_rows_guarded_inner(
+            &conn,
+            "rows_t",
+            &[row("a", "unstamped-peer", None, None, None)],
+            UpsertGuard::NewerBy(&ordering),
+        )
+        .unwrap();
+        assert_eq!((blind.applied, blind.rejected), (0, 1));
+        assert_eq!(read_v(&conn, "a"), "stamped");
+    }
+
+    #[test]
+    fn newer_by_falls_back_to_replace_when_the_table_has_no_ordering_column() {
+        // Configuration claims an ordering the schema cannot supply. Applying
+        // blind is the terminal choice, but it must be REPORTED -- a user who
+        // believes they are ordered and is not is the failure this guard exists
+        // to remove.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE plain (id TEXT PRIMARY KEY, v TEXT);")
+            .unwrap();
+        let mk = |v: &str| {
+            HashMap::from([
+                ("id".to_string(), JsonValue::from("a")),
+                ("v".to_string(), JsonValue::from(v)),
+            ])
+        };
+        upsert_rows_guarded_inner(&conn, "plain", &[mk("first")], UpsertGuard::Replace).unwrap();
+
+        let ordering = legion_ordering();
+        let out = upsert_rows_guarded_inner(
+            &conn,
+            "plain",
+            &[mk("second")],
+            UpsertGuard::NewerBy(&ordering),
+        )
+        .unwrap();
+        assert!(out.ordering_unavailable, "the caller must be told");
+        assert_eq!(out.applied, 1);
+        let v: String = conn
+            .query_row("SELECT v FROM plain WHERE id = 'a'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, "second", "fallback is blind overwrite, as before");
+    }
+
+    #[test]
+    fn newer_by_uses_only_the_ordering_columns_the_table_actually_has() {
+        // A table with updated_at but no created_at/deleted_at still orders --
+        // the absent columns are dropped from the comparison rather than
+        // disabling it.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE partial (id TEXT PRIMARY KEY, v TEXT, updated_at TEXT);")
+            .unwrap();
+        let mk = |v: &str, ts: &str| {
+            HashMap::from([
+                ("id".to_string(), JsonValue::from("a")),
+                ("v".to_string(), JsonValue::from(v)),
+                ("updated_at".to_string(), JsonValue::from(ts)),
+            ])
+        };
+        let ordering = legion_ordering();
+        upsert_rows_guarded_inner(
+            &conn,
+            "partial",
+            &[mk("local", "2026-05-01")],
+            UpsertGuard::NewerBy(&ordering),
+        )
+        .unwrap();
+        let out = upsert_rows_guarded_inner(
+            &conn,
+            "partial",
+            &[mk("stale", "2026-04-01")],
+            UpsertGuard::NewerBy(&ordering),
+        )
+        .unwrap();
+        assert!(!out.ordering_unavailable);
+        assert_eq!((out.applied, out.rejected), (0, 1));
+    }
+
+    #[test]
+    fn newer_by_guards_a_composite_primary_key() {
+        // The conflict target is the table's declared PK columns, not the
+        // rendered `__pk` text, which is a lookup key and not a constraint.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE pair (p TEXT, q TEXT, v TEXT, updated_at TEXT, PRIMARY KEY (p, q));",
+        )
+        .unwrap();
+        let mk = |v: &str, ts: &str| {
+            HashMap::from([
+                ("p".to_string(), JsonValue::from("x")),
+                ("q".to_string(), JsonValue::from("y")),
+                ("v".to_string(), JsonValue::from(v)),
+                ("updated_at".to_string(), JsonValue::from(ts)),
+            ])
+        };
+        let ordering = vec!["updated_at".to_string()];
+        upsert_rows_guarded_inner(
+            &conn,
+            "pair",
+            &[mk("local", "2026-05-01")],
+            UpsertGuard::NewerBy(&ordering),
+        )
+        .unwrap();
+        let out = upsert_rows_guarded_inner(
+            &conn,
+            "pair",
+            &[mk("stale", "2026-01-01")],
+            UpsertGuard::NewerBy(&ordering),
+        )
+        .unwrap();
+        assert_eq!((out.applied, out.rejected), (0, 1));
+        let v: String = conn
+            .query_row("SELECT v FROM pair WHERE p='x' AND q='y'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, "local");
+    }
+
+    #[test]
+    fn keep_local_inserts_new_rows_but_never_overwrites() {
+        let conn = ordered_conn();
+        upsert_rows_guarded_inner(
+            &conn,
+            "rows_t",
+            &[row("a", "local", None, Some("2026-01-01"), None)],
+            UpsertGuard::Replace,
+        )
+        .unwrap();
+
+        let out = upsert_rows_guarded_inner(
+            &conn,
+            "rows_t",
+            &[
+                row("a", "peer", None, Some("2027-01-01"), None),
+                row("b", "peer", None, Some("2027-01-01"), None),
+            ],
+            UpsertGuard::KeepLocal,
+        )
+        .unwrap();
+        assert_eq!((out.applied, out.rejected), (1, 1));
+        assert_eq!(read_v(&conn, "a"), "local", "even a newer peer row loses");
+        assert_eq!(read_v(&conn, "b"), "peer", "absent rows still arrive");
+    }
+
+    #[test]
+    fn replace_still_overwrites_blindly() {
+        // The default multicast policy is remote_wins, and it must behave
+        // exactly as INSERT OR REPLACE always did -- including accepting a row
+        // that is older by every ordering column.
+        let conn = ordered_conn();
+        upsert_rows_guarded_inner(
+            &conn,
+            "rows_t",
+            &[row("a", "local", None, Some("2026-05-01"), None)],
+            UpsertGuard::Replace,
+        )
+        .unwrap();
+        let out = upsert_rows_guarded_inner(
+            &conn,
+            "rows_t",
+            &[row("a", "older-peer", None, Some("2020-01-01"), None)],
+            UpsertGuard::Replace,
+        )
+        .unwrap();
+        assert_eq!((out.applied, out.rejected), (1, 0));
+        assert_eq!(read_v(&conn, "a"), "older-peer");
+    }
+
+    #[test]
+    fn deleted_at_only_write_changes_the_content_hash() {
+        // The seam that would break legion silently: `deleted_at` must stay
+        // VISIBLE to the content hash. `rowhash` excludes updated_at/created_at
+        // and the configured timestamp_column; if the ordering-column list were
+        // ever folded into that exclusion set, a tombstone that only stamps
+        // deleted_at would hash identically to the live row, produce no digest
+        // mismatch, and never be gossiped at all -- while the config says
+        // newer_wins.
+        let conn = ordered_conn();
+        conn.execute(
+            "INSERT INTO rows_t VALUES ('a','v','2026-01-01','2026-05-01',NULL)",
+            [],
+        )
+        .unwrap();
+        let before = get_row_metadata_inner(&conn, "rows_t", "updated_at", &[]).unwrap();
+
+        conn.execute(
+            "UPDATE rows_t SET deleted_at = '2026-06-01' WHERE id = 'a'",
+            [],
+        )
+        .unwrap();
+        let after = get_row_metadata_inner(&conn, "rows_t", "updated_at", &[]).unwrap();
+
+        assert_ne!(
+            before["a"].content_hash, after["a"].content_hash,
+            "a deleted_at-only write must change the digest, or tombstones never propagate"
+        );
+    }
+
+    /// #310 asks that both transports order identically. The remote path orders
+    /// with `diff::compare_ts` in Rust; the LAN path cannot, because its
+    /// comparison has to ride inside the write to stay atomic against a
+    /// concurrent local writer. So the guarantee is pinned here instead: for
+    /// every pair the documented precondition admits -- both sides the same
+    /// storage class -- the SQL guard and `compare_ts` must reach the same
+    /// verdict, or a row would sync one way over D1 and the other way over the
+    /// LAN.
+    #[test]
+    fn sql_guard_agrees_with_compare_ts_on_same_class_pairs() {
+        use std::cmp::Ordering;
+
+        // Same-class pairs only. Numeric pairs are where lexical comparison
+        // would be wrong ("1000" sorts before "999"), text pairs are where
+        // numeric parsing would be.
+        let cases: [(JsonValue, JsonValue, &str, &str); 6] = [
+            (
+                JsonValue::from(999i64),
+                JsonValue::from(1000i64),
+                "999",
+                "1000",
+            ),
+            (
+                JsonValue::from(1000i64),
+                JsonValue::from(999i64),
+                "1000",
+                "999",
+            ),
+            (
+                JsonValue::from(2.5f64),
+                JsonValue::from(10.5f64),
+                "2.5",
+                "10.5",
+            ),
+            (
+                JsonValue::from("2026-01-01T00:00:00+00:00"),
+                JsonValue::from("2026-02-01T00:00:00+00:00"),
+                "2026-01-01T00:00:00+00:00",
+                "2026-02-01T00:00:00+00:00",
+            ),
+            (
+                JsonValue::from("2026-02-01T00:00:00+00:00"),
+                JsonValue::from("2026-01-01T00:00:00+00:00"),
+                "2026-02-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ),
+            (
+                JsonValue::from("2026-01-01T00:00:00+00:00"),
+                JsonValue::from("2026-01-01T00:00:00+00:00"),
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        ];
+
+        let ordering = vec!["updated_at".to_string()];
+        for (stored, incoming, stored_s, incoming_s) in cases {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch("CREATE TABLE t (id TEXT PRIMARY KEY, updated_at);")
+                .unwrap();
+            let mk = |ts: &JsonValue| {
+                HashMap::from([
+                    ("id".to_string(), JsonValue::from("a")),
+                    ("updated_at".to_string(), ts.clone()),
+                ])
+            };
+            upsert_rows_guarded_inner(&conn, "t", &[mk(&stored)], UpsertGuard::Replace).unwrap();
+            let out = upsert_rows_guarded_inner(
+                &conn,
+                "t",
+                &[mk(&incoming)],
+                UpsertGuard::NewerBy(&ordering),
+            )
+            .unwrap();
+
+            // The guard accepts exactly when the incoming value is strictly
+            // greater, which is what Ordering::Greater means to compare_ts.
+            let sql_accepted = out.applied == 1;
+            let rust_accepted =
+                crate::diff::compare_ts(incoming_s, stored_s) == Some(Ordering::Greater);
+            assert_eq!(
+                sql_accepted, rust_accepted,
+                "guard and compare_ts disagree on incoming {incoming_s} vs stored {stored_s}"
+            );
+        }
+    }
+
+    /// The one pair where they deliberately differ, recorded so the divergence
+    /// is a decision rather than a surprise. `compare_ts` returns `None` on a
+    /// numeric-vs-text pair rather than inventing a winner; SQLite's ordering
+    /// across storage classes is total and picks one. That difference is what
+    /// makes the LAN path terminate -- exactly one peer accepts, so the mesh
+    /// quiesces instead of re-firing Want/Delta forever -- at the cost of a
+    /// winner that is arbitrary rather than chronological, which is why
+    /// `Gossip::ordering_notes` reports it.
+    #[test]
+    fn sql_guard_orders_a_mixed_representation_that_compare_ts_abstains_on() {
+        assert_eq!(
+            crate::diff::compare_ts("1800000000", "2026-01-01T00:00:00+00:00"),
+            None,
+            "compare_ts must not invent a winner across representations"
+        );
+
+        let ordering = vec!["updated_at".to_string()];
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (id TEXT PRIMARY KEY, updated_at);")
+            .unwrap();
+        let mk = |ts: JsonValue| {
+            HashMap::from([
+                ("id".to_string(), JsonValue::from("a")),
+                ("updated_at".to_string(), ts),
+            ])
+        };
+
+        // Integer stored, ISO text incoming: TEXT sorts above INTEGER, accepted.
+        upsert_rows_guarded_inner(
+            &conn,
+            "t",
+            &[mk(JsonValue::from(1_800_000_000i64))],
+            UpsertGuard::Replace,
+        )
+        .unwrap();
+        let text_over_int = upsert_rows_guarded_inner(
+            &conn,
+            "t",
+            &[mk(JsonValue::from("2026-01-01T00:00:00+00:00"))],
+            UpsertGuard::NewerBy(&ordering),
+        )
+        .unwrap();
+        assert_eq!(text_over_int.applied, 1);
+
+        // The mirror image is rejected -- so across a pair of peers exactly one
+        // side accepts and the exchange terminates.
+        let int_over_text = upsert_rows_guarded_inner(
+            &conn,
+            "t",
+            &[mk(JsonValue::from(1_800_000_000i64))],
+            UpsertGuard::NewerBy(&ordering),
+        )
+        .unwrap();
+        assert_eq!(int_over_text.applied, 0);
+        assert_eq!(int_over_text.rejected, 1);
+    }
+
+    #[test]
+    fn stored_storage_class_reports_the_first_non_null_class() {
+        let conn = ordered_conn();
+        conn.execute(
+            "INSERT INTO rows_t VALUES ('a','v',NULL,'2026-05-01',NULL)",
+            [],
+        )
+        .unwrap();
+        // Bypass LocalDb::open (which needs a file) by exercising the same SQL.
+        let class: Option<String> = conn
+            .query_row(
+                "SELECT typeof(\"updated_at\") FROM \"rows_t\" WHERE \"updated_at\" IS NOT NULL LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
+        assert_eq!(class.as_deref(), Some("text"));
+        let all_null: Option<String> = conn
+            .query_row(
+                "SELECT typeof(\"deleted_at\") FROM \"rows_t\" WHERE \"deleted_at\" IS NOT NULL LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
+        assert_eq!(all_null, None, "an all-NULL column has no class to compare");
     }
 
     #[test]

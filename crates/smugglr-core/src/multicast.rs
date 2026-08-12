@@ -10,9 +10,21 @@
 //!   DB-identity scoping: two replicas of one logical database sync regardless of
 //!   where each stores its file. Isolate clusters on one LAN with distinct keys
 //!   (a foreign key's datagrams simply fail to decrypt and are dropped).
-//! - **Idempotent apply / last-received-wins.** An incoming row is applied with
-//!   `INSERT OR REPLACE`; applying the same row twice is a no-op, so lost
-//!   datagrams are safe. On same-PK divergence the received row wins.
+//! - **Idempotent apply under a declared policy.** An incoming row is applied
+//!   with a single guarded statement, so applying the same row twice is a no-op
+//!   and lost datagrams are safe. Which side wins a same-PK collision is
+//!   [`BroadcastConfig::conflict_resolution`], which defaults to `remote_wins`
+//!   -- the historical last-received-wins behavior, unchanged. `newer_wins`
+//!   orders by `max` across
+//!   [`BroadcastConfig::ordering_columns`](crate::broadcast::BroadcastConfig::ordering_columns)
+//!   and is an explicit opt-in; the comparison rides inside the write
+//!   (`ON CONFLICT ... DO UPDATE ... WHERE`), so it is atomic against a
+//!   concurrent local write rather than a read-then-write race.
+//!
+//!   Both peers must opt in. A mesh where one node runs `newer_wins` and
+//!   another `remote_wins` converges toward the permissive node -- the policy
+//!   is apply-side, so it is not negotiated on the wire and
+//!   [`PROTOCOL_VERSION`](crate::broadcast::PROTOCOL_VERSION) is unaffected.
 //! - **Heartbeat reconciliation.** Each node periodically multicasts a
 //!   `primary_key -> content_hash` [`Digest`](Body::Digest) for every syncable
 //!   table. A peer that hears a digest covering rows it lacks (or hashes
@@ -22,8 +34,13 @@
 //!
 //! ## v0.1 boundaries (named, per the smugglr conflict doctrine -- do not hide)
 //!
-//! - **Concurrent same-PK divergence resolves silently** (last-received-wins, no
-//!   vector clocks/CRDTs). UUIDv7 PKs make this rare; the single-writer-per-row
+//! - **Concurrent same-PK divergence resolves without a causal record** (no
+//!   vector clocks/CRDTs). Under the default `remote_wins` it resolves silently;
+//!   under `newer_wins` the loser is counted in
+//!   [`GossipEvent::Applied::rejected`] and per-table anomalies are readable via
+//!   [`Gossip::ordering_notes`]. Two writes at the identical instant still tie,
+//!   and a tie is not accepted -- the two nodes stay divergent and re-exchange
+//!   on each heartbeat. UUIDv7 PKs make this rare; the single-writer-per-row
 //!   workload makes it rarer. Visible-conflict / strict-replay is v0.2.
 //! - **Deletes** ride the live [`Delta`](Body::Delta) `deletes` list only. The
 //!   heartbeat advertises *presence*, so an absent PK is indistinguishable from
@@ -36,10 +53,10 @@ use crate::broadcast::{
     maybe_decrypt, maybe_encrypt, BroadcastConfig, DeltaPacket, ReplayGuard, DEFAULT_PORT,
     PROTOCOL_VERSION, SAFE_PACKET_SIZE,
 };
-use crate::config::Config;
+use crate::config::{Config, ConflictResolution};
 use crate::datasource::DataSource;
 use crate::error::{Result, SyncError};
-use crate::local::LocalDb;
+use crate::local::{LocalDb, UpsertGuard};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -164,8 +181,15 @@ pub enum GossipEvent {
     Digest { table: String, wanted: usize },
     /// A `Want` was answered by multicasting `rows` rows.
     Served { table: String, rows: usize },
-    /// A delta was applied; `rows` rows changed locally.
-    Applied { table: String, rows: usize },
+    /// A delta was applied; `rows` rows changed locally and `rejected` rows were
+    /// turned away by the configured conflict guard (see
+    /// [`BroadcastConfig::conflict_resolution`]). Under the default
+    /// `remote_wins` `rejected` is always 0.
+    Applied {
+        table: String,
+        rows: usize,
+        rejected: usize,
+    },
     /// Dropped without effect; see [`IgnoreReason`].
     Ignored(IgnoreReason),
 }
@@ -279,6 +303,43 @@ pub struct Gossip {
     key: Option<[u8; 32]>,
     seq: Arc<AtomicU64>,
     replay: Arc<Mutex<ReplayGuard>>,
+    /// Same-PK resolution policy, taken from the `BroadcastConfig` this node
+    /// bound with -- alongside port, identity, and key, which are read from the
+    /// same place.
+    conflict_resolution: ConflictResolution,
+    /// Configured ordering columns for `newer_wins` (empty = fall back to
+    /// `[sync].timestamp_column` at apply time).
+    ordering_columns: Vec<String>,
+    /// Per-table apply diagnostics, recorded once and readable via
+    /// [`Gossip::ordering_notes`].
+    notes: Arc<Mutex<HashMap<String, OrderingNote>>>,
+}
+
+/// A once-per-table fact about how `newer_wins` is actually behaving on a table.
+///
+/// Logged once and kept queryable, because both conditions it records are
+/// operator-actionable and neither is visible from the outside: a mesh that has
+/// silently stopped ordering, or two nodes that disagree about how a timestamp
+/// is represented. A per-packet log would be noise; silence would be worse --
+/// the failure this whole issue exists to remove is a user who believes they are
+/// ordered and is not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderingNote {
+    /// The table this note is about.
+    pub table: String,
+    /// `newer_wins` was configured but the table has none of the ordering
+    /// columns, so apply fell back to blind overwrite for this table.
+    pub ordering_unavailable: bool,
+    /// Ordering columns whose incoming SQLite storage class does not match the
+    /// class already stored locally -- an integer Unix time on one node against
+    /// ISO-8601 text on the other, say.
+    ///
+    /// The comparison still terminates (SQLite's ordering across storage classes
+    /// is total, so exactly one side of any pair accepts and the mesh
+    /// quiesces), but the winner is arbitrary rather than chronological. Two
+    /// nodes disagreeing on a representation is a fact an operator needs, not
+    /// merely a convergence condition.
+    pub representation_mismatch: Vec<String>,
 }
 
 impl Gossip {
@@ -298,7 +359,21 @@ impl Gossip {
             key: broadcast.encryption_key()?,
             seq: Arc::new(AtomicU64::new(0)),
             replay: Arc::new(Mutex::new(ReplayGuard::new())),
+            conflict_resolution: broadcast.conflict_resolution,
+            ordering_columns: broadcast.ordering_columns.clone(),
+            notes: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// The per-table apply diagnostics recorded so far -- see [`OrderingNote`].
+    ///
+    /// Empty under the default `remote_wins`; an entry appears only when
+    /// `newer_wins` is configured and the table cannot honor it as intended.
+    pub async fn ordering_notes(&self) -> Vec<OrderingNote> {
+        let notes = self.notes.lock().await;
+        let mut out: Vec<OrderingNote> = notes.values().cloned().collect();
+        out.sort_by(|a, b| a.table.cmp(&b.table));
+        out
     }
 
     fn next_seq(&self) -> u64 {
@@ -582,9 +657,41 @@ impl Gossip {
         }
 
         let mut changed = 0;
+        let mut rejected = 0;
         if !d.upserts.is_empty() {
-            match local.upsert_rows(&d.table, &d.upserts).await {
-                Ok(n) => changed += n,
+            // Only newer_wins needs an ordering signal; the other policies are
+            // decided by the shape of the write alone.
+            let ordering: Vec<String> = match self.conflict_resolution {
+                ConflictResolution::NewerWins | ConflictResolution::UuidV7Wins
+                    if self.ordering_columns.is_empty() =>
+                {
+                    vec![config.sync.timestamp_column.clone()]
+                }
+                ConflictResolution::NewerWins | ConflictResolution::UuidV7Wins => {
+                    self.ordering_columns.clone()
+                }
+                _ => Vec::new(),
+            };
+            let guard = match self.conflict_resolution {
+                ConflictResolution::RemoteWins => UpsertGuard::Replace,
+                ConflictResolution::LocalWins => UpsertGuard::KeepLocal,
+                // A same-PK collision carries the same UUID on both sides, so
+                // uuid_v7_wins has nothing to break the tie with and is exactly
+                // newer_wins here.
+                ConflictResolution::NewerWins | ConflictResolution::UuidV7Wins => {
+                    UpsertGuard::NewerBy(&ordering)
+                }
+            };
+
+            match local.upsert_rows_guarded(&d.table, &d.upserts, guard) {
+                Ok(outcome) => {
+                    changed += outcome.applied;
+                    rejected += outcome.rejected;
+                    if !ordering.is_empty() {
+                        self.record_ordering(&d.table, &d.upserts, local, &ordering, &outcome)
+                            .await;
+                    }
+                }
                 // Schema is the user's; a row for a missing table is dropped.
                 Err(e) => warn!("drop delta for table '{}': {}", d.table, e),
             }
@@ -600,9 +707,88 @@ impl Gossip {
             GossipEvent::Applied {
                 table: d.table,
                 rows: changed,
+                rejected,
             },
             Vec::new(),
         ))
+    }
+
+    /// Record the once-per-table apply diagnostics for `table`, logging each
+    /// exactly once. Cheap after the first delta for a table: the lock is taken,
+    /// the entry is found, and nothing else runs.
+    ///
+    /// The lock is released across the probe rather than held, so two deltas for
+    /// the same table racing on their very first packet can both probe and both
+    /// log. That is deliberate: holding an async mutex across blocking SQLite
+    /// calls would serialize the apply path to buy a duplicate log line, and the
+    /// recorded note is identical either way.
+    async fn record_ordering(
+        &self,
+        table: &str,
+        upserts: &[HashMap<String, serde_json::Value>],
+        local: &LocalDb,
+        ordering: &[String],
+        outcome: &crate::local::UpsertOutcome,
+    ) {
+        if self.notes.lock().await.contains_key(table) {
+            return;
+        }
+
+        if outcome.ordering_unavailable {
+            warn!(
+                "table '{}' has none of the configured ordering columns {:?}; \
+                 newer_wins cannot order it and rows are applied blind",
+                table, ordering
+            );
+        }
+
+        // Compare the storage class the peer sent against the class already
+        // stored, per ordering column. One bounded probe per column, once per
+        // table, and only under an ordering policy.
+        let mut mismatch = Vec::new();
+        for col in ordering {
+            let Some(remote_class) = upserts
+                .iter()
+                .filter_map(|r| r.get(col))
+                .find_map(json_storage_class)
+            else {
+                continue;
+            };
+            match local.stored_storage_class(table, col) {
+                Ok(Some(local_class)) if local_class != remote_class => {
+                    warn!(
+                        "table '{}' column '{}': peer sends {} but {} is stored locally -- \
+                         newer_wins still converges, but the winner is arbitrary rather than \
+                         chronological",
+                        table, col, remote_class, local_class
+                    );
+                    mismatch.push(col.clone());
+                }
+                Ok(_) => {}
+                Err(e) => debug!("cannot probe '{}'.'{}': {}", table, col, e),
+            }
+        }
+
+        self.notes.lock().await.insert(
+            table.to_string(),
+            OrderingNote {
+                table: table.to_string(),
+                ordering_unavailable: outcome.ordering_unavailable,
+                representation_mismatch: mismatch,
+            },
+        );
+    }
+}
+
+/// The SQLite storage class a JSON value binds as, matching `JsonToSql`. `None`
+/// for JSON null, which carries no class to compare.
+fn json_storage_class(v: &serde_json::Value) -> Option<&'static str> {
+    match v {
+        serde_json::Value::Null => None,
+        serde_json::Value::Bool(_) => Some("integer"),
+        serde_json::Value::Number(n) if n.as_i64().is_some() => Some("integer"),
+        serde_json::Value::Number(n) if n.as_f64().is_some() => Some("real"),
+        _ => Some("text"),
     }
 }
 
@@ -743,6 +929,251 @@ mod tests {
         }
     }
 
+    // -- Ordering-aware apply (#310) --
+
+    /// Seed a legion-shaped table: the ordering key is the max over three
+    /// columns and `deleted_at` is NULL on every live row.
+    fn seed_ordered(path: &str, rows: &[(&str, &str, &str, Option<&str>)]) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE notes (
+                 id TEXT PRIMARY KEY,
+                 body TEXT,
+                 created_at TEXT,
+                 updated_at TEXT,
+                 deleted_at TEXT
+             );",
+        )
+        .unwrap();
+        for (id, body, updated, deleted) in rows {
+            conn.execute(
+                "INSERT INTO notes VALUES (?1, ?2, '2026-01-01T00:00:00+00:00', ?3, ?4)",
+                rusqlite::params![id, body, updated, deleted],
+            )
+            .unwrap();
+        }
+    }
+
+    fn body_of(path: &str, id: &str) -> Option<String> {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .query_row("SELECT body FROM notes WHERE id = ?1", [id], |r| r.get(0))
+            .ok()
+    }
+
+    fn legion_policy(bc: &mut BroadcastConfig) {
+        bc.conflict_resolution = ConflictResolution::NewerWins;
+        bc.ordering_columns = vec![
+            "created_at".to_string(),
+            "updated_at".to_string(),
+            "deleted_at".to_string(),
+        ];
+    }
+
+    /// The trap this issue exists to avoid walking into. An existing multicast
+    /// deployment carries no `[broadcast].conflict_resolution`, and
+    /// `[sync].conflict_resolution` defaults to LocalWins. If the apply path
+    /// read the sync-scoped field, every such deployment would silently stop
+    /// accepting peer rows -- a convergence break shipped as a bugfix.
+    #[tokio::test]
+    async fn default_policy_is_remote_wins_not_the_sync_scoped_default() {
+        assert_eq!(
+            BroadcastConfig::default().conflict_resolution,
+            ConflictResolution::RemoteWins,
+        );
+        assert_eq!(
+            crate::config::SyncConfig::default().conflict_resolution,
+            ConflictResolution::LocalWins,
+            "the sync-scoped default is the one we must NOT inherit"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let a_path = dir.path().join("a.db").to_str().unwrap().to_string();
+        let b_path = dir.path().join("b.db").to_str().unwrap().to_string();
+        // B's row is NEWER. Under the historical behavior A still takes it.
+        seed_ordered(
+            &a_path,
+            &[("1", "a-newer", "2026-09-01T00:00:00+00:00", None)],
+        );
+        seed_ordered(
+            &b_path,
+            &[("1", "b-older", "2026-02-01T00:00:00+00:00", None)],
+        );
+        let (a, a_cfg, a_local, b, b_cfg, b_local) = two_nodes(&a_path, &b_path).await;
+
+        let digest = only(b.digest_bodies(&b_local, &b_cfg).await.unwrap());
+        let (_ev, out) = route(&b, digest, &a, &a_local, &a_cfg).await;
+        let (_ev, out) = route(&a, only(out), &b, &b_local, &b_cfg).await;
+        let (ev, _) = route(&b, only(out), &a, &a_local, &a_cfg).await;
+
+        assert!(
+            matches!(
+                ev,
+                GossipEvent::Applied {
+                    rows: 1,
+                    rejected: 0,
+                    ..
+                }
+            ),
+            "the default must stay last-received-wins, got {ev:?}"
+        );
+        assert_eq!(body_of(&a_path, "1").as_deref(), Some("b-older"));
+    }
+
+    /// The fix, end to end over the gossip path: with `newer_wins` opted in, a
+    /// peer's stale row does not overwrite a newer local row -- and the loss is
+    /// counted rather than silent.
+    #[tokio::test]
+    async fn newer_wins_turns_away_a_stale_peer_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let a_path = dir.path().join("a.db").to_str().unwrap().to_string();
+        let b_path = dir.path().join("b.db").to_str().unwrap().to_string();
+        seed_ordered(
+            &a_path,
+            &[("1", "a-newer", "2026-09-01T00:00:00+00:00", None)],
+        );
+        seed_ordered(
+            &b_path,
+            &[("1", "b-older", "2026-02-01T00:00:00+00:00", None)],
+        );
+        let (a, a_cfg, a_local, b, b_cfg, b_local) =
+            two_nodes_with(&a_path, &b_path, None, None, legion_policy).await;
+
+        // B advertises; A wants (hashes differ); B serves; A applies -- and
+        // rejects, because B's row is older.
+        let digest = only(b.digest_bodies(&b_local, &b_cfg).await.unwrap());
+        let (_ev, out) = route(&b, digest, &a, &a_local, &a_cfg).await;
+        let (_ev, out) = route(&a, only(out), &b, &b_local, &b_cfg).await;
+        let (ev, _) = route(&b, only(out), &a, &a_local, &a_cfg).await;
+
+        assert!(
+            matches!(
+                ev,
+                GossipEvent::Applied {
+                    rows: 0,
+                    rejected: 1,
+                    ..
+                }
+            ),
+            "got {ev:?}"
+        );
+        assert_eq!(
+            body_of(&a_path, "1").as_deref(),
+            Some("a-newer"),
+            "the newer local row must survive"
+        );
+
+        // And the exchange terminates: the other direction accepts, so the mesh
+        // converges on A's row rather than re-firing forever.
+        let digest = only(a.digest_bodies(&a_local, &a_cfg).await.unwrap());
+        let (_ev, out) = route(&a, digest, &b, &b_local, &b_cfg).await;
+        let (_ev, out) = route(&b, only(out), &a, &a_local, &a_cfg).await;
+        let (ev, _) = route(&a, only(out), &b, &b_local, &b_cfg).await;
+        assert!(
+            matches!(
+                ev,
+                GossipEvent::Applied {
+                    rows: 1,
+                    rejected: 0,
+                    ..
+                }
+            ),
+            "got {ev:?}"
+        );
+        assert_eq!(body_of(&b_path, "1").as_deref(), Some("a-newer"));
+    }
+
+    /// legion's actual case: a tombstone stamps `deleted_at` and leaves
+    /// `updated_at` alone. It must still win, which is only true because the
+    /// ordering signal is a column LIST evaluated with max.
+    #[tokio::test]
+    async fn newer_wins_propagates_a_deleted_at_only_tombstone() {
+        let dir = tempfile::tempdir().unwrap();
+        let a_path = dir.path().join("a.db").to_str().unwrap().to_string();
+        let b_path = dir.path().join("b.db").to_str().unwrap().to_string();
+        let stamp = "2026-05-01T00:00:00+00:00";
+        seed_ordered(&a_path, &[("1", "live", stamp, None)]);
+        seed_ordered(
+            &b_path,
+            &[("1", "tombstoned", stamp, Some("2026-06-01T00:00:00+00:00"))],
+        );
+        let (a, a_cfg, a_local, b, b_cfg, b_local) =
+            two_nodes_with(&a_path, &b_path, None, None, legion_policy).await;
+
+        let digest = only(b.digest_bodies(&b_local, &b_cfg).await.unwrap());
+        let (ev, out) = route(&b, digest, &a, &a_local, &a_cfg).await;
+        assert!(
+            matches!(ev, GossipEvent::Digest { wanted: 1, .. }),
+            "a deleted_at-only write must be visible in the digest, got {ev:?}"
+        );
+        let (_ev, out) = route(&a, only(out), &b, &b_local, &b_cfg).await;
+        let (ev, _) = route(&b, only(out), &a, &a_local, &a_cfg).await;
+
+        assert!(
+            matches!(
+                ev,
+                GossipEvent::Applied {
+                    rows: 1,
+                    rejected: 0,
+                    ..
+                }
+            ),
+            "the tombstone must win on max(deleted_at), got {ev:?}"
+        );
+        assert_eq!(body_of(&a_path, "1").as_deref(), Some("tombstoned"));
+    }
+
+    /// Two nodes disagreeing about how a timestamp is represented is an
+    /// operator-actionable fact, not merely a convergence condition. SQLite's
+    /// cross-class ordering is total, so the exchange still terminates -- but
+    /// the winner is arbitrary rather than chronological, and that must be
+    /// visible.
+    #[tokio::test]
+    async fn representation_mismatch_is_recorded_once_per_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let a_path = dir.path().join("a.db").to_str().unwrap().to_string();
+        let b_path = dir.path().join("b.db").to_str().unwrap().to_string();
+        seed_ordered(
+            &a_path,
+            &[("1", "iso-local", "2026-09-01T00:00:00+00:00", None)],
+        );
+        seed_ordered(&b_path, &[]);
+        let (a, a_cfg, a_local, _b, _b_cfg, _b_local) =
+            two_nodes_with(&a_path, &b_path, None, None, legion_policy).await;
+
+        // A hears a delta whose ordering column carries an integer Unix time
+        // while A stores ISO-8601 text.
+        let mut row: HashMap<String, serde_json::Value> = HashMap::new();
+        row.insert("id".into(), "1".into());
+        row.insert("body".into(), "int-peer".into());
+        row.insert("created_at".into(), serde_json::Value::Null);
+        row.insert("updated_at".into(), serde_json::json!(1_800_000_000i64));
+        row.insert("deleted_at".into(), serde_json::Value::Null);
+
+        let delta = Body::Delta(crate::broadcast::DeltaPacket {
+            version: PROTOCOL_VERSION,
+            source_id: "node-b".into(),
+            seq: 1,
+            part: 0,
+            total_parts: 1,
+            table: "notes".into(),
+            upserts: vec![row],
+            deletes: Vec::new(),
+        });
+        let sealed = a.seal(delta).unwrap();
+        a.handle(&sealed, &a_local, &a_cfg).await.unwrap();
+
+        let notes = a.ordering_notes().await;
+        assert_eq!(notes.len(), 1, "one note per table, got {notes:?}");
+        assert_eq!(notes[0].table, "notes");
+        assert!(!notes[0].ordering_unavailable);
+        assert_eq!(
+            notes[0].representation_mismatch,
+            vec!["updated_at".to_string()],
+            "the disagreeing column must be named"
+        );
+    }
+
     /// Bind two gossip nodes with distinct instance ids on a test group. They
     /// share no path or DB identity, so convergence proves sync is scoped by
     /// group/key membership alone, never by file location.
@@ -761,21 +1192,46 @@ mod tests {
         key_a: Option<&str>,
         key_b: Option<&str>,
     ) -> (Gossip, Config, LocalDb, Gossip, Config, LocalDb) {
+        two_nodes_with(a_path, b_path, key_a, key_b, |_| {}).await
+    }
+
+    /// The port every test binds on.
+    ///
+    /// NOT [`DEFAULT_PORT`]: a test that binds the product's well-known port
+    /// fails whenever anything else on the host holds it -- a real smugglr
+    /// daemon, or an embedder using the same port for its own mesh -- and the
+    /// failure reads as a broken protocol rather than a busy socket.
+    const TEST_PORT: u16 = 39337;
+
+    /// Bind two gossip nodes. Keys are per node (they are what asymmetry tests
+    /// vary); `tweak` is applied to both, for settings a converging mesh must
+    /// share -- the apply policy and its ordering columns.
+    async fn two_nodes_with(
+        a_path: &str,
+        b_path: &str,
+        key_a: Option<&str>,
+        key_b: Option<&str>,
+        tweak: impl Fn(&mut BroadcastConfig),
+    ) -> (Gossip, Config, LocalDb, Gossip, Config, LocalDb) {
         let a_cfg = cfg(a_path);
         let b_cfg = cfg(b_path);
         let a_local = LocalDb::open(a_path).unwrap();
         let b_local = LocalDb::open(b_path).unwrap();
 
-        let bc_a = BroadcastConfig {
+        let mut bc_a = BroadcastConfig {
+            port: TEST_PORT,
             instance_id: Some("node-a".into()),
             secret: key_a.map(String::from),
             ..Default::default()
         };
-        let bc_b = BroadcastConfig {
+        let mut bc_b = BroadcastConfig {
+            port: TEST_PORT,
             instance_id: Some("node-b".into()),
             secret: key_b.map(String::from),
             ..Default::default()
         };
+        tweak(&mut bc_a);
+        tweak(&mut bc_b);
 
         let group = Ipv4Addr::new(239, 255, 99, 88);
         let a = Gossip::bind(&bc_a, group).await.unwrap();

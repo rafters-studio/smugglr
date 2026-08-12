@@ -24,7 +24,13 @@ use tracing::{debug, info, warn};
 /// side, ISO on the other) has no meaningful ordering -- return `None` so the
 /// caller routes it to `content_differs` rather than inventing a confident
 /// winner from a lexical compare of unlike representations.
-fn compare_ts(a: &str, b: &str) -> Option<Ordering> {
+/// `pub(crate)` so the multicast apply path can be cross-checked against it
+/// (`local.rs::sql_guard_agrees_with_compare_ts_on_same_class_pairs`). The LAN
+/// path cannot *call* this -- its comparison rides inside a SQL statement so it
+/// is atomic against a concurrent local write -- but the two must agree on every
+/// pair the documented precondition admits, and a test is the only thing that
+/// keeps them from drifting.
+pub(crate) fn compare_ts(a: &str, b: &str) -> Option<Ordering> {
     match (a.parse::<i64>(), b.parse::<i64>()) {
         (Ok(x), Ok(y)) => Some(x.cmp(&y)),
         _ => match (a.parse::<f64>(), b.parse::<f64>()) {
