@@ -59,6 +59,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       # Inter-crate deps resolve by path locally, so a stale version req is
       # invisible to every other job here and only surfaces in the published
       # artifact, where it is immutable. This is the one check that reads
