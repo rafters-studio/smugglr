@@ -21,7 +21,10 @@ set -euo pipefail
 crate="${1:?usage: publish-crate.sh <crate-name>}"
 
 version="$(cargo metadata --format-version 1 --no-deps \
-  | python3 -c "import json,sys; m=json.load(sys.stdin); print(next(p['version'] for p in m['packages'] if p['name']=='$crate'))")"
+  | python3 -c 'import json, sys
+meta = json.load(sys.stdin)
+name = sys.argv[1]
+print(next(p["version"] for p in meta["packages"] if p["name"] == name))' "$crate")"
 
 # crates.io sparse index path: 1/x, 2/xy, 3/x/xyz, else xx/yy/name
 name_len="${#crate}"
@@ -36,15 +39,13 @@ echo "checking index for $crate@$version"
 
 already_published=no
 if body="$(curl -sf --max-time 30 "https://index.crates.io/$index_path")"; then
-  if printf '%s' "$body" | python3 -c "
-import json, sys
-target = '$version'
+  if printf '%s' "$body" | python3 -c 'import json, sys
+target = sys.argv[1]
 for line in sys.stdin:
     line = line.strip()
-    if line and json.loads(line)['vers'] == target:
+    if line and json.loads(line)["vers"] == target:
         raise SystemExit(0)
-raise SystemExit(1)
-"; then
+raise SystemExit(1)' "$version"; then
     already_published=yes
   fi
 else
