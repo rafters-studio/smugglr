@@ -1085,6 +1085,149 @@ mod tests {
         );
     }
 
+    /// #310 asks that both transports order identically. The remote path orders
+    /// with `diff::compare_ts` in Rust; the LAN path cannot, because its
+    /// comparison has to ride inside the write to stay atomic against a
+    /// concurrent local writer. So the guarantee is pinned here instead: for
+    /// every pair the documented precondition admits -- both sides the same
+    /// storage class -- the SQL guard and `compare_ts` must reach the same
+    /// verdict, or a row would sync one way over D1 and the other way over the
+    /// LAN.
+    #[test]
+    fn sql_guard_agrees_with_compare_ts_on_same_class_pairs() {
+        use std::cmp::Ordering;
+
+        // Same-class pairs only. Numeric pairs are where lexical comparison
+        // would be wrong ("1000" sorts before "999"), text pairs are where
+        // numeric parsing would be.
+        let cases: [(JsonValue, JsonValue, &str, &str); 6] = [
+            (
+                JsonValue::from(999i64),
+                JsonValue::from(1000i64),
+                "999",
+                "1000",
+            ),
+            (
+                JsonValue::from(1000i64),
+                JsonValue::from(999i64),
+                "1000",
+                "999",
+            ),
+            (
+                JsonValue::from(2.5f64),
+                JsonValue::from(10.5f64),
+                "2.5",
+                "10.5",
+            ),
+            (
+                JsonValue::from("2026-01-01T00:00:00+00:00"),
+                JsonValue::from("2026-02-01T00:00:00+00:00"),
+                "2026-01-01T00:00:00+00:00",
+                "2026-02-01T00:00:00+00:00",
+            ),
+            (
+                JsonValue::from("2026-02-01T00:00:00+00:00"),
+                JsonValue::from("2026-01-01T00:00:00+00:00"),
+                "2026-02-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ),
+            (
+                JsonValue::from("2026-01-01T00:00:00+00:00"),
+                JsonValue::from("2026-01-01T00:00:00+00:00"),
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        ];
+
+        let ordering = vec!["updated_at".to_string()];
+        for (stored, incoming, stored_s, incoming_s) in cases {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch("CREATE TABLE t (id TEXT PRIMARY KEY, updated_at);")
+                .unwrap();
+            let mk = |ts: &JsonValue| {
+                HashMap::from([
+                    ("id".to_string(), JsonValue::from("a")),
+                    ("updated_at".to_string(), ts.clone()),
+                ])
+            };
+            upsert_rows_guarded_inner(&conn, "t", &[mk(&stored)], UpsertGuard::Replace).unwrap();
+            let out = upsert_rows_guarded_inner(
+                &conn,
+                "t",
+                &[mk(&incoming)],
+                UpsertGuard::NewerBy(&ordering),
+            )
+            .unwrap();
+
+            // The guard accepts exactly when the incoming value is strictly
+            // greater, which is what Ordering::Greater means to compare_ts.
+            let sql_accepted = out.applied == 1;
+            let rust_accepted =
+                crate::diff::compare_ts(incoming_s, stored_s) == Some(Ordering::Greater);
+            assert_eq!(
+                sql_accepted, rust_accepted,
+                "guard and compare_ts disagree on incoming {incoming_s} vs stored {stored_s}"
+            );
+        }
+    }
+
+    /// The one pair where they deliberately differ, recorded so the divergence
+    /// is a decision rather than a surprise. `compare_ts` returns `None` on a
+    /// numeric-vs-text pair rather than inventing a winner; SQLite's ordering
+    /// across storage classes is total and picks one. That difference is what
+    /// makes the LAN path terminate -- exactly one peer accepts, so the mesh
+    /// quiesces instead of re-firing Want/Delta forever -- at the cost of a
+    /// winner that is arbitrary rather than chronological, which is why
+    /// `Gossip::ordering_notes` reports it.
+    #[test]
+    fn sql_guard_orders_a_mixed_representation_that_compare_ts_abstains_on() {
+        assert_eq!(
+            crate::diff::compare_ts("1800000000", "2026-01-01T00:00:00+00:00"),
+            None,
+            "compare_ts must not invent a winner across representations"
+        );
+
+        let ordering = vec!["updated_at".to_string()];
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (id TEXT PRIMARY KEY, updated_at);")
+            .unwrap();
+        let mk = |ts: JsonValue| {
+            HashMap::from([
+                ("id".to_string(), JsonValue::from("a")),
+                ("updated_at".to_string(), ts),
+            ])
+        };
+
+        // Integer stored, ISO text incoming: TEXT sorts above INTEGER, accepted.
+        upsert_rows_guarded_inner(
+            &conn,
+            "t",
+            &[mk(JsonValue::from(1_800_000_000i64))],
+            UpsertGuard::Replace,
+        )
+        .unwrap();
+        let text_over_int = upsert_rows_guarded_inner(
+            &conn,
+            "t",
+            &[mk(JsonValue::from("2026-01-01T00:00:00+00:00"))],
+            UpsertGuard::NewerBy(&ordering),
+        )
+        .unwrap();
+        assert_eq!(text_over_int.applied, 1);
+
+        // The mirror image is rejected -- so across a pair of peers exactly one
+        // side accepts and the exchange terminates.
+        let int_over_text = upsert_rows_guarded_inner(
+            &conn,
+            "t",
+            &[mk(JsonValue::from(1_800_000_000i64))],
+            UpsertGuard::NewerBy(&ordering),
+        )
+        .unwrap();
+        assert_eq!(int_over_text.applied, 0);
+        assert_eq!(int_over_text.rejected, 1);
+    }
+
     #[test]
     fn stored_storage_class_reports_the_first_non_null_class() {
         let conn = ordered_conn();
