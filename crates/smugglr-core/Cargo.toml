@@ -31,7 +31,7 @@ native = [
 [dependencies]
 # Canonical wire types (TableInfo/ColumnInfo/RowMeta), shared with
 # smugglr-plugin-sdk. serde-only, no tokio -- safe on the wasm32 path. See #228.
-smugglr-wire = { path = "../smugglr-wire", version = "0.4.2" }
+smugglr-wire = { path = "../smugglr-wire", version = "0.5.0" }
 
 # Serialization (always needed)
 serde = { version = "1", features = ["derive"] }

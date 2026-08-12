@@ -109,28 +109,32 @@ jobs:
         uses: rust-lang/crates-io-auth-action@v1
         id: auth
 
+      # Dependency order: wire has no internal deps, sdk and core need
+      # wire, http-sql needs core + sdk, the CLI needs core. Each step is
+      # idempotent (see scripts/publish-crate.sh), so a failure partway
+      # through can be re-run without the earlier crates killing the job.
       - name: Publish smugglr-wire
-        run: cargo publish -p smugglr-wire
+        run: ./scripts/publish-crate.sh smugglr-wire
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
       - name: Publish smugglr-plugin-sdk
-        run: cargo publish -p smugglr-plugin-sdk
+        run: ./scripts/publish-crate.sh smugglr-plugin-sdk
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
       - name: Publish smugglr-core
-        run: cargo publish -p smugglr-core
+        run: ./scripts/publish-crate.sh smugglr-core
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
       - name: Publish smugglr-http-sql
-        run: cargo publish -p smugglr-http-sql
+        run: ./scripts/publish-crate.sh smugglr-http-sql
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
       - name: Publish smugglr (CLI)
-        run: cargo publish -p smugglr
+        run: ./scripts/publish-crate.sh smugglr
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
