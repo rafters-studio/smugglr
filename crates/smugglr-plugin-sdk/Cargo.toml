@@ -16,7 +16,7 @@ categories = ["database", "development-tools"]
 [dependencies]
 # Canonical wire types (TableInfo/ColumnInfo/RowMeta), shared with
 # smugglr-core. See #228.
-smugglr-wire = { path = "../smugglr-wire", version = "0.4.2" }
+smugglr-wire = { path = "../smugglr-wire", version = "0.5.0" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

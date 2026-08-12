@@ -1,6 +1,6 @@
 {
   "name": "@smugglr/nanostores",
-  "version": "0.4.3",
+  "version": "0.5.0",
   "description": "Nanostores adapter that auto-persists atoms and maps to a smugglr-managed SQLite table.",
   "type": "module",
   "main": "dist/index.js",
@@ -31,7 +31,7 @@
   "author": "Sean Silvius",
   "peerDependencies": {
     "nanostores": "^1.0.0",
-    "smugglr": "^0.4.0"
+    "smugglr": "^0.5.0"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

@@ -7,6 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+# Ships to npm via wasm-pack, never to crates.io. Its smugglr-core dep is
+# path-only, which `cargo publish` cannot express -- so declare the intent
+# here rather than discovering it at publish time.
+publish = false
 
 [lib]
 crate-type = ["cdylib", "rlib"]

@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.5.0 (2026-08-12)
+
+`smugglr migrate` lands: envelope-based, self-reversing schema migrations for the SQLite family, built as seven pieces that each hold on their own -- a manifest and structured op enum, a rails-style generator, a tamper-evident ledger, a forward apply engine, faithful reverse/rollback, a destructive-op lint, and a first-run primary-key compatibility check. Alongside it, one silent sync bug is fixed (multicast applied remote rows without consulting the conflict policy the crate already declared), blob columns are canonicalized in the content hash, and the release pipeline is hardened so a single crate can no longer take the whole publish down.
+
+**Note for crates.io consumers.** 0.4.3 was tagged but never published -- its `publish-crates` job failed on the first step and none of the five crates moved. Upgrading a crate dependency from 0.4.2 lands both releases at once, including 0.4.3's internal sweep. One item there is a breaking signature change: `Multicast::recv_and_handle` takes a caller-supplied `&mut [u8]` buffer as its first argument (#211). npm consumers are unaffected -- 0.4.3 published normally there.
+
+### Added
+
+- **`smugglr migrate`** -- schema migrations that cross the same boundary sync does, with the globally-unique-primary-key precondition the engine already assumes.
+  - **Migration manifest and structured `Op` enum**, with a native envelope format instead of raw SQL strings, so a migration is inspectable before it is applied. (#271)
+  - **Rails-style generator** -- `smugglr migrate generate` scaffolds a timestamped migration from the CLI. (#270)
+  - **Migration ledger** -- version-gated, success-gated, and tamper-evident, so a partially applied or edited-after-the-fact migration is detected rather than replayed. (#272)
+  - **Forward apply engine** with idempotent per-op DDL and pure remote generators, so re-running an interrupted apply converges instead of double-applying. (#273)
+  - **Reverse/rollback** with faithful verbatim-DDL reverse and a delta-scoped pre-image, so a rollback restores what was actually there rather than a reconstruction of it. (#274)
+  - **Destructive-op lint** -- two-axis op classification with a pre-image gate, so a destructive migration must declare that it is one. (#275)
+  - **First-run primary-key compatibility check**, warning in 0.5.0, for tables whose keys do not satisfy the migrate precondition. (#268)
+
+### Fixed
+
+- **Multicast apply is ordering-aware.** smugglr-core resolved same-primary-key conflicts two different ways depending on transport, and the LAN one was blind: the remote path honors `ConflictResolution` and `timestamp_column`, while the multicast path read `timestamp_column` only to build the digest, discarded it, and applied with a bare `INSERT OR REPLACE`. A stale peer row silently overwrote a newer local one. Resolution now rides inside the write as a single atomic `ON CONFLICT ... DO UPDATE ... WHERE` per row, with no read-modify-write. Two deliberate choices: the policy lands on `BroadcastConfig` and is **not** inherited from `[sync].conflict_resolution` -- that field defaults to `LocalWins` while multicast has always behaved as `RemoteWins`, so inheriting it would flip every existing deployment to never accepting a peer row, a convergence break shipped as a bugfix. And the ordering signal is a column *list* reduced with max, not a single column, so a tombstone that stamps `deleted_at` without bumping `updated_at` is not a tie that loses the delete. A single-entry list degenerates to the old single-column behavior. (#310)
+- **Blob columns fold to one canonical encoding in the content hash.** The native rusqlite path renders a blob as lowercase hex; the JSON SQL backends (Turso, rqlite, D1, and the wasm executors) commonly render standard base64. Two peers folding different renderings of the *same bytes* never converge -- the row reads `content_differs` on every sync, forever, with no error to point at. The content hash now pins one canonical form (lowercase hex), and a backend that renders otherwise declares its `BlobEncoding` and canonicalizes before hashing. Only explicitly-declared `BLOB` columns are canonicalized: a column with an empty declared type has BLOB affinity in SQLite but holds arbitrary dynamically-typed values, and base64-decoding a genuine text value there would corrupt it. Native-only deployments already emitted the canonical form and see no hash change. (#292, residual of #202)
+
+### Changed
+
+- **The release pipeline is idempotent and diagnostic.** `publish-crates` ran five sequential `cargo publish` steps with no guard, so any failure partway left the earlier crates published and the run unrepeatable -- exactly how 0.4.3 got stuck. Each step now skips a crate version already on the index and treats a lost race as success (`scripts/publish-crate.sh`). A new CI job asserts every inter-crate version req equals the workspace version, which is the one thing local builds structurally cannot catch: they resolve those deps by path and never read the version string that `cargo publish` actually ships (`scripts/check-crate-versions.py`). The test matrix no longer cancels its siblings on the first red, so a single-platform failure still returns a complete run.
+- **`smugglr-wasm` is marked `publish = false`.** It ships to npm via wasm-pack and its `smugglr-core` dep is path-only, which `cargo publish` cannot express -- previously that was true but undeclared.
+
+### Docs
+
+- **Migration design and sequencing** -- drift-audit corrections folded into the design and sequencing docs (#304), and the D1 atomicity citation in decision 6 corrected after a `SPEC.md` S4.2 misread (#307).
+
 ## 0.4.3 (2026-07-17)
 
 The last 0.4.x release before the 0.5.0 `smugglr migrate` work. One real correctness fix in the sync path -- composite primary keys with a `|` in a value no longer collide -- plus a numeric float-timestamp ordering fix, a large internal structural-debt sweep from the code audit, and the design groundwork for `smugglr migrate` landed as a doc.

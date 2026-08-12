@@ -51,12 +51,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: shellcheck install.sh
+      - run: shellcheck install.sh scripts/publish-crate.sh
+
+  versions:
+    name: Crate versions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Inter-crate deps resolve by path locally, so a stale version req is
+      # invisible to every other job here and only surfaces in the published
+      # artifact, where it is immutable. This is the one check that reads
+      # what `cargo publish` would actually ship.
+      - run: python3 scripts/check-crate-versions.py
 
   test:
     name: Test
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
