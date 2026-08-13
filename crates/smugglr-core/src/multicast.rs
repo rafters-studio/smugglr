@@ -500,9 +500,16 @@ impl Gossip {
     /// This is a hard boundary, not an oversight to route around. Applying a bare
     /// delete on receipt would be *less* correct than dropping it: with no
     /// tombstone, any peer that still holds the row re-gossips it on the next
-    /// heartbeat and resurrects it -- and since `newer_wins` orders by the
-    /// ordering columns, a stale surviving row wins cleanly against a deletion
-    /// that carries no timestamp at all. Model deletion as a soft-delete column
+    /// heartbeat and resurrects it.
+    ///
+    /// Note the resurrection needs no help from the conflict policy, which an
+    /// earlier version of this comment got wrong by blaming `newer_wins`. Once
+    /// the row is physically gone locally, the peer's copy arrives with NO
+    /// primary-key collision to guard -- it is a plain insert, and every policy
+    /// admits it. `remote_wins`, `local_wins` and `newer_wins` all resurrect it,
+    /// because a conflict guard only fires when there is a local row to conflict
+    /// with. That makes the case against applying bare deletes stronger than the
+    /// policy-specific one, not weaker. Model deletion as a soft-delete column
     /// (a `deleted_at` upsert) if you need it now; that rides the upsert path,
     /// converges, and is what the `ordering_columns` list is a `max` over so a
     /// tombstone stamping only `deleted_at` is not a tie that loses.
