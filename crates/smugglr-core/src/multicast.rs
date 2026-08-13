@@ -42,10 +42,16 @@
 //!   and a tie is not accepted -- the two nodes stay divergent and re-exchange
 //!   on each heartbeat. UUIDv7 PKs make this rare; the single-writer-per-row
 //!   workload makes it rarer. Visible-conflict / strict-replay is v0.2.
-//! - **Deletes** ride the live [`Delta`](Body::Delta) `deletes` list only. The
-//!   heartbeat advertises *presence*, so an absent PK is indistinguishable from
+//! - **Deletes do not propagate at all** (#311). Not by the heartbeat, and not by
+//!   the live [`Delta`](Body::Delta) either: through 0.4.x that packet's `deletes`
+//!   list was populated and put on the wire, but no receiver ever applied it, so
+//!   the live path documented here as the one that worked never did.
+//!   [`Gossip::broadcast_delta`] no longer accepts deletes, and the receive side
+//!   drops any a 0.4.x peer still sends. The heartbeat cannot substitute: it
+//!   advertises *presence*, so an absent PK is indistinguishable from
 //!   not-yet-received -- the digest reconciles upserts/divergence, not deletions.
-//!   Tombstone propagation is v0.2.
+//!   Tombstone propagation is v0.2; until then, model deletion as a `deleted_at`
+//!   column and let it ride the upsert path.
 //! - **Schema is the user's.** smugglr syncs rows, never DDL; a row for a table
 //!   that does not exist locally is dropped with a warning.
 
@@ -449,18 +455,22 @@ impl Gossip {
 
     /// Build delta datagrams for `rows` of `table` (a live write or a `Want`
     /// answer), each part given a unique seq so the replay guard dedupes.
+    ///
+    /// Always sends an empty `deletes` list. The wire field exists and
+    /// [`crate::broadcast::split_delta`] still packs it, but no receiver applies
+    /// deletes (see [`Gossip::broadcast_delta`]), so populating it here would put
+    /// bytes on the wire that every peer ignores.
     fn delta_bodies(
         &self,
         table: &str,
         upserts: Vec<HashMap<String, serde_json::Value>>,
-        deletes: Vec<String>,
     ) -> Result<Vec<Body>> {
         let parts = crate::broadcast::split_delta(
             &self.instance_id,
             0,
             table,
             upserts,
-            deletes,
+            Vec::new(),
             DELTA_WIRE_RESERVE,
         )?;
         Ok(parts
@@ -473,14 +483,40 @@ impl Gossip {
     }
 
     /// Multicast `rows` of `table` as a delta. Returns rows sent.
+    ///
+    /// # Deletes are not propagated (#311)
+    ///
+    /// This takes upserts only. Through 0.4.x it also took a `deletes: Vec<String>`
+    /// list, which was packed onto the wire and then applied by nothing: the
+    /// receive path logs the count and drops it (see `on_delta`). A parameter that
+    /// silently discards the caller's deletions is worse than an absent one, so it
+    /// is gone rather than merely documented.
+    ///
+    /// Deleting a row therefore does not replicate by any path today. The
+    /// heartbeat cannot cover the gap either: a digest advertises *presence*, so an
+    /// absent primary key is indistinguishable from one not yet received. Real
+    /// delete propagation needs tombstones and is v0.2.
+    ///
+    /// This is a hard boundary, not an oversight to route around. Applying a bare
+    /// delete on receipt would be *less* correct than dropping it: with no
+    /// tombstone, any peer that still holds the row re-gossips it on the next
+    /// heartbeat and resurrects it -- and since `newer_wins` orders by the
+    /// ordering columns, a stale surviving row wins cleanly against a deletion
+    /// that carries no timestamp at all. Model deletion as a soft-delete column
+    /// (a `deleted_at` upsert) if you need it now; that rides the upsert path,
+    /// converges, and is what the `ordering_columns` list is a `max` over so a
+    /// tombstone stamping only `deleted_at` is not a tie that loses.
+    ///
+    /// The wire format is unchanged: `DeltaPacket` keeps its `deletes` field, so
+    /// 0.4.x peers still parse our datagrams and we still parse theirs (a peer
+    /// that sends deletes has them dropped, exactly as before).
     pub async fn broadcast_delta(
         &self,
         table: &str,
         upserts: Vec<HashMap<String, serde_json::Value>>,
-        deletes: Vec<String>,
     ) -> Result<usize> {
         let rows = upserts.len();
-        let bodies = self.delta_bodies(table, upserts, deletes)?;
+        let bodies = self.delta_bodies(table, upserts)?;
         self.emit(bodies).await?;
         Ok(rows)
     }
@@ -630,7 +666,7 @@ impl Gossip {
             ));
         }
         let n = rows.len();
-        let out = self.delta_bodies(&w.table, rows, Vec::new())?;
+        let out = self.delta_bodies(&w.table, rows)?;
         Ok((
             GossipEvent::Served {
                 table: w.table,
@@ -696,9 +732,14 @@ impl Gossip {
                 Err(e) => warn!("drop delta for table '{}': {}", d.table, e),
             }
         }
+        // Deletes are parsed and dropped, never applied (#311). We no longer send
+        // them, but a 0.4.x peer still can, so the field is read and discarded
+        // rather than treated as malformed. Applying it would need a tombstone --
+        // without one, any peer still holding the row resurrects it on the next
+        // heartbeat. See `broadcast_delta` for why this is a boundary, not a gap.
         if !d.deletes.is_empty() {
             debug!(
-                "delta carries {} deletes for '{}' (live-path only in v0.1)",
+                "dropping {} delete(s) for '{}': delete propagation needs tombstones (v0.2, #311)",
                 d.deletes.len(),
                 d.table
             );
@@ -1174,6 +1215,64 @@ mod tests {
         );
     }
 
+    /// A `Delta` carrying deletes is parsed and dropped, never applied (#311).
+    ///
+    /// This pins a deliberate boundary, not a bug to fix later in place.
+    /// `broadcast_delta` no longer sends deletes, but a 0.4.x peer still can, and
+    /// the row it names must survive: applying a bare delete needs a tombstone,
+    /// and without one any peer still holding the row resurrects it on the next
+    /// heartbeat -- so dropping it loses less than applying it. If a future
+    /// change makes this test fail, tombstone propagation (v0.2) is the thing
+    /// that has to land with it.
+    #[tokio::test]
+    async fn delta_deletes_are_dropped_not_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let a_path = dir.path().join("a.db").to_str().unwrap().to_string();
+        let b_path = dir.path().join("b.db").to_str().unwrap().to_string();
+        seed(&a_path, &[("1", "alice"), ("2", "bob")]);
+        seed(&b_path, &[]);
+        let (a, a_cfg, a_local, _b, _bc, _bl) = two_nodes(&a_path, &b_path).await;
+
+        let delta = Body::Delta(crate::broadcast::DeltaPacket {
+            version: PROTOCOL_VERSION,
+            source_id: "node-b".into(),
+            seq: 1,
+            part: 0,
+            total_parts: 1,
+            table: "users".into(),
+            upserts: Vec::new(),
+            deletes: vec!["1".to_string()],
+        });
+        let sealed = a.seal(delta).unwrap();
+        let (event, out) = a.handle(&sealed, &a_local, &a_cfg).await.unwrap();
+
+        assert_eq!(
+            count(&a_path),
+            2,
+            "a delete carried on the wire must not remove the row"
+        );
+        assert_eq!(
+            name_of(&a_path, "1").as_deref(),
+            Some("alice"),
+            "the named row must be untouched, not just present"
+        );
+        assert!(
+            out.is_empty(),
+            "a deletes-only delta produces no response datagram"
+        );
+        assert!(
+            matches!(
+                event,
+                GossipEvent::Applied {
+                    rows: 0,
+                    rejected: 0,
+                    ..
+                }
+            ),
+            "a deletes-only delta applies nothing and rejects nothing, got {event:?}"
+        );
+    }
+
     /// Bind two gossip nodes with distinct instance ids on a test group. They
     /// share no path or DB identity, so convergence proves sync is scoped by
     /// group/key membership alone, never by file location.
@@ -1419,7 +1518,7 @@ mod tests {
                 ])
             })
             .collect();
-        let bodies = a.delta_bodies("users", rows, Vec::new()).unwrap();
+        let bodies = a.delta_bodies("users", rows).unwrap();
         assert!(bodies.len() > 1, "rows should span multiple delta parts");
         for body in bodies {
             let sealed = a.seal(body).unwrap();
