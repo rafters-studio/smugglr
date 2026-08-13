@@ -223,6 +223,28 @@ impl RemoteTarget {
 /// this lowers to one batch. Cross-table DDL wants `defer_foreign_keys` so an
 /// out-of-order reference does not trip mid batch. The first statement enables
 /// it; the rest are the ops in order.
+///
+/// # Precondition: execute these as one atomic batch
+///
+/// The returned slice is sound **only** when the caller executes it inside a
+/// single enclosing transaction -- for D1, one `db.batch()` call.
+///
+/// `PRAGMA defer_foreign_keys` defers enforcement until the *outermost*
+/// transaction commits. Under autocommit -- which is exactly what a non-atomic
+/// batch is, one implicit transaction per statement -- every statement commits
+/// at its own end, enforcement fires there, and statement 0 buys nothing. So
+/// splitting this slice across requests, or handing it to a driver that batches
+/// non-atomically, silently reinstates the mid-batch foreign-key failure the
+/// pragma is here to prevent. The failure is in the caller's transaction scope,
+/// not in this SQL, which is why it cannot be detected by reading the output.
+///
+/// Contrast [`rqlite_statements`], which frames its own ops in `BEGIN`/`COMMIT`
+/// and therefore carries no such precondition; the framing is omitted here only
+/// because D1 rejects `BEGIN`.
+///
+/// This crate cannot enforce the boundary: [`apply_remote`] has no transport in
+/// 0.5.0, so callers use these generators directly and own the batch boundary
+/// themselves.
 pub fn d1_statements(ops: &[ClassifiedOp]) -> Vec<String> {
     let mut out = Vec::with_capacity(ops.len() + 1);
     out.push("PRAGMA defer_foreign_keys = ON".to_string());
@@ -258,7 +280,10 @@ pub fn rqlite_statements(ops: &[ClassifiedOp]) -> Vec<String> {
 /// [`MigrateError::RemoteTransportUnsupported`], deferred to #291. The statement
 /// generators above are the usable half today. Callers that only need the SQL
 /// should call `d1_statements` / `turso_statements` / `rqlite_statements`
-/// directly rather than routing through this.
+/// directly rather than routing through this -- and must then honor each
+/// generator's own transaction contract, which this function would otherwise
+/// have owned. In particular [`d1_statements`] is sound only as one atomic
+/// batch; see its precondition.
 pub fn apply_remote(target: RemoteTarget, _ops: &[ClassifiedOp]) -> Result<(), MigrateError> {
     Err(MigrateError::RemoteTransportUnsupported(
         target.name().to_string(),
