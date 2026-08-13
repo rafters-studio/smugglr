@@ -262,19 +262,70 @@ fn default_timestamp_column() -> String {
     "updated_at".to_string()
 }
 
+/// How a same-primary-key collision resolves.
+///
+/// # One enum, two paths, different guarantees
+///
+/// These variants name a *preference* -- which side is kept. On the directional
+/// push/pull path (`[sync].conflict_resolution`) that is the whole story: there
+/// is one local row, one remote row, and one exchange, so every variant is
+/// deterministic and the name says what happens.
+///
+/// Under masterless multicast (`[broadcast].conflict_resolution`,
+/// [`crate::broadcast::BroadcastConfig::conflict_resolution`]) the same names
+/// carry a second property they do not mention: whether the mesh **converges**.
+/// N peers apply independently with no coordinator, so a preference that reads
+/// as decisive can still leave two nodes permanently holding different rows for
+/// one primary key. Only [`ConflictResolution::NewerWins`] is a total order.
+/// Per-variant detail below; read it before choosing one for a mesh.
+///
+/// If you need ordering guarantees the transport does not give you, either opt
+/// into `newer_wins` on **both** peers, or apply your own last-write-wins at
+/// apply time (legion does the latter, and their tombstones converge because of
+/// their code, not because of this setting).
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[allow(clippy::enum_variant_names)]
 pub enum ConflictResolution {
-    /// Local changes always win
+    /// Keep the local row. **Directional:** deterministic -- the remote row is
+    /// not applied. **`[broadcast]`:** does not converge, by construction. It
+    /// lowers to `UpsertGuard::KeepLocal` in `local.rs`
+    /// (`ON CONFLICT DO NOTHING`), so on a
+    /// mesh where every node prefers its own row, a contended primary key stays
+    /// divergent forever -- each node keeps what it has and rejects every peer's
+    /// copy.
+    ///
+    /// This is why [`crate::broadcast::BroadcastConfig::conflict_resolution`] is
+    /// scoped to `[broadcast]` and does NOT inherit this field, which defaults
+    /// here to `local_wins`: inheriting it would have flipped every existing
+    /// multicast deployment to never-accept-a-peer-row (#310).
     #[default]
     LocalWins,
-    /// Remote changes always win
+    /// Apply the incoming row. **Directional:** deterministic -- one remote, one
+    /// local, one exchange, so "the remote wins" names a single outcome.
+    ///
+    /// **`[broadcast]`: last-*received*-wins, not last-*written*-wins.** It
+    /// lowers to `UpsertGuard::Replace` in `local.rs` -- an unconditional
+    /// `INSERT OR REPLACE` that reads no timestamp at all. The winner is
+    /// whichever datagram arrives last, evaluated independently at each node, so
+    /// two peers that receive the same two writes in different orders converge to
+    /// **different rows for the same primary key, permanently**, with no error
+    /// and no anomaly counter. Choosing this on a mesh is choosing that.
     RemoteWins,
-    /// Newer timestamp wins
+    /// Higher ordering value wins, compared as the `max` across the configured
+    /// ordering columns. The **only** variant that is a total order: every node
+    /// independently picks the same winner, so a mesh actually converges.
+    ///
+    /// Apply-side and not negotiated on the wire, so **both** peers must opt in
+    /// -- a mesh mixing this with `remote_wins` converges toward the permissive
+    /// node.
     NewerWins,
     /// UUIDv7 primary key with higher embedded timestamp wins.
     /// Falls back to NewerWins when PKs are not valid UUIDv7.
+    ///
+    /// Degenerates to [`ConflictResolution::NewerWins`] under `[broadcast]`: a
+    /// same-primary-key collision means both rows carry the *same* UUID, so the
+    /// key has nothing to break the tie with.
     UuidV7Wins,
 }
 
