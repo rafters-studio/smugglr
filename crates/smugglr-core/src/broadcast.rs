@@ -1243,10 +1243,10 @@ mod tests {
     /// the inverse: every datagram is handed up unchanged, whatever its first
     /// byte. Looped over fresh random nonces so the assertion is about the whole
     /// byte distribution rather than one lucky sample. Under the old code this
-    /// loop fails on its *first* iteration with probability 126/128 -- the old
-    /// arm returned `Some` only for the 2 byte values in 256 it recognized, which
-    /// is the same coin the old test was losing 1 time in 128 by flipping it the
-    /// other way.
+    /// loop fails on its *first* iteration with probability 254/256 = 127/128 --
+    /// the old arm returned `Some` only for the 2 byte values in 256 it
+    /// recognized, which is the same coin the old test was losing 2/256 = 1/128
+    /// of the time by flipping it the other way.
     #[test]
     fn plaintext_mode_classifies_nothing_and_is_not_probabilistic() {
         let key = test_key();

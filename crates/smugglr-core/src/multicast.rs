@@ -360,11 +360,32 @@ impl Gossip {
             broadcast.port
         };
         let socket = bind_multicast(port, group)?;
+        let key = broadcast.encryption_key()?;
+        if key.is_none() {
+            // #313 review: removing the first-byte sniff also removed the only
+            // runtime signal a keyless node ever emitted ("Dropping encrypted
+            // packet: no secret configured"). That line was per-packet and fired
+            // at ~1/128, but it was the one thing that told an operator who MEANT
+            // to set a key that they had not -- a typo'd field name or an
+            // unexpanded env var otherwise produces silence and a mesh that
+            // simply never converges with its keyed peers.
+            //
+            // Emitted once at bind rather than per datagram: it does not depend
+            // on a foreign packet happening to arrive, and it cannot become the
+            // log spam a per-packet warning would be now that every datagram
+            // reaches this path.
+            warn!(
+                "multicast bound on port {port} with NO cluster secret: datagrams are \
+                 unauthenticated and unencrypted, this node has no cluster isolation, and any \
+                 host on the subnet can originate rows for it. Peers running with a key cannot \
+                 sync with this node. Set [broadcast].secret if this was not intended."
+            );
+        }
         Ok(Self {
             socket: Arc::new(socket),
             dest: SocketAddrV4::new(group, port),
             instance_id: broadcast.resolve_instance_id(),
-            key: broadcast.encryption_key()?,
+            key,
             seq: Arc::new(AtomicU64::new(0)),
             replay: Arc::new(Mutex::new(ReplayGuard::new())),
             conflict_resolution: broadcast.conflict_resolution,
@@ -1185,14 +1206,21 @@ mod tests {
     /// A keyless node drops a foreign cluster's sealed datagram, every time.
     ///
     /// This pins the isolation claim in the module doc at the gossip layer, where
-    /// an embedder observes it. Honest scope note: this invariant held under the
-    /// old first-byte sniff too -- a sniffed-through packet was rejected by the
-    /// `Msg` parser a moment later, so the end state was already correct. What
-    /// #313 broke was determinism *inside* `maybe_decrypt` (and the unit test
-    /// pinning it); the regression test for that is
-    /// `plaintext_mode_classifies_nothing_and_is_not_probabilistic` in
-    /// `broadcast.rs`. This test guards the user-visible half so a future change
-    /// to the keyless arm cannot quietly start accepting foreign rows.
+    /// an embedder observes it.
+    ///
+    /// An earlier version of this comment called the test weaker than it is,
+    /// claiming it "would have passed under the old sniff too" because the packet
+    /// was dropped either way. Review corrected that, and the correction is worth
+    /// keeping: the assertion is on `IgnoreReason::Malformed`, and under the old
+    /// code a keyless node reported `Undecryptable` for ~127/128 of foreign
+    /// datagrams (the sniff rejected them before the parser ever ran). So this
+    /// test would have FAILED almost immediately against the old behavior -- it
+    /// is a genuine regression test, not merely a guard.
+    ///
+    /// That mistake came from the same premise #313 itself is about: assuming
+    /// "which layer dropped it" is unobservable. `IgnoreReason` is public, so it
+    /// is observable, and the reason a packet was dropped is part of the
+    /// behavior rather than an implementation detail.
     #[tokio::test]
     async fn keyless_node_drops_sealed_foreign_datagram() {
         let dir = tempfile::tempdir().unwrap();
