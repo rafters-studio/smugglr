@@ -308,6 +308,21 @@ fn build_sync_config(js: &JsSyncConfig) -> Result<SyncConfig, JsValue> {
     if let Some(bs) = js.batch_size {
         sync.batch_size = bs;
     }
+
+    // This crate never goes through `parse_with_env`, so it does not inherit the
+    // config validation `Config::load` / `Config::from_toml_str` get. Call it
+    // explicitly.
+    //
+    // A no-op today: `JsSyncConfig` exposes no `convergeColumns` field, so
+    // `converge_columns` is always empty here and the exclude/converge overlap
+    // cannot arise. It is wired anyway, because "the guard is unreachable from
+    // this path" and "the field is not exposed yet" are different facts, and only
+    // the second one is true. Whoever adds `convergeColumns` to `JsSyncConfig`
+    // for parity would otherwise reopen the overlap bug for every npm consumer
+    // and have nothing force them to notice (#293).
+    sync.validate_column_lists()
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
     Ok(sync)
 }
 
@@ -500,18 +515,25 @@ async fn diff_table_cached(
     source_cache: &RefCell<HashMap<String, CachedMeta>>,
     dest_cache: &RefCell<HashMap<String, CachedMeta>>,
     table: &str,
-    timestamp_column: &str,
-    exclude_columns: &[String],
+    sync_config: &SyncConfig,
 ) -> Result<TableDiff, JsValue> {
+    // Takes the whole SyncConfig rather than timestamp_column + exclude_columns +
+    // converge_columns separately. Those three must come from one config: the
+    // hash-exclusion set is the union of the latter two, and every producer of a
+    // content hash has to cover the identical set or identical rows hash
+    // differently and never converge (#293).
+    let timestamp_column = &sync_config.timestamp_column;
+    let hash_excluded = sync_config.hash_excluded_columns();
+
     ensure_cached_metadata(
         source,
         source_cache,
         table,
         timestamp_column,
-        exclude_columns,
+        &hash_excluded,
     )
     .await?;
-    ensure_cached_metadata(dest, dest_cache, table, timestamp_column, exclude_columns).await?;
+    ensure_cached_metadata(dest, dest_cache, table, timestamp_column, &hash_excluded).await?;
 
     let source_ref = source_cache.borrow();
     let dest_ref = dest_cache.borrow();
@@ -522,7 +544,12 @@ async fn diff_table_cached(
         .get(table)
         .ok_or_else(|| JsValue::from_str("dest cache missing after populate"))?;
 
-    Ok(classify_diff(&source_meta.hashes, &dest_meta.hashes, table))
+    Ok(classify_diff(
+        &source_meta.hashes,
+        &dest_meta.hashes,
+        table,
+        sync_config.converge_columns.is_empty(),
+    ))
 }
 
 #[wasm_bindgen]
@@ -798,8 +825,7 @@ impl Smugglr {
                 &self.source_cache,
                 &self.dest_cache,
                 table,
-                &self.sync_config.timestamp_column,
-                &self.sync_config.exclude_columns,
+                &self.sync_config,
             )
             .await?;
 
@@ -857,8 +883,7 @@ impl Smugglr {
                 &self.source_cache,
                 &self.dest_cache,
                 table,
-                &self.sync_config.timestamp_column,
-                &self.sync_config.exclude_columns,
+                &self.sync_config,
             )
             .await?;
 
@@ -920,8 +945,7 @@ impl Smugglr {
                 &self.source_cache,
                 &self.dest_cache,
                 table,
-                &self.sync_config.timestamp_column,
-                &self.sync_config.exclude_columns,
+                &self.sync_config,
             )
             .await?;
 
@@ -1033,8 +1057,7 @@ impl Smugglr {
                 &self.source_cache,
                 &self.dest_cache,
                 table,
-                &self.sync_config.timestamp_column,
-                &self.sync_config.exclude_columns,
+                &self.sync_config,
             )
             .await?;
 
@@ -1165,7 +1188,11 @@ mod tests {
         assert_eq!(entry.hashes.len(), 1);
     }
 
-    #[test]
+    // Was `#[test]`, which NEVER RAN: this crate is `#![cfg(target_arch =
+    // "wasm32")]`, so host `cargo test` compiles it to nothing, and `wasm-pack
+    // test` collects only `#[wasm_bindgen_test]`. The assertions type-checked and
+    // never executed. Surfaced by review of #293 (which changed this call site).
+    #[wasm_bindgen_test::wasm_bindgen_test]
     fn classify_diff_local_only_remote_only() {
         let mut source_meta = HashMap::new();
         source_meta.insert("pk1".into(), make_meta("pk1", Some("2024-01-01"), "h1"));
@@ -1175,7 +1202,7 @@ mod tests {
         dest_meta.insert("pk2".into(), make_meta("pk2", Some("2024-01-01"), "h2"));
         dest_meta.insert("pk3".into(), make_meta("pk3", Some("2024-01-01"), "h3"));
 
-        let diff = classify_diff(&source_meta, &dest_meta, "test_table");
+        let diff = classify_diff(&source_meta, &dest_meta, "test_table", true);
 
         assert_eq!(diff.local_only, vec!["pk1".to_string()]);
         assert_eq!(diff.remote_only, vec!["pk3".to_string()]);
@@ -1183,7 +1210,8 @@ mod tests {
         assert!(diff.content_differs.is_empty());
     }
 
-    #[test]
+    // Same as above: previously `#[test]` and therefore never executed.
+    #[wasm_bindgen_test::wasm_bindgen_test]
     fn classify_diff_timestamp_newer_wins() {
         let mut source_meta = HashMap::new();
         source_meta.insert(
@@ -1197,7 +1225,7 @@ mod tests {
             make_meta("pk1", Some("2024-01-01"), "hash_old"),
         );
 
-        let diff = classify_diff(&source_meta, &dest_meta, "test_table");
+        let diff = classify_diff(&source_meta, &dest_meta, "test_table", true);
 
         assert_eq!(diff.local_newer, vec!["pk1".to_string()]);
         assert!(diff.remote_newer.is_empty());

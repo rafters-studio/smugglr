@@ -328,10 +328,19 @@ pub async fn sync_table<A: DataSource, B: DataSource>(
     conflict_resolution: ConflictResolution,
     batch_config: &BatchConfig,
     exclude_columns: &[String],
+    converge_columns: &[String],
     dry_run: bool,
     progress: &dyn SyncProgress,
 ) -> Result<SyncResult> {
-    let diff = diff_table(a, b, table, timestamp_column, exclude_columns).await?;
+    let diff = diff_table(
+        a,
+        b,
+        table,
+        timestamp_column,
+        exclude_columns,
+        converge_columns,
+    )
+    .await?;
     diff.warn_unresolved_conflicts(conflict_resolution);
     let (stats, detail) = if dry_run {
         (Some(diff.stats()), Some(DiffDetail::from_diff(&diff)))
@@ -475,6 +484,7 @@ async fn run_directional<A: DataSource, B: DataSource>(
             table,
             &config.sync.timestamp_column,
             &config.sync.exclude_columns,
+            &config.sync.converge_columns,
         )
         .await?;
         diff.warn_unresolved_conflicts(config.sync.conflict_resolution);
@@ -596,6 +606,7 @@ pub async fn sync_all<A: DataSource, B: DataSource>(
             config.sync.conflict_resolution,
             &batch_config,
             &config.sync.exclude_columns,
+            &config.sync.converge_columns,
             dry_run,
             progress,
         )
