@@ -308,6 +308,21 @@ fn build_sync_config(js: &JsSyncConfig) -> Result<SyncConfig, JsValue> {
     if let Some(bs) = js.batch_size {
         sync.batch_size = bs;
     }
+
+    // This crate never goes through `parse_with_env`, so it does not inherit the
+    // config validation `Config::load` / `Config::from_toml_str` get. Call it
+    // explicitly.
+    //
+    // A no-op today: `JsSyncConfig` exposes no `convergeColumns` field, so
+    // `converge_columns` is always empty here and the exclude/converge overlap
+    // cannot arise. It is wired anyway, because "the guard is unreachable from
+    // this path" and "the field is not exposed yet" are different facts, and only
+    // the second one is true. Whoever adds `convergeColumns` to `JsSyncConfig`
+    // for parity would otherwise reopen the overlap bug for every npm consumer
+    // and have nothing force them to notice (#293).
+    sync.validate_column_lists()
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
     Ok(sync)
 }
 

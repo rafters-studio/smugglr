@@ -294,6 +294,22 @@ pub fn classify_diff(
                 // every sync, so they stay `identical` -- a documented limitation
                 // of configuring converge_columns on a table with no usable
                 // timestamp_column, not a judgement that the rows agree.
+                //
+                // Reviewed and kept deliberately: unlike the two silent-loss bugs
+                // this branch was fixed for, this one cannot fire on a correctly
+                // configured table. It requires converge_columns on a table where
+                // `timestamp_column` resolves for no row at all -- i.e. where the
+                // reconciliation mechanism the feature depends on is absent. And
+                // `content_differs` would not rescue that table either: under
+                // local_wins/remote_wins it churn-retransfers every row forever,
+                // under newer_wins/uuid_v7_wins it moves nothing, which is the
+                // same practical outcome as today with a warning attached.
+                //
+                // The genuine gap is that the state is SILENT -- nothing tells an
+                // operator that converge_columns is configured but inert here.
+                // Making it observable needs a once-per-table signal, and
+                // `classify_diff` is documented as pure with no I/O, so it does
+                // not belong at this line. Tracked rather than bolted on.
                 (None, None) => diff.identical.push((*pk).clone()),
             }
             continue;
