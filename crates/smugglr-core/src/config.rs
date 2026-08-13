@@ -108,11 +108,29 @@ pub struct SyncConfig {
     /// Column name patterns to exclude from sync entirely (glob-style:
     /// "*_embedding", "vector").
     ///
-    /// These are stripped from the content hash AND from the rows that cross the
-    /// wire, so the destination never receives them. Use for values that are
+    /// These are stripped from the content hash, and from the rows that cross the
+    /// wire **on the directional push/pull path**. Use for values that are
     /// derived, huge, or recomputed per node -- embeddings being the motivating
     /// case. If you need a column kept out of the hash but still *synced*, that
     /// is [`SyncConfig::converge_columns`], not this.
+    ///
+    /// # Stripping is NOT universal across transports -- do not read this as a
+    /// privacy guarantee
+    ///
+    /// Only the directional path applies it. Two transports fetch and ship whole
+    /// rows without consulting this list, so a column excluded here still leaves
+    /// the machine on them:
+    ///
+    /// - **`stash` / `retrieve`** -- rows go to the S3-compatible relay unfiltered.
+    /// - **`[broadcast]` multicast `Want` responses** -- a peer that asks for rows
+    ///   receives every column (AEAD-sealed to the cluster key, but decrypted and
+    ///   persisted by any peer holding it).
+    ///
+    /// Both predate `converge_columns` and are tracked separately; they are named
+    /// here because the natural reading of "excluded from sync" is "never leaves
+    /// the machine," and on those two paths that is currently false. If you are
+    /// excluding a column for confidentiality rather than for size or
+    /// recomputability, do not rely on this field alone today.
     #[serde(default)]
     pub exclude_columns: Vec<String>,
 

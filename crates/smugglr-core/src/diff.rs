@@ -256,21 +256,45 @@ pub fn classify_diff(
             // is not proof of equality -- an edit confined to a converge column
             // lands here. Order by timestamp instead of skipping (#293).
             //
-            // A tie resolves to `identical`, NOT `content_differs`, and the
-            // difference matters. Equal hashes mean the hashed columns agree, so
-            // the only possible disagreement is in the unhashed ones, and equal
-            // timestamps leave no basis to prefer either side. Calling that a
-            // conflict would put every such row into `content_differs` on every
-            // sync forever -- permanent noise for a pair of rows we have no
-            // evidence differ at all.
+            // "Cannot compare" and "compared equal" are DIFFERENT answers here,
+            // and the sibling branch below collapses them only because both of
+            // its outcomes are the same bucket. This branch must keep them apart.
+            //
+            // A genuine tie (`Ordering::Equal`) resolves to `identical`. Equal
+            // hashes mean the hashed columns agree, equal timestamps mean neither
+            // side is newer, and the overwhelmingly common case reaching here is
+            // a row that is simply unchanged. Routing that to `content_differs`
+            // would flag EVERY unchanged row on a converge-column table as a
+            // conflict, on every sync, forever -- unusable.
+            //
+            // `None` is not a tie. It means `compare_ts` refused: the two sides
+            // carry unlike representations (one integer Unix time, one ISO-8601
+            // text) and there is no meaningful ordering between them. Treating
+            // that as `identical` would silently drop a real converge-column edit
+            // whenever a deployment has mixed timestamp formats -- which is
+            // exactly the failure class #293 exists to kill. It goes to
+            // `content_differs`, which `warn_unresolved_conflicts` surfaces and a
+            // conflict policy can resolve, matching the sibling branch's
+            // treatment of the same `None`.
             match (&local_row.updated_at, &remote_row.updated_at) {
                 (Some(local_ts), Some(remote_ts)) => match compare_ts(local_ts, remote_ts) {
                     Some(Ordering::Greater) => diff.local_newer.push((*pk).clone()),
                     Some(Ordering::Less) => diff.remote_newer.push((*pk).clone()),
-                    Some(Ordering::Equal) | None => diff.identical.push((*pk).clone()),
+                    Some(Ordering::Equal) => diff.identical.push((*pk).clone()),
+                    // Unlike representations -- unorderable, not equal.
+                    None => diff.content_differs.push((*pk).clone()),
                 },
-                // No timestamp to order by and no hash signal: nothing to act on.
-                _ => diff.identical.push((*pk).clone()),
+                // Exactly one side carries a timestamp. Also unorderable, and
+                // anomalous rather than routine, so it is surfaced rather than
+                // dropped.
+                (Some(_), None) | (None, Some(_)) => diff.content_differs.push((*pk).clone()),
+                // Neither side has a timestamp: this table has no ordering signal
+                // at all, so converge columns cannot be reconciled on it by any
+                // means. Every row would otherwise land in `content_differs` on
+                // every sync, so they stay `identical` -- a documented limitation
+                // of configuring converge_columns on a table with no usable
+                // timestamp_column, not a judgement that the rows agree.
+                (None, None) => diff.identical.push((*pk).clone()),
             }
             continue;
         }
@@ -518,8 +542,9 @@ mod tests {
         );
     }
 
-    // Missing timestamps with matching hashes: nothing to order by and no hash
-    // signal, so there is nothing to act on. Must not manufacture a conflict.
+    // Neither side has a timestamp: the table has no ordering signal at all, so
+    // converge columns cannot be reconciled on it by any means. Must not
+    // manufacture a conflict for every row.
     #[test]
     fn converge_column_without_timestamps_is_identical() {
         let local = one("same-hash", None);
@@ -529,6 +554,53 @@ mod tests {
 
         assert_eq!(diff.identical, vec!["r".to_string()]);
         assert!(diff.content_differs.is_empty());
+    }
+
+    // Review finding (#321): `compare_ts` returning None is "unorderable", NOT
+    // "equal". Mixed representations -- integer Unix time on one side, ISO-8601
+    // text on the other -- previously fell into the same arm as a genuine tie and
+    // were classified `identical`, silently dropping a real converge-column edit.
+    // That is the #293 failure class re-entering through the fix for it.
+    #[test]
+    fn converge_column_unorderable_timestamps_are_a_conflict_not_identical() {
+        let local = one("same-hash", Some("1700000000"));
+        let remote = one("same-hash", Some("2023-11-14T22:13:20Z"));
+
+        let diff = classify_diff(&local, &remote, "t", false);
+
+        assert_eq!(
+            diff.content_differs,
+            vec!["r".to_string()],
+            "unlike timestamp representations are unorderable and must surface, not vanish"
+        );
+        assert!(
+            diff.identical.is_empty(),
+            "classifying an unorderable pair as identical is silent data loss"
+        );
+        // And it is actually visible: content_differs is the bucket
+        // warn_unresolved_conflicts reports under a skipping policy.
+        assert_eq!(
+            diff.unresolved_conflicts(ConflictResolution::NewerWins),
+            &["r".to_string()]
+        );
+    }
+
+    // Asymmetric presence is also unorderable, and anomalous rather than routine.
+    #[test]
+    fn converge_column_one_sided_timestamp_is_a_conflict() {
+        for (local_ts, remote_ts) in [(Some("200"), None), (None, Some("200"))] {
+            let local = one("same-hash", local_ts);
+            let remote = one("same-hash", remote_ts);
+
+            let diff = classify_diff(&local, &remote, "t", false);
+
+            assert_eq!(
+                diff.content_differs,
+                vec!["r".to_string()],
+                "one-sided timestamp ({local_ts:?} vs {remote_ts:?}) must surface"
+            );
+            assert!(diff.identical.is_empty());
+        }
     }
 
     // Differing hashes must keep their existing classification regardless of the
