@@ -105,9 +105,47 @@ pub struct SyncConfig {
     #[serde(default = "default_exclude_tables")]
     pub exclude_tables: Vec<String>,
 
-    /// Column name patterns to exclude from sync (glob-style: "*_embedding", "vector")
+    /// Column name patterns to exclude from sync entirely (glob-style:
+    /// "*_embedding", "vector").
+    ///
+    /// These are stripped from the content hash AND from the rows that cross the
+    /// wire, so the destination never receives them. Use for values that are
+    /// derived, huge, or recomputed per node -- embeddings being the motivating
+    /// case. If you need a column kept out of the hash but still *synced*, that
+    /// is [`SyncConfig::converge_columns`], not this.
     #[serde(default)]
     pub exclude_columns: Vec<String>,
+
+    /// Column name patterns excluded from the content hash but still synced
+    /// (glob-style, same syntax as [`SyncConfig::exclude_columns`]).
+    ///
+    /// The distinction from `exclude_columns` is what crosses the wire. Both are
+    /// omitted from the content hash; `exclude_columns` are also stripped from
+    /// the transferred row, while these are transferred normally and converge by
+    /// timestamp.
+    ///
+    /// # Why this exists (#293)
+    ///
+    /// Omitting a column from the hash means a change confined to that column
+    /// produces a hash MATCH, and a hash match is the diff's skip condition. So
+    /// an edit to an excluded-but-synced column was silently dropped: the row
+    /// looked identical, was classified `identical`, and never transferred --
+    /// even with a newer `updated_at`. For any table with a pattern in this
+    /// list, a hash match is no longer treated as proof of equality; the diff
+    /// falls through to comparing [`SyncConfig::timestamp_column`] and takes the
+    /// newer row.
+    ///
+    /// # This is not automatic for existing configs
+    ///
+    /// Nothing moves columns here for you. A deployment relying on
+    /// `exclude_columns` for a column it actually wants synced (a PII column
+    /// kept out of the hash, say) keeps losing those edits until an operator
+    /// moves the pattern into this list. That migration is deliberate: the two
+    /// lists mean different things, and guessing which one a given pattern
+    /// wanted would silently start transmitting a column an operator may have
+    /// excluded precisely so it would never leave the machine.
+    #[serde(default)]
+    pub converge_columns: Vec<String>,
 
     /// Column used for timestamp-based change detection
     #[serde(default = "default_timestamp_column")]
@@ -148,6 +186,7 @@ impl Default for SyncConfig {
             tables: Vec::new(),
             exclude_tables: default_exclude_tables(),
             exclude_columns: Vec::new(),
+            converge_columns: Vec::new(),
             timestamp_column: default_timestamp_column(),
             conflict_resolution: ConflictResolution::default(),
             retry: RetryConfig::default(),
@@ -155,6 +194,41 @@ impl Default for SyncConfig {
             max_statement_bytes: default_max_statement_bytes(),
         }
     }
+}
+
+impl SyncConfig {
+    /// Every pattern omitted from the content hash: [`SyncConfig::exclude_columns`]
+    /// plus [`SyncConfig::converge_columns`].
+    ///
+    /// One accessor rather than a union assembled at each call site, because
+    /// every producer of a content hash MUST agree on this set. Two nodes (or
+    /// two code paths on one node -- the diff and the multicast digest) that
+    /// hash different column sets for the same row produce different hashes for
+    /// identical data, and the row then reads as divergent on every sync,
+    /// forever, with no error to point at. That is the #292 blob-encoding bug
+    /// with a different cause, and splitting this union across call sites is how
+    /// it would come back.
+    ///
+    /// Borrows in the common case: with no `converge_columns` configured this is
+    /// exactly `exclude_columns` and allocates nothing.
+    pub fn hash_excluded_columns(&self) -> std::borrow::Cow<'_, [String]> {
+        hash_excluded_columns(&self.exclude_columns, &self.converge_columns)
+    }
+}
+
+/// The hash-exclusion union, for callers holding the two lists rather than a
+/// whole [`SyncConfig`]. See [`SyncConfig::hash_excluded_columns`] for why this
+/// must have exactly one implementation.
+pub fn hash_excluded_columns<'a>(
+    exclude_columns: &'a [String],
+    converge_columns: &[String],
+) -> std::borrow::Cow<'a, [String]> {
+    if converge_columns.is_empty() {
+        return std::borrow::Cow::Borrowed(exclude_columns);
+    }
+    let mut all = exclude_columns.to_vec();
+    all.extend(converge_columns.iter().cloned());
+    std::borrow::Cow::Owned(all)
 }
 
 /// Check if a column name matches any exclusion pattern in the given list.
@@ -1078,6 +1152,65 @@ exclude_columns = ["*_embedding", "vector"]
         assert!(column_excluded("title_embedding", patterns));
         assert!(column_excluded("vector", patterns));
         assert!(!column_excluded("name", patterns));
+    }
+
+    // #293: converge_columns parses from the same [sync] table and is a SEPARATE
+    // list from exclude_columns -- the two mean different things (both leave the
+    // hash; only exclude_columns leaves the wire), so a config setting one must
+    // not populate the other.
+    #[test]
+    fn test_parse_toml_with_converge_columns() {
+        let toml_str = r#"
+local_db = "game.db"
+
+[sync]
+exclude_columns = ["*_embedding"]
+converge_columns = ["email", "phone_*"]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.sync.exclude_columns, vec!["*_embedding".to_string()]);
+        assert_eq!(
+            config.sync.converge_columns,
+            vec!["email".to_string(), "phone_*".to_string()]
+        );
+
+        let converge = &config.sync.converge_columns;
+        assert!(column_excluded("email", converge));
+        assert!(column_excluded("phone_mobile", converge));
+        assert!(!column_excluded("name", converge));
+        // The excluded pattern must not have leaked into the converge list.
+        assert!(!column_excluded("title_embedding", converge));
+    }
+
+    // Absent from the config, converge_columns defaults empty, which is what
+    // keeps the hash-match fast path on for every existing deployment.
+    #[test]
+    fn converge_columns_defaults_empty_and_borrows() {
+        let config: Config = toml::from_str("local_db = \"game.db\"\n").unwrap();
+        assert!(config.sync.converge_columns.is_empty());
+        assert!(matches!(
+            config.sync.hash_excluded_columns(),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    // The hash-exclusion union is the invariant every hash producer depends on:
+    // the diff path, the multicast digest, and the wasm cached diff must all
+    // cover the same columns or identical rows hash differently and never
+    // converge.
+    #[test]
+    fn hash_excluded_columns_unions_both_lists() {
+        let sync = SyncConfig {
+            exclude_columns: vec!["*_embedding".to_string()],
+            converge_columns: vec!["email".to_string()],
+            ..Default::default()
+        };
+
+        let all = sync.hash_excluded_columns();
+        assert!(matches!(all, std::borrow::Cow::Owned(_)));
+        assert!(column_excluded("title_embedding", &all));
+        assert!(column_excluded("email", &all));
+        assert!(!column_excluded("name", &all));
     }
 
     #[test]

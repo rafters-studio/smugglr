@@ -236,9 +236,10 @@ async fn sync_table<S: DataSource, D: DataSource>(
     label: &str,
     set_count: impl FnOnce(&mut SyncResult, usize),
 ) -> Result<SyncResult> {
-    // Stash operations use an empty exclusion list; column exclusion is
-    // applied by the higher-level sync engine that owns the SyncConfig.
-    let diff = diff_table(source, dest, table, timestamp_column, &[]).await?;
+    // Stash operations use empty exclusion lists; column exclusion -- both the
+    // stripped kind and the converge kind -- is applied by the higher-level sync
+    // engine that owns the SyncConfig.
+    let diff = diff_table(source, dest, table, timestamp_column, &[], &[]).await?;
     diff.warn_unresolved_conflicts(conflict_resolution);
 
     let (stats, detail) = if dry_run {

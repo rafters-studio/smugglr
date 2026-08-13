@@ -387,11 +387,17 @@ impl Gossip {
         config: &Config,
         table: &str,
     ) -> Result<HashMap<String, String>> {
+        // The digest advertises content hashes to peers, so it must cover the
+        // SAME column set the diff path hashes -- `hash_excluded_columns`, not
+        // `exclude_columns` alone. A node whose digest hashed converge columns
+        // while its peer's diff did not would advertise a hash no peer can ever
+        // match, and the row would read as divergent on every heartbeat forever
+        // (#293; the #292 blob-encoding failure with a different cause).
         Ok(local
             .get_row_metadata(
                 table,
                 &config.sync.timestamp_column,
-                &config.sync.exclude_columns,
+                &config.sync.hash_excluded_columns(),
             )
             .await?
             .into_iter()

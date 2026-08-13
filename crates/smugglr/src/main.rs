@@ -730,6 +730,7 @@ async fn run_diff(
         &tables,
         &config.sync.timestamp_column,
         &config.sync.exclude_columns,
+        &config.sync.converge_columns,
         fmt,
     )
     .await
@@ -741,11 +742,20 @@ async fn output_diffs<A: DataSource, B: DataSource>(
     tables: &[String],
     timestamp_column: &str,
     exclude_columns: &[String],
+    converge_columns: &[String],
     fmt: OutputFormat,
 ) -> error::Result<()> {
     let mut diffs = Vec::new();
     for table_name in tables {
-        let diff = diff_table(local, remote, table_name, timestamp_column, exclude_columns).await?;
+        let diff = diff_table(
+            local,
+            remote,
+            table_name,
+            timestamp_column,
+            exclude_columns,
+            converge_columns,
+        )
+        .await?;
         diffs.push((table_name.clone(), diff));
     }
 
