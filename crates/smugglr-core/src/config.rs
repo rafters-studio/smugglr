@@ -214,6 +214,74 @@ impl SyncConfig {
     pub fn hash_excluded_columns(&self) -> std::borrow::Cow<'_, [String]> {
         hash_excluded_columns(&self.exclude_columns, &self.converge_columns)
     }
+
+    /// Refuse a config where a column could match BOTH
+    /// [`SyncConfig::exclude_columns`] and [`SyncConfig::converge_columns`].
+    ///
+    /// # Why this is a hard error rather than a precedence rule (#293)
+    ///
+    /// An overlapping column is not merely ambiguous, it silently destroys the
+    /// edit it was configured to protect, and reports success while doing it:
+    ///
+    /// 1. The hash excludes it (the union covers both lists), so both sides hash
+    ///    identically and the row looks unchanged.
+    /// 2. `converge_columns` is non-empty, so the diff stops treating a hash
+    ///    match as proof of equality and selects the row on its newer timestamp.
+    /// 3. The transfer strips it, because stripping honors `exclude_columns`
+    ///    alone -- so the row is sent WITHOUT the one column that caused it to be
+    ///    sent.
+    /// 4. The destination applies it. On the `INSERT OR REPLACE` backends
+    ///    (http-sql, and any adapter using `batch_sql::generate_batch_sql`) that
+    ///    is a DELETE+INSERT, so the destination's value for that column is
+    ///    NULLED rather than merely left stale. The native `ON CONFLICT DO
+    ///    UPDATE` path leaves it stale instead. Both lose the edit; one destroys
+    ///    the old value too.
+    /// 5. `updated_at` did cross, so the timestamps now match. On the next sync
+    ///    the hashes match and the timestamps tie, which resolves to `identical`.
+    ///    The edit is gone permanently, and every step reported success.
+    ///
+    /// That is the bug #293 exists to fix, re-entered through the exact
+    /// migration this feature documents -- an operator COPYING a pattern into
+    /// `converge_columns` instead of MOVING it. So the config is refused at load
+    /// rather than resolved by a precedence rule: any precedence answer is wrong
+    /// for somebody (exclude-wins silently keeps losing the edit, converge-wins
+    /// silently transmits a column an operator may have excluded precisely so it
+    /// would never leave the machine), and this is cheap to state and impossible
+    /// to hit by accident once stated.
+    ///
+    /// No existing deployment can trip this: `converge_columns` is new, so an
+    /// overlap can only be introduced by a config written against this release.
+    ///
+    /// # Limits, stated rather than implied
+    ///
+    /// Glob-vs-glob intersection is not decidable in general, and this does not
+    /// attempt it. It catches the realistic cases: an identical pattern in both
+    /// lists, and a pattern in one list that matches the other's pattern text
+    /// (`*email*` in `exclude_columns` against `email` in `converge_columns`).
+    /// Two partially-overlapping globs (`email*` and `*mail`) pass this check and
+    /// would still be ambiguous for the names in their intersection.
+    pub fn validate_column_lists(&self) -> Result<()> {
+        for converge in &self.converge_columns {
+            for exclude in &self.exclude_columns {
+                let overlaps = exclude == converge
+                    || column_glob_match(exclude, converge)
+                    || column_glob_match(converge, exclude);
+                if overlaps {
+                    return Err(SyncError::Config(format!(
+                        "[sync] column pattern '{converge}' appears in converge_columns while \
+                         '{exclude}' in exclude_columns also matches it. A column matching both \
+                         is excluded from the content hash, selected for transfer by its \
+                         timestamp, then stripped before it is sent -- the edit is lost and, on \
+                         INSERT OR REPLACE backends, the destination's existing value is nulled. \
+                         The two lists mean different things: exclude_columns never leaves the \
+                         machine, converge_columns is synced but not hashed. MOVE the pattern \
+                         into exactly one of them rather than copying it."
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The hash-exclusion union, for callers holding the two lists rather than a
@@ -420,9 +488,11 @@ fn parse_with_env(content: &str) -> Result<Config> {
     let mut value: toml::Value =
         toml::from_str(content).map_err(|e| SyncError::Config(e.to_string()))?;
     expand_value(&mut value)?;
-    value
+    let config: Config = value
         .try_into()
-        .map_err(|e| SyncError::Config(e.to_string()))
+        .map_err(|e| SyncError::Config(e.to_string()))?;
+    config.sync.validate_column_lists()?;
+    Ok(config)
 }
 
 /// Recursively expand `${VAR}` in every string leaf of a parsed TOML tree.
@@ -1211,6 +1281,67 @@ converge_columns = ["email", "phone_*"]
         assert!(column_excluded("title_embedding", &all));
         assert!(column_excluded("email", &all));
         assert!(!column_excluded("name", &all));
+    }
+
+    // #293 review finding: an overlapping pattern is silent destructive data
+    // loss (hash-excluded -> selected on timestamp -> stripped before send ->
+    // destination nulled on INSERT OR REPLACE backends -> timestamps now tie ->
+    // classified identical forever), so it is refused at load, not resolved.
+    #[test]
+    fn overlapping_exclude_and_converge_patterns_are_refused() {
+        // The literal copy-instead-of-move case the migration note invites.
+        let exact = r#"
+local_db = "game.db"
+
+[sync]
+exclude_columns = ["email"]
+converge_columns = ["email"]
+"#;
+        let err = Config::from_toml_str(exact).unwrap_err().to_string();
+        assert!(
+            err.contains("converge_columns") && err.contains("exclude_columns"),
+            "error must name both lists so the operator knows what to move: {err}"
+        );
+
+        // A broader glob left behind in exclude_columns while the specific name
+        // is moved -- the same trap with one more step of indirection.
+        let glob = r#"
+local_db = "game.db"
+
+[sync]
+exclude_columns = ["*email*"]
+converge_columns = ["email"]
+"#;
+        assert!(
+            Config::from_toml_str(glob).is_err(),
+            "a glob in exclude_columns that matches a converge pattern must be refused"
+        );
+
+        // Symmetric: the glob on the converge side.
+        let glob_other = r#"
+local_db = "game.db"
+
+[sync]
+exclude_columns = ["email"]
+converge_columns = ["*email*"]
+"#;
+        assert!(Config::from_toml_str(glob_other).is_err());
+    }
+
+    // The guard must not fire on legitimately disjoint lists, or it blocks the
+    // feature it exists to protect.
+    #[test]
+    fn disjoint_exclude_and_converge_lists_are_accepted() {
+        let toml_str = r#"
+local_db = "game.db"
+
+[sync]
+exclude_columns = ["*_embedding", "vector"]
+converge_columns = ["email", "phone_*"]
+"#;
+        let config = Config::from_toml_str(toml_str).expect("disjoint lists must parse");
+        assert_eq!(config.sync.converge_columns.len(), 2);
+        assert_eq!(config.sync.exclude_columns.len(), 2);
     }
 
     #[test]

@@ -210,8 +210,12 @@ impl TableDiff {
 /// Used by [`diff_table`] after fetching metadata, and by the WASM package's
 /// cached diff path which bypasses per-call full scans.
 ///
-/// `hash_covers_row` says whether the content hash was computed over every
-/// column that syncs. Pass `false` when the table has
+/// `hash_covers_synced_columns` says whether the content hash was computed over
+/// every column that actually SYNCS -- deliberately not "every column in the
+/// row". A table with only [`crate::config::SyncConfig::exclude_columns`] set
+/// passes `true`, because those columns are stripped before transfer and so are
+/// not synced at all: the hash covers everything that crosses the wire, which is
+/// the property the skip condition needs. Pass `false` when the table has
 /// [`crate::config::SyncConfig::converge_columns`] configured: those columns are
 /// omitted from the hash but still transferred, so a hash match no longer proves
 /// the rows are equal and cannot be used as the skip condition (#293). Pass
@@ -221,7 +225,7 @@ pub fn classify_diff(
     local_meta: &HashMap<String, RowMeta>,
     remote_meta: &HashMap<String, RowMeta>,
     table: &str,
-    hash_covers_row: bool,
+    hash_covers_synced_columns: bool,
 ) -> TableDiff {
     let local_keys: HashSet<&String> = local_meta.keys().collect();
     let remote_keys: HashSet<&String> = remote_meta.keys().collect();
@@ -242,7 +246,7 @@ pub fn classify_diff(
 
         let hashes_match = local_row.content_hash == remote_row.content_hash;
 
-        if hashes_match && hash_covers_row {
+        if hashes_match && hash_covers_synced_columns {
             diff.identical.push((*pk).clone());
             continue;
         }
@@ -534,12 +538,12 @@ mod tests {
         let local = one("A", Some("200"));
         let remote = one("B", Some("100"));
 
-        for hash_covers_row in [true, false] {
-            let diff = classify_diff(&local, &remote, "t", hash_covers_row);
+        for hash_covers_synced_columns in [true, false] {
+            let diff = classify_diff(&local, &remote, "t", hash_covers_synced_columns);
             assert_eq!(
                 diff.local_newer,
                 vec!["r".to_string()],
-                "hash_covers_row={hash_covers_row} must not change a differing-hash row"
+                "hash_covers_synced_columns={hash_covers_synced_columns} must not change a differing-hash row"
             );
         }
     }

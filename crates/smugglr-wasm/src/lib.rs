@@ -1173,7 +1173,11 @@ mod tests {
         assert_eq!(entry.hashes.len(), 1);
     }
 
-    #[test]
+    // Was `#[test]`, which NEVER RAN: this crate is `#![cfg(target_arch =
+    // "wasm32")]`, so host `cargo test` compiles it to nothing, and `wasm-pack
+    // test` collects only `#[wasm_bindgen_test]`. The assertions type-checked and
+    // never executed. Surfaced by review of #293 (which changed this call site).
+    #[wasm_bindgen_test::wasm_bindgen_test]
     fn classify_diff_local_only_remote_only() {
         let mut source_meta = HashMap::new();
         source_meta.insert("pk1".into(), make_meta("pk1", Some("2024-01-01"), "h1"));
@@ -1191,7 +1195,8 @@ mod tests {
         assert!(diff.content_differs.is_empty());
     }
 
-    #[test]
+    // Same as above: previously `#[test]` and therefore never executed.
+    #[wasm_bindgen_test::wasm_bindgen_test]
     fn classify_diff_timestamp_newer_wins() {
         let mut source_meta = HashMap::new();
         source_meta.insert(
