@@ -9,7 +9,15 @@
 //!   the key is the only access control. There is no path-, filename-, or
 //!   DB-identity scoping: two replicas of one logical database sync regardless of
 //!   where each stores its file. Isolate clusters on one LAN with distinct keys
-//!   (a foreign key's datagrams simply fail to decrypt and are dropped).
+//!   (a foreign key's datagrams fail AEAD authentication and are dropped).
+//!
+//!   That mechanism requires a key. A node configured *without* one decrypts
+//!   nothing and verifies nothing -- it hands every datagram to the `Msg` parser,
+//!   which rejects a foreign cluster's ciphertext as unparseable. The datagram is
+//!   still dropped, but by a parse failure rather than an authentication check,
+//!   so a keyless node has no cluster isolation in the security sense and no
+//!   integrity guarantee on what it does accept: any host on the subnet can
+//!   originate rows for it. Run with a key (#313).
 //! - **Idempotent apply under a declared policy.** An incoming row is applied
 //!   with a single guarded statement, so applying the same row twice is a no-op
 //!   and lost datagrams are safe. Which side wins a same-PK collision is
@@ -1172,6 +1180,64 @@ mod tests {
             vec!["updated_at".to_string()],
             "the disagreeing column must be named"
         );
+    }
+
+    /// A keyless node drops a foreign cluster's sealed datagram, every time.
+    ///
+    /// This pins the isolation claim in the module doc at the gossip layer, where
+    /// an embedder observes it. Honest scope note: this invariant held under the
+    /// old first-byte sniff too -- a sniffed-through packet was rejected by the
+    /// `Msg` parser a moment later, so the end state was already correct. What
+    /// #313 broke was determinism *inside* `maybe_decrypt` (and the unit test
+    /// pinning it); the regression test for that is
+    /// `plaintext_mode_classifies_nothing_and_is_not_probabilistic` in
+    /// `broadcast.rs`. This test guards the user-visible half so a future change
+    /// to the keyless arm cannot quietly start accepting foreign rows.
+    #[tokio::test]
+    async fn keyless_node_drops_sealed_foreign_datagram() {
+        let dir = tempfile::tempdir().unwrap();
+        let a_path = dir.path().join("a.db").to_str().unwrap().to_string();
+        let b_path = dir.path().join("b.db").to_str().unwrap().to_string();
+        seed(&a_path, &[("1", "alice")]);
+        seed(&b_path, &[("2", "bob")]);
+        // A runs keyless; B is sealed under a key A does not have.
+        let key = "b".repeat(64);
+        let (a, a_cfg, a_local, b, _b_cfg, _b_local) =
+            two_nodes_keyed(&a_path, &b_path, None, Some(&key)).await;
+
+        for i in 0..256 {
+            let mut row: HashMap<String, serde_json::Value> = HashMap::new();
+            row.insert("id".into(), "2".into());
+            row.insert("name".into(), "bob".into());
+            let sealed = b
+                .seal(Body::Delta(crate::broadcast::DeltaPacket {
+                    version: PROTOCOL_VERSION,
+                    source_id: "node-b".into(),
+                    seq: i + 1,
+                    part: 0,
+                    total_parts: 1,
+                    table: "users".into(),
+                    upserts: vec![row],
+                    deletes: Vec::new(),
+                }))
+                .unwrap();
+            let (event, out) = a.handle(&sealed, &a_local, &a_cfg).await.unwrap();
+            assert!(
+                matches!(event, GossipEvent::Ignored(IgnoreReason::Malformed)),
+                "iteration {i}: a foreign sealed datagram must be dropped, got {event:?}"
+            );
+            assert!(
+                out.is_empty(),
+                "iteration {i}: dropped datagram answers nothing"
+            );
+        }
+
+        assert_eq!(
+            count(&a_path),
+            1,
+            "no foreign row may ever land in a keyless node's database"
+        );
+        assert_eq!(name_of(&a_path, "2"), None, "row 2 belongs to B's cluster");
     }
 
     /// Bind two gossip nodes with distinct instance ids on a test group. They

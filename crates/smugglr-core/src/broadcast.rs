@@ -317,10 +317,23 @@ pub fn maybe_decrypt(data: &[u8], key: &Option<[u8; 32]>) -> Result<Option<Vec<u
             Ok(Some(decrypt_packet(data, k)?))
         }
         None => {
-            if data.first() != Some(&b'{') && data.first() != Some(&b'[') {
-                warn!("Dropping encrypted packet: no secret configured");
-                return Ok(None);
-            }
+            // No key: nothing can be authenticated, so the datagram is handed up
+            // as-is and the message parser is the only filter. A foreign
+            // cluster's sealed datagram is ciphertext, which does not
+            // deserialize into a `Msg` and is dropped one layer up.
+            //
+            // Deliberately no first-byte sniff for `{` / `[` (#313). That test
+            // guessed "is this plaintext JSON?" against a 24-byte random nonce,
+            // so it matched 2 byte values in 256 -- 1 foreign datagram in 128
+            // was called plaintext and passed up anyway, and the invariant test
+            // failed at the same rate. The guess never changed the outcome for
+            // those packets either, since the parser rejected them immediately
+            // afterward; it only decided *which layer* dropped them, at random.
+            // Deferring to the parser reaches the identical end state
+            // deterministically. It also removes the false implication that this
+            // arm authenticates anything: in plaintext mode nothing decrypts and
+            // nothing is verified, which is a property of running without a key,
+            // not something a byte test can recover.
             Ok(Some(data.to_vec()))
         }
     }
@@ -1216,12 +1229,37 @@ mod tests {
         assert_eq!(decrypted, plaintext);
     }
 
+    /// A keyless node classifies nothing, and does so deterministically (#313).
+    ///
+    /// This replaces `test_plaintext_mode_drops_encrypted_packet`, which asserted
+    /// that `maybe_decrypt` itself returned `None` for a sealed datagram. It did
+    /// that by sniffing the first byte for `{` or `[` -- a guess against a 24-byte
+    /// random nonce, matching 2 byte values in 256, so the old assertion failed
+    /// for 1 packet in 128 (measured 6/1000). The guess never changed the end
+    /// state for the packets it let through, since the `Msg` parser rejected them
+    /// immediately after; it only decided which layer dropped them, at random.
+    ///
+    /// The contract now is that this arm makes no decision at all, so the test is
+    /// the inverse: every datagram is handed up unchanged, whatever its first
+    /// byte. Looped over fresh random nonces so the assertion is about the whole
+    /// byte distribution rather than one lucky sample. Under the old code this
+    /// loop fails on its *first* iteration with probability 126/128 -- the old
+    /// arm returned `Some` only for the 2 byte values in 256 it recognized, which
+    /// is the same coin the old test was losing 1 time in 128 by flipping it the
+    /// other way.
     #[test]
-    fn test_plaintext_mode_drops_encrypted_packet() {
+    fn plaintext_mode_classifies_nothing_and_is_not_probabilistic() {
         let key = test_key();
-        let encrypted = encrypt_packet(b"secret", &key).expect("encrypt");
-        let result = maybe_decrypt(&encrypted, &None).expect("should not error");
-        assert!(result.is_none());
+        for i in 0..2_000 {
+            let encrypted = encrypt_packet(b"secret", &key).expect("encrypt");
+            let out = maybe_decrypt(&encrypted, &None)
+                .expect("a keyless node never errors on a datagram")
+                .expect("a keyless node passes every datagram up, whatever its first byte");
+            assert_eq!(
+                out, encrypted,
+                "iteration {i}: bytes must be handed up unchanged, not filtered here"
+            );
+        }
     }
 
     #[test]
