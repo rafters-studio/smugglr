@@ -153,6 +153,25 @@ pub struct SyncConfig {
     /// falls through to comparing [`SyncConfig::timestamp_column`] and takes the
     /// newer row.
     ///
+    /// # Every peer in a mesh must configure this identically
+    ///
+    /// The hash-exclusion set is local config, and it is never negotiated on the
+    /// wire -- there is no handshake, no config fingerprint, and
+    /// `PROTOCOL_VERSION` does not cover it. Two `[broadcast]` peers on the same
+    /// group and table with DIFFERENT `converge_columns` therefore hash the same
+    /// row over different column sets, and their hashes will essentially never
+    /// coincide. The digest advertises a hash the peer can never match, the peer
+    /// asks for the row on every heartbeat, and the mesh never quiesces: no
+    /// error, no warning, just permanent Want/Delta churn and rows that read as
+    /// divergent forever.
+    ///
+    /// This is not new to `converge_columns` -- `exclude_columns` has always had
+    /// the same property, since it feeds the same hash. It is stated here because
+    /// this field is the one that makes an operator think about the hash-input
+    /// set for the first time, and because "converge" in the name invites exactly
+    /// the wrong assumption. Roll a change to these lists out to every peer, and
+    /// expect churn on any table where the rollout is partway through.
+    ///
     /// # This is not automatic for existing configs
     ///
     /// Nothing moves columns here for you. A deployment relying on
