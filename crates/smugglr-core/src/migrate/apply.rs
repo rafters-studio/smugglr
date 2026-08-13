@@ -238,9 +238,13 @@ impl RemoteTarget {
 /// pragma is here to prevent. The failure is in the caller's transaction scope,
 /// not in this SQL, which is why it cannot be detected by reading the output.
 ///
-/// Contrast [`rqlite_statements`], which frames its own ops in `BEGIN`/`COMMIT`
-/// and therefore carries no such precondition; the framing is omitted here only
-/// because D1 rejects `BEGIN`.
+/// Contrast [`rqlite_statements`], which supplies its own `BEGIN`/`COMMIT`. It
+/// still expects its statements to travel together -- what differs is the
+/// failure mode when they do not. A split there is loud: an unbalanced `BEGIN`
+/// or a stray `COMMIT` fails where it is sent. A split here is silent, because
+/// every statement is individually valid and only the deferral quietly stops
+/// meaning anything. That is why this one needs saying and that one does not.
+/// The explicit framing is omitted here only because D1 rejects `BEGIN`.
 ///
 /// This crate cannot enforce the boundary: [`apply_remote`] has no transport in
 /// 0.5.0, so callers use these generators directly and own the batch boundary
