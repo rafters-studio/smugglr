@@ -9,7 +9,15 @@
 //!   the key is the only access control. There is no path-, filename-, or
 //!   DB-identity scoping: two replicas of one logical database sync regardless of
 //!   where each stores its file. Isolate clusters on one LAN with distinct keys
-//!   (a foreign key's datagrams simply fail to decrypt and are dropped).
+//!   (a foreign key's datagrams fail AEAD authentication and are dropped).
+//!
+//!   That mechanism requires a key. A node configured *without* one decrypts
+//!   nothing and verifies nothing -- it hands every datagram to the `Msg` parser,
+//!   which rejects a foreign cluster's ciphertext as unparseable. The datagram is
+//!   still dropped, but by a parse failure rather than an authentication check,
+//!   so a keyless node has no cluster isolation in the security sense and no
+//!   integrity guarantee on what it does accept: any host on the subnet can
+//!   originate rows for it. Run with a key (#313).
 //! - **Idempotent apply under a declared policy.** An incoming row is applied
 //!   with a single guarded statement, so applying the same row twice is a no-op
 //!   and lost datagrams are safe. Which side wins a same-PK collision is
@@ -358,11 +366,32 @@ impl Gossip {
             broadcast.port
         };
         let socket = bind_multicast(port, group)?;
+        let key = broadcast.encryption_key()?;
+        if key.is_none() {
+            // #313 review: removing the first-byte sniff also removed the only
+            // runtime signal a keyless node ever emitted ("Dropping encrypted
+            // packet: no secret configured"). That line was per-packet and fired
+            // at ~1/128, but it was the one thing that told an operator who MEANT
+            // to set a key that they had not -- a typo'd field name or an
+            // unexpanded env var otherwise produces silence and a mesh that
+            // simply never converges with its keyed peers.
+            //
+            // Emitted once at bind rather than per datagram: it does not depend
+            // on a foreign packet happening to arrive, and it cannot become the
+            // log spam a per-packet warning would be now that every datagram
+            // reaches this path.
+            warn!(
+                "multicast bound on port {port} with NO cluster secret: datagrams are \
+                 unauthenticated and unencrypted, this node has no cluster isolation, and any \
+                 host on the subnet can originate rows for it. Peers running with a key cannot \
+                 sync with this node. Set [broadcast].secret if this was not intended."
+            );
+        }
         Ok(Self {
             socket: Arc::new(socket),
             dest: SocketAddrV4::new(group, port),
             instance_id: broadcast.resolve_instance_id(),
-            key: broadcast.encryption_key()?,
+            key,
             seq: Arc::new(AtomicU64::new(0)),
             replay: Arc::new(Mutex::new(ReplayGuard::new())),
             conflict_resolution: broadcast.conflict_resolution,
@@ -1284,6 +1313,71 @@ mod tests {
             ),
             "a deletes-only delta applies nothing and rejects nothing, got {event:?}"
         );
+    }
+
+    /// A keyless node drops a foreign cluster's sealed datagram, every time.
+    ///
+    /// This pins the isolation claim in the module doc at the gossip layer, where
+    /// an embedder observes it.
+    ///
+    /// An earlier version of this comment called the test weaker than it is,
+    /// claiming it "would have passed under the old sniff too" because the packet
+    /// was dropped either way. Review corrected that, and the correction is worth
+    /// keeping: the assertion is on `IgnoreReason::Malformed`, and under the old
+    /// code a keyless node reported `Undecryptable` for ~127/128 of foreign
+    /// datagrams (the sniff rejected them before the parser ever ran). So this
+    /// test would have FAILED almost immediately against the old behavior -- it
+    /// is a genuine regression test, not merely a guard.
+    ///
+    /// That mistake came from the same premise #313 itself is about: assuming
+    /// "which layer dropped it" is unobservable. `IgnoreReason` is public, so it
+    /// is observable, and the reason a packet was dropped is part of the
+    /// behavior rather than an implementation detail.
+    #[tokio::test]
+    async fn keyless_node_drops_sealed_foreign_datagram() {
+        let dir = tempfile::tempdir().unwrap();
+        let a_path = dir.path().join("a.db").to_str().unwrap().to_string();
+        let b_path = dir.path().join("b.db").to_str().unwrap().to_string();
+        seed(&a_path, &[("1", "alice")]);
+        seed(&b_path, &[("2", "bob")]);
+        // A runs keyless; B is sealed under a key A does not have.
+        let key = "b".repeat(64);
+        let (a, a_cfg, a_local, b, _b_cfg, _b_local) =
+            two_nodes_keyed(&a_path, &b_path, None, Some(&key)).await;
+
+        for i in 0..256 {
+            let mut row: HashMap<String, serde_json::Value> = HashMap::new();
+            row.insert("id".into(), "2".into());
+            row.insert("name".into(), "bob".into());
+            let sealed = b
+                .seal(Body::Delta(crate::broadcast::DeltaPacket {
+                    version: PROTOCOL_VERSION,
+                    source_id: "node-b".into(),
+                    seq: i + 1,
+                    part: 0,
+                    total_parts: 1,
+                    table: "users".into(),
+                    upserts: vec![row],
+                    deletes: Vec::new(),
+                }))
+                .unwrap();
+            let (event, out) = a.handle(&sealed, &a_local, &a_cfg).await.unwrap();
+            assert!(
+                matches!(event, GossipEvent::Ignored(IgnoreReason::Malformed)),
+                "iteration {i}: a foreign sealed datagram must be dropped, got {event:?}"
+            );
+            assert!(
+                out.is_empty(),
+                "iteration {i}: dropped datagram answers nothing"
+            );
+        }
+
+        assert_eq!(
+            count(&a_path),
+            1,
+            "no foreign row may ever land in a keyless node's database"
+        );
+        assert_eq!(name_of(&a_path, "2"), None, "row 2 belongs to B's cluster");
     }
 
     /// Bind two gossip nodes with distinct instance ids on a test group. They
