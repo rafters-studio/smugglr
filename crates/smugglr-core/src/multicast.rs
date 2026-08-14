@@ -642,6 +642,18 @@ impl Gossip {
 
         let local_hashes = match self.row_hashes(local, config, &d.table).await {
             Ok(h) => h,
+            // A duplicate `__pk` is a refusal, not a missing view, and the two
+            // must not share an arm. Treating it as empty would Want every row
+            // the peer advertises and apply them through `on_delta`, which
+            // bypasses the duplicate-`__pk` guard entirely (#269) and is not
+            // itself guarded until #278 -- so swallowing here would turn a
+            // refusal into a full-table pull down the one unguarded path, on
+            // the transport where cross-node key collisions actually originate.
+            // Propagate instead: `recv_and_handle`'s caller logs it at `warn`,
+            // matching how the emission side already reports (`digest_bodies`
+            // propagates with `?`), so a node stops pulling rather than
+            // silently stops advertising while still pulling.
+            Err(e @ SyncError::DuplicatePrimaryKey { .. }) => return Err(e),
             // No local view (e.g. the table is absent on a late joiner) -> treat
             // as empty so we want everything the peer advertises.
             Err(e) => {
@@ -1537,6 +1549,119 @@ mod tests {
             Some("Alice2"),
             "divergent row resolves last-received-wins"
         );
+    }
+
+    /// Seed a table holding two DISTINCT rows whose `__pk` renders identically.
+    ///
+    /// The PK column is declared `BLOB`, so it has SQLite affinity NONE and
+    /// keeps each value in the storage class it arrived as. Integer `1` and
+    /// text `'1'` are different values to the PK unique index (SQLite orders
+    /// INTEGER before TEXT, so they never compare equal), which is why both
+    /// insert -- but `pk_text_expr` renders a single-column PK as
+    /// `CAST(col AS TEXT)` and both render `"1"`. That is the real cross-node
+    /// shape: one node minted the key as a number, another as a string.
+    fn seed_colliding_pk(path: &str) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE users (id BLOB PRIMARY KEY, name TEXT, updated_at TEXT);
+             INSERT INTO users VALUES (1, 'MintedAsInt', '2026-01-01T00:00:00Z');
+             INSERT INTO users VALUES ('1', 'MintedAsText', '2026-01-02T00:00:00Z');",
+        )
+        .unwrap();
+    }
+
+    /// A node whose own table has a duplicate `__pk` must not answer a peer's
+    /// digest by pulling that peer's rows.
+    ///
+    /// The regression this pins is specific and was introduced by #269 itself.
+    /// `on_digest` used to funnel EVERY `row_hashes` error into one arm written
+    /// for "table absent on a late joiner", which treats the local view as
+    /// empty so the node wants everything advertised. Once #269 made
+    /// `row_hashes` able to fail for a second reason with opposite meaning, a
+    /// node with colliding keys read its own table as empty on every received
+    /// digest, requested every peer row, and applied them through `on_delta` --
+    /// the one path that bypasses the duplicate-`__pk` guard (#278, deferred).
+    /// A refusal became a silent full-table pull down the unguarded path.
+    ///
+    /// The assertion is on the emitted Want payload rather than on the event or
+    /// on the call returning `Err`, because the whole defect is that the wrong
+    /// thing happened while every status reported fine: pre-fix this returns
+    /// `Ok` with a `GossipEvent::Digest` and a Want naming both of A's rows.
+    #[tokio::test]
+    async fn duplicate_pk_node_does_not_pull_peer_rows_on_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let a_path = dir.path().join("a.db").to_str().unwrap().to_string();
+        let b_path = dir.path().join("b.db").to_str().unwrap().to_string();
+
+        // A is a healthy peer advertising two rows; B's own table collides.
+        seed(&a_path, &[("1", "Alice"), ("2", "Bob")]);
+        seed_colliding_pk(&b_path);
+        let (a, a_cfg, a_local, b, b_cfg, b_local) = two_nodes(&a_path, &b_path).await;
+
+        let digest = only(a.digest_bodies(&a_local, &a_cfg).await.unwrap());
+        let sealed = a.seal(digest).unwrap();
+        let result = b.handle(&sealed, &b_local, &b_cfg).await;
+
+        // Whatever shape the outcome takes, no Want may leave B: it cannot know
+        // which of its rows are missing while its own key space is ambiguous.
+        let bodies = match &result {
+            Ok((_, out)) => out.clone(),
+            Err(_) => Vec::new(),
+        };
+        let wanted: Vec<String> = bodies
+            .iter()
+            .flat_map(|body| match body {
+                Body::Want(w) => w.pks.clone(),
+                _ => Vec::new(),
+            })
+            .collect();
+        assert!(
+            wanted.is_empty(),
+            "a node with a duplicate __pk must not request peer rows -- those \
+             would apply through on_delta, which bypasses the guard; wanted {wanted:?}"
+        );
+
+        // And the refusal must be visible rather than absorbed: the daemon's
+        // recv loop logs this at `warn`, so an operator sees the collision named.
+        match result {
+            Err(SyncError::DuplicatePrimaryKey { table, pk, .. }) => {
+                assert_eq!(table, "users");
+                assert_eq!(pk, "1");
+            }
+            Err(other) => panic!("expected DuplicatePrimaryKey, got {other:?}"),
+            Ok((ev, _)) => panic!("expected the refusal to surface, got event {ev:?}"),
+        }
+    }
+
+    /// The benign cause keeps its old behavior: a late joiner missing the table
+    /// still treats its local view as empty and wants everything. Guards the
+    /// narrowing above from being over-read as "any row_hashes error refuses",
+    /// which would break late-joiner convergence entirely.
+    #[tokio::test]
+    async fn missing_table_still_wants_everything_on_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let a_path = dir.path().join("a.db").to_str().unwrap().to_string();
+        let b_path = dir.path().join("b.db").to_str().unwrap().to_string();
+
+        seed(&a_path, &[("1", "Alice"), ("2", "Bob")]);
+        // B has a database but not the advertised table at all.
+        rusqlite::Connection::open(&b_path)
+            .unwrap()
+            .execute_batch("CREATE TABLE unrelated (id TEXT PRIMARY KEY);")
+            .unwrap();
+        let (a, a_cfg, a_local, b, b_cfg, b_local) = two_nodes(&a_path, &b_path).await;
+
+        let digest = only(a.digest_bodies(&a_local, &a_cfg).await.unwrap());
+        let (ev, out) = route(&a, digest, &b, &b_local, &b_cfg).await;
+
+        assert!(
+            matches!(ev, GossipEvent::Digest { wanted: 2, .. }),
+            "a late joiner must still want every advertised row, got {ev:?}"
+        );
+        match only(out) {
+            Body::Want(w) => assert_eq!(w.pks.len(), 2),
+            other => panic!("expected a Want, got {other:?}"),
+        }
     }
 
     // Convergence over the ENCRYPTED wire: the same shared key on both nodes.
