@@ -1,0 +1,194 @@
+//! Break a schema, watch a probe fail, send it through JSON, and require the
+//! same failure out the other side.
+//!
+//! # Why equality is not the test
+//!
+//! A schema that serializes and deserializes to something equal is necessary
+//! and nowhere near sufficient. What a regression fixture promises is that the
+//! *failure* survives -- and a schema can compare equal while the thing that
+//! reproduces the defect lives somewhere the fixture never carried: in the
+//! statements a rebuild ran, in the trait whose probe is supposed to look at
+//! it, in the message that says which of a probe's several assertions fired.
+//! So the round trip here is measured at the far end, by running the
+//! deserialized fixture and comparing what its probe said to what the live
+//! one said. The equality assertion is kept as well, one test down, because
+//! when both fail together the narrower one says where.
+//!
+//! # The failure being reproduced
+//!
+//! smugglr#341's shape: a rebuild reads five of the eight columns
+//! `pragma foreign_key_list` hands it, and the referential action is in one of
+//! the three it does not, so `ON DELETE CASCADE` comes back as the `NO ACTION`
+//! default. Nothing about it is visible at the row counts on the day of the
+//! migration -- the children are still there, which is exactly what a rebuild
+//! that kept them would look like.
+
+use smugglr_forger::corpus::{CorpusError, Regression};
+use smugglr_forger::error::ProbeError;
+use smugglr_forger::fixture::{Backing, Fixture, Route};
+use smugglr_forger::registry::TraitCase;
+use smugglr_forger::schema::{Schema, TableConstraint, Trait};
+
+/// The registry case's schema with `ON DELETE CASCADE` taken off the cascading
+/// child -- what the rebuild in smugglr#341 produced.
+fn cascade_lost() -> Schema {
+    let mut schema = TraitCase::for_trait(Trait::ForeignKeyWithAction).schema;
+    let foreign_key = schema
+        .tables
+        .iter_mut()
+        .find(|table| table.name == "cascade_child")
+        .expect("the case schema has a cascade_child table")
+        .constraints
+        .iter_mut()
+        .find_map(|constraint| match constraint {
+            TableConstraint::ForeignKey(fk) => Some(fk),
+            _ => None,
+        })
+        .expect("cascade_child declares a foreign key");
+    foreign_key.on_delete = None;
+    schema
+}
+
+/// Run the broken schema the way `tests/probes_are_non_vacuous.rs` does, with
+/// nothing serialized anywhere, and return what the probe said.
+fn live_failure(schema: &Schema, kind: Trait) -> String {
+    let case = TraitCase::for_trait(kind);
+    let mut fixture = Fixture::new(Backing::Memory).expect("fixture");
+    fixture
+        .bring_to(Route::Ddl(&schema.to_ddl()))
+        .expect("the broken schema still renders DDL SQLite accepts");
+    case.seed(fixture.conn()).expect("seed");
+    match case.probe(fixture.conn()) {
+        Err(ProbeError::Failed(message)) => message,
+        other => panic!("the break did not make the probe fail; it said {other:?}"),
+    }
+}
+
+fn recorded(schema: Schema, kind: Trait, failure: String) -> Regression {
+    Regression {
+        provenance: "the round-trip test's own fixture, built in memory".into(),
+        kind,
+        schema,
+        after_seed: Vec::new(),
+        expected_failure: failure,
+    }
+}
+
+#[test]
+fn a_failure_recorded_as_json_reproduces_itself_when_read_back() {
+    let schema = cascade_lost();
+    let failure = live_failure(&schema, Trait::ForeignKeyWithAction);
+    assert!(
+        !failure.is_empty(),
+        "a probe that fails with an empty message records nothing"
+    );
+
+    let json = recorded(schema, Trait::ForeignKeyWithAction, failure.clone()).to_json();
+    let read_back = Regression::from_json(&json).expect("the fixture parses");
+
+    // The whole requirement: not that the value survived, but that running
+    // what came back out reproduces the failure that went in. `run` accepts
+    // only a `ProbeError::Failed` whose message matches, so this passing is
+    // the message having survived byte for byte.
+    read_back
+        .run()
+        .unwrap_or_else(|error| panic!("the recorded failure did not reproduce: {error}"));
+    assert_eq!(read_back.expected_failure, failure);
+}
+
+#[test]
+fn the_schema_itself_survives_the_round_trip() {
+    let schema = cascade_lost();
+    let fixture = recorded(schema.clone(), Trait::ForeignKeyWithAction, "any".into());
+    let read_back = Regression::from_json(&fixture.to_json()).expect("the fixture parses");
+
+    assert_eq!(read_back.schema, schema);
+    assert_eq!(read_back.schema.to_ddl(), schema.to_ddl());
+    assert_eq!(read_back, fixture);
+}
+
+#[test]
+fn a_fixture_whose_defect_stopped_reproducing_is_a_failure() {
+    // The unbroken case schema: the cascade is intact, so the probe passes and
+    // the fixture is no longer about anything. A corpus that reported this as
+    // green would keep a fixture that has quietly stopped asserting.
+    let intact = TraitCase::for_trait(Trait::ForeignKeyWithAction).schema;
+    let fixture = recorded(
+        intact,
+        Trait::ForeignKeyWithAction,
+        live_failure(&cascade_lost(), Trait::ForeignKeyWithAction),
+    );
+
+    assert!(matches!(fixture.run(), Err(CorpusError::NoFailure)));
+}
+
+#[test]
+fn a_fixture_reproducing_some_other_failure_is_a_failure() {
+    // Same break, same probe, a message from a different assertion. Running it
+    // has to notice, or the recorded message is decoration and every fixture
+    // in the corpus asserts only that something somewhere went wrong.
+    let fixture = recorded(
+        cascade_lost(),
+        Trait::ForeignKeyWithAction,
+        "some other thing the probe never said".into(),
+    );
+
+    match fixture.run() {
+        Err(CorpusError::DifferentFailure { reported, .. }) => {
+            assert_eq!(
+                reported,
+                live_failure(&cascade_lost(), Trait::ForeignKeyWithAction)
+            );
+        }
+        other => panic!("a mismatched message was not reported as one: {other:?}"),
+    }
+}
+
+#[test]
+fn a_probe_that_could_not_observe_anything_is_not_the_failure() {
+    // The trigger case, seeded and then emptied. The probe reports `Unseeded`
+    // rather than `Failed` -- and a fixture that accepted it would be a
+    // committed guard reproducing nothing at all, which is the one outcome
+    // that must never read as a finding.
+    let case = TraitCase::for_trait(Trait::Trigger);
+    let fixture = Regression {
+        provenance: "a trigger fixture whose rows never arrive".into(),
+        kind: Trait::Trigger,
+        schema: case.schema,
+        after_seed: vec!["DELETE FROM \"audit\"; DELETE FROM \"evented\";".into()],
+        expected_failure: "nothing to observe: the audit table is empty".into(),
+    };
+
+    assert!(matches!(fixture.run(), Err(CorpusError::NotAFinding(_))));
+}
+
+#[test]
+fn a_fixture_that_asserts_nothing_is_refused_at_the_door() {
+    let empty_message = recorded(cascade_lost(), Trait::ForeignKeyWithAction, String::new());
+    assert!(matches!(
+        Regression::from_json(&empty_message.to_json()),
+        Err(CorpusError::NoExpectedFailure)
+    ));
+
+    let mut anonymous = recorded(cascade_lost(), Trait::ForeignKeyWithAction, "said".into());
+    anonymous.provenance = "   ".into();
+    assert!(matches!(
+        Regression::from_json(&anonymous.to_json()),
+        Err(CorpusError::NoProvenance)
+    ));
+}
+
+#[test]
+fn a_misspelled_key_is_refused_rather_than_ignored() {
+    // A fixture is hand-editable. `after_seeds` silently ignored would leave a
+    // file that looks like it runs statements after the seed and does not, and
+    // the fixture would be testing something other than what it says.
+    let json = recorded(cascade_lost(), Trait::ForeignKeyWithAction, "said".into())
+        .to_json()
+        .replace("\"after_seed\"", "\"after_seeds\"");
+
+    assert!(matches!(
+        Regression::from_json(&json),
+        Err(CorpusError::Parse(_))
+    ));
+}
