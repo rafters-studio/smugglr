@@ -61,6 +61,13 @@
 //! loop and so cannot see a capture that does not exist yet; the "no mutation
 //! without a snapshot" guarantee lives in [`PreimageCapturer::capture_before`],
 //! which refuses a destructive op it cannot capture *before* the op runs.
+//!
+//! That guarantee is scoped to the **forward `up` path**, for the same reason the
+//! lint is (`lint.rs`, "Scope"): a `down` op is a legitimately-destructive-by-
+//! structure inverse -- the `DropColumn` that undoes an `AddColumn` -- whose data
+//! was never there to lose. So [`apply_compensating`] running `apply_ops` with a
+//! no-op hook over [`additive_down_ops`] is correct, not a hole: there is nothing
+//! to snapshot on the way back out.
 
 use crate::migrate::{ClassifiedOp, MigrateError, Op};
 use serde::{Deserialize, Serialize};
@@ -882,8 +889,9 @@ pub async fn load_preimage(
 /// **Nothing writes `preimage_ref` in 0.5.0**, so this returns `None` for every
 /// row a 0.5.0 apply produces. The ledger exposes no setter for the column -- it
 /// appears in `ledger.rs`'s `CREATE TABLE` and in the `SELECT` projections, and in
-/// no write: [`Ledger::try_elect`]'s insert does not list it, so every row is born
-/// NULL and nothing updates it afterwards. The forward driver (#296) returns the
+/// no write path: the election insert does not list it, so every row is born NULL,
+/// and none of [`Ledger::mark_success`], [`Ledger::mark_failed`], or either lease
+/// reclaim touches it afterwards. The forward driver (#296) returns the
 /// captured payload in its apply outcome instead of stashing a key on the row.
 /// Until some component takes ownership of writing it, a `Ref` pre-image reaches a
 /// reverse by travelling on the manifest, not by being looked up here.
