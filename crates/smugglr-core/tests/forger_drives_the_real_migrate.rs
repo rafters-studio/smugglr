@@ -29,40 +29,51 @@
 //! the ledger as a divergence; hand in the engine's list and the same run is
 //! silent. forger learns the name from the caller either way.
 //!
-//! # What this migration deliberately does not do, and which defects that
-//! routes around
+//! # The two paths, and which defects each one reaches
 //!
-//! The ops here are additive: `ADD COLUMN` and `CREATE TABLE`. Neither reaches
-//! `migrate::apply::rebuild_dropping_column`, which is the only path in the
-//! apply engine that *reconstructs* a table rather than asking SQLite to alter
-//! it -- and reconstruction is where the open defects live. A manifest that
-//! reached it over this schema is red today, by construction and not by
-//! accident:
+//! There are two tests here because the apply engine has two ways to change a
+//! table, and only one of them was ever broken.
 //!
-//! * **#341** -- `reconstruct_foreign_keys` reads five of `foreign_key_list`'s
-//!   eight columns, so a rebuilt `cascade_child` comes back with its foreign
-//!   key and without `ON DELETE CASCADE`. [`Trait::ForeignKeyWithAction`].
+//! [`the_real_apply_path_preserves_every_trait_it_migrates_over`] is additive --
+//! `ADD COLUMN` and `CREATE TABLE`. Neither reaches
+//! `migrate::apply::rebuild_dropping_column`, the only path that *reconstructs*
+//! a table rather than asking SQLite to alter it. **Do not read a green run
+//! there as coverage of the rebuild**; it was measured green on all eight
+//! traits while the rebuild was red on three.
+//!
+//! [`the_rebuild_path_preserves_the_referential_actions_it_reconstructs`] is the
+//! other one, added with the fix for **#341**. `reconstruct_foreign_keys` read
+//! five of `foreign_key_list`'s eight columns, so a rebuilt `cascade_child` came
+//! back holding its foreign key and not its `ON DELETE CASCADE` -- present and
+//! inert. That test is the red-to-green flip: against this same wiring before
+//! the fix, the probe reported *"deleting keeper.id = 1 was refused (FOREIGN KEY
+//! constraint failed), and a child declared ON DELETE CASCADE does not refuse
+//! it"*.
+//!
+//! Reaching the rebuild takes deliberate setup, which is worth knowing before
+//! writing a third test here: `drop_column` tries the direct `ALTER` first and
+//! rebuilds only when SQLite refuses, so the dropped column has to be one SQLite
+//! will refuse -- hence [`REBUILD_FORCER`] being `UNIQUE`.
+//!
+//! # What is still not reached
+//!
 //! * **#342** -- `PRAGMA table_info` does not return generated columns at all,
 //!   so a rebuild never sees them and cannot copy them.
-//!   [`Trait::GeneratedVirtual`] and [`Trait::GeneratedStored`].
-//!
-//! Both are open and neither is this file's to fix (#377 is the wiring; #341 is
-//! sequenced behind it, to be proven *by* it). So this test asserts what the
-//! additive path preserves and claims nothing about the rebuild. **Do not read
-//! a green run here as coverage of the rebuild.** The measurement of the
-//! rebuild belongs in #341's and #342's own PRs, where a red-to-green flip is
-//! the evidence the fix works; a test committed here asserting today's red
-//! would go green on a defect and fail when the defect is fixed.
-//!
-//! One more thing this manifest does not reach, for the same reason: both ops
-//! are structurally additive, so the lint never classifies a destructive op and
-//! the pre-image capturer bound to the apply loop's write-ahead hook captures
-//! nothing. The destructive lane runs in the closure and is inert.
-//!
-//! A caveat survives even for what is covered: the referential-action probe
-//! exercises the `ON DELETE` half only. `ON UPDATE` has no probe (#374) and
-//! `RESTRICT` is behaviourally identical to the `NO ACTION` default under
-//! immediate enforcement. forger's own boundary output states both.
+//!   [`Trait::GeneratedVirtual`] and [`Trait::GeneratedStored`]. Open. The
+//!   rebuild test above drops a column from the two tables carrying foreign
+//!   keys, and the generated columns live on other tables, so no rebuild in this
+//!   file touches one. A manifest that rebuilt `virtual_generated` is red today.
+//! * **The destructive lane.** Both manifests declare `preimage: None` and
+//!   neither op is classified destructive, so the pre-image capturer bound to
+//!   the apply loop's write-ahead hook captures nothing. `DROP COLUMN` on a
+//!   column nothing reads does not exercise it. That is #378.
+//! * **`ON UPDATE` beyond `CASCADE`, and `RESTRICT`.** The referential-action
+//!   probe now covers both `ON DELETE` and `ON UPDATE` (#374 added the update
+//!   arm, and the rebuild test drops a column from `updating_child` so the real
+//!   engine reconstructs that key too). `SET NULL` and `SET DEFAULT` are
+//!   declared by no case on either side (#384), and `RESTRICT` is behaviourally
+//!   identical to the `NO ACTION` default under immediate enforcement. forger's
+//!   own boundary output states all of it.
 
 use rusqlite::Connection;
 
@@ -81,7 +92,7 @@ use smugglr_forger::schema::builder::{schema, table};
 // Renamed on import: `smugglr_core::migrate::Column` is a manifest op's column
 // and this one is a schema model's. Two `Column`s in one file is a reader
 // tripping over which layer they are in.
-use smugglr_forger::schema::{Column as ForgedColumn, ColumnType, Schema, Trait};
+use smugglr_forger::schema::{Column as ForgedColumn, ColumnConstraint, ColumnType, Schema, Trait};
 
 /// The table in forger's every-trait schema that carries the foreign key with a
 /// referential action -- the #341 table. The migration adds a column to *this*
@@ -183,6 +194,152 @@ fn the_real_apply_path_preserves_every_trait_it_migrates_over() {
             "{backing:?}: ADD COLUMN on {FK_TABLE:?} lost its referential action"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The rebuild path (#341)
+// ---------------------------------------------------------------------------
+
+/// The table carrying the `ON UPDATE CASCADE` key, since #374 gave the case one.
+const UPDATE_FK_TABLE: &str = "updating_child";
+
+/// A column that exists only to make the direct `ALTER TABLE DROP COLUMN`
+/// refuse, so the op falls through to the rebuild.
+///
+/// `drop_column` tries the direct ALTER first and rebuilds only when SQLite
+/// turns it down (`apply.rs:497-507`), and forger's case schema has nothing on
+/// these tables that would refuse. Dropping an ordinary column here would test
+/// the path that was never broken -- #379 measured the direct drop green on all
+/// eight traits while the rebuild was red on three.
+const REBUILD_FORCER: &str = "rebuild_forcer";
+
+/// The rebuild reconstructs the referential actions it used to drop.
+///
+/// This is #341's red-to-green flip, and it is deliberately *not* asserting
+/// reconstructed DDL text: the defect produced a key that was present and
+/// inert, so `foreign_key_list` reporting a row proves nothing. What is asserted
+/// is that forger's probe -- which deletes a parent and moves a key and reads
+/// what happened to the children -- holds after the real engine rebuilt both
+/// tables.
+///
+/// Against the same wiring before the fix, `ForeignKeyWithAction` reported:
+/// *"deleting keeper.id = 1 was refused (FOREIGN KEY constraint failed), and a
+/// child declared ON DELETE CASCADE does not refuse it -- the action was
+/// reconstructed as something else, or dropped, which leaves NO ACTION"*.
+#[test]
+fn the_rebuild_path_preserves_the_referential_actions_it_reconstructs() {
+    for backing in Backing::ALL {
+        let start = every_trait_schema_with_a_rebuild_forcer();
+        let target = every_trait_schema();
+        let sealed = the_rebuilding_migration();
+
+        let ignore = SyncConfig::default().exclude_tables;
+
+        let mut applied = Vec::new();
+        let mut transform = |conn: &mut Connection| -> Result<(), BoxError> {
+            applied.push(apply_migration(conn, &sealed, &ApplyOptions::default())?);
+            Ok(())
+        };
+
+        let report = differential(backing, &start, &target, &mut transform, &ignore)
+            .unwrap_or_else(|error| panic!("{backing:?}: the migration did not run: {error}"));
+
+        let outcome = match applied.as_slice() {
+            [outcome] => outcome,
+            other => panic!("{backing:?}: the transformation ran {} times", other.len()),
+        };
+        assert_eq!(
+            outcome.election,
+            Election::Won,
+            "{backing:?}: the driver has to have won its election, or it applied nothing"
+        );
+
+        assert!(
+            report.baseline_is_sound(),
+            "{backing:?}: the arm built from the target schema did not hold, so nothing compared \
+             against it means anything: {:?}",
+            report.unsound_baseline()
+        );
+
+        // Named first and separately, because this trait is the one the fix is
+        // about and a loop that happened to skip it would still read as green.
+        assert_eq!(
+            report.for_trait(Trait::ForeignKeyWithAction).transformed,
+            Outcome::Held,
+            "{backing:?}: the rebuild lost a referential action -- #341"
+        );
+
+        for observed in &report.traits {
+            assert_eq!(
+                observed.transformed,
+                Outcome::Held,
+                "{backing:?}: {:?} did not hold after the real rebuild",
+                observed.kind
+            );
+        }
+
+        assert_eq!(
+            report.divergences(),
+            Vec::new(),
+            "{backing:?}: the rebuilt database and the one built from the target schema answered \
+             differently"
+        );
+    }
+}
+
+/// The every-trait schema with a `UNIQUE` column on each table carrying a
+/// referential action, so dropping it forces the rebuild.
+///
+/// `UNIQUE` rather than an index, because the column has to be refused by the
+/// direct `ALTER` and has to be droppable without taking a trait with it. It is
+/// nullable and nothing seeds it, so it is invisible to every probe.
+fn every_trait_schema_with_a_rebuild_forcer() -> Schema {
+    let mut start = every_trait_schema();
+    for name in [FK_TABLE, UPDATE_FK_TABLE] {
+        let table = start
+            .tables
+            .iter_mut()
+            .find(|existing| existing.name == name)
+            .unwrap_or_else(|| panic!("the every-trait schema carries {name:?}"));
+        table.columns.push(ForgedColumn {
+            name: REBUILD_FORCER.into(),
+            decl_type: Some(ColumnType::Text),
+            constraints: vec![ColumnConstraint::Unique(None)],
+        });
+    }
+    start
+        .validate()
+        .expect("the pre-migration schema is one SQLite accepts");
+    start
+}
+
+/// Two `DROP COLUMN`s, each landing on a table whose foreign key carries an
+/// action, and each forced through the rebuild by the column being `UNIQUE`.
+///
+/// The target schema is `every_trait_schema()` itself rather than a third
+/// description: this migration removes exactly what
+/// [`every_trait_schema_with_a_rebuild_forcer`] added, so arriving back at the
+/// registry's own schema is the strongest available statement that it arrived
+/// where it claimed.
+fn the_rebuilding_migration() -> ChecksummedManifest {
+    ChecksummedManifest::seal(Manifest {
+        version: 1,
+        target_schema: "opaque".into(),
+        up: vec![FK_TABLE, UPDATE_FK_TABLE]
+            .into_iter()
+            .map(|table| {
+                ClassifiedOp::new(Op::DropColumn {
+                    table: table.into(),
+                    column: REBUILD_FORCER.into(),
+                })
+            })
+            .collect(),
+        down: Vec::new(),
+        preimage: None,
+        flags: Flags::default(),
+        author: None,
+    })
+    .expect("the manifest seals")
 }
 
 // ---------------------------------------------------------------------------
