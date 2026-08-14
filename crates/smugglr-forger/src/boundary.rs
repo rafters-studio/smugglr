@@ -47,9 +47,15 @@
 //! sentence, and the difference is the whole point: declaring `ON UPDATE
 //! CASCADE` in a case changes the line's wording without emptying it, so a
 //! substring check would stay green over a build that had lost the claim and
-//! kept the blind spot. Measured, not assumed -- adding that declaration to
-//! `registry/cases.rs` turns both tests red, and the line's prose alone does not
-//! say so.
+//! kept the blind spot.
+//!
+//! That was written as a prediction and has since been run. Closing smugglr#374
+//! added the declaration to `registry/cases.rs`, and the set-valued assertion
+//! went red naming the arriving action -- while the line's prose stayed true, as
+//! the paragraph above says it would. The `ON UPDATE` line is still here,
+//! because `CASCADE` gaining a probe does not give the other four one. That is
+//! the shape this whole module exists to keep legible: coverage of one member is
+//! not coverage of the set it belongs to.
 //!
 //! # The three lines nothing here can measure
 //!
@@ -197,12 +203,16 @@ pub enum Subject {
     OnDelete,
     /// `ON UPDATE` actions no case schema declares.
     ///
-    /// The `ForeignKeyWithAction` case declares `ON DELETE` actions only and its
-    /// probe reads `fk.on_delete`, so nothing in forger asks what an `UPDATE` to
-    /// a parent key does. smugglr#374.
-    /// `smugglr_341_a_dropped_on_update_action_is_not_rediscovered` shows the
-    /// loss is real and the oracle silent about it, and asserts this line is
-    /// still here.
+    /// `CASCADE` is no longer among them: the `ForeignKeyWithAction` case
+    /// declares an `ON UPDATE CASCADE` key on its own parent, and the probe
+    /// moves that parent's key and asserts the child followed (smugglr#374).
+    /// `smugglr_341_an_on_update_action_is_rediscovered` is the flipped form of
+    /// the test that used to pin this as a blind spot.
+    ///
+    /// The rest of the family stays here, and the distinction is the point: one
+    /// action having a probe is not the same as the clause having one. A rebuild
+    /// that drops `ON UPDATE SET NULL` is still silent, because no case declares
+    /// it and no probe reads it.
     OnUpdate,
     /// `ON DELETE RESTRICT`, which is declared and cannot be told apart from the
     /// default it differs from.
@@ -339,14 +349,18 @@ impl Boundary {
             lines.push(Unexercised {
                 subject: Subject::OnUpdate,
                 statement: "every action. No case declares one and no probe reads one, so a \
-                            rebuild that drops ON UPDATE CASCADE is silent. smugglr#374."
+                            rebuild that drops ON UPDATE CASCADE is silent. This was the state \
+                            smugglr#374 closed; reaching it again means a case lost its \
+                            declaration."
                     .to_string(),
             });
         } else if !on_update.is_empty() {
             lines.push(Unexercised {
                 subject: Subject::OnUpdate,
                 statement: format!(
-                    "{} -- declared by no case schema. smugglr#374.",
+                    "{} -- declared by no case schema. CASCADE is probed (smugglr#374) and these \
+                     are not, which is the distinction worth keeping: a rebuild that drops ON \
+                     UPDATE SET NULL is silent by the same mechanism. smugglr#384.",
                     spell(&on_update)
                 ),
             });
@@ -600,13 +614,22 @@ mod tests {
             "the ForeignKeyWithAction case declares ON DELETE CASCADE, so the boundary does not \
              claim it goes unexercised"
         );
+        assert!(
+            !boundary
+                .undeclared_on_update()
+                .contains(&ReferentialAction::Cascade),
+            "the ForeignKeyWithAction case declares ON UPDATE CASCADE and its probe moves the \
+             parent key to read it (#374), so the boundary does not claim it goes unexercised"
+        );
+        let mut still_undeclared = declarable().into_iter().collect::<BTreeSet<_>>();
+        still_undeclared.remove(&ReferentialAction::Cascade);
         assert_eq!(
             boundary.undeclared_on_update(),
-            &declarable().into_iter().collect::<BTreeSet<_>>(),
-            "no case schema declares an ON UPDATE action of any kind. A case that starts \
-             declaring one changes this set, and the test in \
-             the_known_defects_are_rediscovered.rs that pins the ON UPDATE blind spot goes red \
-             until a probe earns the change"
+            &still_undeclared,
+            "CASCADE is the only ON UPDATE action any case declares. The rest are undeclared and \
+             the boundary has to keep saying so -- a rebuild that drops ON UPDATE SET NULL is \
+             still silent, and the one action that is now covered must not be read as covering \
+             the family"
         );
     }
 

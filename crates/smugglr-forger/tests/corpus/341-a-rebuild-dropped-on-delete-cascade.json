@@ -121,6 +121,79 @@
         "without_rowid": false,
         "strict": false,
         "triggers": []
+      },
+      {
+        "name": "updating_keeper",
+        "columns": [
+          {
+            "name": "id",
+            "decl_type": "Integer",
+            "constraints": [
+              {
+                "PrimaryKey": {
+                  "order": "Asc",
+                  "autoincrement": false,
+                  "on_conflict": null
+                }
+              }
+            ]
+          },
+          {
+            "name": "label",
+            "decl_type": "Text",
+            "constraints": []
+          }
+        ],
+        "constraints": [],
+        "without_rowid": false,
+        "strict": false,
+        "triggers": []
+      },
+      {
+        "name": "updating_child",
+        "columns": [
+          {
+            "name": "id",
+            "decl_type": "Integer",
+            "constraints": [
+              {
+                "PrimaryKey": {
+                  "order": "Asc",
+                  "autoincrement": false,
+                  "on_conflict": null
+                }
+              }
+            ]
+          },
+          {
+            "name": "keeper_id",
+            "decl_type": "Integer",
+            "constraints": []
+          },
+          {
+            "name": "label",
+            "decl_type": "Text",
+            "constraints": []
+          }
+        ],
+        "constraints": [
+          {
+            "ForeignKey": {
+              "columns": [
+                "keeper_id"
+              ],
+              "parent_table": "updating_keeper",
+              "parent_columns": [
+                "id"
+              ],
+              "on_delete": null,
+              "on_update": "Cascade"
+            }
+          }
+        ],
+        "without_rowid": false,
+        "strict": false,
+        "triggers": []
       }
     ]
   },

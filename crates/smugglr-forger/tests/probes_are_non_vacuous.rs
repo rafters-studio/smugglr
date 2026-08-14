@@ -115,6 +115,15 @@ fn breaks(kind: Trait) -> Vec<Break> {
             let mut dropped_action = schema();
             foreign_key_mut(&mut dropped_action, "cascade_child").on_delete = None;
 
+            // The update side gets its own break rather than riding on the one
+            // above. Both actions come off the same pragma row, so it is easy to
+            // assume one break covers the clause -- but the probe reads them in
+            // separate arms against separate tables, and only a break that
+            // touches `on_update` can show the update arm asserting anything
+            // (#374).
+            let mut dropped_update_action = schema();
+            foreign_key_mut(&mut dropped_update_action, "updating_child").on_update = None;
+
             let mut dropped_key = schema();
             table_mut(&mut dropped_key, "restrict_child")
                 .constraints
@@ -127,6 +136,11 @@ fn breaks(kind: Trait) -> Vec<Break> {
                 Break::schema(
                     "ON DELETE CASCADE, leaving the key with the NO ACTION default",
                     dropped_action,
+                ),
+                Break::schema(
+                    "ON UPDATE CASCADE, leaving the key with the NO ACTION default -- the same \
+                     loss as above, on the half of the clause that had no probe before #374",
+                    dropped_update_action,
                 ),
                 Break::schema(
                     "the RESTRICT child's foreign key, dropped whole",

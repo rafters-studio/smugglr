@@ -62,6 +62,19 @@ fn foreign_key_with_action() -> Schema {
                 .fk(["keeper_id"], "keeper", ["id"])
                 .on_delete(ReferentialAction::Restrict),
         )
+        .table(
+            table("updating_keeper")
+                .pk_int("id")
+                .col("label", Text, []),
+        )
+        .table(
+            table("updating_child")
+                .pk_int("id")
+                .col("keeper_id", Integer, [])
+                .col("label", Text, [])
+                .fk(["keeper_id"], "updating_keeper", ["id"])
+                .on_update(ReferentialAction::Cascade),
+        )
         .build()
         .expect("a valid schema")
     // <<< ForeignKeyWithAction
