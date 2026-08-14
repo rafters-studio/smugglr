@@ -49,11 +49,24 @@
 //! `PRAGMA table_info` / `foreign_key_list` plus the original
 //! `sqlite_master.sql`, which recovers column types, `NOT NULL`, defaults, the
 //! primary key (single-column rowid-alias **and** composite), foreign keys
-//! (**including composite**), and `AUTOINCREMENT`. It still **cannot** recover
-//! `CHECK` constraints, table-level / surviving-column `UNIQUE`, column
-//! `COLLATE`, generated columns, or `WITHOUT ROWID`. Rather than drop those
-//! silently, the rebuild emits a `tracing::warn!` when the table being rebuilt
-//! carries such constructs, so the loss is visible. A rebuild driven by an
+//! (**including composite**) with their `ON DELETE` / `ON UPDATE` referential
+//! actions, and `AUTOINCREMENT`. It still **cannot** recover `CHECK`
+//! constraints, table-level / surviving-column `UNIQUE`, column `COLLATE`,
+//! generated columns, or `WITHOUT ROWID`. Rather than drop those silently, the
+//! rebuild emits a `tracing::warn!` when the table being rebuilt carries such
+//! constructs, so the loss is visible.
+//!
+//! Two things a foreign key can carry are **not** recovered, and they are named
+//! rather than left to the word "foreign keys" to imply. `MATCH` is absent from
+//! `foreign_key_list` entirely -- the pragma reports `NONE` even for a key
+//! declared `MATCH FULL` -- so it joins the warned-loss list above; SQLite
+//! parses `MATCH` and ignores it, so what is lost is declared text and not
+//! behaviour. `DEFERRABLE` / `INITIALLY DEFERRED` has no pragma column at all
+//! and is not warned about, so a rebuild silently makes a deferred constraint
+//! immediate. That is the shape of #341 still open on a narrower construct, and
+//! stating it here is the point: the sentence above used to claim foreign keys
+//! were recovered while their actions were being dropped, and the fix for that
+//! is not to write a slightly wider claim. A rebuild driven by an
 //! *explicit* target schema (as reverse #274 / convert #280 will pass) does not
 //! have this gap.
 //!
@@ -1263,6 +1276,35 @@ fn lost_constructs(
         if up.contains("WITHOUT ROWID") {
             lost.push("WITHOUT ROWID".to_string());
         }
+        // MATCH is not in `foreign_key_list` at all -- the pragma reports NONE
+        // even for a key declared `MATCH FULL`, measured rather than assumed --
+        // so unlike the referential actions it cannot be reconstructed and is
+        // warned about instead (#341).
+        //
+        // Found with the identifier scan rather than `up.contains("MATCH")`,
+        // which the three above can afford and this one cannot: MATCH is a
+        // common substring, and a column named `match_id` would warn on every
+        // rebuild. The scan skips string literals and comments and compares
+        // whole tokens, so a substring never matches and a quoted `"MATCH"`
+        // column is read as the identifier it is.
+        //
+        // What it still warns on, named rather than left to be discovered: a
+        // column named bare `match` (SQLite accepts it as an identifier), and
+        // an FTS5 `MATCH` operator inside a CHECK. Both are whole bare tokens
+        // and this scan cannot tell them from the FK clause. That is the
+        // over-approximation direction the rest of this function already takes,
+        // and the consequence is bounded -- a spurious `tracing::warn!` and no
+        // change to any DDL. A silent drop is not bounded, which is why the
+        // trade goes this way.
+        if any_sql_identifier(sql, |quoted, token| {
+            !quoted && token.eq_ignore_ascii_case("MATCH")
+        }) {
+            lost.push(
+                "MATCH clause(s) (SQLite parses MATCH and ignores it, so this is a loss of \
+                       declared text rather than of behaviour)"
+                    .to_string(),
+            );
+        }
     }
     Ok(lost)
 }
@@ -1294,6 +1336,14 @@ struct FkInfo {
     /// `(from, to)` column pairs in `seq` order. `to` is `None` when the FK
     /// references the parent's primary key implicitly (`REFERENCES parent`).
     cols: Vec<(String, Option<String>)>,
+    /// The referential actions, as the pragma spells them, or `None` where it
+    /// reported the `NO ACTION` default.
+    ///
+    /// Per-constraint rather than per-column: `foreign_key_list` repeats these
+    /// on every row of a composite key, so they are captured once with the
+    /// group rather than pushed into [`cols`](Self::cols) (#341).
+    on_delete: Option<String>,
+    on_update: Option<String>,
 }
 
 #[cfg(feature = "native")]
@@ -1316,18 +1366,40 @@ impl FkInfo {
                 .collect::<Vec<_>>()
                 .join(", ");
             format!(
-                "FOREIGN KEY ({}) REFERENCES {}({})",
+                "FOREIGN KEY ({}) REFERENCES {}({}){}",
                 froms,
                 quote_ident(&self.parent_table),
-                tos
+                tos,
+                self.actions()
             )
         } else {
             format!(
-                "FOREIGN KEY ({}) REFERENCES {}",
+                "FOREIGN KEY ({}) REFERENCES {}{}",
                 froms,
-                quote_ident(&self.parent_table)
+                quote_ident(&self.parent_table),
+                self.actions()
             )
         }
+    }
+
+    /// The `ON DELETE` / `ON UPDATE` clauses, or the empty string.
+    ///
+    /// The pragma's own spelling is passed through rather than parsed into an
+    /// enum and re-rendered. The vocabulary here is SQLite's parser output, not
+    /// user text, so pass-through makes all five actions correct by
+    /// construction and cannot be outgrown by a future one.
+    ///
+    /// `ON DELETE` before `ON UPDATE` is arbitrary -- SQLite accepts either
+    /// order -- and fixed so the emitted text is deterministic.
+    fn actions(&self) -> String {
+        let mut out = String::new();
+        if let Some(action) = &self.on_delete {
+            out.push_str(&format!(" ON DELETE {action}"));
+        }
+        if let Some(action) = &self.on_update {
+            out.push_str(&format!(" ON UPDATE {action}"));
+        }
+        out
     }
 
     /// Whether any member column of this FK is `column` -- in which case the
@@ -1356,6 +1428,8 @@ fn reconstruct_foreign_keys(conn: &Connection, table: &str) -> Result<Vec<FkInfo
                 r.get::<_, String>(2)?,         // parent table
                 r.get::<_, String>(3)?,         // from (local column)
                 r.get::<_, Option<String>>(4)?, // to (parent column; NULL => PK)
+                r.get::<_, String>(5)?,         // on_update
+                r.get::<_, String>(6)?,         // on_delete
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1363,22 +1437,56 @@ fn reconstruct_foreign_keys(conn: &Connection, table: &str) -> Result<Vec<FkInfo
     // Group by FK id, preserving a deterministic id order with a BTreeMap.
     use std::collections::BTreeMap;
     #[allow(clippy::type_complexity)]
-    let mut groups: BTreeMap<i64, (String, Vec<(i64, String, Option<String>)>)> = BTreeMap::new();
-    for (id, seq, parent_table, from, to) in rows {
+    let mut groups: BTreeMap<
+        i64,
+        (
+            String,
+            Option<String>,
+            Option<String>,
+            Vec<(i64, String, Option<String>)>,
+        ),
+    > = BTreeMap::new();
+    for (id, seq, parent_table, from, to, on_update, on_delete) in rows {
         groups
             .entry(id)
-            .or_insert_with(|| (parent_table, Vec::new()))
-            .1
+            // The actions belong to the constraint, and the pragma repeats them
+            // on every member row of a composite key -- so they are taken from
+            // whichever row arrives first and not re-read per column.
+            .or_insert_with(|| {
+                (
+                    parent_table,
+                    declared_action(on_delete),
+                    declared_action(on_update),
+                    Vec::new(),
+                )
+            })
+            .3
             .push((seq, from, to));
     }
 
     let mut fks = Vec::with_capacity(groups.len());
-    for (_, (parent_table, mut members)) in groups {
+    for (_, (parent_table, on_delete, on_update, mut members)) in groups {
         members.sort_by_key(|(seq, _, _)| *seq);
         let cols = members.into_iter().map(|(_, f, t)| (f, t)).collect();
-        fks.push(FkInfo { parent_table, cols });
+        fks.push(FkInfo {
+            parent_table,
+            cols,
+            on_delete,
+            on_update,
+        });
     }
     Ok(fks)
+}
+
+/// A referential action worth emitting, or `None` for the default.
+///
+/// `foreign_key_list` reports `NO ACTION` where the key declared nothing, so
+/// emitting it verbatim would rewrite every actionless key's DDL for no change
+/// in meaning. Suppressing it keeps a key that never had an action rendering
+/// byte-identically to before #341.
+#[cfg(feature = "native")]
+fn declared_action(action: String) -> Option<String> {
+    (!action.eq_ignore_ascii_case("NO ACTION")).then_some(action)
 }
 
 /// Names of explicit (`CREATE INDEX`, origin `'c'`) indexes on `table` that
@@ -2057,6 +2165,230 @@ mod tests {
             // Referential integrity holds under enforcement.
             let violations = foreign_key_violations(&conn, "c").unwrap();
             assert!(violations.is_empty(), "composite FK intact: {violations:?}");
+        }
+
+        /// #341: the actions come back, and the assertion is the behaviour
+        /// rather than the reconstructed DDL text.
+        ///
+        /// A key can be present and inert -- that is exactly what the defect
+        /// produced -- so `foreign_key_list` reporting a row proves nothing.
+        /// Both directions are exercised on their own parent, so neither
+        /// assertion can be satisfied by the other's side effects.
+        #[test]
+        fn drop_column_rebuild_preserves_referential_actions() {
+            let conn = mem();
+            conn.execute_batch(
+                "CREATE TABLE keeper (id INTEGER PRIMARY KEY);
+                 CREATE TABLE mover (id INTEGER PRIMARY KEY);
+                 CREATE TABLE cascade_child (
+                     id INTEGER PRIMARY KEY,
+                     keeper_id INTEGER REFERENCES keeper(id) ON DELETE CASCADE,
+                     code TEXT UNIQUE
+                 );
+                 CREATE TABLE update_child (
+                     id INTEGER PRIMARY KEY,
+                     mover_id INTEGER REFERENCES mover(id) ON UPDATE CASCADE,
+                     code TEXT UNIQUE
+                 );
+                 INSERT INTO keeper (id) VALUES (1);
+                 INSERT INTO mover (id) VALUES (5);
+                 INSERT INTO cascade_child (id, keeper_id, code) VALUES (10, 1, 'k1');
+                 INSERT INTO update_child (id, mover_id, code) VALUES (20, 5, 'k2');",
+            )
+            .unwrap();
+
+            // `code` is UNIQUE on both, so each drop takes the rebuild path.
+            for table in ["cascade_child", "update_child"] {
+                apply(
+                    &conn,
+                    Op::DropColumn {
+                        table: table.into(),
+                        column: "code".into(),
+                    },
+                )
+                .unwrap();
+            }
+
+            conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+            // ON DELETE CASCADE: the delete is permitted and takes the child.
+            conn.execute("DELETE FROM keeper WHERE id = 1", []).expect(
+                "a child declared ON DELETE CASCADE does not refuse its parent's delete; a \
+                 refusal means the action came back as the NO ACTION default",
+            );
+            let orphans: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM cascade_child WHERE keeper_id = 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(orphans, 0, "ON DELETE CASCADE did not cascade");
+
+            // ON UPDATE CASCADE: the key moves and the child follows.
+            conn.execute("UPDATE mover SET id = 6 WHERE id = 5", [])
+                .expect("a child declared ON UPDATE CASCADE does not refuse its parent's update");
+            let followed: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM update_child WHERE mover_id = 6",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                followed, 1,
+                "ON UPDATE CASCADE did not carry the child over"
+            );
+        }
+
+        /// #341 on a composite key, which is where a per-column read of the
+        /// action would go wrong invisibly.
+        ///
+        /// `foreign_key_list` repeats `on_delete` on every member row of a
+        /// composite FK, so capturing it per column instead of per constraint
+        /// can still look right on a single-column key. `drop_column_preserves_
+        /// composite_fk` covers composites and declares no action, and the test
+        /// above covers actions and declares no composite -- neither reaches
+        /// this square.
+        #[test]
+        fn drop_column_rebuild_preserves_an_action_on_a_composite_key() {
+            let conn = mem();
+            conn.execute_batch(
+                "CREATE TABLE p (x, y, PRIMARY KEY(x, y));
+                 CREATE TABLE c (
+                     id INTEGER PRIMARY KEY,
+                     a, b,
+                     code TEXT UNIQUE,
+                     FOREIGN KEY(a, b) REFERENCES p(x, y) ON DELETE CASCADE
+                 );
+                 INSERT INTO p VALUES (1, 1), (2, 2);
+                 INSERT INTO c (id, a, b, code) VALUES (10, 1, 1, 'k1'), (20, 2, 2, 'k2');",
+            )
+            .unwrap();
+
+            apply(
+                &conn,
+                Op::DropColumn {
+                    table: "c".into(),
+                    column: "code".into(),
+                },
+            )
+            .unwrap();
+
+            // Still one composite key, not two single-column ones -- the #273
+            // property this must not regress while gaining the action.
+            let members: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM pragma_foreign_key_list('c')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let ids: i64 = conn
+                .query_row(
+                    "SELECT count(DISTINCT id) FROM pragma_foreign_key_list('c')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!((members, ids), (2, 1), "one composite key of two members");
+
+            conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+            conn.execute("DELETE FROM p WHERE x = 1 AND y = 1", [])
+                .expect("the composite key declared ON DELETE CASCADE and must not refuse");
+            let left: i64 = conn
+                .query_row("SELECT count(*) FROM c WHERE a = 1 AND b = 1", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(left, 0, "the composite key's CASCADE did not cascade");
+        }
+
+        /// A key that never declared an action does not acquire one.
+        ///
+        /// `foreign_key_list` reports `NO ACTION` for such a key, and rendering
+        /// that verbatim would rewrite the DDL of every actionless key in the
+        /// database for no change in meaning -- a diff that reads as a
+        /// behavioural change and is not.
+        #[test]
+        fn drop_column_rebuild_does_not_invent_a_referential_action() {
+            let conn = mem();
+            conn.execute_batch(
+                "CREATE TABLE parent (id INTEGER PRIMARY KEY);
+                 CREATE TABLE child (
+                     id INTEGER PRIMARY KEY,
+                     parent_id INTEGER REFERENCES parent(id),
+                     code TEXT UNIQUE
+                 );
+                 INSERT INTO parent (id) VALUES (1);
+                 INSERT INTO child (id, parent_id, code) VALUES (10, 1, 'k1');",
+            )
+            .unwrap();
+
+            apply(
+                &conn,
+                Op::DropColumn {
+                    table: "child".into(),
+                    column: "code".into(),
+                },
+            )
+            .unwrap();
+
+            let sql: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'child'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let upper = sql.to_ascii_uppercase();
+            assert!(
+                !upper.contains("ON DELETE") && !upper.contains("ON UPDATE"),
+                "the rebuild wrote an action onto a key that declared none: {sql}"
+            );
+        }
+
+        /// MATCH cannot be reconstructed, so it is warned about instead.
+        ///
+        /// The pragma reports `NONE` even for a key declared `MATCH FULL`
+        /// (measured, not assumed), which is why this is in the warned-loss list
+        /// rather than in the reconstruction.
+        #[test]
+        fn a_match_clause_is_named_in_the_warned_losses() {
+            let conn = mem();
+            conn.execute_batch(
+                "CREATE TABLE p (x TEXT PRIMARY KEY);
+                 CREATE TABLE c (
+                     id INTEGER PRIMARY KEY,
+                     px TEXT,
+                     code TEXT UNIQUE,
+                     FOREIGN KEY(px) REFERENCES p(x) MATCH FULL
+                 );",
+            )
+            .unwrap();
+            let sql = table_sql(&conn, "c").unwrap();
+            let lost = lost_constructs(&conn, "c", "code", sql.as_deref(), &[]).unwrap();
+            assert!(
+                lost.iter().any(|l| l.contains("MATCH")),
+                "MATCH is unrecoverable and has to be named: {lost:?}"
+            );
+
+            // ...and an ordinary column whose name merely contains the keyword
+            // does not trigger it. A substring scan would warn here on every
+            // rebuild of a table nobody declared MATCH on.
+            let plain = mem();
+            plain
+                .execute_batch(
+                    "CREATE TABLE t (id INTEGER PRIMARY KEY, match_id TEXT, code TEXT UNIQUE);",
+                )
+                .unwrap();
+            let plain_sql = table_sql(&plain, "t").unwrap();
+            let plain_lost =
+                lost_constructs(&plain, "t", "code", plain_sql.as_deref(), &[]).unwrap();
+            assert!(
+                !plain_lost.iter().any(|l| l.contains("MATCH")),
+                "a column named match_id is not a MATCH clause: {plain_lost:?}"
+            );
         }
 
         #[test]
