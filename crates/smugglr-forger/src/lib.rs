@@ -28,6 +28,8 @@
 //! * [`oracle`] -- the differential comparison: seed and transform one arm,
 //!   build the other from scratch, hold both to the same promise and report
 //!   where they part company.
+//! * [`corpus`] -- a failure written down as JSON and committed, so a defect
+//!   found once runs thereafter as an ordinary test input.
 //!
 //! ```
 //! use smugglr_forger::fixture::{Backing, Fixture, Route};
@@ -48,12 +50,14 @@
 //! fixture.bring_to(Route::Schema(&target)).unwrap();
 //! ```
 
+pub mod corpus;
 pub mod error;
 pub mod fixture;
 pub mod oracle;
 pub mod registry;
 pub mod schema;
 
+pub use corpus::Regression;
 pub use error::{BoxError, ForgeError, ProbeError, ValidationError};
 pub use fixture::{Backing, Fixture, Route};
 pub use oracle::{differential, Arm, Divergence, Outcome, Report, TraitOutcome};

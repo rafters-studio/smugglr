@@ -1,0 +1,129 @@
+{
+  "provenance": "smugglr#341. A rebuild reads five of the eight columns pragma foreign_key_list hands it, and the referential action is in one of the three it does not, so ON DELETE CASCADE comes back as the NO ACTION default. Nothing about it shows at the row counts on the day of the migration: the children are still there, which is what a rebuild that kept them looks like. Recorded 2026-08-14 from the ForeignKeyWithAction case with the action dropped.",
+  "trait": "ForeignKeyWithAction",
+  "schema": {
+    "tables": [
+      {
+        "name": "keeper",
+        "columns": [
+          {
+            "name": "id",
+            "decl_type": "Integer",
+            "constraints": [
+              {
+                "PrimaryKey": {
+                  "order": "Asc",
+                  "autoincrement": false,
+                  "on_conflict": null
+                }
+              }
+            ]
+          },
+          {
+            "name": "label",
+            "decl_type": "Text",
+            "constraints": []
+          }
+        ],
+        "constraints": [],
+        "without_rowid": false,
+        "strict": false,
+        "triggers": []
+      },
+      {
+        "name": "cascade_child",
+        "columns": [
+          {
+            "name": "id",
+            "decl_type": "Integer",
+            "constraints": [
+              {
+                "PrimaryKey": {
+                  "order": "Asc",
+                  "autoincrement": false,
+                  "on_conflict": null
+                }
+              }
+            ]
+          },
+          {
+            "name": "keeper_id",
+            "decl_type": "Integer",
+            "constraints": []
+          },
+          {
+            "name": "label",
+            "decl_type": "Text",
+            "constraints": []
+          }
+        ],
+        "constraints": [
+          {
+            "ForeignKey": {
+              "columns": [
+                "keeper_id"
+              ],
+              "parent_table": "keeper",
+              "parent_columns": [
+                "id"
+              ],
+              "on_delete": null,
+              "on_update": null
+            }
+          }
+        ],
+        "without_rowid": false,
+        "strict": false,
+        "triggers": []
+      },
+      {
+        "name": "restrict_child",
+        "columns": [
+          {
+            "name": "id",
+            "decl_type": "Integer",
+            "constraints": [
+              {
+                "PrimaryKey": {
+                  "order": "Asc",
+                  "autoincrement": false,
+                  "on_conflict": null
+                }
+              }
+            ]
+          },
+          {
+            "name": "keeper_id",
+            "decl_type": "Integer",
+            "constraints": []
+          },
+          {
+            "name": "label",
+            "decl_type": "Text",
+            "constraints": []
+          }
+        ],
+        "constraints": [
+          {
+            "ForeignKey": {
+              "columns": [
+                "keeper_id"
+              ],
+              "parent_table": "keeper",
+              "parent_columns": [
+                "id"
+              ],
+              "on_delete": "Restrict",
+              "on_update": null
+            }
+          }
+        ],
+        "without_rowid": false,
+        "strict": false,
+        "triggers": []
+      }
+    ]
+  },
+  "after_seed": [],
+  "expected_failure": "deleting keeper.id = 1 was refused (FOREIGN KEY constraint failed), and a child declared ON DELETE CASCADE does not refuse it -- the action was reconstructed as something else, or dropped, which leaves NO ACTION"
+}

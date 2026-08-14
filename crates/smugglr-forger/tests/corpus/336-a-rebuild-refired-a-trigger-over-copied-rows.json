@@ -1,0 +1,76 @@
+{
+  "provenance": "smugglr#336. A rebuild re-created the trigger before copying rows into the new table, so the INSERT ... SELECT re-fired it over rows that had already been audited. The schema is correct in every particular -- what is wrong is the order the rebuild did things in, which is why this fixture's break lives in after_seed and its schema is the unmodified case. Recorded 2026-08-14 from the Trigger case.",
+  "trait": "Trigger",
+  "schema": {
+    "tables": [
+      {
+        "name": "evented",
+        "columns": [
+          {
+            "name": "id",
+            "decl_type": "Integer",
+            "constraints": [
+              {
+                "PrimaryKey": {
+                  "order": "Asc",
+                  "autoincrement": false,
+                  "on_conflict": null
+                }
+              }
+            ]
+          },
+          {
+            "name": "note",
+            "decl_type": "Text",
+            "constraints": []
+          }
+        ],
+        "constraints": [],
+        "without_rowid": false,
+        "strict": false,
+        "triggers": [
+          {
+            "name": "evented_audit",
+            "timing": "After",
+            "event": "Insert",
+            "when": null,
+            "body": [
+              "INSERT INTO \"audit\" (\"note\") VALUES (new.\"note\")"
+            ]
+          }
+        ]
+      },
+      {
+        "name": "audit",
+        "columns": [
+          {
+            "name": "id",
+            "decl_type": "Integer",
+            "constraints": [
+              {
+                "PrimaryKey": {
+                  "order": "Asc",
+                  "autoincrement": false,
+                  "on_conflict": null
+                }
+              }
+            ]
+          },
+          {
+            "name": "note",
+            "decl_type": "Text",
+            "constraints": []
+          }
+        ],
+        "constraints": [],
+        "without_rowid": false,
+        "strict": false,
+        "triggers": []
+      }
+    ]
+  },
+  "after_seed": [
+    "DROP TRIGGER \"evented_audit\";\nCREATE TABLE \"evented_new\" (\"id\" INTEGER PRIMARY KEY, \"note\" TEXT);\nCREATE TRIGGER \"evented_audit\" AFTER INSERT ON \"evented_new\"\nFOR EACH ROW BEGIN\n  INSERT INTO \"audit\" (\"note\") VALUES (new.\"note\");\nEND;\nINSERT INTO \"evented_new\" SELECT * FROM \"evented\";\nDROP TABLE \"evented\";\nALTER TABLE \"evented_new\" RENAME TO \"evented\";"
+  ],
+  "expected_failure": "audit holds [\"before\", \"before\", \"after\"] after one row was seeded and one inserted; the trigger's side effect is [\"before\", \"after\"]. Fewer means it did not fire -- a trigger can sit in sqlite_master and still never run. More means it fired over rows that had already been audited, which is what a rebuild's INSERT ... SELECT does when the trigger is re-created before the copy rather than after it"
+}
