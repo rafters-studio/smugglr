@@ -1045,12 +1045,10 @@ async fn run_stash(
 
     let results = smugglr_core::stash::stash(
         stash_config,
+        &config.sync,
         config.local_db_path(),
-        &config.sync.timestamp_column,
-        config.sync.conflict_resolution,
         table,
         dry_run,
-        &config.sync.exclude_tables,
     )
     .await?;
 
@@ -1070,12 +1068,10 @@ async fn run_retrieve(
 
     let results = smugglr_core::stash::retrieve(
         stash_config,
+        &config.sync,
         config.local_db_path(),
-        &config.sync.timestamp_column,
-        config.sync.conflict_resolution,
         table,
         dry_run,
-        &config.sync.exclude_tables,
     )
     .await?;
 

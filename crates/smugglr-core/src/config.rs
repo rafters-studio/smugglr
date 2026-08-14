@@ -1458,29 +1458,61 @@ converge_columns = ["email", "phone_*"]
         );
     }
 
+    /// Both spellings parse. This pins the serde surface only -- it says nothing
+    /// about the error message; that cross-check is the test below.
     #[test]
-    fn duplicate_pk_parses_the_warn_escape_hatch() {
-        let config: Config = toml::from_str(
-            "local_db = \"game.db\"\n\
-             [sync]\n\
-             duplicate_pk = \"warn\"\n",
-        )
-        .unwrap();
-        assert_eq!(config.sync.duplicate_pk, DuplicatePkPolicy::Warn);
+    fn duplicate_pk_parses_both_spellings() {
+        let parse = |v: &str| -> DuplicatePkPolicy {
+            let config: Config = toml::from_str(&format!(
+                "local_db = \"game.db\"\n[sync]\nduplicate_pk = \"{v}\"\n"
+            ))
+            .unwrap();
+            config.sync.duplicate_pk
+        };
+        assert_eq!(parse("warn"), DuplicatePkPolicy::Warn);
+        assert_eq!(parse("refuse"), DuplicatePkPolicy::Refuse);
     }
 
+    /// The remedy the refusal prints must be a config the parser accepts.
+    ///
+    /// `SyncError::DuplicatePrimaryKey` hardcodes `set [sync] duplicate_pk =
+    /// "warn"` in its message. That string is the operator's only instruction
+    /// for getting unstuck, and nothing structural ties it to the serde
+    /// spelling -- rename the variant or change `rename_all` and the message
+    /// keeps confidently printing an incantation that no longer parses. So this
+    /// lifts the value straight out of the rendered message and feeds it to the
+    /// TOML parser, rather than asserting the two look alike by eye.
     #[test]
-    fn duplicate_pk_refuse_is_spelled_the_way_the_error_message_says() {
-        // The refusal message tells operators to set duplicate_pk = "refuse" /
-        // "warn"; if the serde spelling ever drifts from the message, the
-        // documented remedy stops working.
-        let config: Config = toml::from_str(
-            "local_db = \"game.db\"\n\
-             [sync]\n\
-             duplicate_pk = \"refuse\"\n",
-        )
-        .unwrap();
-        assert_eq!(config.sync.duplicate_pk, DuplicatePkPolicy::Refuse);
+    fn the_remedy_the_refusal_prints_is_a_config_that_actually_parses() {
+        let rendered = SyncError::DuplicatePrimaryKey {
+            table: "items".into(),
+            pk: "1".into(),
+            first_hash: "aaaa".into(),
+            second_hash: "bbbb".into(),
+        }
+        .to_string();
+
+        // Pull the value out of `duplicate_pk = "<value>"` as the message prints it.
+        let marker = "duplicate_pk = \"";
+        let start = rendered
+            .find(marker)
+            .expect("the refusal must tell the operator which key to set")
+            + marker.len();
+        let value = &rendered[start..][..rendered[start..]
+            .find('"')
+            .expect("the remedy value must be quoted")];
+
+        let config: Config = toml::from_str(&format!(
+            "local_db = \"game.db\"\n[sync]\nduplicate_pk = \"{value}\"\n"
+        ))
+        .unwrap_or_else(|e| {
+            panic!("the refusal prints duplicate_pk = \"{value}\", which does not parse: {e}")
+        });
+        assert_eq!(
+            config.sync.duplicate_pk,
+            DuplicatePkPolicy::Warn,
+            "the refusal offers `warn` as the escape hatch, so its printed value must mean Warn"
+        );
     }
 
     // The hash-exclusion union is the invariant every hash producer depends on:

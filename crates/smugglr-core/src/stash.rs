@@ -4,7 +4,7 @@
 //! The `retrieve` command downloads the relay and syncs it with the local database.
 //! Both use the existing diff engine since both sides are SQLite.
 
-use crate::config::{ConflictResolution, StashConfig};
+use crate::config::{StashConfig, SyncConfig};
 use crate::datasource::DataSource;
 use crate::diff::diff_table;
 use crate::error::{Result, SyncError};
@@ -230,17 +230,20 @@ async fn sync_table<S: DataSource, D: DataSource>(
     source: &S,
     dest: &D,
     table: &str,
-    timestamp_column: &str,
-    conflict_resolution: ConflictResolution,
+    sync: &SyncConfig,
     dry_run: bool,
     label: &str,
     set_count: impl FnOnce(&mut SyncResult, usize),
 ) -> Result<SyncResult> {
-    // Stash operations use empty exclusion lists; column exclusion -- both the
-    // stripped kind and the converge kind -- is applied by the higher-level sync
-    // engine that owns the SyncConfig.
-    let diff = diff_table(source, dest, table, timestamp_column, &[], &[]).await?;
-    diff.warn_unresolved_conflicts(conflict_resolution);
+    // Stash operations still pass EMPTY exclusion lists. The `SyncConfig` is now
+    // in scope, so this is a deliberate hold rather than a plumbing limit:
+    // honoring `exclude_columns` here needs the transfer side sorted out first,
+    // because the apply path binds NULL for an absent column inside
+    // `INSERT OR REPLACE` -- stripping a column on this path would null the
+    // destination's value rather than leave it stale. That is #322's call, not
+    // a line to flip here.
+    let diff = diff_table(source, dest, table, &sync.timestamp_column, &[], &[]).await?;
+    diff.warn_unresolved_conflicts(sync.conflict_resolution);
 
     let (stats, detail) = if dry_run {
         (
@@ -261,7 +264,7 @@ async fn sync_table<S: DataSource, D: DataSource>(
     result.diff_detail = detail;
 
     // Both stash and retrieve use "push" semantics: source-only + source-newer rows go to dest.
-    let rows_to_sync = diff.rows_to_push(conflict_resolution);
+    let rows_to_sync = diff.rows_to_push(sync.conflict_resolution);
 
     if rows_to_sync.is_empty() {
         info!("No changes to sync for table: {}", table);
@@ -400,19 +403,26 @@ fn init_relay_schema(source: &LocalDb, relay_path: &Path) -> Result<()> {
 }
 
 /// Execute the `stash` command: upload local state to S3 relay.
+///
+/// Takes `&SyncConfig` rather than the individual settings it needs. Three of
+/// them (`timestamp_column`, `conflict_resolution`, `exclude_tables`) were
+/// already being pulled apart from that one struct at the call site and passed
+/// back in as scalars, and each new setting this path had to honor widened the
+/// parameter list by one -- which is how it reached seven. Passing the struct
+/// means a setting added to `[sync]` reaches the relay path without another
+/// signature change. `table_filter` and `dry_run` stay separate because they
+/// are per-invocation CLI arguments, not config.
 pub async fn stash(
     config: &StashConfig,
+    sync: &SyncConfig,
     local_db_path: &str,
-    timestamp_column: &str,
-    conflict_resolution: ConflictResolution,
     table_filter: Option<String>,
     dry_run: bool,
-    exclude_tables: &[String],
 ) -> Result<Vec<SyncResult>> {
     let (store, obj_path) = build_store(config)?;
 
     // Open local database (read-only -- we only read from it)
-    let local = LocalDb::open_readonly(local_db_path)?;
+    let local = LocalDb::open_readonly(local_db_path)?.with_duplicate_pk(sync.duplicate_pk);
 
     // Download existing relay (or create new one).
     // IMPORTANT: temp_file must live until end of function -- dropping it deletes the file.
@@ -422,26 +432,23 @@ pub async fn stash(
     // Initialize relay schema from local (creates missing tables)
     init_relay_schema(&local, &relay_path)?;
 
-    // Open relay as writable LocalDb
-    let relay = LocalDb::open(&relay_path)?;
+    // Open relay as writable LocalDb. The relay carries the same policy as the
+    // local side: the diff builds metadata for BOTH, so a relay opened under the
+    // default while the local side honors `warn` would refuse a collision the
+    // local side tolerates, and the knob would read as half-applied.
+    let relay = LocalDb::open(&relay_path)?.with_duplicate_pk(sync.duplicate_pk);
 
     // Determine tables to sync
     let filter_vec: Option<Vec<String>> = table_filter.map(|t| vec![t]);
-    let tables = get_stash_tables(&local, &relay, filter_vec.as_deref(), exclude_tables).await?;
+    let tables =
+        get_stash_tables(&local, &relay, filter_vec.as_deref(), &sync.exclude_tables).await?;
 
     let mut results = Vec::new();
 
     for table in &tables {
-        let result = sync_table(
-            &local,
-            &relay,
-            table,
-            timestamp_column,
-            conflict_resolution,
-            dry_run,
-            "stash",
-            |r, n| r.rows_pushed = n,
-        )
+        let result = sync_table(&local, &relay, table, sync, dry_run, "stash", |r, n| {
+            r.rows_pushed = n
+        })
         .await?;
         results.push(result);
     }
@@ -462,14 +469,14 @@ pub async fn stash(
 }
 
 /// Execute the `retrieve` command: download and sync from S3 relay.
+///
+/// Takes `&SyncConfig` for the same reason as [`stash`] -- see its note.
 pub async fn retrieve(
     config: &StashConfig,
+    sync: &SyncConfig,
     local_db_path: &str,
-    timestamp_column: &str,
-    conflict_resolution: ConflictResolution,
     table_filter: Option<String>,
     dry_run: bool,
-    exclude_tables: &[String],
 ) -> Result<Vec<SyncResult>> {
     let (store, obj_path) = build_store(config)?;
 
@@ -478,29 +485,24 @@ pub async fn retrieve(
     let (temp_file, _etag) = download_relay(store.as_ref(), &obj_path, false).await?;
     let relay_path = temp_file.path().to_path_buf();
 
-    // Open relay as read-only
-    let relay = LocalDb::open_readonly(&relay_path)?;
+    // Open relay as read-only. Both sides carry the same policy -- see the note
+    // on the relay open in `stash`.
+    let relay = LocalDb::open_readonly(&relay_path)?.with_duplicate_pk(sync.duplicate_pk);
 
     // Open local database as writable
-    let local = LocalDb::open(local_db_path)?;
+    let local = LocalDb::open(local_db_path)?.with_duplicate_pk(sync.duplicate_pk);
 
     // Determine tables to sync (relay is source, local is dest)
     let filter_vec: Option<Vec<String>> = table_filter.map(|t| vec![t]);
-    let tables = get_stash_tables(&relay, &local, filter_vec.as_deref(), exclude_tables).await?;
+    let tables =
+        get_stash_tables(&relay, &local, filter_vec.as_deref(), &sync.exclude_tables).await?;
 
     let mut results = Vec::new();
 
     for table in &tables {
-        let result = sync_table(
-            &relay,
-            &local,
-            table,
-            timestamp_column,
-            conflict_resolution,
-            dry_run,
-            "retrieve",
-            |r, n| r.rows_pulled = n,
-        )
+        let result = sync_table(&relay, &local, table, sync, dry_run, "retrieve", |r, n| {
+            r.rows_pulled = n
+        })
         .await?;
         results.push(result);
     }
@@ -511,6 +513,7 @@ pub async fn retrieve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ConflictResolution;
     use rusqlite::Connection;
     use tempfile::TempDir;
 
@@ -701,12 +704,10 @@ mod tests {
 
         let results = stash(
             &config,
+            &sync_cfg(ConflictResolution::LocalWins),
             local_path.to_str().unwrap(),
-            "updated_at",
-            ConflictResolution::LocalWins,
             None,
             false,
-            &default_excludes(),
         )
         .await
         .unwrap();
@@ -756,12 +757,10 @@ mod tests {
 
         let results = retrieve(
             &config,
+            &sync_cfg(ConflictResolution::LocalWins),
             local_path.to_str().unwrap(),
-            "updated_at",
-            ConflictResolution::LocalWins,
             None,
             false,
-            &default_excludes(),
         )
         .await
         .unwrap();
@@ -773,6 +772,123 @@ mod tests {
         // Verify local has all 3 rows now
         let items = read_items(&local_path);
         assert_eq!(items.len(), 3);
+    }
+
+    /// Build a local db whose `items` table holds two DISTINCT rows rendering
+    /// the same `__pk`. The PK column is declared `BLOB` (SQLite affinity NONE),
+    /// so integer `1` and text `'1'` keep their storage classes and never
+    /// compare equal to the unique index, but both render `"1"` under
+    /// `CAST(id AS TEXT)`.
+    fn create_colliding_db(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE items (id BLOB PRIMARY KEY, name TEXT NOT NULL, updated_at TEXT);
+             INSERT INTO items VALUES (1, 'MintedAsInt', '2024-01-01');
+             INSERT INTO items VALUES ('1', 'MintedAsText', '2024-01-02');",
+        )
+        .unwrap();
+    }
+
+    fn stash_config_for(relay_dir: &Path) -> StashConfig {
+        StashConfig {
+            url: format!("file://{}/relay.sqlite", relay_dir.display()),
+            access_key_id: None,
+            secret_access_key: None,
+            region: None,
+            endpoint: None,
+        }
+    }
+
+    /// `stash` refuses a duplicate `__pk` under the default policy.
+    ///
+    /// The relay path reaches `diff_table` through this module's own
+    /// `sync_table`, so it needs the guard as much as push/pull do -- and it is
+    /// CLI-reachable (`smugglr stash`).
+    #[tokio::test]
+    async fn stash_refuses_a_duplicate_pk_by_default() {
+        let dir = TempDir::new().unwrap();
+        let local_path = dir.path().join("local.sqlite");
+        let relay_dir = dir.path().join("relay_store");
+        std::fs::create_dir_all(&relay_dir).unwrap();
+        create_colliding_db(&local_path);
+
+        let err = stash(
+            &stash_config_for(&relay_dir),
+            &sync_cfg(ConflictResolution::LocalWins),
+            local_path.to_str().unwrap(),
+            None,
+            false,
+        )
+        .await
+        .expect_err("a duplicate __pk must refuse on the stash path too");
+
+        match err {
+            SyncError::DuplicatePrimaryKey { table, pk, .. } => {
+                assert_eq!(table, "items");
+                assert_eq!(pk, "1");
+            }
+            other => panic!("expected DuplicatePrimaryKey, got {other:?}"),
+        }
+    }
+
+    /// `stash` honors `duplicate_pk = "warn"`.
+    ///
+    /// This is the regression the `&SyncConfig` refactor closes. `stash` and
+    /// `retrieve` built their `LocalDb`s with no policy at all, so they took the
+    /// `Refuse` default unconditionally and silently ignored an operator who had
+    /// set `warn` to keep syncing while re-keying. It failed safe rather than
+    /// unsafe, which is exactly why nothing caught it -- the assertion is that
+    /// the run SUCCEEDS, since a refusal here is indistinguishable from the bug.
+    #[tokio::test]
+    async fn stash_honors_the_warn_policy_from_config() {
+        let dir = TempDir::new().unwrap();
+        let local_path = dir.path().join("local.sqlite");
+        let relay_dir = dir.path().join("relay_store");
+        std::fs::create_dir_all(&relay_dir).unwrap();
+        create_colliding_db(&local_path);
+
+        let mut sync = sync_cfg(ConflictResolution::LocalWins);
+        sync.duplicate_pk = crate::config::DuplicatePkPolicy::Warn;
+
+        let results = stash(
+            &stash_config_for(&relay_dir),
+            &sync,
+            local_path.to_str().unwrap(),
+            None,
+            false,
+        )
+        .await
+        .expect("configured duplicate_pk = warn must be honored on the stash path");
+
+        // The colliding rows collapse onto one entry -- that is what `warn`
+        // means -- so the table still stashes rather than stopping.
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].table, "items");
+    }
+
+    /// `retrieve` honors the policy too: it opens BOTH the relay and the local
+    /// db, and the diff builds metadata for both sides, so a policy applied to
+    /// only one of them would still refuse.
+    #[tokio::test]
+    async fn retrieve_honors_the_warn_policy_from_config() {
+        let dir = TempDir::new().unwrap();
+        let local_path = dir.path().join("local.sqlite");
+        let relay_dir = dir.path().join("relay_store");
+        std::fs::create_dir_all(&relay_dir).unwrap();
+        create_colliding_db(&local_path);
+
+        let mut sync = sync_cfg(ConflictResolution::LocalWins);
+        sync.duplicate_pk = crate::config::DuplicatePkPolicy::Warn;
+        let config = stash_config_for(&relay_dir);
+
+        // Seed the relay by stashing first, then pull it back down.
+        stash(&config, &sync, local_path.to_str().unwrap(), None, false)
+            .await
+            .expect("stash must honor warn");
+
+        retrieve(&config, &sync, local_path.to_str().unwrap(), None, false)
+            .await
+            .expect("configured duplicate_pk = warn must be honored on the retrieve path");
     }
 
     #[tokio::test]
@@ -794,12 +910,10 @@ mod tests {
 
         let results = stash(
             &config,
+            &sync_cfg(ConflictResolution::LocalWins),
             local_path.to_str().unwrap(),
-            "updated_at",
-            ConflictResolution::LocalWins,
             None,
             true, // dry run
-            &default_excludes(),
         )
         .await
         .unwrap();
@@ -831,12 +945,10 @@ mod tests {
 
         let result = retrieve(
             &config,
+            &sync_cfg(ConflictResolution::LocalWins),
             local_path.to_str().unwrap(),
-            "updated_at",
-            ConflictResolution::LocalWins,
             None,
             false,
-            &default_excludes(),
         )
         .await;
 
@@ -873,12 +985,10 @@ mod tests {
         // Only stash the "items" table
         let results = stash(
             &config,
+            &sync_cfg(ConflictResolution::LocalWins),
             local_path.to_str().unwrap(),
-            "updated_at",
-            ConflictResolution::LocalWins,
             Some("items".to_string()),
             false,
-            &default_excludes(),
         )
         .await
         .unwrap();
@@ -909,12 +1019,10 @@ mod tests {
 
         let results = stash(
             &config,
+            &sync_cfg(ConflictResolution::LocalWins),
             local_path.to_str().unwrap(),
-            "updated_at",
-            ConflictResolution::LocalWins,
             None,
             false,
-            &default_excludes(),
         )
         .await
         .unwrap();
@@ -951,12 +1059,10 @@ mod tests {
         // Machine A stashes
         stash(
             &config,
+            &sync_cfg(ConflictResolution::LocalWins),
             machine_a.to_str().unwrap(),
-            "updated_at",
-            ConflictResolution::LocalWins,
             None,
             false,
-            &default_excludes(),
         )
         .await
         .unwrap();
@@ -964,12 +1070,10 @@ mod tests {
         // Machine B retrieves
         let results = retrieve(
             &config,
+            &sync_cfg(ConflictResolution::LocalWins),
             machine_b.to_str().unwrap(),
-            "updated_at",
-            ConflictResolution::LocalWins,
             None,
             false,
-            &default_excludes(),
         )
         .await
         .unwrap();
@@ -1005,12 +1109,10 @@ mod tests {
 
         let results = retrieve(
             &config,
+            &sync_cfg(ConflictResolution::LocalWins),
             local_path.to_str().unwrap(),
-            "updated_at",
-            ConflictResolution::LocalWins,
             None,
             true, // dry run
-            &default_excludes(),
         )
         .await
         .unwrap();
@@ -1046,12 +1148,10 @@ mod tests {
 
         let results = stash(
             &config,
+            &sync_cfg(ConflictResolution::LocalWins),
             local_path.to_str().unwrap(),
-            "updated_at",
-            ConflictResolution::LocalWins,
             None,
             false,
-            &default_excludes(),
         )
         .await
         .unwrap();
@@ -1090,12 +1190,10 @@ mod tests {
         // NewerWins: relay is newer, so it should win
         let results = retrieve(
             &config,
+            &sync_cfg(ConflictResolution::NewerWins),
             local_path.to_str().unwrap(),
-            "updated_at",
-            ConflictResolution::NewerWins,
             None,
             false,
-            &default_excludes(),
         )
         .await
         .unwrap();
@@ -1128,12 +1226,10 @@ mod tests {
         // RemoteWins in retrieve context: local (dest) wins, relay changes are NOT applied
         let _results = retrieve(
             &config,
+            &sync_cfg(ConflictResolution::RemoteWins),
             local_path.to_str().unwrap(),
-            "updated_at",
-            ConflictResolution::RemoteWins,
             None,
             false,
-            &default_excludes(),
         )
         .await
         .unwrap();
@@ -1222,12 +1318,10 @@ mod tests {
         // Should only sync "items" (shared table), skip "extra" (relay-only)
         let results = retrieve(
             &config,
+            &sync_cfg(ConflictResolution::LocalWins),
             local_path.to_str().unwrap(),
-            "updated_at",
-            ConflictResolution::LocalWins,
             None,
             false,
-            &default_excludes(),
         )
         .await
         .unwrap();
@@ -1320,6 +1414,19 @@ mod tests {
         // A's data must survive intact.
         let got = std::fs::read(store_dir.join("relay.sqlite")).unwrap();
         assert_eq!(got, b"machine-a-rows");
+    }
+
+    /// The `[sync]` settings these tests used to pass as loose scalars, now
+    /// assembled into the struct the signature takes. Only `conflict_resolution`
+    /// varies across the suite; `timestamp_column` and `exclude_tables` were the
+    /// same at every call site, which is part of why they belonged in the struct.
+    fn sync_cfg(conflict_resolution: ConflictResolution) -> SyncConfig {
+        SyncConfig {
+            timestamp_column: "updated_at".to_string(),
+            conflict_resolution,
+            exclude_tables: default_excludes(),
+            ..Default::default()
+        }
     }
 
     fn default_excludes() -> Vec<String> {
