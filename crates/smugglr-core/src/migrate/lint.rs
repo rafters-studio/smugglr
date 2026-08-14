@@ -11,9 +11,32 @@
 //!   whose declared class understates the danger on some axis. Over-declaration (a
 //!   conservative author declaring an op *more* dangerous than it is) is allowed:
 //!   the rail catches dishonest *understatement*, never caution.
-//! - [`enforce_preimage`] gates the forward apply: a destructive op with no
-//!   captured pre-image **refuses**, because its reverse would be a lie
-//!   (decision 4 -- destructive reverse exists only against a pre-image).
+//! - [`enforce_preimage`] gates the forward apply on what a *manifest body* can
+//!   honestly be judged for before anything runs: it refuses a destructive
+//!   manifest that **claims** a pre-image it does not carry. It deliberately does
+//!   **not** require a pre-image payload to already exist -- see below.
+//!
+//! # The gate runs BEFORE capture, so it cannot check that a pre-image exists
+//!
+//! Pre-image capture happens *during* the forward apply, on the per-op `pre_op`
+//! write-ahead hook
+//! ([`PreimageCapturer::capture_before`](crate::migrate::reverse::PreimageCapturer::capture_before)),
+//! which fires immediately before each op mutates. Every manifest-level gate --
+//! this one included -- necessarily runs before that loop. So at gate time a
+//! freshly-authored destructive manifest has no pre-image *and cannot have one*:
+//! [`Manifest::preimage`] is inside the checksummed body (see
+//! [`Manifest`]'s canonicalization note), so the apply that captures a pre-image
+//! can never write it back into the manifest without changing that manifest's
+//! checksum -- and therefore its ledger identity. The captured payload leaves the
+//! apply through the driver's outcome instead (#296), never through the manifest.
+//!
+//! The requirement "a destructive op does not mutate without a pre-image" is
+//! therefore enforced **per op, at capture time**, by `capture_before` refusing a
+//! destructive op it cannot snapshot -- before the mutation, not after. Wiring
+//! that capture into the loop is what
+//! [`apply_with_capture`](crate::migrate::reverse::apply_with_capture) exists to
+//! make structural. The order is: this gate (is the body honest?) -> per-op
+//! capture (snapshot, or refuse) -> mutation.
 //!
 //! Scope: the lint reasons over the forward `up` path only. The reverse (`down`)
 //! ops are a legitimately-destructive-by-structure inverse (a `DropColumn` undoing
@@ -21,7 +44,9 @@
 //! module provides [`enforce_preimage`] but does **not** wire it into apply -- the
 //! composing driver (#296) is what calls the rail at apply time.
 
-use crate::migrate::{Manifest, Op, OpClass};
+use crate::migrate::reverse::PreimagePayload;
+use crate::migrate::{Manifest, Op, OpClass, Preimage};
+use serde::Deserialize;
 use thiserror::Error;
 
 /// The two independent safety axes of a single op.
@@ -126,10 +151,19 @@ pub enum LintError {
         derived: Classification,
     },
 
-    /// A destructive op has no captured pre-image, so its reverse would lose data
-    /// irrecoverably. Apply must refuse until a pre-image is captured (decision 5).
-    #[error("up[{index}]: destructive op refused -- no pre-image captured")]
-    MissingPreimage {
+    /// A destructive manifest carries a [`Preimage`] that holds no capture at all
+    /// -- an empty `Inline` placeholder, an unparseable one, or a `Ref` with a
+    /// blank key. The body claims a pre-image exists somewhere; it does not.
+    ///
+    /// This is the *dishonest-body* refusal, and it is the only pre-image verdict
+    /// a manifest-level gate can honestly reach: see the module docs on why
+    /// "the field is absent" is the **normal** state of a destructive manifest
+    /// awaiting apply, not a violation.
+    #[error(
+        "up[{index}]: destructive op refused -- the manifest carries a pre-image that holds no \
+         capture (an empty placeholder claims a snapshot that does not exist)"
+    )]
+    PlaceholderPreimage {
         /// Index into the manifest's `up` list.
         index: usize,
     },
@@ -173,32 +207,81 @@ pub fn lint_manifest(manifest: &Manifest) -> Result<Vec<Classification>, LintErr
     Ok(classifications)
 }
 
-/// Refuse the forward apply of any destructive op that has no captured pre-image.
+/// Refuse the forward apply of a destructive manifest whose carried pre-image is
+/// a placeholder holding no capture.
+///
+/// # Ordering: this runs before capture, and is scoped to what that allows
+///
+/// This is the pre-apply gate, so it runs **before** the apply loop in which
+/// pre-images are captured (module docs, "The gate runs BEFORE capture"). Two
+/// consequences define its whole contract:
+///
+/// - `manifest.preimage == None` on a destructive manifest is **not** a refusal.
+///   It is the expected state of every honestly-authored destructive migration
+///   awaiting its first apply: nothing has captured yet, and nothing *can* write
+///   a capture into the checksummed body afterwards. Refusing it made the honest
+///   path unrunnable while stopping nothing (#326).
+/// - `manifest.preimage == Some(placeholder)` **is** a refusal. A body that
+///   asserts a pre-image while carrying no capture is a lie, and it is exactly the
+///   bypass an author reached for while the absent-field refusal was in force. A
+///   [`Preimage::Inline`] whose payload holds no [`crate::migrate::reverse::TablePreimage`]
+///   (`{"tables": []}`, `null`, anything that will not deserialize) and a
+///   [`Preimage::Ref`] with a blank key all fail here. Note that a *present*
+///   capture with zero captured rows is legitimate -- dropping a column of an
+///   empty table loses no rows -- so the test is "is there a capture", never
+///   "are there rows".
+///
+/// The guarantee that a destructive op does not mutate without a snapshot is
+/// enforced per-op at capture time by
+/// [`PreimageCapturer::capture_before`](crate::migrate::reverse::PreimageCapturer::capture_before),
+/// which refuses before the mutation; wiring that hook into the loop is what
+/// [`apply_with_capture`](crate::migrate::reverse::apply_with_capture) makes
+/// structural.
 ///
 /// Gates on the **derived** classification ([`classify_op`]), not the declared
-/// class: a structurally-additive op has nothing to snapshot, so gating on a
-/// (possibly over-declared) destructive *declaration* would be an unsatisfiable
-/// false positive with no override built. Conversely, a drop dishonestly declared
-/// additive is still caught here, because the derive sees the data loss -- so this
-/// gate holds even when [`lint_manifest`] was not run first.
-///
-/// The pre-image is manifest-level ([`Manifest::preimage`]): its presence is what
-/// "captured" means for 0.5.0. The concrete capture shape
-/// ([`crate::migrate::Preimage::Inline`] vs [`crate::migrate::Preimage::Ref`]) is
-/// reverse's concern (#274); this gate only requires that
-/// *some* pre-image exists when a destructive op is present.
+/// class, for the same reason [`lint_manifest`]'s surfacing verdict does not: a
+/// structurally-additive op has nothing to snapshot, so keying on a (possibly
+/// over-declared) destructive *declaration* would refuse a manifest that risks no
+/// data. A drop dishonestly declared additive is still judged here, because the
+/// derive sees the data loss -- so this gate holds even when [`lint_manifest`] was
+/// not run first.
 pub fn enforce_preimage(manifest: &Manifest) -> Result<(), LintError> {
+    let Some(preimage) = manifest.preimage.as_ref() else {
+        return Ok(());
+    };
+    if !is_placeholder(preimage) {
+        return Ok(());
+    }
     for (index, classified) in manifest.up.iter().enumerate() {
-        if classify_op(&classified.op).destructive && manifest.preimage.is_none() {
-            return Err(LintError::MissingPreimage { index });
+        if classify_op(&classified.op).destructive {
+            return Err(LintError::PlaceholderPreimage { index });
         }
     }
     Ok(())
 }
 
+/// Whether a carried [`Preimage`] holds no capture at all.
+///
+/// Deserializes the inline payload into the real
+/// [`PreimagePayload`](crate::migrate::reverse::PreimagePayload) rather than
+/// poking at JSON keys, so this cannot drift from the shape reverse (#274)
+/// actually writes; a payload that will not deserialize into one carries no
+/// capture either, so it is a placeholder too. Borrows the `Value` (serde
+/// deserializes from `&Value`), so a large inline payload is not cloned to answer
+/// the question.
+fn is_placeholder(preimage: &Preimage) -> bool {
+    match preimage {
+        Preimage::Inline { rows } => PreimagePayload::deserialize(rows)
+            .map(|payload| payload.is_empty())
+            .unwrap_or(true),
+        Preimage::Ref { key } => key.trim().is_empty(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::migrate::reverse::{CapturedValue, TablePreimage};
     use crate::migrate::{ClassifiedOp, Column, ColumnKind, Flags, Manifest, Op, Preimage};
 
     /// A minimal typed column with no constraints or tags.
@@ -419,6 +502,37 @@ mod tests {
 
     // --- enforce_preimage ---------------------------------------------------
 
+    /// A one-table pre-image that actually carries a capture, serialized the way
+    /// reverse (#274) writes it.
+    fn real_inline_preimage() -> Preimage {
+        let payload = PreimagePayload {
+            tables: vec![TablePreimage::Column {
+                table: "users".into(),
+                dropped: "email".into(),
+                create_sql: "CREATE TABLE users (id TEXT PRIMARY KEY, email TEXT)".into(),
+                aux_ddl: Vec::new(),
+                dropped_requires_value: false,
+                pk: vec!["id".into()],
+                captured_columns: vec!["id".into(), "email".into()],
+                rows: vec![vec![
+                    CapturedValue::Text("u1".into()),
+                    CapturedValue::Text("a@x".into()),
+                ]],
+            }],
+        };
+        Preimage::Inline {
+            rows: serde_json::to_value(&payload).expect("payload serializes"),
+        }
+    }
+
+    /// The placeholder that used to clear the old presence check: a well-formed
+    /// `Inline` whose payload holds no capture at all.
+    fn empty_inline() -> Preimage {
+        Preimage::Inline {
+            rows: serde_json::json!({ "tables": [] }),
+        }
+    }
+
     #[test]
     fn enforce_allows_additive_only_without_preimage() {
         let m = manifest_with(vec![ClassifiedOp::new(add_column())]);
@@ -426,18 +540,80 @@ mod tests {
     }
 
     #[test]
-    fn enforce_refuses_destructive_without_preimage() {
+    fn enforce_allows_a_generator_shaped_destructive_manifest_with_no_preimage_yet() {
+        // The #326 headline: an honestly-authored destructive manifest -- derived
+        // op classes, `preimage: None` -- must pass the pre-apply gate, because the
+        // pre-image is captured *inside* the apply this gate runs before. Refusing
+        // here made the honest path unrunnable.
         let m = manifest_with(vec![ClassifiedOp::new(drop_column())]);
-        let err = enforce_preimage(&m).expect_err("destructive op needs a pre-image");
-        assert!(matches!(err, LintError::MissingPreimage { index: 0 }));
+        assert!(m.preimage.is_none());
+        assert!(enforce_preimage(&m).is_ok());
     }
 
     #[test]
-    fn enforce_allows_destructive_with_preimage() {
+    fn enforce_allows_destructive_with_a_real_preimage() {
         let mut m = manifest_with(vec![ClassifiedOp::new(drop_column())]);
         m.preimage = Some(Preimage::Ref {
             key: "snapshot-key".into(),
         });
+        assert!(enforce_preimage(&m).is_ok());
+
+        m.preimage = Some(real_inline_preimage());
+        assert!(enforce_preimage(&m).is_ok());
+    }
+
+    #[test]
+    fn enforce_refuses_an_empty_inline_placeholder() {
+        // The bypass #296's own test used: an `Inline` carrying nothing at all
+        // cleared the old presence check. It is a claim of a snapshot that does
+        // not exist, so it is now the thing that refuses.
+        let mut m = manifest_with(vec![ClassifiedOp::new(drop_column())]);
+        m.preimage = Some(empty_inline());
+        let err = enforce_preimage(&m).expect_err("an empty Inline carries no capture");
+        assert!(matches!(err, LintError::PlaceholderPreimage { index: 0 }));
+    }
+
+    #[test]
+    fn enforce_refuses_every_shape_of_empty_preimage() {
+        // Null, a bare object, a payload that will not deserialize into a
+        // PreimagePayload at all, and a blank relay key: none of them carries a
+        // capture, so none of them may pass.
+        for rows in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!("snapshot"),
+            serde_json::json!({ "tables": "not-a-list" }),
+        ] {
+            let mut m = manifest_with(vec![ClassifiedOp::new(drop_column())]);
+            m.preimage = Some(Preimage::Inline { rows: rows.clone() });
+            assert!(
+                matches!(
+                    enforce_preimage(&m),
+                    Err(LintError::PlaceholderPreimage { index: 0 })
+                ),
+                "inline {rows} must refuse"
+            );
+        }
+
+        for key in ["", "   "] {
+            let mut m = manifest_with(vec![ClassifiedOp::new(drop_column())]);
+            m.preimage = Some(Preimage::Ref { key: key.into() });
+            assert!(
+                matches!(
+                    enforce_preimage(&m),
+                    Err(LintError::PlaceholderPreimage { index: 0 })
+                ),
+                "blank ref key {key:?} must refuse"
+            );
+        }
+    }
+
+    #[test]
+    fn enforce_ignores_a_placeholder_on_an_additive_only_manifest() {
+        // The gate is scoped to destructive ops: a pointless placeholder on a
+        // manifest that loses no data risks nothing.
+        let mut m = manifest_with(vec![ClassifiedOp::new(add_column())]);
+        m.preimage = Some(empty_inline());
         assert!(enforce_preimage(&m).is_ok());
     }
 
@@ -445,21 +621,23 @@ mod tests {
     fn enforce_catches_a_drop_dishonestly_declared_additive() {
         // enforce_preimage keys on the derived class, so it holds even when the
         // declaration lies and lint_manifest was not run first.
-        let m = manifest_with(vec![ClassifiedOp::declared(
+        let mut m = manifest_with(vec![ClassifiedOp::declared(
             drop_column(),
             OpClass::Additive,
         )]);
-        let err = enforce_preimage(&m).expect_err("derived-destructive drop needs a pre-image");
-        assert!(matches!(err, LintError::MissingPreimage { index: 0 }));
+        m.preimage = Some(empty_inline());
+        let err = enforce_preimage(&m).expect_err("a derived-destructive drop is still judged");
+        assert!(matches!(err, LintError::PlaceholderPreimage { index: 0 }));
     }
 
     #[test]
-    fn enforce_reports_the_first_uncovered_destructive_index() {
-        let m = manifest_with(vec![
+    fn enforce_reports_the_first_destructive_index() {
+        let mut m = manifest_with(vec![
             ClassifiedOp::new(add_column()),
             ClassifiedOp::new(drop_column()),
         ]);
+        m.preimage = Some(empty_inline());
         let err = enforce_preimage(&m).expect_err("destructive op at index 1");
-        assert!(matches!(err, LintError::MissingPreimage { index: 1 }));
+        assert!(matches!(err, LintError::PlaceholderPreimage { index: 1 }));
     }
 }
