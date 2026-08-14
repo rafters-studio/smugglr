@@ -1,0 +1,37 @@
+{
+  "note": "The floor under forger's execution accounting (FR-FORGER-007). Each entry is the number of probes that trait executed on the run that recorded this file, and the census fails when a trait executes fewer -- or stops being executed at all. Raise it deliberately: run the census with FORGER_RECORD_BASELINE=1 and commit the rewritten file in the same change as the work that earned the new number. Lowering an entry is how coverage leaves without anyone noticing, so a decrease is reported as a decrease.",
+  "traits": [
+    {
+      "trait": "ForeignKeyWithAction",
+      "probes": 4
+    },
+    {
+      "trait": "GeneratedVirtual",
+      "probes": 4
+    },
+    {
+      "trait": "GeneratedStored",
+      "probes": 4
+    },
+    {
+      "trait": "ColumnOnConflict",
+      "probes": 4
+    },
+    {
+      "trait": "ExpressionDefault",
+      "probes": 4
+    },
+    {
+      "trait": "TypelessColumn",
+      "probes": 4
+    },
+    {
+      "trait": "Trigger",
+      "probes": 4
+    },
+    {
+      "trait": "DescendingPrimaryKey",
+      "probes": 4
+    }
+  ]
+}
