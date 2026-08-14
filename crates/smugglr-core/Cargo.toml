@@ -85,3 +85,22 @@ libc = { version = "0.2", optional = true }
 # Multicast socket setup (SO_REUSEADDR/SO_REUSEPORT, group join)
 # "all" feature exposes set_reuse_port on unix.
 socket2 = { version = "0.5", features = ["all"], optional = true }
+
+[dev-dependencies]
+# The differential oracle, driven by tests/forger_drives_the_real_migrate.rs.
+#
+# **dev-dependencies only, and by path.** The dependency runs exactly one way --
+# smugglr's tests depend on forger, never the reverse -- and
+# `scripts/check-forger-boundary.py` fails CI on either half being broken. A
+# normal dependency here would put forger in the shipped artifact and, with the
+# forward rule ("forger depends on no smugglr crate"), form a cycle.
+#
+# No version key, and do not add one. forger is `publish = false` and carries
+# its own version line because it is an independent artifact that happens to
+# live in this workspace. Measured: `cargo package` ships a path-only
+# dev-dependency as an EMPTY `[dev-dependencies]` table, while a dev-dependency
+# carrying a version keeps the req and must resolve on crates.io -- so a version
+# here would turn a working `cargo publish` into one that fails looking for a
+# crate that will never be published. `scripts/check-crate-versions.py` knows
+# this and exempts exactly this shape.
+smugglr-forger = { path = "../smugglr-forger" }

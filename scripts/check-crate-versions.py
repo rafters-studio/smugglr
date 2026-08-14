@@ -90,6 +90,28 @@ def main() -> int:
             if not dep["name"].startswith(INTERNAL_PREFIX):
                 continue
 
+            # A path-only DEV-dependency is the one case where "no req" is
+            # correct rather than broken, so it is exempt from the rule
+            # below. Measured on cargo 1.9x rather than assumed, both
+            # directions:
+            #
+            #   path-only dev-dep  -> the packaged manifest ships an EMPTY
+            #                         `[dev-dependencies]` table. There is no
+            #                         req, so there is nothing to rot and
+            #                         nothing for this script to guard.
+            #   dev-dep + version  -> the req IS shipped and must resolve on
+            #                         crates.io at publish time.
+            #
+            # Which makes the demand below actively harmful here. smugglr-core
+            # takes smugglr-forger as a path-only dev-dependency (#377), and
+            # forger is `publish = false` and always will be -- so adding the
+            # version this script asks for would turn a working publish into a
+            # failing one, resolving a registry crate that does not exist. The
+            # exemption is scoped to `dev`: a normal or build dep still ships
+            # its req, and a versioned dev-dep is still checked.
+            if dep["req"] == "*" and dep.get("kind") == "dev":
+                continue
+
             # A path-only dep ships no version req at all, which means
             # `cargo publish` cannot express the dependency and refuses.
             # Report it here rather than at publish time.
