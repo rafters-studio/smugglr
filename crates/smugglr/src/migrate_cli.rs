@@ -100,7 +100,11 @@ struct ApplyOutput<'a> {
     status: Status,
     /// The version the driver assigned and claimed in the ledger.
     version: u64,
-    /// The manifest's content identity, as recorded on the ledger row.
+    /// The **applied manifest's** content identity. This is the checksum of the
+    /// file that was just applied, not a read-back of the ledger row's stored
+    /// value -- on a reclaimed row those diverge, because the ledger's reclaim
+    /// paths leave the stored checksum at the previous manifest's value (see
+    /// `driver::apply_migration`'s "Known gap", owned by #272).
     checksum: &'a str,
     /// `won` (this run applied), `already_applied`, or `held_by_other`.
     election: &'static str,

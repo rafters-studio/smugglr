@@ -114,7 +114,11 @@ impl Default for ApplyOptions {
 pub struct ApplyOutcome {
     /// The version the driver assigned and elected.
     pub version: u64,
-    /// The manifest checksum the ledger row was claimed under.
+    /// The **manifest's** checksum, copied from `sealed.checksum`. This is not
+    /// re-read from the ledger row and is not always what the row holds: on a
+    /// reclaim the stored checksum is left at the previous manifest's value (see
+    /// [`apply_migration`]'s "Known gap"). Read the row via [`Ledger::entry`]
+    /// when you need the value the ledger actually recorded.
     pub checksum: String,
     /// The election result. Only [`Election::Won`] means this call applied ops.
     pub election: Election,
@@ -146,9 +150,11 @@ pub fn apply_migration_to_file(
 ///
 /// The composition, and why each step sits where it does:
 ///
-/// 1. **Verify the checksum.** The ledger row is claimed under
-///    `sealed.checksum`; electing under a checksum that does not match the body
-///    about to be applied would record a content identity for ops nobody ran.
+/// 1. **Verify the checksum.** [`ChecksummedManifest::verify`] establishes
+///    exactly one thing: the body about to be applied matches the checksum
+///    *travelling with it*, so the manifest was not altered after sealing. It
+///    establishes nothing about the checksum on the ledger row, and the two can
+///    legitimately diverge -- see the note below.
 /// 2. **Ensure the ledger schema**, so a first-ever apply on a fresh database
 ///    does not fail reading a table that has never been created.
 /// 3. **Assign the version.** `current_version + 1`, or 1 on an empty ledger.
@@ -159,14 +165,34 @@ pub fn apply_migration_to_file(
 ///    on `UNIQUE(version)`, so this whole path is portable to a target with no
 ///    interactive transactions.
 /// 5. **Only if won:** lint, then apply, then settle. Everything past the
-///    election is wrapped so that *any* failure -- including a lint refusal --
-///    settles the claimed row as `failed` rather than abandoning it pending for
-///    a whole lease.
+///    election funnels through one settle point, so *any* failure -- a lint
+///    refusal, a failed op, or a failed `mark_success` -- settles the claimed
+///    row as `failed` rather than abandoning it pending for a whole lease. Only
+///    process death escapes the funnel, and the lease expiry covers that.
 ///
 /// The lint runs once over the manifest (both of its gates are manifest-level),
 /// while pre-image capture rides the per-op `pre_op` write-ahead hook
 /// [`apply_ops`] exposes, firing before each op's own transaction so it snapshots
 /// committed, pre-mutation state.
+///
+/// # Known gap: a reclaimed row keeps the previous manifest's checksum
+///
+/// [`Ledger::try_elect`] writes `sealed.checksum` **only** on the fresh-`INSERT`
+/// path. Its two reclaim paths (`reclaim_pending` at `ledger.rs:426`,
+/// `reclaim_failed` at `ledger.rs:442`) take no checksum parameter and their
+/// `UPDATE`s never touch the `checksum` column. So the ordinary fix-and-retry
+/// loop -- apply, fail, edit the manifest, re-apply -- reclaims row `vN` and
+/// settles it `success` while the row still holds the **previous** manifest's
+/// checksum. [`Ledger::verify_chain`] cannot catch it, because the chain is
+/// recomputed from the *stored* checksum: the row is internally consistent and
+/// merely factually wrong, so the tamper-evidence certifies the divergence
+/// rather than flagging it.
+///
+/// This driver cannot close that from the outside -- a checksum-aware reclaim
+/// is the ledger's to own (#272) -- and papering over it here (re-`UPDATE`ing
+/// the checksum after winning) would rewrite a chain-hash input out of band and
+/// trip the very tamper check it is trying to keep honest. Recorded rather than
+/// worked around.
 pub fn apply_migration(
     conn: &Connection,
     sealed: &ChecksummedManifest,
@@ -224,21 +250,32 @@ pub fn apply_migration(
         Ok((classifications, capturer.into_payload()))
     })();
 
-    match attempt {
-        Ok((classifications, payload)) => {
-            Ledger::mark_success(conn, version)?;
-            Ok(ApplyOutcome {
-                version,
-                checksum: sealed.checksum.clone(),
-                election,
-                classifications,
-                preimage: (!payload.is_empty()).then_some(payload),
-            })
-        }
+    // `mark_success` is folded INTO the funnel rather than run after it: a bare
+    // `?` here would leave the row `pending` with a live lease over a fully
+    // mutated database -- the abandoned-pending state this funnel exists to
+    // prevent, and worse than the lint-refusal case, because here the ops
+    // actually ran. Settling `failed` instead is honest about *this run* not
+    // completing, not a claim that nothing applied: apply is idempotent per-op,
+    // so the reclaimer re-drives the ops as no-ops and settles `success`. The
+    // one state that must never survive is a live lease nobody is holding.
+    let settled = attempt.and_then(|applied| {
+        Ledger::mark_success(conn, version)?;
+        Ok(applied)
+    });
+
+    match settled {
+        Ok((classifications, payload)) => Ok(ApplyOutcome {
+            version,
+            checksum: sealed.checksum.clone(),
+            election,
+            classifications,
+            preimage: (!payload.is_empty()).then_some(payload),
+        }),
         Err(e) => {
             // Best-effort settle: leave the row `failed` (and so immediately
             // reclaimable) rather than pending for the rest of the lease. The
-            // original error is what the caller sees.
+            // original error is what the caller sees -- if this settle also
+            // fails, the lease expiry is the backstop.
             let _ = Ledger::mark_failed(conn, version);
             Err(e)
         }
@@ -249,6 +286,7 @@ pub fn apply_migration(
 mod tests {
     use super::*;
     use crate::migrate::ledger::MigrationStatus;
+    use crate::migrate::reverse::{CapturedValue, TablePreimage};
     use crate::migrate::{Column, ColumnKind, Constraint, Flags, Manifest, Op, OpClass, Preimage};
     use rusqlite::OptionalExtension;
     use std::cell::RefCell;
@@ -389,11 +427,16 @@ mod tests {
         assert!(!table_exists(&conn, "users"));
     }
 
+    /// Pins #273's `apply_ops` hook **contract**, not this driver's use of it:
+    /// it drives `apply_ops` directly with its own closure, so it would still
+    /// pass if the driver's capture wiring were deleted. The driver's own
+    /// interleave is covered by
+    /// [`the_driver_interleaves_capture_per_op_before_each_mutates`].
     #[test]
-    fn the_write_ahead_hook_fires_once_per_op_before_it_mutates() {
-        // #289's seam: the hook must see every op, in order, and must observe
-        // pre-mutation state. `users` is created by op 1, so a hook that fires
-        // before op 1 cannot see it and a hook firing before op 2 must.
+    fn the_apply_ops_primitive_fires_the_hook_once_per_op_before_it_mutates() {
+        // The hook must see every op, in order, and must observe pre-mutation
+        // state. `users` is created by op 1, so a hook that fires before op 1
+        // cannot see it and a hook firing before op 2 must.
         let conn = conn();
         let sealed = manifest_with(
             vec![
@@ -418,6 +461,85 @@ mod tests {
 
         // Two ops, two firings, and the second saw the first op's committed effect.
         assert_eq!(seen.into_inner(), vec![false, true]);
+    }
+
+    #[test]
+    fn the_driver_interleaves_capture_per_op_before_each_mutates() {
+        // The composition's own interleave, asserted through `apply_migration`
+        // rather than through `apply_ops`: delete the wiring inside the driver
+        // and this fails. The captured VALUES are the proof of ordering -- a
+        // hook firing after its op would find the column already gone and
+        // capture nothing (or error), so recovering the pre-drop cells can only
+        // happen if the hook ran first. Two destructive ops give one capture
+        // each, in apply order, which is the per-op part.
+        let conn = conn();
+        let mut id = col("id", ColumnKind::Int);
+        id.constraints.push(Constraint::Pk);
+        apply_migration(
+            &conn,
+            &manifest_with(
+                vec![ClassifiedOp::new(Op::CreateTable {
+                    table: "users".into(),
+                    columns: vec![
+                        id,
+                        col("email", ColumnKind::Text),
+                        col("phone", ColumnKind::Text),
+                    ],
+                    without_rowid: false,
+                })],
+                None,
+            ),
+            &ApplyOptions::default(),
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO users (id, email, phone) VALUES (1, 'a@example.com', '555-0100');",
+        )
+        .unwrap();
+
+        let sealed = manifest_with(
+            vec![
+                ClassifiedOp::new(Op::DropColumn {
+                    table: "users".into(),
+                    column: "email".into(),
+                }),
+                ClassifiedOp::new(Op::DropColumn {
+                    table: "users".into(),
+                    column: "phone".into(),
+                }),
+            ],
+            Some(Preimage::Inline {
+                rows: serde_json::json!({ "tables": [] }),
+            }),
+        );
+        let outcome = apply_migration(&conn, &sealed, &ApplyOptions::default()).unwrap();
+
+        let payload = outcome.preimage.expect("the driver captured a pre-image");
+        assert_eq!(payload.tables.len(), 2, "one capture per destructive op");
+
+        // In apply order, each holding the value its own op was about to lose.
+        let dropped_values: Vec<(String, CapturedValue)> = payload
+            .tables
+            .iter()
+            .map(|t| match t {
+                TablePreimage::Column { dropped, rows, .. } => {
+                    (dropped.clone(), rows[0][1].clone())
+                }
+                other => panic!("expected a dropped-column capture, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            dropped_values,
+            vec![
+                (
+                    "email".to_string(),
+                    CapturedValue::Text("a@example.com".into())
+                ),
+                ("phone".to_string(), CapturedValue::Text("555-0100".into())),
+            ]
+        );
+        assert!(!column_exists(&conn, "users", "email"));
+        assert!(!column_exists(&conn, "users", "phone"));
     }
 
     #[test]
@@ -479,7 +601,17 @@ mod tests {
 
     #[test]
     fn an_under_declared_op_is_refused_before_anything_applies() {
+        // `users` must exist first, or "nothing applied" would hold trivially --
+        // a drop of an absent table leaves the schema unchanged either way, so
+        // the assertion would prove nothing about the lint.
         let conn = conn();
+        apply_migration(
+            &conn,
+            &manifest_with(vec![create_users()], None),
+            &ApplyOptions::default(),
+        )
+        .unwrap();
+
         let sealed = manifest_with(
             vec![ClassifiedOp::declared(
                 Op::DropTable {
@@ -492,7 +624,16 @@ mod tests {
 
         let err = apply_migration(&conn, &sealed, &ApplyOptions::default()).unwrap_err();
         assert!(err.to_string().contains("under-states"));
-        assert_eq!(Ledger::current_version(&conn).unwrap(), None);
+
+        // Refused *before anything applied*: the table is still there. Checking
+        // only `current_version` would not say that -- it stays 1 under a
+        // ledger-after-apply ordering too, which is the bug this whole design
+        // exists to rule out.
+        assert!(table_exists(&conn, "users"));
+        let entry = Ledger::entry(&conn, 2).unwrap().expect("ledger row");
+        assert_eq!(entry.status, MigrationStatus::Failed);
+        assert_eq!(entry.lease_expires_at, None);
+        assert_eq!(Ledger::current_version(&conn).unwrap(), Some(1));
     }
 
     #[test]
