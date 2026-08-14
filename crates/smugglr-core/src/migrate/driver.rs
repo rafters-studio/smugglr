@@ -508,9 +508,9 @@ mod tests {
                     column: "phone".into(),
                 }),
             ],
-            Some(Preimage::Inline {
-                rows: serde_json::json!({ "tables": [] }),
-            }),
+            // See the note in `a_destructive_apply_captures_its_pre_image`: an
+            // absent pre-image is the normal state, and the driver captures.
+            None,
         );
         let outcome = apply_migration(&conn, &sealed, &ApplyOptions::default()).unwrap();
 
@@ -572,8 +572,15 @@ mod tests {
 
     #[test]
     fn a_lint_refusal_settles_the_claimed_row_rather_than_abandoning_it() {
-        // A destructive op with no pre-image is refused by `enforce_preimage`
-        // *after* the election is won, so the row must not be left pending.
+        // The property: a lint refusal lands *after* the election is won, so the
+        // claimed row must be settled `failed` rather than abandoned pending for a
+        // whole lease. Provoked here by an under-declared op -- a `DropColumn`
+        // declared `additive` -- which is a genuine `lint_manifest` refusal.
+        //
+        // This test previously provoked the refusal with a destructive op carrying
+        // no pre-image. That path was the #326 defect: the gate refused the normal
+        // pre-apply state of every honestly authored destructive manifest, so the
+        // test was resting on the bug it now must not depend on.
         let conn = conn();
         apply_migration(
             &conn,
@@ -582,15 +589,21 @@ mod tests {
         )
         .unwrap();
 
-        let destructive = manifest_with(
-            vec![ClassifiedOp::new(Op::DropColumn {
-                table: "users".into(),
-                column: "email".into(),
-            })],
+        let under_declared = manifest_with(
+            vec![ClassifiedOp::declared(
+                Op::DropColumn {
+                    table: "users".into(),
+                    column: "email".into(),
+                },
+                OpClass::Additive,
+            )],
             None,
         );
-        let err = apply_migration(&conn, &destructive, &ApplyOptions::default()).unwrap_err();
-        assert!(err.to_string().contains("lint refused"));
+        let err = apply_migration(&conn, &under_declared, &ApplyOptions::default()).unwrap_err();
+        assert!(
+            err.to_string().contains("under-states"),
+            "expected an under-declaration refusal, got: {err}"
+        );
 
         let entry = Ledger::entry(&conn, 2).unwrap().expect("ledger row");
         assert_eq!(entry.status, MigrationStatus::Failed);
@@ -656,9 +669,9 @@ mod tests {
                 table: "users".into(),
                 column: "email".into(),
             })],
-            Some(Preimage::Inline {
-                rows: serde_json::json!({ "tables": [] }),
-            }),
+            // `None` is the honest pre-apply state of a destructive manifest: the
+            // capture happens during `apply_ops`, so the body cannot carry one yet.
+            None,
         );
         let outcome = apply_migration(&conn, &sealed, &ApplyOptions::default()).unwrap();
 
