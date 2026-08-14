@@ -48,6 +48,17 @@ pub enum Backing {
     File,
 }
 
+impl Backing {
+    /// Every backing, for iterating.
+    ///
+    /// Read by [`boundary`](crate::boundary), which derives the execution paths
+    /// forger exercises from the backings it can stand a database up on. A
+    /// backing that is not listed here is a path the boundary will not claim,
+    /// which understates coverage rather than overstating it -- the direction
+    /// this crate errs in on purpose.
+    pub const ALL: [Backing; 2] = [Backing::Memory, Backing::File];
+}
+
 /// How a fixture is brought to a state.
 ///
 /// One method takes all three, and the symmetry is load-bearing rather than

@@ -35,6 +35,10 @@
 //!   empty one.
 //! * [`failure`] -- what a failure says: the trait, the before and the after,
 //!   and the schema that carries it as source a reader can paste.
+//! * [`boundary`] -- what forger does *not* exercise, worked out from what it
+//!   does and printed on every census run. It is not restated here: a second
+//!   copy of a boundary is a copy that can go stale, which is the failure the
+//!   module exists to prevent.
 //!
 //! ```
 //! use smugglr_forger::fixture::{Backing, Fixture, Route};
@@ -55,6 +59,7 @@
 //! fixture.bring_to(Route::Schema(&target)).unwrap();
 //! ```
 
+pub mod boundary;
 pub mod census;
 pub mod corpus;
 pub mod error;
@@ -64,6 +69,7 @@ pub mod oracle;
 pub mod registry;
 pub mod schema;
 
+pub use boundary::{Boundary, Path, Subject, Unexercised};
 pub use census::{Anomaly, Baseline, Census, Shortfall};
 pub use corpus::Regression;
 pub use error::{BoxError, ForgeError, ProbeError, ValidationError};

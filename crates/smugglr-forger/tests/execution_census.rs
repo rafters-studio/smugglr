@@ -34,6 +34,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+use smugglr_forger::boundary::Boundary;
 use smugglr_forger::census::{Baseline, Census, Phase, TraitTally};
 use smugglr_forger::failure::render_report;
 use smugglr_forger::fixture::Backing;
@@ -64,6 +65,12 @@ fn main() -> ExitCode {
     let elapsed = started.elapsed();
 
     print_tally(&census, elapsed);
+
+    // Unconditionally, and before any verdict: what a run covers is only half of
+    // what a reviewer needs, and the half they are liable to assume. A boundary
+    // printed only on failure is one nobody reads on the run that convinced
+    // them. FR-FORGER-010.
+    println!("{}", Boundary::of_this_build());
 
     if std::env::var_os(RECORD).is_some() {
         return record(&census);

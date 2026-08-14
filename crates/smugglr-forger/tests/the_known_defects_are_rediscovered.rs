@@ -33,24 +33,23 @@
 //! # What forger cannot rediscover, and why
 //!
 //! This list is the point of the exercise as much as the tests are, and it is
-//! kept here rather than in a report nobody re-reads. FR-FORGER-010.
+//! kept here rather than in a report nobody re-reads. FR-FORGER-012.
 //!
-//! * **smugglr#341's `ON UPDATE` half.** The registry's `ForeignKeyWithAction`
-//!   case declares only `ON DELETE` actions and its probe reads only
-//!   `fk.on_delete`, so a rebuild that drops `ON UPDATE CASCADE` is silent.
-//!   Demonstrated below rather than asserted, in
-//!   [`smugglr_341_a_dropped_on_update_action_is_not_rediscovered`], which shows
-//!   the loss is real and the oracle says nothing about it.
+//! Most of it is not a fact about this register but about forger's coverage
+//! envelope: the adapters, the `ON UPDATE` and `RESTRICT` halves of
+//! smugglr#341, `MATCH`, anything a log would have said, smugglr#340, and
+//! smugglr#347's missing rebuild. Those are stated by [`Boundary`], derived
+//! from the covered set and printed by every census run -- FR-FORGER-010 -- and
+//! they are deliberately not restated here. Two accounts of one truth can
+//! disagree, and this file would be the copy that goes stale the first time
+//! somebody adds a probe. The two blind spots nothing can measure are
+//! demonstrated below instead, in
+//! [`smugglr_341_a_dropped_on_update_action_is_not_rediscovered`] and
+//! [`smugglr_341_the_same_loss_on_a_restrict_key_alone_is_not_rediscovered`],
+//! each of which asserts both that the loss goes unreported *and* that the
+//! boundary still says so.
 //!
-//! * **smugglr#341's `RESTRICT` half.** Also demonstrated below. `RESTRICT` and
-//!   the `NO ACTION` default are behaviourally identical while enforcement is
-//!   immediate -- they differ only under `DEFERRABLE INITIALLY DEFERRED`, which
-//!   the schema model cannot express -- so the probe's silence is a correct
-//!   answer about this connection and a blind spot about the defect.
-//!
-//! * **smugglr#341's `MATCH` clause.** Not in the schema model, and there would
-//!   be nothing to probe if it were: SQLite parses `MATCH` and ignores it. This
-//!   one is unprobeable rather than merely uncovered.
+//! What is left is particular to a defect rather than to what forger covers:
 //!
 //! * **smugglr#343's expression-`DEFAULT` defect in the shape it was found.**
 //!   The reconstruction is a syntax error, so the transformation fails and
@@ -69,39 +68,29 @@
 //!   rowid alias -- which exists only for the single-column column-level form.
 //!   The single-column form is rediscovered below; the composite one is not.
 //!
-//! * **The silence itself, in smugglr#342 and smugglr#336.** Both issues are
-//!   half about a `tracing::warn!` that the module doc promised and the code
-//!   never emitted. forger observes a database and never a log, so it can see
-//!   the loss and can never see whether anyone was told about it.
-//!
 //! * **smugglr#344's corruption, as opposed to its promotion.** The promotion to
 //!   declared `BLOB` is rediscovered below. The corruption it opens the door to
 //!   is base64 canonicalization in smugglr's `rowhash`, which is a decision made
 //!   about a column's declared type in another crate -- there is no state of the
 //!   database that differs.
 //!
-//! * **smugglr#340 entirely.** It is a defect in a scanner over `sqlite_master`
-//!   text, and forger cannot even stage its input domain:
-//!   `schema::ddl::quote` double-quotes every identifier unconditionally, so no
-//!   schema forger renders can produce the bare non-ASCII name that mis-splices
-//!   or the single-quoted name that is refused. Even given the input, the issue
-//!   records the outcome as a hard SQLite syntax error -- the error door again,
-//!   naming no trait.
+//! * **smugglr#340's outcome, as opposed to its input domain.** [`Boundary`]
+//!   states that forger cannot render the identifier that defect needs. Even
+//!   given the input, the issue records the outcome as a hard SQLite syntax
+//!   error -- the error door again, naming no trait.
 //!
-//! * **smugglr#347 entirely**, for two independent reasons. It is a defect of
-//!   the direct `ALTER TABLE ... DROP COLUMN` path, which never reaches a
-//!   rebuild, so there is no reconstruction for a differential comparison to be
-//!   about. And its shape cannot be staged here anyway: the only trigger in the
-//!   registry references exactly the column the trigger probe's own `INSERT`
-//!   names, so "a trigger abandoned by a dropped column" and "the probe's
-//!   statement named a column that is gone" are the same observation. Separating
-//!   them needs a registry case with a trigger over a column no probe writes,
-//!   which is a change to `registry/cases.rs` and is not made here -- a
-//!   committed corpus fixture is run against a case's schema, so editing one
-//!   can stop a pinned defect reproducing.
+//! * **smugglr#347's shape, beyond the missing rebuild [`Boundary`] states.**
+//!   The only trigger in the registry references exactly the column the trigger
+//!   probe's own `INSERT` names, so "a trigger abandoned by a dropped column"
+//!   and "the probe's statement named a column that is gone" are the same
+//!   observation. Separating them needs a registry case with a trigger over a
+//!   column no probe writes, which is a change to `registry/cases.rs` and is not
+//!   made here -- a committed corpus fixture is run against a case's schema, so
+//!   editing one can stop a pinned defect reproducing.
 
 use rusqlite::Connection;
 
+use smugglr_forger::boundary::{Boundary, Subject};
 use smugglr_forger::error::BoxError;
 use smugglr_forger::fixture::{Backing, Fixture, Route};
 use smugglr_forger::oracle::{differential, Divergence, Outcome, Report};
@@ -165,8 +154,24 @@ fn smugglr_341_a_rebuild_that_dropped_every_referential_action_is_rediscovered()
 ///
 /// So the rediscovery above rests entirely on its `CASCADE` half. The same
 /// defect on a database whose only referential action is a `RESTRICT` passes.
+///
+/// The second half of the lock is the assertion that [`Boundary`] still says so.
+/// Nothing can measure "these two are the same behaviour here" -- it is a fact
+/// about a spelling the schema model does not have -- so the claim is held
+/// between two assertions that fail in opposite directions: this test goes red
+/// if the blind spot closes, and red again if the statement disappears without
+/// it closing.
 #[test]
 fn smugglr_341_the_same_loss_on_a_restrict_key_alone_is_not_rediscovered() {
+    assert!(
+        Boundary::of_this_build()
+            .statement(Subject::Restrict)
+            .is_some(),
+        "this test demonstrates a blind spot the boundary no longer states. Either the boundary \
+         stopped deriving the line -- no case schema declares ON DELETE RESTRICT any more -- or \
+         the statement was edited away while the blind spot below is still open"
+    );
+
     // The premise, checked rather than assumed: this transformation really does
     // leave the key without its action. A test that records a blind spot has to
     // fail when the blind spot closes *and* when it has quietly stopped removing
@@ -239,8 +244,23 @@ fn stored_ddl(fixture: &Fixture, table: &str) -> String {
 /// does. The first half of this test proves the loss is real -- the same rebuild
 /// against a fixture stops the update cascading -- and the second half runs the
 /// oracle over a schema carrying that key and gets silence.
+///
+/// The boundary's `ON UPDATE` line is derived: it is there because no case
+/// schema declares an `ON UPDATE` action. That derivation cannot tell a case
+/// that gained a key from a case that gained a *probe*, so the assertion below
+/// closes the gap from the other side -- declaring the action without reading it
+/// removes the line and turns this test red.
 #[test]
 fn smugglr_341_a_dropped_on_update_action_is_not_rediscovered() {
+    assert!(
+        Boundary::of_this_build()
+            .undeclared_on_update()
+            .contains(&ReferentialAction::Cascade),
+        "the boundary no longer claims ON UPDATE CASCADE goes unexercised, and the run below \
+         still shows the loss going unreported. A case schema that declares the action without a \
+         probe that reads it takes the claim away and leaves the blind spot open"
+    );
+
     const SEED: &str = r#"
         INSERT INTO "updating_keeper" ("id", "label") VALUES (1, 'renumbered');
         INSERT INTO "updating_child" ("id", "keeper_id", "label") VALUES (10, 1, 'follows');

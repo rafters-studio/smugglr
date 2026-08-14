@@ -248,7 +248,12 @@ pub struct ForeignKey {
     pub on_update: Option<ReferentialAction>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// What a foreign key does when the row it points at moves or goes away.
+///
+/// `Ord` so a set of them can be collected and subtracted from
+/// [`ALL`](Self::ALL) in declaration order -- [`boundary`](crate::boundary)
+/// derives what goes unexercised that way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum ReferentialAction {
     NoAction,
@@ -259,6 +264,24 @@ pub enum ReferentialAction {
 }
 
 impl ReferentialAction {
+    /// Every action, for iterating.
+    ///
+    /// Scaffolding rather than enforcement, exactly as [`Trait::ALL`] is: the
+    /// compiler will not notice a variant left out of this array. What makes
+    /// the omission survivable is the direction it fails in --
+    /// [`boundary`](crate::boundary) subtracts what the registry declares from
+    /// this list to derive which actions go unexercised, so a variant missing
+    /// here is a gap the boundary does not claim rather than coverage it
+    /// invents. [`as_sql`](Self::as_sql) below is the exhaustive match a new
+    /// variant does break, and it is the next thing anyone adding one reads.
+    pub const ALL: [ReferentialAction; 5] = [
+        ReferentialAction::NoAction,
+        ReferentialAction::Restrict,
+        ReferentialAction::SetNull,
+        ReferentialAction::SetDefault,
+        ReferentialAction::Cascade,
+    ];
+
     pub fn as_sql(&self) -> &'static str {
         match self {
             ReferentialAction::NoAction => "NO ACTION",
