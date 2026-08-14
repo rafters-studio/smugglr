@@ -2,16 +2,18 @@
 //! accepts.
 //!
 //! A rendering test that only compares strings proves the renderer agrees with
-//! itself. These go through a real database, and the schema they go through
-//! with carries one instance of every feature [`Trait`] declares, because
-//! those are the shapes a transformation has been observed to lose.
+//! itself. These go through a real database. The first schema carries one
+//! instance of every feature the `Trait` enum declares, because those are the
+//! shapes a transformation has been observed to lose; the second exists to
+//! reach the renderer arms the first does not, since an arm SQLite has never
+//! parsed is a rendering nobody has actually checked.
 
 use rusqlite::params;
 use smugglr_forger::fixture::{Backing, Fixture, Route};
 use smugglr_forger::schema::builder::{schema, table, Attr::*};
 use smugglr_forger::schema::{
-    ColumnType::*, DefaultValue, IndexedColumn, ReferentialAction, Schema, SortOrder, Trigger,
-    TriggerEvent, TriggerTiming,
+    ColumnConstraint, ColumnType::*, DefaultValue, IndexedColumn, OnConflict, ReferentialAction,
+    Schema, SortOrder, TableConstraint, Trigger, TriggerEvent, TriggerTiming,
 };
 
 /// One instance of every declared trait, in one schema.
@@ -156,6 +158,111 @@ fn a_generated_column_computes_rather_than_stores_what_it_was_given() {
         .expect("read back");
     assert_eq!(slug, "hello");
     assert_eq!(shout, "HELLO");
+}
+
+/// Everything the trait corpus does not happen to use: conflict algorithms on
+/// keys, table-level constraints, the remaining literal defaults, the
+/// remaining trigger timings and events, and the type names that are not
+/// storage classes.
+fn remaining_grammar() -> Schema {
+    let mut target = schema()
+        .table(
+            table("ledger")
+                .pk_int("id")
+                .autoincrement()
+                .col(
+                    "note",
+                    Text,
+                    [Collate("NOCASE".into()), Default(DefaultValue::Null)],
+                )
+                .col("amount", Numeric, [Default(DefaultValue::Real(1.5))])
+                .col("sig", Blob, [Default(DefaultValue::Blob(vec![0x00, 0xff]))])
+                .col("qty", Integer, [Default(DefaultValue::Integer(0))])
+                .col(
+                    "tag",
+                    Other("VARCHAR(32)".into()),
+                    [Check("length(\"tag\") < 32".into())],
+                )
+                .trigger(Trigger {
+                    name: "ledger_before_delete".into(),
+                    timing: TriggerTiming::Before,
+                    event: TriggerEvent::Delete,
+                    when: None,
+                    body: vec!["UPDATE \"counter\" SET \"n\" = \"n\" + 1".into()],
+                }),
+        )
+        .table(
+            table("pair")
+                .col("a", Text, [NotNull])
+                .col("b", Text, [NotNull])
+                .col("note", Text, [])
+                .pk_composite([
+                    IndexedColumn::new("a", SortOrder::Asc),
+                    IndexedColumn::new("b", SortOrder::Desc),
+                ])
+                .constraint(TableConstraint::Unique {
+                    columns: vec![IndexedColumn::new("note", SortOrder::Asc)],
+                    on_conflict: Some(OnConflict::Replace),
+                })
+                .constraint(TableConstraint::Check("\"a\" <> \"b\"".into()))
+                .trigger(Trigger {
+                    name: "pair_after_update".into(),
+                    timing: TriggerTiming::After,
+                    event: TriggerEvent::Update,
+                    when: None,
+                    body: vec!["UPDATE \"counter\" SET \"n\" = \"n\" + 1".into()],
+                }),
+        )
+        .table(table("counter").pk_int("id").col("n", Integer, []))
+        .build()
+        .expect("valid");
+
+    // A conflict algorithm on a key is not reachable through the builder --
+    // the pk_* constructors take no attributes, which is what keeps a
+    // generated column from becoming one. Reach into the model for it, since
+    // the rendering still has to be right.
+    target.tables[0].columns[0].constraints = vec![ColumnConstraint::PrimaryKey {
+        order: SortOrder::Asc,
+        autoincrement: true,
+        on_conflict: Some(OnConflict::Rollback),
+    }];
+    target.tables[1].constraints[0] = TableConstraint::PrimaryKey {
+        columns: vec![
+            IndexedColumn::new("a", SortOrder::Asc),
+            IndexedColumn::new("b", SortOrder::Desc),
+        ],
+        on_conflict: Some(OnConflict::Ignore),
+    };
+    target.validate().expect("still a legal schema");
+    target
+}
+
+#[test]
+fn sqlite_accepts_every_arm_the_renderer_can_take() {
+    let mut fixture = Fixture::new(Backing::Memory).expect("fixture");
+    fixture
+        .bring_to(Route::Schema(&remaining_grammar()))
+        .expect("SQLite accepts the rendered DDL");
+
+    // The defaults are the arms most likely to render as something that parses
+    // and means the wrong thing, so read them back rather than trusting the
+    // statement's acceptance.
+    fixture
+        .conn()
+        .execute("INSERT INTO \"ledger\" (\"tag\") VALUES ('x')", [])
+        .expect("insert");
+    let (note, amount, sig, qty): (Option<String>, f64, Vec<u8>, i64) = fixture
+        .conn()
+        .query_row(
+            "SELECT \"note\", \"amount\", \"sig\", \"qty\" FROM \"ledger\"",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("read back");
+    assert_eq!(note, None);
+    assert_eq!(amount, 1.5);
+    assert_eq!(sig, vec![0x00, 0xff]);
+    assert_eq!(qty, 0);
 }
 
 #[test]

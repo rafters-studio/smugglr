@@ -305,19 +305,15 @@ impl<P, R> TableBuilder<P, R> {
 
     /// Set `ON DELETE` on the most recent foreign key.
     pub fn on_delete(self, action: ReferentialAction) -> Self {
-        self.set_fk_action(Some(action), None)
+        self.refine_last_fk(move |fk| fk.on_delete = Some(action))
     }
 
     /// Set `ON UPDATE` on the most recent foreign key.
     pub fn on_update(self, action: ReferentialAction) -> Self {
-        self.set_fk_action(None, Some(action))
+        self.refine_last_fk(move |fk| fk.on_update = Some(action))
     }
 
-    fn set_fk_action(
-        mut self,
-        on_delete: Option<ReferentialAction>,
-        on_update: Option<ReferentialAction>,
-    ) -> Self {
+    fn refine_last_fk(mut self, refine: impl FnOnce(&mut ForeignKey)) -> Self {
         let last = self
             .table
             .constraints
@@ -328,14 +324,7 @@ impl<P, R> TableBuilder<P, R> {
                 _ => None,
             });
         match last {
-            Some(fk) => {
-                if on_delete.is_some() {
-                    fk.on_delete = on_delete;
-                }
-                if on_update.is_some() {
-                    fk.on_update = on_update;
-                }
-            }
+            Some(fk) => refine(fk),
             // Nothing to attach to. The table itself would still be
             // well-formed, so the action would vanish silently -- which is the
             // exact defect shape forger exists to catch. Report it.
@@ -443,14 +432,20 @@ impl TableBuilder<IntPk, Rowid> {
     /// let t = table("k").pk_int("id").without_rowid().autoincrement();
     /// ```
     pub fn autoincrement(mut self) -> TableBuilder<IntPk, AutoKey> {
-        for column in &mut self.table.columns {
-            for constraint in &mut column.constraints {
-                if let ColumnConstraint::PrimaryKey { autoincrement, .. } = constraint {
-                    // The IntPk state guarantees this column exists.
-                    *autoincrement = true;
-                }
-            }
-        }
+        // The IntPk state is reachable only through pk_int, which pushed
+        // exactly one column-level key, so this finds it and there is no
+        // second one to find.
+        let key = self
+            .table
+            .columns
+            .iter_mut()
+            .flat_map(|column| column.constraints.iter_mut())
+            .find_map(|constraint| match constraint {
+                ColumnConstraint::PrimaryKey { autoincrement, .. } => Some(autoincrement),
+                _ => None,
+            })
+            .expect("the IntPk state means pk_int declared a key");
+        *key = true;
         self.retype()
     }
 }

@@ -152,17 +152,9 @@ fn render_table_constraint(constraint: &TableConstraint) -> String {
 fn render_foreign_key(fk: &ForeignKey) -> String {
     let mut sql = format!(
         "FOREIGN KEY ({}) REFERENCES {} ({})",
-        fk.columns
-            .iter()
-            .map(|c| quote(c))
-            .collect::<Vec<_>>()
-            .join(", "),
+        name_list(&fk.columns),
         quote(&fk.parent_table),
-        fk.parent_columns
-            .iter()
-            .map(|c| quote(c))
-            .collect::<Vec<_>>()
-            .join(", "),
+        name_list(&fk.parent_columns),
     );
     if let Some(action) = &fk.on_delete {
         sql.push_str(&format!(" ON DELETE {}", action.as_sql()));
@@ -182,14 +174,7 @@ pub fn render_trigger(table: &str, trigger: &Trigger) -> String {
         TriggerEvent::Insert => "INSERT".to_string(),
         TriggerEvent::Delete => "DELETE".to_string(),
         TriggerEvent::Update => "UPDATE".to_string(),
-        TriggerEvent::UpdateOf(columns) => format!(
-            "UPDATE OF {}",
-            columns
-                .iter()
-                .map(|c| quote(c))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+        TriggerEvent::UpdateOf(columns) => format!("UPDATE OF {}", name_list(columns)),
     };
 
     let mut sql = format!(
@@ -206,6 +191,15 @@ pub fn render_trigger(table: &str, trigger: &Trigger) -> String {
     }
     sql.push_str("END");
     sql
+}
+
+/// A comma-separated list of quoted identifiers.
+fn name_list(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|name| quote(name))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn indexed_columns(columns: &[IndexedColumn]) -> String {
