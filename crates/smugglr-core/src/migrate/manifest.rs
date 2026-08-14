@@ -55,6 +55,18 @@ pub enum MigrateError {
     #[error("migration apply failed: {0}")]
     Apply(String),
 
+    /// The destructive-lint refused the manifest at apply time (#275's rail,
+    /// called by the driver #296): an op under-states its structural danger, or
+    /// a destructive op has no captured pre-image so its reverse would be a lie.
+    ///
+    /// Carries the rendered [`crate::migrate::lint::LintError`] rather than the
+    /// typed value: `LintError` is deliberately lint-local (its doc says
+    /// `error.rs` stays untouched and the composing driver bridges it), and
+    /// nesting it here would drag the lint's types into every consumer of this
+    /// enum for no gain -- the rendering already names the offending `up` index.
+    #[error("migration lint refused the manifest: {0}")]
+    Lint(String),
+
     /// Remote apply (D1 / Turso / rqlite) generated its statements but cannot
     /// execute them: the host->target DDL transport does not exist in 0.5.0 and
     /// is deferred to #291. The statement *generators*
