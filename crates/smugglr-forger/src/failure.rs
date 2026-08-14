@@ -468,18 +468,14 @@ fn render_table(table: &Table, needs: &mut Needs) -> Result<String, String> {
     let mut out = format!("table({})\n", literal(&table.name));
 
     for (index, column) in table.columns.iter().enumerate() {
-        if Some(index) == key.map(|(at, _)| at) {
-            let (autoincrement, order) = match key {
-                Some((_, constraint)) => constraint,
-                // `key` is Some here by the condition above.
-                None => unreachable!("the key column is the key column"),
-            };
-            out.push_str(&render_key_column(table, column, order, needs)?);
-            if autoincrement {
-                out.push_str("    .autoincrement()\n");
+        match key {
+            Some(key) if key.at == index => {
+                out.push_str(&render_key_column(table, column, key.order, needs)?);
+                if key.autoincrement {
+                    out.push_str("    .autoincrement()\n");
+                }
             }
-        } else {
-            out.push_str(&render_column(column, needs));
+            _ => out.push_str(&render_column(column, needs)),
         }
     }
 
@@ -515,16 +511,24 @@ fn render_table(table: &Table, needs: &mut Needs) -> Result<String, String> {
     Ok(trim_trailing_newline(out) + ",\n")
 }
 
-/// The column that declares the key, its position, whether it is
-/// `AUTOINCREMENT`, and which way it sorts.
+/// The column-level primary key: which column it is on, and how it is spelled.
+#[derive(Clone, Copy)]
+struct KeyColumn {
+    /// Its position among the table's columns, so the `pk_*` constructor is
+    /// emitted where the column actually sits rather than first.
+    at: usize,
+    autoincrement: bool,
+    order: SortOrder,
+}
+
+/// The column that declares the key, if one does.
 ///
 /// `Err` where the model holds a key the builder has no spelling for. Those
 /// shapes are real -- `id INTEGER PRIMARY KEY NOT NULL` is ordinary SQLite --
 /// and the builder's `pk_*` constructors deliberately take no attributes, so
 /// there is nothing to emit that would round-trip.
-#[allow(clippy::type_complexity)]
-fn primary_key_column(table: &Table) -> Result<Option<(usize, (bool, SortOrder))>, String> {
-    let mut found: Option<(usize, (bool, SortOrder))> = None;
+fn primary_key_column(table: &Table) -> Result<Option<KeyColumn>, String> {
+    let mut found: Option<KeyColumn> = None;
     for (index, column) in table.columns.iter().enumerate() {
         for constraint in &column.constraints {
             let ColumnConstraint::PrimaryKey {
@@ -556,7 +560,11 @@ fn primary_key_column(table: &Table) -> Result<Option<(usize, (bool, SortOrder))
                     table.name
                 ));
             }
-            found = Some((index, (*autoincrement, *order)));
+            found = Some(KeyColumn {
+                at: index,
+                autoincrement: *autoincrement,
+                order: *order,
+            });
         }
     }
     Ok(found)
