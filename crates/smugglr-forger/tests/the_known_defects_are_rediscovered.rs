@@ -167,18 +167,32 @@ fn smugglr_341_a_rebuild_that_dropped_every_referential_action_is_rediscovered()
 /// defect on a database whose only referential action is a `RESTRICT` passes.
 #[test]
 fn smugglr_341_the_same_loss_on_a_restrict_key_alone_is_not_rediscovered() {
-    let report = run(r#"
-        CREATE TABLE "restrict_child_new" (
-            "id" INTEGER PRIMARY KEY,
-            "keeper_id" INTEGER,
-            "label" TEXT,
-            FOREIGN KEY ("keeper_id") REFERENCES "keeper" ("id")
-        );
-        INSERT INTO "restrict_child_new" ("id", "keeper_id", "label")
-            SELECT "id", "keeper_id", "label" FROM "restrict_child";
-        DROP TABLE "restrict_child";
-        ALTER TABLE "restrict_child_new" RENAME TO "restrict_child";
-        "#);
+    // The premise, checked rather than assumed: this transformation really does
+    // leave the key without its action. A test that records a blind spot has to
+    // fail when the blind spot closes *and* when it has quietly stopped removing
+    // anything -- and the second of those is invisible to the run below, whose
+    // whole finding is silence. There is no behavioural check available here, so
+    // this one reads the DDL SQLite stored, which is exactly the comparison the
+    // oracle refuses to make and is sound for asking what a statement did rather
+    // than whether two arms agree.
+    let mut fixture = Fixture::new(Backing::Memory).expect("fixture");
+    fixture
+        .bring_to(Route::Schema(&every_trait()))
+        .expect("the schema stands up");
+    assert!(
+        stored_ddl(&fixture, "restrict_child").contains("RESTRICT"),
+        "the case schema declares the action this test is about removing"
+    );
+    fixture
+        .conn()
+        .execute_batch(DROPS_THE_RESTRICT_ACTION)
+        .expect("the rebuild applies");
+    assert!(
+        !stored_ddl(&fixture, "restrict_child").contains("RESTRICT"),
+        "this test's premise is that the rebuild below leaves the key with the NO ACTION default"
+    );
+
+    let report = run(DROPS_THE_RESTRICT_ACTION);
 
     // Sound baseline, so the silence below is blindness rather than two arms
     // agreeing about a database that was already broken.
@@ -189,6 +203,33 @@ fn smugglr_341_the_same_loss_on_a_restrict_key_alone_is_not_rediscovered() {
         "if this ever reports, the blind spot recorded in this file's docs has closed and the \
          docs are now wrong"
     );
+}
+
+/// The rebuild from the test above, used twice: once to show what it removed,
+/// once to show that removing it goes unreported.
+const DROPS_THE_RESTRICT_ACTION: &str = r#"
+    CREATE TABLE "restrict_child_new" (
+        "id" INTEGER PRIMARY KEY,
+        "keeper_id" INTEGER,
+        "label" TEXT,
+        FOREIGN KEY ("keeper_id") REFERENCES "keeper" ("id")
+    );
+    INSERT INTO "restrict_child_new" ("id", "keeper_id", "label")
+        SELECT "id", "keeper_id", "label" FROM "restrict_child";
+    DROP TABLE "restrict_child";
+    ALTER TABLE "restrict_child_new" RENAME TO "restrict_child";
+"#;
+
+/// The `CREATE` text SQLite stored for a table.
+fn stored_ddl(fixture: &Fixture, table: &str) -> String {
+    fixture
+        .conn()
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get(0),
+        )
+        .expect("the table is there")
 }
 
 /// The other half that is invisible here, also demonstrated.
