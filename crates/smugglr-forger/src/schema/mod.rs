@@ -10,6 +10,37 @@
 //! model can hold a generated primary key; SQLite cannot. [`validate`] is
 //! where that gap is closed, and [`builder`] closes part of it earlier, in the
 //! type system. See the module docs there for which invariants land where.
+//!
+//! # Why every type here refuses unknown fields
+//!
+//! A schema reaches this model from a hand-edited regression fixture, and a
+//! misspelled key that serde ignored -- `"decl_types"` for `"decl_type"`,
+//! `"trigger"` for `"triggers"` -- would parse cleanly and drop the field. The
+//! fixture would then sit in the corpus, run green, and appear to guard a
+//! defect it no longer carries, which is the one failure a regression corpus
+//! cannot tolerate: a fixture that has quietly stopped testing its defect is
+//! indistinguishable from one that still does, and the misspelling is
+//! invisible in review because the reader sees the key they expected.
+//!
+//! So `deny_unknown_fields` is on every container, including the enums whose
+//! variants carry no named fields today and where it is therefore inert. The
+//! point is that a variant gaining a named field later must not open the gap
+//! again, and remembering to add the attribute at that moment is exactly the
+//! kind of thing nobody remembers. It composes with the `#[serde(default)]`
+//! fields below rather than fighting them: `default` says a field that *is*
+//! declared may be omitted, while this refuses keys that are not fields at
+//! all.
+//!
+//! Where it earns its keep is the optional fields, and not only the ones
+//! marked `#[serde(default)]`. Serde supplies `None` for any missing
+//! `Option` field whether or not the attribute is written, so a misspelled
+//! `decl_type` or `on_conflict` used to deserialize to a column with no type
+//! and a key with no conflict algorithm -- both of which are traits with
+//! probes of their own, so the fixture would still stand up and still run,
+//! reporting on a different defect than the one it reads as declaring. A
+//! required field of a non-optional type was already caught, but as "missing
+//! field", which names the key the author meant rather than the one they
+//! typed.
 
 pub mod builder;
 pub mod ddl;
@@ -22,11 +53,13 @@ use serde::{Deserialize, Serialize};
 /// Not `Eq`, because a `REAL` default is an `f64`. `PartialEq` is what the
 /// "authored and literal compare equal" property needs.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Schema {
     pub tables: Vec<Table>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Table {
     pub name: String,
     pub columns: Vec<Column>,
@@ -48,6 +81,7 @@ pub struct Table {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Column {
     pub name: String,
     /// `None` is a typeless column -- legal SQLite, blank affinity, and a
@@ -59,6 +93,7 @@ pub struct Column {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ColumnType {
     Integer,
     Text,
@@ -86,6 +121,7 @@ impl ColumnType {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ColumnConstraint {
     PrimaryKey {
         order: SortOrder,
@@ -108,6 +144,7 @@ pub enum ColumnConstraint {
 /// that can carry one holds it inline rather than the column holding a
 /// separate list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum OnConflict {
     Rollback,
     Abort,
@@ -129,6 +166,7 @@ impl OnConflict {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum SortOrder {
     #[default]
     Asc,
@@ -136,12 +174,14 @@ pub enum SortOrder {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum Generated {
     Virtual,
     Stored,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum DefaultValue {
     Null,
     Integer(i64),
@@ -165,6 +205,7 @@ impl DefaultValue {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum TableConstraint {
     PrimaryKey {
         columns: Vec<IndexedColumn>,
@@ -179,6 +220,7 @@ pub enum TableConstraint {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IndexedColumn {
     pub name: String,
     #[serde(default)]
@@ -195,6 +237,7 @@ impl IndexedColumn {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ForeignKey {
     pub columns: Vec<String>,
     pub parent_table: String,
@@ -206,6 +249,7 @@ pub struct ForeignKey {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ReferentialAction {
     NoAction,
     Restrict,
@@ -227,6 +271,7 @@ impl ReferentialAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Trigger {
     pub name: String,
     pub timing: TriggerTiming,
@@ -239,12 +284,14 @@ pub struct Trigger {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum TriggerTiming {
     Before,
     After,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum TriggerEvent {
     Insert,
     Delete,
@@ -260,6 +307,7 @@ pub enum TriggerEvent {
 /// because the model is where a feature is named; wiring each one to a seed
 /// and a probe, and dispatching over them exhaustively, is FR-FORGER-003.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum Trait {
     /// A foreign key carrying `ON DELETE`/`ON UPDATE`. A rebuild that
     /// re-declares the key without its action silently turns a cascade into a

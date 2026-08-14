@@ -192,3 +192,86 @@ fn a_misspelled_key_is_refused_rather_than_ignored() {
         Err(CorpusError::Parse(_))
     ));
 }
+
+/// Misspell one key in a fixture's JSON and hand the result back to the parser,
+/// requiring that what comes back is a refusal naming that key.
+///
+/// Two things are checked that a bare `Err(Parse(_))` would not. The
+/// misspelling has to have landed -- a `.replace` matching nothing leaves valid
+/// JSON, and the assertion would then be about a file nobody edited. And the
+/// refusal has to be *about* the key, because a parse error from some unrelated
+/// cause would satisfy `Err(Parse(_))` while the test read as though it had
+/// proved the field was guarded. That is the same defect shape this whole
+/// mechanism exists to refuse, one level up.
+fn refuses_the_misspelling(schema: Schema, kind: Trait, correct: &str, misspelled: &str) {
+    let json = recorded(schema, kind, "said".into()).to_json();
+    assert!(
+        json.contains(&format!("\"{correct}\"")),
+        "the serialized fixture has no {correct} key to misspell, so this test edits nothing"
+    );
+    let edited = json.replace(&format!("\"{correct}\""), &format!("\"{misspelled}\""));
+
+    match Regression::from_json(&edited) {
+        Err(CorpusError::Parse(source)) => {
+            let said = source.to_string();
+            assert!(
+                said.contains(&format!("unknown field `{misspelled}`")),
+                "the fixture was refused, but not for the misspelled key -- serde said {said:?}"
+            );
+        }
+        Ok(_) => panic!(
+            "{misspelled} parsed as though it were {correct}; the field was dropped and the \
+             fixture now tests something other than what it reads as"
+        ),
+        Err(other) => panic!("{misspelled} was refused for the wrong reason: {other}"),
+    }
+}
+
+#[test]
+fn a_misspelled_key_on_a_nested_schema_type_is_refused() {
+    // `decl_types` for `decl_type`. Dropped silently, the column becomes
+    // typeless -- which is a trait of its own with its own probe, so the
+    // fixture would still stand up, still run, and be about a different
+    // defect than the one its JSON reads as declaring.
+    refuses_the_misspelling(
+        cascade_lost(),
+        Trait::ForeignKeyWithAction,
+        "decl_type",
+        "decl_types",
+    );
+
+    // `trigger` for `triggers`, the other misspelling that is one character
+    // from the real key. Dropped, the table renders without its trigger and
+    // the Trigger case's probe reports a defect nobody introduced.
+    refuses_the_misspelling(
+        TraitCase::for_trait(Trait::Trigger).schema,
+        Trait::Trigger,
+        "triggers",
+        "trigger",
+    );
+}
+
+#[test]
+fn a_misspelled_key_inside_an_enum_variant_is_refused() {
+    // The nesting that container-level `deny_unknown_fields` has to reach
+    // *through* a variant to guard: `on_conflict` is a field of
+    // `ColumnConstraint::PrimaryKey`, not of any struct. If serde's attribute
+    // stopped at the enum, every struct variant in the model would still be an
+    // open door, and this is the only test that would notice.
+    //
+    // `on_conflict` rather than its siblings, and this is the part worth
+    // reading twice. Serde supplies `None` for a missing `Option` field
+    // whether or not anyone wrote `#[serde(default)]`, so this is the one
+    // field of the variant a misspelling drops in silence -- `autoincrement`
+    // is a `bool` and comes back as "missing field" on its own. Which is to
+    // say the attribute is load-bearing exactly where the model is optional,
+    // and `on_conflict` going missing is not a small loss: it is the whole of
+    // `Trait::ColumnOnConflict`, and it changes what an INSERT does to rows
+    // that are already there.
+    refuses_the_misspelling(
+        cascade_lost(),
+        Trait::ForeignKeyWithAction,
+        "on_conflict",
+        "on_conflcit",
+    );
+}
