@@ -282,12 +282,12 @@ impl SyncConfig {
     /// 3. The transfer strips it, because stripping honors `exclude_columns`
     ///    alone -- so the row is sent WITHOUT the one column that caused it to be
     ///    sent.
-    /// 4. The destination applies it. On the `INSERT OR REPLACE` backends
-    ///    (http-sql, and any adapter using `batch_sql::generate_batch_sql`) that
-    ///    is a DELETE+INSERT, so the destination's value for that column is
-    ///    NULLED rather than merely left stale. The native `ON CONFLICT DO
-    ///    UPDATE` path leaves it stale instead. Both lose the edit; one destroys
-    ///    the old value too.
+    /// 4. The destination applies it, without the column. On the
+    ///    `INSERT OR REPLACE` backends (http-sql, and any adapter using
+    ///    `batch_sql::generate_batch_sql`) that is a DELETE+INSERT, so the
+    ///    destination's value for that column is NULLED. The native apply path
+    ///    leaves what it already stored alone (#324). Either way the edit does
+    ///    not arrive.
     /// 5. `updated_at` did cross, so the timestamps now match. On the next sync
     ///    the hashes match and the timestamps tie, which resolves to `identical`.
     ///    The edit is gone permanently, and every step reported success.
