@@ -1,13 +1,19 @@
-//! forger's two error types, kept apart on purpose.
+//! forger's three error types, kept apart on purpose.
 //!
 //! [`ValidationError`] is a statement about a schema: it says the model
 //! describes something SQLite would reject, and it is produced before any
 //! database exists. [`ForgeError`] is a statement about a run.
+//! [`ProbeError`] is a statement about what a database did.
 //!
-//! The split matters downstream. A differential oracle has to tell "the
+//! The splits matter downstream. A differential oracle has to tell "the
 //! caller's transformation failed" apart from "the two schemas diverged", and
 //! a single flat error type collapses exactly that distinction --
 //! [`ForgeError::Transform`] is a separate matchable variant for that reason.
+//! It has to tell both of those apart from "the probe could not have observed
+//! anything either way", which is [`ProbeError::Unseeded`]: a probe whose
+//! precondition does not hold is not evidence of a healthy database, and
+//! reporting it as either a pass or a behavioural failure is a lie about what
+//! was measured.
 
 use thiserror::Error;
 
@@ -114,6 +120,33 @@ pub enum ValidationError {
 
     #[error("table {table:?} refines a referential action with no foreign key in front of it")]
     NoForeignKeyToRefine { table: String },
+}
+
+/// What a probe reports about the database in front of it.
+///
+/// Three variants and no more. Severity, context stacks and diff rendering are
+/// FR-FORGER-008's problem, and a probe that formats its own report is a probe
+/// whose message drifts from every other one.
+#[derive(Debug, Error)]
+pub enum ProbeError {
+    /// The construct did not do what the schema said it does. This is the
+    /// finding: the message names the observation, not the rule.
+    #[error("{0}")]
+    Failed(String),
+
+    /// The probe's precondition does not hold, so the assertion under it would
+    /// have been vacuous -- the seed did not run, or the connection is not in
+    /// the state the probe needs. Distinct from [`Failed`](Self::Failed)
+    /// because an empty database is green on every behavioural assertion ever
+    /// written, and "nothing to see" must never read as "nothing wrong".
+    #[error("nothing to observe: {0}")]
+    Unseeded(String),
+
+    /// SQLite refused a statement the probe did not expect it to refuse.
+    /// Statements a probe expects to fail are handled inline, so anything
+    /// reaching here is the probe itself being wrong about the database.
+    #[error("sqlite: {0}")]
+    Sqlite(#[from] rusqlite::Error),
 }
 
 /// Anything that can go wrong standing a fixture up or driving it.

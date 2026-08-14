@@ -291,6 +291,26 @@ pub enum Trait {
     DescendingPrimaryKey,
 }
 
+impl Trait {
+    /// Every variant, for iterating.
+    ///
+    /// Scaffolding, not enforcement: nothing stops a new variant from being
+    /// left out of this array. What cannot be left out is the seed and the
+    /// probe -- [`TraitCase::for_trait`](crate::registry::TraitCase::for_trait)
+    /// matches exhaustively, so a variant with no case fails to compile
+    /// whether or not it is listed here.
+    pub const ALL: [Trait; 8] = [
+        Trait::ForeignKeyWithAction,
+        Trait::GeneratedVirtual,
+        Trait::GeneratedStored,
+        Trait::ColumnOnConflict,
+        Trait::ExpressionDefault,
+        Trait::TypelessColumn,
+        Trait::Trigger,
+        Trait::DescendingPrimaryKey,
+    ];
+}
+
 impl Schema {
     /// Reject anything SQLite would reject. See [`validate`].
     pub fn validate(&self) -> Result<(), crate::error::ValidationError> {
