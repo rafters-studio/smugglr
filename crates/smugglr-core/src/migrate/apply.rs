@@ -1285,10 +1285,17 @@ fn lost_constructs(
         // which the three above can afford and this one cannot: MATCH is a
         // common substring, and a column named `match_id` would warn on every
         // rebuild. The scan skips string literals and comments and compares
-        // whole tokens, so only a bare keyword matches. It still cannot tell
-        // the FK clause from an FTS5 `MATCH` operator inside a CHECK, which is
-        // the over-approximation direction the rest of this function already
-        // takes: a spurious warning is recoverable, a silent drop is not.
+        // whole tokens, so a substring never matches and a quoted `"MATCH"`
+        // column is read as the identifier it is.
+        //
+        // What it still warns on, named rather than left to be discovered: a
+        // column named bare `match` (SQLite accepts it as an identifier), and
+        // an FTS5 `MATCH` operator inside a CHECK. Both are whole bare tokens
+        // and this scan cannot tell them from the FK clause. That is the
+        // over-approximation direction the rest of this function already takes,
+        // and the consequence is bounded -- a spurious `tracing::warn!` and no
+        // change to any DDL. A silent drop is not bounded, which is why the
+        // trade goes this way.
         if any_sql_identifier(sql, |quoted, token| {
             !quoted && token.eq_ignore_ascii_case("MATCH")
         }) {
