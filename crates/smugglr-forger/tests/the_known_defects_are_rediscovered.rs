@@ -95,8 +95,7 @@ use smugglr_forger::error::BoxError;
 use smugglr_forger::fixture::{Backing, Fixture, Route};
 use smugglr_forger::oracle::{differential, Divergence, Outcome, Report};
 use smugglr_forger::registry::TraitCase;
-use smugglr_forger::schema::builder::{schema, table};
-use smugglr_forger::schema::{ColumnType, ReferentialAction, Schema, Trait};
+use smugglr_forger::schema::{ReferentialAction, Schema, Trait};
 
 // ---------------------------------------------------------------------------
 // smugglr#341 -- the rebuild read five of the eight columns foreign_key_list
@@ -245,35 +244,37 @@ fn stored_ddl(fixture: &Fixture, table: &str) -> String {
 /// against a fixture stops the update cascading -- and the second half runs the
 /// oracle over a schema carrying that key and gets silence.
 ///
-/// The boundary's `ON UPDATE` line is derived: it is there because no case
-/// schema declares an `ON UPDATE` action. That derivation cannot tell a case
-/// that gained a key from a case that gained a *probe*, so the assertion below
-/// closes the gap from the other side -- declaring the action without reading it
-/// removes the line and turns this test red.
+/// The flipped form of a test that used to pin this as a blind spot.
+///
+/// It asserted that dropping `ON UPDATE CASCADE` went unreported, because the
+/// `ForeignKeyWithAction` case declared `ON DELETE` actions only and its probe
+/// read `fk.on_delete`. smugglr#374 gave the case an `ON UPDATE CASCADE` key on
+/// its own parent and the probe an arm that moves that key, so the same
+/// transformation is now caught. The boundary assertion is kept and inverted:
+/// the claim has to be gone, and gone because a probe earned it.
 #[test]
-fn smugglr_341_a_dropped_on_update_action_is_not_rediscovered() {
+fn smugglr_341_an_on_update_action_is_rediscovered() {
     assert!(
-        Boundary::of_this_build()
+        !Boundary::of_this_build()
             .undeclared_on_update()
             .contains(&ReferentialAction::Cascade),
-        "the boundary no longer claims ON UPDATE CASCADE goes unexercised, and the run below \
-         still shows the loss going unreported. A case schema that declares the action without a \
-         probe that reads it takes the claim away and leaves the blind spot open"
+        "the boundary still claims ON UPDATE CASCADE goes unexercised, but the run below reports \
+         the loss. The claim and the coverage have come apart -- one of them is lying"
     );
-
-    const SEED: &str = r#"
-        INSERT INTO "updating_keeper" ("id", "label") VALUES (1, 'renumbered');
-        INSERT INTO "updating_child" ("id", "keeper_id", "label") VALUES (10, 1, 'follows');
-    "#;
 
     // What the loss does, shown against a fixture rather than argued for:
     // whether the parent key could move at all, and whether the child followed.
+    // Kept from the blind-spot version, because the premise it establishes is
+    // what makes the oracle's report below meaningful rather than circular.
     let moving_the_parent_key = |ddl: Option<&str>| -> (bool, i64) {
         let mut fixture = Fixture::new(Backing::Memory).expect("fixture");
         fixture
-            .bring_to(Route::Schema(&every_trait_plus_an_on_update_key()))
+            .bring_to(Route::Schema(&every_trait()))
             .expect("the schema stands up");
-        fixture.conn().execute_batch(SEED).expect("the seed lands");
+        fixture
+            .conn()
+            .execute_batch(ON_UPDATE_SEED)
+            .expect("the seed lands");
         if let Some(ddl) = ddl {
             fixture
                 .conn()
@@ -307,7 +308,7 @@ fn smugglr_341_a_dropped_on_update_action_is_not_rediscovered() {
          on the ON UPDATE side"
     );
 
-    let schema = every_trait_plus_an_on_update_key();
+    let schema = every_trait();
     let report = differential(
         Backing::Memory,
         &schema,
@@ -321,12 +322,20 @@ fn smugglr_341_a_dropped_on_update_action_is_not_rediscovered() {
     .expect("the transformation runs");
 
     assert_baseline_is_sound(&report);
-    assert_eq!(
-        report.divergences(),
-        Vec::new(),
-        "if this ever reports, ON UPDATE has gained a probe and this file's docs are now wrong"
-    );
+    assert_broke(&report, Trait::ForeignKeyWithAction);
+    assert_only_these_diverged(&report, &[Trait::ForeignKeyWithAction]);
 }
+
+/// The rows the ON UPDATE demonstration above moves.
+///
+/// Its own seed rather than the registry's: the demonstration builds a bare
+/// schema and asserts on ids 1 and 2, while the case's seed uses its own key
+/// values for the same tables. Sharing one would couple a hand-written
+/// assertion to a constant that exists for a different reason.
+const ON_UPDATE_SEED: &str = r#"
+    INSERT INTO "updating_keeper" ("id", "label") VALUES (1, 'renumbered');
+    INSERT INTO "updating_child" ("id", "keeper_id", "label") VALUES (10, 1, 'follows');
+"#;
 
 /// The rebuild from the test above, kept next to the schema it is about.
 const DROPS_THE_ON_UPDATE_ACTION: &str = r#"
@@ -725,39 +734,6 @@ fn every_trait() -> Schema {
     }
     all.validate()
         .expect("the union of the case schemas is one SQLite would accept");
-    all
-}
-
-/// The union, plus a key carrying the referential action no probe reads.
-///
-/// Its own parent rather than the registry's: the `ForeignKeyWithAction` probe
-/// deletes `keeper.id = 1` before anything else runs, and another child pinning
-/// that row would make the cascade probe fail in both arms -- an unsound
-/// baseline dressed up as a silent report. Plain in every other respect, so it
-/// stays invisible to the probes that resolve their target by reading the
-/// schema.
-fn every_trait_plus_an_on_update_key() -> Schema {
-    let extra = schema()
-        .table(
-            table("updating_keeper")
-                .pk_int("id")
-                .col("label", ColumnType::Text, []),
-        )
-        .table(
-            table("updating_child")
-                .pk_int("id")
-                .col("keeper_id", ColumnType::Integer, [])
-                .col("label", ColumnType::Text, [])
-                .fk(["keeper_id"], "updating_keeper", ["id"])
-                .on_update(ReferentialAction::Cascade),
-        )
-        .build()
-        .expect("the ON UPDATE schema is valid");
-
-    let mut all = every_trait();
-    all.tables.extend(extra.tables);
-    all.validate()
-        .expect("the union still is one SQLite would accept");
     all
 }
 

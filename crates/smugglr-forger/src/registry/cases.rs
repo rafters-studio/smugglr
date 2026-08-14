@@ -45,6 +45,10 @@ const LABEL: &str = "label";
 const DOOMED: i64 = 1;
 /// The parent row an `ON DELETE RESTRICT` child is expected to pin in place.
 const PROTECTED: i64 = 2;
+/// The parent key `ON UPDATE CASCADE` is expected to let move.
+const RENUMBERED: i64 = 30;
+/// Where that key is expected to move to, and where its child should follow.
+const RENUMBERED_TO: i64 = 31;
 
 pub(super) fn foreign_key_with_action() -> TraitCase {
     let schema = schema()
@@ -65,6 +69,22 @@ pub(super) fn foreign_key_with_action() -> TraitCase {
                 .fk(["keeper_id"], "keeper", [KEY])
                 .on_delete(ReferentialAction::Restrict),
         )
+        // The ON UPDATE key gets its own parent rather than sharing `keeper`.
+        // The ON DELETE arm below removes `keeper.id = DOOMED` and tries to
+        // remove `keeper.id = PROTECTED`, and a third child hanging off either
+        // row would make the update arm depend on which arm ran first -- or pin
+        // a row the RESTRICT assertion expects to be pinned by something else.
+        // Separate parents make the two arms independent by construction rather
+        // than by ordering (#374).
+        .table(table("updating_keeper").pk_int(KEY).col(LABEL, Text, []))
+        .table(
+            table("updating_child")
+                .pk_int(KEY)
+                .col("keeper_id", Integer, [])
+                .col(LABEL, Text, [])
+                .fk(["keeper_id"], "updating_keeper", [KEY])
+                .on_update(ReferentialAction::Cascade),
+        )
         .build()
         .expect("the ForeignKeyWithAction case schema is valid");
 
@@ -79,7 +99,11 @@ pub(super) fn foreign_key_with_action() -> TraitCase {
                  INSERT INTO \"cascade_child\" (\"{KEY}\", \"keeper_id\", \"{LABEL}\") \
                    VALUES (10, {DOOMED}, 'first'), (11, {DOOMED}, 'second');
                  INSERT INTO \"restrict_child\" (\"{KEY}\", \"keeper_id\", \"{LABEL}\") \
-                   VALUES (20, {PROTECTED}, 'only');"
+                   VALUES (20, {PROTECTED}, 'only');
+                 INSERT INTO \"updating_keeper\" (\"{KEY}\", \"{LABEL}\") \
+                   VALUES ({RENUMBERED}, 'its key moves and its child follows');
+                 INSERT INTO \"updating_child\" (\"{KEY}\", \"keeper_id\", \"{LABEL}\") \
+                   VALUES (40, {RENUMBERED}, 'follows');"
             ))?;
             Ok(())
         },
@@ -92,12 +116,15 @@ fn probe_foreign_key_with_action(schema: &Schema, conn: &Connection) -> Result<(
 
     let cascading = children_with(schema, ReferentialAction::Cascade);
     let restricting = children_with(schema, ReferentialAction::Restrict);
-    if cascading.is_empty() || restricting.is_empty() {
+    let updating = children_updating_with(schema, ReferentialAction::Cascade);
+    if cascading.is_empty() || restricting.is_empty() || updating.is_empty() {
         return Err(ProbeError::Failed(format!(
-            "the schema handed to this probe declares {} ON DELETE CASCADE and {} ON DELETE \
-             RESTRICT foreign keys, and the probe needs one of each to have anything to assert",
+            "the schema handed to this probe declares {} ON DELETE CASCADE, {} ON DELETE RESTRICT \
+             and {} ON UPDATE CASCADE foreign keys, and the probe needs one of each to have \
+             anything to assert",
             cascading.len(),
-            restricting.len()
+            restricting.len(),
+            updating.len()
         )));
     }
 
@@ -212,12 +239,97 @@ fn probe_foreign_key_with_action(schema: &Schema, conn: &Connection) -> Result<(
         }
     }
 
+    // ON UPDATE CASCADE, on its own parent, so nothing above has touched the
+    // rows this arm reads. The delete arm resolves its parent from the ON
+    // DELETE key and this one from the ON UPDATE key, and the case declares
+    // them on different tables (#374).
+    let (moving, moving_key) = parent_of(updating[0].1)?;
+    for (child, fk) in &updating {
+        let child_column = child_column_of(fk)?;
+        let rows = count(
+            conn,
+            &format!(
+                "SELECT count(*) FROM {} WHERE {} = {RENUMBERED}",
+                quote(&child.name),
+                quote(child_column)
+            ),
+        )?;
+        if rows == 0 {
+            return Err(ProbeError::Unseeded(format!(
+                "{} has no row referencing {moving}.{moving_key} = {RENUMBERED}, so moving that \
+                 key would prove nothing either way",
+                child.name
+            )));
+        }
+    }
+
+    // Both halves are load-bearing and they fail differently. With the action
+    // dropped the parent key cannot move at all -- the UPDATE is refused by the
+    // key it still has -- so asserting only that the child followed would report
+    // a cascade failure for an update that never happened.
+    let moved = conn.execute(
+        &format!(
+            "UPDATE {} SET {} = {RENUMBERED_TO} WHERE {} = {RENUMBERED}",
+            quote(moving),
+            quote(moving_key),
+            quote(moving_key)
+        ),
+        [],
+    );
+    if let Err(error) = moved {
+        return Err(ProbeError::Failed(format!(
+            "moving {moving}.{moving_key} from {RENUMBERED} to {RENUMBERED_TO} was refused \
+             ({error}), and a child declared ON UPDATE CASCADE does not refuse it -- the action \
+             was reconstructed as something else, or dropped, which leaves NO ACTION"
+        )));
+    }
+    for (child, fk) in &updating {
+        let child_column = child_column_of(fk)?;
+        let followed = count(
+            conn,
+            &format!(
+                "SELECT count(*) FROM {} WHERE {} = {RENUMBERED_TO}",
+                quote(&child.name),
+                quote(child_column)
+            ),
+        )?;
+        if followed != 1 {
+            return Err(ProbeError::Failed(format!(
+                "{followed} row(s) of {} reference {moving}.{moving_key} = {RENUMBERED_TO} after \
+                 that key moved from {RENUMBERED}; ON UPDATE CASCADE did not carry the child over",
+                child.name
+            )));
+        }
+    }
+
     Ok(())
 }
 
 /// Foreign keys in the schema whose `ON DELETE` is this action, with the table
 /// that declares them.
 fn children_with(schema: &Schema, action: ReferentialAction) -> Vec<(&Table, &ForeignKey)> {
+    children_where(schema, move |fk| fk.on_delete == Some(action))
+}
+
+/// Foreign keys in the schema whose `ON UPDATE` is this action, with the table
+/// that declares them.
+fn children_updating_with(
+    schema: &Schema,
+    action: ReferentialAction,
+) -> Vec<(&Table, &ForeignKey)> {
+    children_where(schema, move |fk| fk.on_update == Some(action))
+}
+
+/// The shared walk behind [`children_with`] and [`children_updating_with`].
+///
+/// Both arms resolve their targets by reading the schema rather than naming
+/// tables, so a case that gains or renames a key is picked up without editing
+/// the probe -- and so a schema handed in with the action missing yields an
+/// empty set the probe can refuse on, instead of silently probing nothing.
+fn children_where<'s>(
+    schema: &'s Schema,
+    matches: impl Fn(&ForeignKey) -> bool + Copy + 's,
+) -> Vec<(&'s Table, &'s ForeignKey)> {
     schema
         .tables
         .iter()
@@ -226,9 +338,7 @@ fn children_with(schema: &Schema, action: ReferentialAction) -> Vec<(&Table, &Fo
                 .constraints
                 .iter()
                 .filter_map(move |constraint| match constraint {
-                    TableConstraint::ForeignKey(fk) if fk.on_delete == Some(action) => {
-                        Some((table, fk))
-                    }
+                    TableConstraint::ForeignKey(fk) if matches(fk) => Some((table, fk)),
                     _ => None,
                 })
         })
