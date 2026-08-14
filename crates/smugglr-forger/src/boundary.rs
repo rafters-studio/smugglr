@@ -21,9 +21,11 @@
 //!   [`Backing`], and a new backing does not compile until [`path_of`] says
 //!   which path it drives -- at which point that path leaves this list without
 //!   anyone editing prose.
-//! * The **referential action** lines are [`ReferentialAction::ALL`] minus what
-//!   the registry's case schemas actually declare. Declaring `ON UPDATE
-//!   CASCADE` in a case removes the `ON UPDATE` line by itself.
+//! * The **referential action** lines are the actions a schema can declare --
+//!   [`ReferentialAction::ALL`] without the `NO ACTION` default, for the reason
+//!   [`declarable`] gives -- minus what the registry's case schemas actually
+//!   declare. Declaring `ON UPDATE CASCADE` in a case removes the `ON UPDATE`
+//!   line by itself.
 //! * The **unrenderable** line asks [`quote`] what it does with an ordinary
 //!   identifier. It is there because that function double-quotes
 //!   unconditionally; a `quote` that emitted a bare name where SQLite allows one
@@ -83,9 +85,15 @@ use crate::registry::TraitCase;
 use crate::schema::ddl::quote;
 use crate::schema::{ForeignKey, ReferentialAction, TableConstraint, Trait};
 
-/// An identifier with nothing about it that needs quoting. What [`quote`] does
-/// to this one is what it does to every name forger renders.
-const PLAIN_IDENTIFIER: &str = "plain";
+/// The kind of identifier smugglr#340 needs rendered bare.
+///
+/// Non-ASCII rather than a plain word on purpose. A [`quote`] that went
+/// conditional -- bare where the name is a safe ASCII identifier, quoted
+/// otherwise -- would retract the `unrenderable` line while forger still could
+/// not stage that defect's input, which is a false retraction in the unsafe
+/// direction. Asking about this name asks the question the line is actually
+/// about.
+const NON_ASCII_IDENTIFIER: &str = "naïve";
 
 // ---------------------------------------------------------------------------
 // Execution paths
@@ -323,7 +331,11 @@ impl Boundary {
                 ),
             });
         }
-        if on_update.len() == ReferentialAction::ALL.len() {
+        // The emphatic form only where *nothing* is declared. Counted against
+        // the declarable set rather than against ReferentialAction::ALL, which
+        // would never be reached and would silently demote this to the list
+        // form below.
+        if on_update.len() == declarable().len() {
             lines.push(Unexercised {
                 subject: Subject::OnUpdate,
                 statement: "every action. No case declares one and no probe reads one, so a \
@@ -361,10 +373,10 @@ impl Boundary {
         });
 
         // The renderer, asked rather than assumed.
-        if quote(PLAIN_IDENTIFIER) != PLAIN_IDENTIFIER {
+        if quote(NON_ASCII_IDENTIFIER) != NON_ASCII_IDENTIFIER {
             lines.push(Unexercised {
                 subject: Subject::Unrenderable,
-                statement: "a bare or single-quoted identifier -- ddl::quote always \
+                statement: "a bare non-ASCII or single-quoted identifier -- ddl::quote always \
                             double-quotes. smugglr#340."
                     .to_string(),
             });
@@ -483,9 +495,27 @@ fn declared_actions() -> (BTreeSet<ReferentialAction>, BTreeSet<ReferentialActio
     (on_delete, on_update)
 }
 
-/// [`ReferentialAction::ALL`] minus what was declared.
-fn undeclared(declared: &BTreeSet<ReferentialAction>) -> BTreeSet<ReferentialAction> {
+/// The actions a schema can declare, and that a rebuild can therefore drop.
+///
+/// [`ReferentialAction::NoAction`] is not one of them. It is what a key with no
+/// clause already means, so "no case schema declares NO ACTION" describes the
+/// state every undecorated key in the registry is already in rather than a gap
+/// -- and on the `ON DELETE` side it is worse than useless: the `RESTRICT` half
+/// of `probe_foreign_key_with_action` asserts that the protected parent survives
+/// its delete, which *is* the NO ACTION behaviour, since the two are
+/// indistinguishable under immediate enforcement. Reporting it as unexercised
+/// made two lines of this boundary contradict each other, which is the defect
+/// this module exists to prevent, arriving inside the module itself.
+fn declarable() -> Vec<ReferentialAction> {
     ReferentialAction::ALL
+        .into_iter()
+        .filter(|action| *action != ReferentialAction::NoAction)
+        .collect()
+}
+
+/// The declarable actions minus what was declared.
+fn undeclared(declared: &BTreeSet<ReferentialAction>) -> BTreeSet<ReferentialAction> {
+    declarable()
         .into_iter()
         .filter(|action| !declared.contains(action))
         .collect()
@@ -572,7 +602,7 @@ mod tests {
         );
         assert_eq!(
             boundary.undeclared_on_update(),
-            &BTreeSet::from(ReferentialAction::ALL),
+            &declarable().into_iter().collect::<BTreeSet<_>>(),
             "no case schema declares an ON UPDATE action of any kind. A case that starts \
              declaring one changes this set, and the test in \
              the_known_defects_are_rediscovered.rs that pins the ON UPDATE blind spot goes red \
@@ -623,7 +653,10 @@ mod tests {
     /// The unrenderable line asks the renderer rather than asserting about it.
     #[test]
     fn the_unrenderable_line_is_what_quote_does() {
-        assert_eq!(quote(PLAIN_IDENTIFIER), format!("\"{PLAIN_IDENTIFIER}\""));
+        assert_eq!(
+            quote(NON_ASCII_IDENTIFIER),
+            format!("\"{NON_ASCII_IDENTIFIER}\"")
+        );
         assert!(Boundary::of_this_build()
             .statement(Subject::Unrenderable)
             .expect("quote double-quotes unconditionally, so the line is there")
