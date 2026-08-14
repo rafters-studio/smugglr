@@ -1282,8 +1282,19 @@ fn lost_constructs(
     //
     // The dropped column is excluded: a generated column that is itself being
     // dropped is going away on purpose and is not a loss to warn about.
+    //
+    // Compared case-insensitively because SQLite identifiers are, and the two
+    // sides come from different places -- `name` from the pragma, which echoes
+    // the declared spelling, and `column` from a manifest somebody wrote by
+    // hand. A byte comparison warns that `"v"` was lost while dropping `"V"`.
+    //
+    // Unreachable through `apply` today, and that is a defect rather than a
+    // reason to drop the guard: `drop_column`'s idempotence precheck reads
+    // `PRAGMA table_info`, which cannot see a generated column, so asking to
+    // drop one is a silent successful no-op that never reaches this function.
+    // Same `table_info` blindness as #342 itself, one call earlier. Filed.
     for (name, storage) in generated_columns(conn, table)? {
-        if name != column {
+        if !name.eq_ignore_ascii_case(column) {
             lost.push(format!("generated column {name:?} ({storage})"));
         }
     }
@@ -1353,8 +1364,15 @@ fn lost_constructs(
 /// What it does **not** give is the generation expression -- that is in no
 /// pragma, only in `sqlite_master.sql`. So this makes the loss detectable and
 /// does nothing toward making it recoverable.
+///
+/// `pub(super)` so [`reverse`](crate::migrate::reverse) shares it rather than
+/// keeping its own copy. Both need the same answer for opposite reasons --
+/// `reverse` to keep generated columns *out of a projection*, since writing to
+/// one is an error, and this module to name them in a warning -- and two
+/// private copies of "which `hidden` values mean generated" is one rule that
+/// can drift into two.
 #[cfg(feature = "native")]
-fn generated_columns(
+pub(super) fn generated_columns(
     conn: &Connection,
     table: &str,
 ) -> Result<Vec<(String, &'static str)>, MigrateError> {
@@ -2455,11 +2473,24 @@ mod tests {
             );
         }
 
-        /// The column being dropped is not reported as a loss.
+        /// The column being dropped is not reported as a loss, in either
+        /// casing.
         ///
         /// Dropping a generated column on purpose is the operator's request,
         /// not a construct the rebuild failed to carry, and warning about it
-        /// would train them to ignore the warning.
+        /// would train them to ignore the warning. The casing half is not
+        /// decoration: `name` comes from the pragma and `column` from a
+        /// hand-written manifest, SQLite identifiers are case-insensitive, and
+        /// a byte comparison warns that `"v"` was lost while dropping `"V"`.
+        ///
+        /// **This calls `lost_constructs` directly because `apply` cannot
+        /// currently reach it with a generated column named.** `drop_column`'s
+        /// idempotence precheck reads `PRAGMA table_info`, which does not see
+        /// generated columns, so `DROP COLUMN` on one is a silent successful
+        /// no-op that never gets as far as a rebuild -- the same `table_info`
+        /// blindness as #342, one call earlier, filed separately. So this test
+        /// pins a guard that is correct and presently unreachable, and says so
+        /// rather than reading as coverage of a path that runs.
         #[test]
         fn a_generated_column_being_dropped_is_not_a_warned_loss() {
             let conn = mem();
@@ -2473,11 +2504,13 @@ mod tests {
             )
             .unwrap();
             let sql = table_sql(&conn, "t").unwrap();
-            let lost = lost_constructs(&conn, "t", "v", sql.as_deref(), &[]).unwrap();
-            assert!(
-                !lost.iter().any(|l| l.contains("generated column")),
-                "the dropped column is not a loss: {lost:?}"
-            );
+            for spelling in ["v", "V"] {
+                let lost = lost_constructs(&conn, "t", spelling, sql.as_deref(), &[]).unwrap();
+                assert!(
+                    !lost.iter().any(|l| l.contains("generated column")),
+                    "dropping {spelling:?} must not report the column being dropped: {lost:?}"
+                );
+            }
         }
 
         /// An ordinary table produces no generated-column warning.
@@ -2486,6 +2519,11 @@ mod tests {
         /// got wrong: `table_xinfo` answers structurally, so a column named
         /// `generated` or a `CHECK` mentioning `AS` cannot produce a false
         /// positive the way `contains("GENERATED")` would.
+        ///
+        /// The table therefore carries both spellings for real rather than in
+        /// prose -- a column literally named `generated`, and a `CHECK` whose
+        /// text contains `AS` -- because a test whose doc comment claims an
+        /// input it does not have is the drift this file keeps finding.
         #[test]
         fn an_ordinary_table_reports_no_generated_column() {
             let conn = mem();
@@ -2493,7 +2531,7 @@ mod tests {
                 "CREATE TABLE t (
                      id INTEGER PRIMARY KEY,
                      generated TEXT,
-                     n INTEGER CHECK (n > 0),
+                     n INTEGER CHECK (CAST(n AS TEXT) <> ''),
                      code TEXT UNIQUE
                  );",
             )

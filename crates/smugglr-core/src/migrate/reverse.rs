@@ -287,24 +287,20 @@ fn primary_key(info: &[ColRow]) -> Vec<String> {
     pk.into_iter().map(|c| c.name.clone()).collect()
 }
 
-/// The generated (`GENERATED ALWAYS AS`) column names of a table, via
-/// `PRAGMA table_xinfo`'s `hidden` flag (`2` = virtual, `3` = stored). A rebuild
+/// The generated (`GENERATED ALWAYS AS`) column names of a table. A rebuild
 /// must never project into these -- inserting a value into a generated column is
 /// an error; they self-populate from the copied base columns.
+///
+/// The `PRAGMA table_xinfo` walk itself lives in
+/// [`apply`](crate::migrate::apply), which needs the same answer with the
+/// storage class attached in order to name the loss in a warning (#342). This
+/// module only needs the names, and asking the shared one keeps a single
+/// statement of which `hidden` values mean generated.
 #[cfg(feature = "native")]
 fn generated_columns(conn: &Connection, table: &str) -> Result<Vec<String>, MigrateError> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_xinfo({})", quote_ident(table)))?;
-    let rows = stmt
-        .query_map([], |r| {
-            let name: String = r.get(1)?;
-            let hidden: i64 = r.get(6)?;
-            Ok((name, hidden))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows
+    Ok(crate::migrate::apply::generated_columns(conn, table)?
         .into_iter()
-        .filter(|(_, hidden)| *hidden == 2 || *hidden == 3)
-        .map(|(name, _)| name)
+        .map(|(name, _storage)| name)
         .collect())
 }
 
