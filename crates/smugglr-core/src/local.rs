@@ -1,5 +1,6 @@
 //! Local SQLite database operations
 
+use crate::config::DuplicatePkPolicy;
 use crate::datasource::{ColumnInfo, DataSource, RowMeta, TableInfo};
 use crate::error::{Result, SyncError};
 use crate::table::TableSchema;
@@ -13,11 +14,30 @@ use tracing::{debug, info, warn};
 /// Wrapper for local SQLite database
 pub struct LocalDb {
     conn: Mutex<Connection>,
+    /// What a duplicate rendered `__pk` means when building row metadata.
+    ///
+    /// A field rather than a [`DataSource::get_row_metadata`] parameter: that
+    /// method is also the plugin-SDK wire contract (`table`, `timestamp_column`,
+    /// `exclude_columns` are decoded from a JSON-RPC request), so widening it
+    /// would be a plugin protocol change for every implementor. Defaults to
+    /// [`DuplicatePkPolicy::Refuse`] so a `LocalDb` opened without config is
+    /// safe by default; the CLI overrides it from `[sync].duplicate_pk` via
+    /// [`LocalDb::with_duplicate_pk`].
+    duplicate_pk: DuplicatePkPolicy,
 }
 
 impl LocalDb {
     pub(crate) fn conn(&self) -> MutexGuard<'_, Connection> {
         self.conn.lock().expect("mutex poisoned")
+    }
+
+    /// Set the duplicate-`__pk` policy from `[sync].duplicate_pk`.
+    ///
+    /// Chainable at the open site so `open`/`open_readonly` keep their
+    /// signatures and every caller that does not care keeps the safe default.
+    pub fn with_duplicate_pk(mut self, policy: DuplicatePkPolicy) -> Self {
+        self.duplicate_pk = policy;
+        self
     }
 
     /// Open a local SQLite database
@@ -29,6 +49,7 @@ impl LocalDb {
 
         Ok(Self {
             conn: Mutex::new(conn),
+            duplicate_pk: DuplicatePkPolicy::default(),
         })
     }
 
@@ -41,6 +62,7 @@ impl LocalDb {
 
         Ok(Self {
             conn: Mutex::new(conn),
+            duplicate_pk: DuplicatePkPolicy::default(),
         })
     }
 
@@ -113,7 +135,13 @@ impl DataSource for LocalDb {
         exclude_columns: &[String],
     ) -> Result<HashMap<String, RowMeta>> {
         let conn = self.conn();
-        get_row_metadata_inner(&conn, table, timestamp_column, exclude_columns)
+        get_row_metadata_inner(
+            &conn,
+            table,
+            timestamp_column,
+            exclude_columns,
+            self.duplicate_pk,
+        )
     }
 
     async fn get_rows(
@@ -196,6 +224,7 @@ fn get_row_metadata_inner(
     table: &str,
     timestamp_column: &str,
     exclude_columns: &[String],
+    duplicate_pk: DuplicatePkPolicy,
 ) -> Result<HashMap<String, RowMeta>> {
     let info = table_info_inner(conn, table)?;
     let pk_cols = &info.primary_key;
@@ -222,7 +251,7 @@ fn get_row_metadata_inner(
     debug!("Executing: {}", sql);
 
     let mut stmt = conn.prepare(&sql)?;
-    let mut result = HashMap::new();
+    let mut result: HashMap<String, RowMeta> = HashMap::new();
 
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
@@ -260,21 +289,27 @@ fn get_row_metadata_inner(
             None
         };
 
-        if let Some(prev) = result.insert(
+        // Two rows rendering the same PK text means the PK is not unique as
+        // encoded, so the map can keep only one of them. Checked BEFORE the
+        // insert, not after: under `Refuse` this returns while the metadata map
+        // is still being built, which is upstream of the diff and of every
+        // write, so no row is upserted (#269).
+        if let Some(prev) = result.get(&pk_value) {
+            if let Some(message) =
+                duplicate_pk.check(table, &pk_value, &prev.content_hash, &content_hash)?
+            {
+                warn!("{}", message);
+            }
+        }
+
+        result.insert(
             pk_value.clone(),
             RowMeta {
                 pk_value: pk_value.clone(),
                 updated_at,
                 content_hash,
             },
-        ) {
-            // Two rows rendering to the same PK text means the PK is not unique
-            // as encoded -- the metadata map silently lost `prev`. Surface it.
-            warn!(
-                "duplicate primary key {} in {} -- a row was overwritten in change metadata (prev hash {})",
-                pk_value, table, prev.content_hash
-            );
-        }
+        );
     }
 
     debug!("Got {} rows from {}", result.len(), table);
@@ -654,6 +689,137 @@ mod tests {
 
     /// A table shaped like legion's: an ordering key that is the max over three
     /// columns, one of which (`deleted_at`) is NULL on every live row.
+    /// A table holding two DISTINCT rows whose `__pk` renders identically.
+    ///
+    /// The column is declared `BLOB`, so it has SQLite affinity NONE and stores
+    /// each value in the storage class it arrives as. The integer `1` and the
+    /// text `'1'` are different values to the primary-key unique index (SQLite
+    /// orders INTEGER before TEXT, so they never compare equal), which is why
+    /// SQLite accepts both -- but `pk_text_expr` renders a single-column PK as
+    /// `CAST(col AS TEXT)`, and both cast to `"1"`.
+    ///
+    /// This is the real cross-node shape, not a contrivance: node A minted the
+    /// key as a number and node B minted the same key as a string, so the two
+    /// nodes hold different logical rows under one `__pk`. Composite PKs cannot
+    /// reach this state -- `pk_text_expr` escapes the delimiter and is injective.
+    fn colliding_pk_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE items (
+                 id BLOB PRIMARY KEY,
+                 name TEXT,
+                 updated_at TEXT
+             );
+             INSERT INTO items VALUES (1, 'alice', '2026-01-01');
+             INSERT INTO items VALUES ('1', 'bob', '2026-01-02');",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn duplicate_pk_refuses_by_default() {
+        // #269: the default policy stops the sync. Before this, the second row
+        // silently evicted the first from the metadata map and the sync
+        // continued -- the evicted row then read as a row to delete.
+        let conn = colliding_pk_conn();
+
+        let err =
+            get_row_metadata_inner(&conn, "items", "updated_at", &[], DuplicatePkPolicy::Refuse)
+                .expect_err("two rows rendering __pk '1' must refuse under the default policy");
+
+        match err {
+            SyncError::DuplicatePrimaryKey {
+                table,
+                pk,
+                first_hash,
+                second_hash,
+            } => {
+                assert_eq!(table, "items");
+                assert_eq!(pk, "1");
+                // Both hashes must be present and distinct: they are what lets an
+                // operator tell WHICH two rows collided. Reporting one (or the
+                // same one twice) would name the collision without locating it.
+                assert_ne!(
+                    first_hash, second_hash,
+                    "the two colliding rows differ, so their content hashes must differ"
+                );
+                assert!(!first_hash.is_empty() && !second_hash.is_empty());
+            }
+            other => panic!("expected DuplicatePrimaryKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_pk_refusal_names_both_rows_in_its_message() {
+        // The rendered message is the whole remedy surface -- an operator with
+        // only "duplicate primary key" cannot find the two rows. Pin that the
+        // table, the key, and both hashes reach the text a user actually sees.
+        let conn = colliding_pk_conn();
+        let err =
+            get_row_metadata_inner(&conn, "items", "updated_at", &[], DuplicatePkPolicy::Refuse)
+                .expect_err("must refuse");
+        let (first, second) = match &err {
+            SyncError::DuplicatePrimaryKey {
+                first_hash,
+                second_hash,
+                ..
+            } => (first_hash.clone(), second_hash.clone()),
+            other => panic!("expected DuplicatePrimaryKey, got {other:?}"),
+        };
+
+        let msg = err.to_string();
+        assert!(msg.contains("items"), "message must name the table: {msg}");
+        assert!(msg.contains('1'), "message must name the key: {msg}");
+        assert!(
+            msg.contains(&first),
+            "message must carry both hashes: {msg}"
+        );
+        assert!(
+            msg.contains(&second),
+            "message must carry both hashes: {msg}"
+        );
+    }
+
+    #[test]
+    fn duplicate_pk_warn_policy_keeps_the_previous_behavior() {
+        // The escape hatch: `warn` restores pre-#269 overwrite-and-continue, so
+        // a deployment that cannot re-key immediately is not hard-stopped. The
+        // map keeps ONE entry for the colliding key -- that is the data loss the
+        // default now refuses, made explicit here so nobody reads `warn` as safe.
+        let conn = colliding_pk_conn();
+
+        let meta =
+            get_row_metadata_inner(&conn, "items", "updated_at", &[], DuplicatePkPolicy::Warn)
+                .expect("warn policy must not stop the sync");
+
+        assert_eq!(
+            meta.len(),
+            1,
+            "warn keeps the old behavior: the colliding rows collapse onto one entry"
+        );
+        assert!(meta.contains_key("1"));
+    }
+
+    #[test]
+    fn distinct_pks_are_unaffected_by_the_refusal() {
+        // Guard against over-refusing: the default policy must be invisible to
+        // every table whose keys are actually unique, which is all of them.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE items (id TEXT PRIMARY KEY, name TEXT, updated_at TEXT);
+             INSERT INTO items VALUES ('a', 'alice', '2026-01-01');
+             INSERT INTO items VALUES ('b', 'bob', '2026-01-02');",
+        )
+        .unwrap();
+
+        let meta =
+            get_row_metadata_inner(&conn, "items", "updated_at", &[], DuplicatePkPolicy::Refuse)
+                .expect("unique keys must not refuse");
+
+        assert_eq!(meta.len(), 2);
+    }
+
     fn ordered_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -1070,14 +1236,28 @@ mod tests {
             [],
         )
         .unwrap();
-        let before = get_row_metadata_inner(&conn, "rows_t", "updated_at", &[]).unwrap();
+        let before = get_row_metadata_inner(
+            &conn,
+            "rows_t",
+            "updated_at",
+            &[],
+            DuplicatePkPolicy::default(),
+        )
+        .unwrap();
 
         conn.execute(
             "UPDATE rows_t SET deleted_at = '2026-06-01' WHERE id = 'a'",
             [],
         )
         .unwrap();
-        let after = get_row_metadata_inner(&conn, "rows_t", "updated_at", &[]).unwrap();
+        let after = get_row_metadata_inner(
+            &conn,
+            "rows_t",
+            "updated_at",
+            &[],
+            DuplicatePkPolicy::default(),
+        )
+        .unwrap();
 
         assert_ne!(
             before["a"].content_hash, after["a"].content_hash,

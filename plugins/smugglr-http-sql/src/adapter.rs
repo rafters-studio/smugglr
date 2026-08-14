@@ -3,6 +3,8 @@
 use crate::profile::{AuthFormat, Profile};
 use reqwest::Client;
 use serde_json::Value;
+use smugglr_core::config::DuplicatePkPolicy;
+use smugglr_core::error::SyncError;
 use smugglr_plugin_sdk::{ColumnInfo, PluginAdapter, PluginError, RowMeta, TableInfo};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -275,13 +277,20 @@ impl PluginAdapter for HttpSqlAdapter {
         // Canonicalize BLOB columns (base64 on the wire) to the lowercase hex the
         // content hash pins, so blob columns converge with the native path (#292).
         canonicalize_row_blobs(&mut maps, &info);
-        Ok(build_row_metadata(
+        // The `[sync].duplicate_pk` knob is host-side config; the plugin wire
+        // request carries only (table, timestamp_column, exclude_columns), so
+        // the plugin always takes the safe default and refuses (#269). The
+        // refusal crosses back as a non-transient PluginError, which the host
+        // surfaces as SyncError::Plugin carrying this same message text.
+        build_row_metadata(
             &maps,
             &column_order,
             timestamp_column,
             exclude_columns,
             table,
-        ))
+            DuplicatePkPolicy::default(),
+        )
+        .map_err(|e| PluginError::new(e.to_string()))
     }
 
     async fn get_rows(
@@ -401,8 +410,9 @@ fn build_row_metadata(
     timestamp_column: &str,
     exclude_columns: &[String],
     table: &str,
-) -> HashMap<String, RowMeta> {
-    let mut result = HashMap::new();
+    duplicate_pk: DuplicatePkPolicy,
+) -> Result<HashMap<String, RowMeta>, SyncError> {
+    let mut result: HashMap<String, RowMeta> = HashMap::new();
     for row in maps {
         let pk = match row.get("__pk").and_then(|v| v.as_str()) {
             Some(pk) => pk.to_string(),
@@ -422,21 +432,27 @@ fn build_row_metadata(
             timestamp_column,
         );
 
-        if let Some(prev) = result.insert(
+        // Parity with core local.rs: checked BEFORE the insert so a `Refuse`
+        // returns while metadata is still being built -- upstream of the diff
+        // and of every write, so no row is upserted (#269).
+        if let Some(prev) = result.get(&pk) {
+            if let Some(message) =
+                duplicate_pk.check(table, &pk, &prev.content_hash, &content_hash)?
+            {
+                eprintln!("smugglr-http-sql: {}", message);
+            }
+        }
+
+        result.insert(
             pk.clone(),
             RowMeta {
                 pk_value: pk.clone(),
                 updated_at,
                 content_hash,
             },
-        ) {
-            eprintln!(
-                "smugglr-http-sql: duplicate primary key {} in {} -- a row was overwritten in change metadata (prev hash {})",
-                pk, table, prev.content_hash
-            );
-        }
+        );
     }
-    result
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -456,12 +472,82 @@ mod tests {
         b.insert("__pk".to_string(), Value::Null);
         b.insert("name".to_string(), Value::from("bob"));
 
-        let meta = build_row_metadata(&[a, b], &["name".to_string()], "updated_at", &[], "items");
+        let meta = build_row_metadata(
+            &[a, b],
+            &["name".to_string()],
+            "updated_at",
+            &[],
+            "items",
+            DuplicatePkPolicy::default(),
+        )
+        .expect("NULL __pk rows are skipped, so no duplicate can be detected");
 
         assert!(
             meta.is_empty(),
             "NULL-__pk rows must be skipped, not collapsed onto one key; got {} entries",
             meta.len()
+        );
+    }
+
+    /// Two row maps rendering the same `__pk`. The plugin receives `__pk`
+    /// already rendered by the backend, so the collision arrives as JSON rather
+    /// than being produced by a CAST here -- but it is the same condition the
+    /// native builder refuses, and it must refuse identically or the guard is
+    /// transport-dependent (the #231 failure shape on this exact code path).
+    fn colliding_maps() -> Vec<HashMap<String, Value>> {
+        let mut a = HashMap::new();
+        a.insert("__pk".to_string(), Value::from("1"));
+        a.insert("name".to_string(), Value::from("alice"));
+        let mut b = HashMap::new();
+        b.insert("__pk".to_string(), Value::from("1"));
+        b.insert("name".to_string(), Value::from("bob"));
+        vec![a, b]
+    }
+
+    #[test]
+    fn duplicate_pk_refuses_by_default() {
+        // #269 plugin path: parity with native local.rs.
+        let err = build_row_metadata(
+            &colliding_maps(),
+            &["name".to_string()],
+            "updated_at",
+            &[],
+            "items",
+            DuplicatePkPolicy::Refuse,
+        )
+        .expect_err("two rows sharing __pk must refuse");
+
+        match err {
+            SyncError::DuplicatePrimaryKey {
+                table,
+                pk,
+                first_hash,
+                second_hash,
+            } => {
+                assert_eq!(table, "items");
+                assert_eq!(pk, "1");
+                assert_ne!(first_hash, second_hash);
+            }
+            other => panic!("expected DuplicatePrimaryKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_pk_warn_policy_keeps_the_previous_behavior() {
+        let meta = build_row_metadata(
+            &colliding_maps(),
+            &["name".to_string()],
+            "updated_at",
+            &[],
+            "items",
+            DuplicatePkPolicy::Warn,
+        )
+        .expect("warn must not stop the sync");
+
+        assert_eq!(
+            meta.len(),
+            1,
+            "warn collapses the collision, as it did before"
         );
     }
 
@@ -498,7 +584,15 @@ mod tests {
         native.insert("__pk".to_string(), Value::from("1"));
         native.insert("id".to_string(), Value::from(1));
         native.insert("data".to_string(), Value::from("4865"));
-        let native_meta = build_row_metadata(&[native], &column_order, "updated_at", &[], "t");
+        let native_meta = build_row_metadata(
+            &[native],
+            &column_order,
+            "updated_at",
+            &[],
+            "t",
+            DuplicatePkPolicy::default(),
+        )
+        .expect("single row cannot collide");
 
         // JSON backend (base64) row: diverges until canonicalized.
         let mut json = HashMap::new();
@@ -507,7 +601,15 @@ mod tests {
         json.insert("data".to_string(), Value::from("SGU="));
         let mut maps = vec![json];
 
-        let raw_meta = build_row_metadata(&maps, &column_order, "updated_at", &[], "t");
+        let raw_meta = build_row_metadata(
+            &maps,
+            &column_order,
+            "updated_at",
+            &[],
+            "t",
+            DuplicatePkPolicy::default(),
+        )
+        .expect("single row cannot collide");
         assert_ne!(
             native_meta.get("1").unwrap().content_hash,
             raw_meta.get("1").unwrap().content_hash,
@@ -515,7 +617,15 @@ mod tests {
         );
 
         canonicalize_row_blobs(&mut maps, &info);
-        let json_meta = build_row_metadata(&maps, &column_order, "updated_at", &[], "t");
+        let json_meta = build_row_metadata(
+            &maps,
+            &column_order,
+            "updated_at",
+            &[],
+            "t",
+            DuplicatePkPolicy::default(),
+        )
+        .expect("single row cannot collide");
         assert_eq!(
             native_meta.get("1").unwrap().content_hash,
             json_meta.get("1").unwrap().content_hash,
@@ -530,7 +640,15 @@ mod tests {
         a.insert("__pk".to_string(), Value::from("k1"));
         a.insert("name".to_string(), Value::from("alice"));
 
-        let meta = build_row_metadata(&[a], &["name".to_string()], "updated_at", &[], "items");
+        let meta = build_row_metadata(
+            &[a],
+            &["name".to_string()],
+            "updated_at",
+            &[],
+            "items",
+            DuplicatePkPolicy::default(),
+        )
+        .expect("single row cannot collide");
 
         assert_eq!(meta.len(), 1);
         assert!(meta.contains_key("k1"));

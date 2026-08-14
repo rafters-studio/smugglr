@@ -68,7 +68,7 @@ pub async fn run_watch(
                         // Mirrors run_sync/run_pull's dry-run-readonly convention: in
                         // dry-run nothing is written (sync_all bails before
                         // transfer_rows), so the target does not need write access.
-                        let target_db = crate::TargetSource::open(&target, !dry_run).await?;
+                        let target_db = crate::TargetSource::open(&target, !dry_run, config.sync.duplicate_pk).await?;
                         sync_all(&local, &target_db, config, None, dry_run, &NoProgress).await
                     }
                     ResolvedTarget::Plugin { .. } => {
@@ -169,11 +169,12 @@ fn format_tick_summary(pushed: usize, pulled: usize, tables: usize, dry_run: boo
 /// diverges from the dry-run-readonly convention `run_sync`/`run_pull`
 /// establish (#217).
 fn open_local(config: &Config, dry_run: bool) -> Result<LocalDb> {
-    if dry_run {
-        LocalDb::open_readonly(config.local_db_path())
+    let db = if dry_run {
+        LocalDb::open_readonly(config.local_db_path())?
     } else {
-        LocalDb::open(config.local_db_path())
-    }
+        LocalDb::open(config.local_db_path())?
+    };
+    Ok(db.with_duplicate_pk(config.sync.duplicate_pk))
 }
 
 #[cfg(test)]
@@ -272,9 +273,13 @@ mod tests {
         };
         let dry_run = true;
 
-        let target_db = crate::TargetSource::open(&target, !dry_run)
-            .await
-            .expect("dry-run target open should succeed");
+        let target_db = crate::TargetSource::open(
+            &target,
+            !dry_run,
+            smugglr_core::config::DuplicatePkPolicy::default(),
+        )
+        .await
+        .expect("dry-run target open should succeed");
         let write = target_db
             .upsert_rows("t", std::slice::from_ref(&sample_row()))
             .await;

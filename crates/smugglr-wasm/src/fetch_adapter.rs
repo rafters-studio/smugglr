@@ -3,6 +3,7 @@
 //! Implements the DataSource trait from smugglr-core using web-sys fetch
 //! instead of reqwest. Shares profile definitions with the native http-sql plugin.
 
+use smugglr_core::config::DuplicatePkPolicy;
 use smugglr_core::datasource::{DataSource, RowMeta, TableInfo};
 use smugglr_core::error::{Result, SyncError};
 use smugglr_core::profile::{AuthFormat, Profile};
@@ -220,13 +221,17 @@ impl FetchDataSource {
         let mut maps = adapter_common::rows_to_maps(&columns, &rows);
         adapter_common::canonicalize_json_blobs(&mut maps, &info);
 
-        Ok(adapter_common::row_maps_to_metadata(
+        // The `[sync].duplicate_pk` knob is native-config-only -- the wasm
+        // adapters take their options from JS and never see a SyncConfig -- so
+        // the browser paths always take the safe default and refuse (#269).
+        adapter_common::row_maps_to_metadata(
             &maps,
             &column_order,
             timestamp_column,
             exclude_columns,
             table,
-        ))
+            DuplicatePkPolicy::default(),
+        )
     }
 
     async fn cached_table_info(&self, table: &str) -> Result<TableInfo> {
@@ -295,13 +300,17 @@ impl DataSource for FetchDataSource {
         let mut maps = adapter_common::rows_to_maps(&columns, &rows);
         adapter_common::canonicalize_json_blobs(&mut maps, &info);
 
-        Ok(adapter_common::row_maps_to_metadata(
+        // The `[sync].duplicate_pk` knob is native-config-only -- the wasm
+        // adapters take their options from JS and never see a SyncConfig -- so
+        // the browser paths always take the safe default and refuse (#269).
+        adapter_common::row_maps_to_metadata(
             &maps,
             &column_order,
             timestamp_column,
             exclude_columns,
             table,
-        ))
+            DuplicatePkPolicy::default(),
+        )
     }
 
     async fn get_rows(
