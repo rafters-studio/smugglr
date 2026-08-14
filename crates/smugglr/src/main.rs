@@ -17,7 +17,7 @@ use output::{
     SnapshotTableInfo, Status, StatusConfig, StatusDb, StatusOutput, StatusTable,
 };
 use serde_json::Value as JsonValue;
-use smugglr_core::config::{Config, ResolvedTarget};
+use smugglr_core::config::{Config, DuplicatePkPolicy, ResolvedTarget};
 use smugglr_core::datasource::{DataSource, RowMeta, TableInfo};
 use smugglr_core::diff::diff_table;
 use smugglr_core::error;
@@ -94,7 +94,18 @@ enum TargetSource {
 impl TargetSource {
     /// Open the resolved target. `writable` selects read-write vs read-only for
     /// SQLite targets (plugins manage their own access mode).
-    async fn open(target: &ResolvedTarget, writable: bool) -> error::Result<Self> {
+    ///
+    /// `duplicate_pk` comes from `[sync].duplicate_pk` and must match the policy
+    /// the local side was opened with: the diff builds metadata for BOTH sides,
+    /// so a target opened with a different policy would refuse a collision the
+    /// local side tolerates (or vice versa) and the knob would read as
+    /// half-applied (#269). Plugin targets are unaffected -- the plugin wire
+    /// request carries no policy, so they always refuse.
+    async fn open(
+        target: &ResolvedTarget,
+        writable: bool,
+        duplicate_pk: DuplicatePkPolicy,
+    ) -> error::Result<Self> {
         match target {
             ResolvedTarget::Sqlite { database } => {
                 let db = if writable {
@@ -102,7 +113,7 @@ impl TargetSource {
                 } else {
                     LocalDb::open_readonly(database)?
                 };
-                Ok(TargetSource::Sqlite(db))
+                Ok(TargetSource::Sqlite(db.with_duplicate_pk(duplicate_pk)))
             }
             ResolvedTarget::Plugin {
                 path,
@@ -607,7 +618,8 @@ async fn run_push(
     fmt: OutputFormat,
     verbose: bool,
 ) -> error::Result<()> {
-    let local = LocalDb::open_readonly(config.local_db_path())?;
+    let local =
+        LocalDb::open_readonly(config.local_db_path())?.with_duplicate_pk(config.sync.duplicate_pk);
     let tables = resolve_tables(&local, table)?;
     let progress = make_progress(fmt);
 
@@ -615,7 +627,7 @@ async fn run_push(
         ResolvedTarget::Sqlite { database } => info!("Push mode: local -> SQLite ({})", database),
         ResolvedTarget::Plugin { name, .. } => info!("Push mode: local -> plugin ({})", name),
     }
-    let target = TargetSource::open(&target, true).await?;
+    let target = TargetSource::open(&target, true, config.sync.duplicate_pk).await?;
     let results = push_all(&local, &target, config, tables, dry_run, progress.as_ref()).await?;
 
     emit_command_output(fmt, "push", &results, dry_run, verbose, |r| r.rows_pushed);
@@ -631,9 +643,9 @@ async fn run_pull(
     verbose: bool,
 ) -> error::Result<()> {
     let local = if dry_run {
-        LocalDb::open_readonly(config.local_db_path())?
+        LocalDb::open_readonly(config.local_db_path())?.with_duplicate_pk(config.sync.duplicate_pk)
     } else {
-        LocalDb::open(config.local_db_path())?
+        LocalDb::open(config.local_db_path())?.with_duplicate_pk(config.sync.duplicate_pk)
     };
     let tables = resolve_tables(&local, table)?;
     let progress = make_progress(fmt);
@@ -643,7 +655,7 @@ async fn run_pull(
         ResolvedTarget::Plugin { name, .. } => info!("Pull mode: plugin ({}) -> local", name),
     }
     // Pull reads from the target, so it is opened read-only.
-    let target = TargetSource::open(&target, false).await?;
+    let target = TargetSource::open(&target, false, config.sync.duplicate_pk).await?;
     let results = pull_all(&local, &target, config, tables, dry_run, progress.as_ref()).await?;
 
     emit_command_output(fmt, "pull", &results, dry_run, verbose, |r| r.rows_pulled);
@@ -659,9 +671,9 @@ async fn run_sync(
     verbose: bool,
 ) -> error::Result<()> {
     let local = if dry_run {
-        LocalDb::open_readonly(config.local_db_path())?
+        LocalDb::open_readonly(config.local_db_path())?.with_duplicate_pk(config.sync.duplicate_pk)
     } else {
-        LocalDb::open(config.local_db_path())?
+        LocalDb::open(config.local_db_path())?.with_duplicate_pk(config.sync.duplicate_pk)
     };
     let tables = resolve_tables(&local, table)?;
     let progress = make_progress(fmt);
@@ -674,7 +686,7 @@ async fn run_sync(
             info!("Sync mode: bidirectional (local <-> plugin {})", name)
         }
     }
-    let target = TargetSource::open(&target, true).await?;
+    let target = TargetSource::open(&target, true, config.sync.duplicate_pk).await?;
     let results = sync_all(&local, &target, config, tables, dry_run, progress.as_ref()).await?;
 
     // JSON output is identical to the other commands; only sync's text summary
@@ -712,8 +724,9 @@ async fn run_diff(
     fmt: OutputFormat,
 ) -> error::Result<()> {
     info!("Computing differences...");
-    let local = LocalDb::open_readonly(config.local_db_path())?;
-    let remote = TargetSource::open(&target, false).await?;
+    let local =
+        LocalDb::open_readonly(config.local_db_path())?.with_duplicate_pk(config.sync.duplicate_pk);
+    let remote = TargetSource::open(&target, false, config.sync.duplicate_pk).await?;
 
     let tables = match table {
         Some(t) => {
@@ -910,7 +923,7 @@ async fn run_status(
     };
 
     // Gather target info
-    let target_status = match TargetSource::open(&target, false).await {
+    let target_status = match TargetSource::open(&target, false, config.sync.duplicate_pk).await {
         Ok(remote) => gather_status(&remote, config).await,
         Err(e) => StatusDb {
             connected: false,
@@ -1032,12 +1045,10 @@ async fn run_stash(
 
     let results = smugglr_core::stash::stash(
         stash_config,
+        &config.sync,
         config.local_db_path(),
-        &config.sync.timestamp_column,
-        config.sync.conflict_resolution,
         table,
         dry_run,
-        &config.sync.exclude_tables,
     )
     .await?;
 
@@ -1057,12 +1068,10 @@ async fn run_retrieve(
 
     let results = smugglr_core::stash::retrieve(
         stash_config,
+        &config.sync,
         config.local_db_path(),
-        &config.sync.timestamp_column,
-        config.sync.conflict_resolution,
         table,
         dry_run,
-        &config.sync.exclude_tables,
     )
     .await?;
 

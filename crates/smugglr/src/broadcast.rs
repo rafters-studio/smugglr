@@ -54,7 +54,9 @@ pub async fn run_broadcast(
         DEFAULT_GROUP, broadcast_config.port, interval_secs, instance_id, dry_run
     );
 
-    let local = Arc::new(LocalDb::open(config.local_db_path())?);
+    let local = Arc::new(
+        LocalDb::open(config.local_db_path())?.with_duplicate_pk(config.sync.duplicate_pk),
+    );
 
     if dry_run {
         // Advertise nothing, apply nothing -- just report what we would gossip.

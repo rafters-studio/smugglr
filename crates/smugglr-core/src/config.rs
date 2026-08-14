@@ -192,6 +192,20 @@ pub struct SyncConfig {
     #[serde(default)]
     pub conflict_resolution: ConflictResolution,
 
+    /// What to do when two rows in one table render the same `__pk` (#269).
+    ///
+    /// Defaults to [`DuplicatePkPolicy::Refuse`]. This is distinct from
+    /// [`SyncConfig::conflict_resolution`], which decides between a local and a
+    /// remote row that legitimately share a key: this field is about two rows
+    /// **in the same table on the same node** colliding, which no resolution
+    /// policy can fix because there is no second side to prefer.
+    ///
+    /// Scope: consulted by the diff/sync metadata builders. The multicast
+    /// `on_delta` apply path does not build metadata, so a duplicate arriving
+    /// as a Delta is not covered by this field (#278).
+    #[serde(default)]
+    pub duplicate_pk: DuplicatePkPolicy,
+
     /// Retry policy for transient failures. Flattened into the `[sync]` table,
     /// so the TOML keys stay `max_retries`, `initial_retry_delay_ms`,
     /// `max_retry_delay_ms`, and `backoff_multiplier`. These are the raw
@@ -226,6 +240,7 @@ impl Default for SyncConfig {
             converge_columns: Vec::new(),
             timestamp_column: default_timestamp_column(),
             conflict_resolution: ConflictResolution::default(),
+            duplicate_pk: DuplicatePkPolicy::default(),
             retry: RetryConfig::default(),
             batch_size: default_batch_size(),
             max_statement_bytes: default_max_statement_bytes(),
@@ -439,6 +454,79 @@ fn default_exclude_tables() -> Vec<String> {
 
 fn default_timestamp_column() -> String {
     "updated_at".to_string()
+}
+
+/// What to do when two rows in one table render the same `__pk` text.
+///
+/// # Why this is a refusal and not a warning (#269)
+///
+/// smugglr's identity **is** the primary key -- every path matches rows by the
+/// rendered `__pk`, so the metadata map is keyed by it. Two rows rendering the
+/// same key means the map can only hold one of them: the second silently
+/// evicts the first, and from that moment the evicted row is invisible to the
+/// diff. It is never compared, never transferred, and -- because the
+/// destination is reconciled against a metadata map that does not mention it --
+/// it reads as a row that should not exist.
+///
+/// Under the globally-unique-PK precondition this is not a benign event. A
+/// duplicate `__pk` means two nodes minted the same key for different logical
+/// rows, which is exactly the cross-node data loss the precondition exists to
+/// prevent. Overwriting one with the other **is** the data loss, so the default
+/// is to stop before any row is written rather than to log and continue.
+///
+/// This is the runtime half of the precondition. The structural half (#268)
+/// checks the *declared* primary-key shape at first run; only runtime can see
+/// that actual *values* collide.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DuplicatePkPolicy {
+    /// Stop the sync and return [`SyncError::DuplicatePrimaryKey`], naming the
+    /// colliding key, the table, and both rows' content hashes. Nothing is
+    /// upserted -- the refusal happens while metadata is still being built,
+    /// before the diff runs and before any write is issued.
+    #[default]
+    Refuse,
+    /// Log the collision and keep the pre-#269 behavior: the later row
+    /// overwrites the earlier one in the metadata map and the sync continues.
+    /// The escape hatch for a deployment that cannot fix its keys immediately;
+    /// it does not make the collision safe, it only defers the failure.
+    Warn,
+}
+
+impl DuplicatePkPolicy {
+    /// Decide what a duplicate rendered `__pk` means for this policy.
+    ///
+    /// Returns `Err` under [`DuplicatePkPolicy::Refuse`], and
+    /// `Ok(Some(message))` under [`DuplicatePkPolicy::Warn`] -- the caller
+    /// emits that message on its own sink (`tracing::warn`, `console.warn`, or
+    /// `eprintln`, depending on transport). Both strings are built here so the
+    /// native, wasm, and http-sql builders cannot drift on what a collision
+    /// says, which is the failure mode #231 already hit once on this exact
+    /// code path.
+    ///
+    /// `first_hash` is the content hash of the row already in the map,
+    /// `second_hash` the one that would evict it.
+    pub fn check(
+        self,
+        table: &str,
+        pk: &str,
+        first_hash: &str,
+        second_hash: &str,
+    ) -> Result<Option<String>> {
+        match self {
+            Self::Refuse => Err(SyncError::DuplicatePrimaryKey {
+                table: table.to_string(),
+                pk: pk.to_string(),
+                first_hash: first_hash.to_string(),
+                second_hash: second_hash.to_string(),
+            }),
+            Self::Warn => Ok(Some(format!(
+                "duplicate primary key {pk} in {table} -- a row was overwritten in change \
+                 metadata (kept hash {second_hash}, lost hash {first_hash}). The lost row is \
+                 invisible to this sync. Set [sync] duplicate_pk = \"refuse\" to stop instead."
+            ))),
+        }
+    }
 }
 
 /// How a same-primary-key collision resolves.
@@ -1350,6 +1438,81 @@ converge_columns = ["email", "phone_*"]
             config.sync.hash_excluded_columns(),
             std::borrow::Cow::Borrowed(_)
         ));
+    }
+
+    // #269: absent from the config, duplicate_pk defaults to REFUSE. This is the
+    // shipped-behavior change -- an existing config that never mentioned the key
+    // now refuses a collision it previously overwrote-and-warned through -- so
+    // the default is pinned here rather than left to the derive.
+    #[test]
+    fn duplicate_pk_defaults_to_refuse() {
+        let config: Config = toml::from_str("local_db = \"game.db\"\n").unwrap();
+        assert_eq!(config.sync.duplicate_pk, DuplicatePkPolicy::Refuse);
+        // The Default impl and serde's default must agree; a field added to the
+        // struct without a matching Default arm does not compile, but a
+        // MISMATCHED arm would, and would make behavior depend on how the config
+        // was constructed.
+        assert_eq!(
+            SyncConfig::default().duplicate_pk,
+            DuplicatePkPolicy::Refuse
+        );
+    }
+
+    /// Both spellings parse. This pins the serde surface only -- it says nothing
+    /// about the error message; that cross-check is the test below.
+    #[test]
+    fn duplicate_pk_parses_both_spellings() {
+        let parse = |v: &str| -> DuplicatePkPolicy {
+            let config: Config = toml::from_str(&format!(
+                "local_db = \"game.db\"\n[sync]\nduplicate_pk = \"{v}\"\n"
+            ))
+            .unwrap();
+            config.sync.duplicate_pk
+        };
+        assert_eq!(parse("warn"), DuplicatePkPolicy::Warn);
+        assert_eq!(parse("refuse"), DuplicatePkPolicy::Refuse);
+    }
+
+    /// The remedy the refusal prints must be a config the parser accepts.
+    ///
+    /// `SyncError::DuplicatePrimaryKey` hardcodes `set [sync] duplicate_pk =
+    /// "warn"` in its message. That string is the operator's only instruction
+    /// for getting unstuck, and nothing structural ties it to the serde
+    /// spelling -- rename the variant or change `rename_all` and the message
+    /// keeps confidently printing an incantation that no longer parses. So this
+    /// lifts the value straight out of the rendered message and feeds it to the
+    /// TOML parser, rather than asserting the two look alike by eye.
+    #[test]
+    fn the_remedy_the_refusal_prints_is_a_config_that_actually_parses() {
+        let rendered = SyncError::DuplicatePrimaryKey {
+            table: "items".into(),
+            pk: "1".into(),
+            first_hash: "aaaa".into(),
+            second_hash: "bbbb".into(),
+        }
+        .to_string();
+
+        // Pull the value out of `duplicate_pk = "<value>"` as the message prints it.
+        let marker = "duplicate_pk = \"";
+        let start = rendered
+            .find(marker)
+            .expect("the refusal must tell the operator which key to set")
+            + marker.len();
+        let value = &rendered[start..][..rendered[start..]
+            .find('"')
+            .expect("the remedy value must be quoted")];
+
+        let config: Config = toml::from_str(&format!(
+            "local_db = \"game.db\"\n[sync]\nduplicate_pk = \"{value}\"\n"
+        ))
+        .unwrap_or_else(|e| {
+            panic!("the refusal prints duplicate_pk = \"{value}\", which does not parse: {e}")
+        });
+        assert_eq!(
+            config.sync.duplicate_pk,
+            DuplicatePkPolicy::Warn,
+            "the refusal offers `warn` as the escape hatch, so its printed value must mean Warn"
+        );
     }
 
     // The hash-exclusion union is the invariant every hash producer depends on:

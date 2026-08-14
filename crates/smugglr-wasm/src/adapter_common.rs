@@ -5,6 +5,7 @@
 //! These functions are self-free (no adapter state) so they live here once
 //! and are called from both adapters as `adapter_common::<fn>`.
 
+use smugglr_core::config::DuplicatePkPolicy;
 use smugglr_core::datasource::{extract_updated_at, ColumnInfo, RowMeta, TableInfo};
 use smugglr_core::error::Result;
 use std::collections::HashMap;
@@ -75,14 +76,21 @@ pub(crate) fn parse_table_info(table: &str, columns: &[String], rows: &[Vec<Valu
 /// Convert result rows (each with a synthetic `__pk` column) into RowMeta
 /// entries keyed by primary key. Used by both full-scan and incremental
 /// metadata fetches.
+///
+/// Returns `Err` when two rows render the same `__pk` and `duplicate_pk` is
+/// [`DuplicatePkPolicy::Refuse`] (#269). Every wasm caller passes the default:
+/// the `[sync].duplicate_pk` knob is native-config-only, because the browser
+/// adapters take their options from JS and never see a `SyncConfig`, so the
+/// browser paths always take the safe default and refuse.
 pub(crate) fn row_maps_to_metadata(
     maps: &[HashMap<String, Value>],
     column_order: &[String],
     timestamp_column: &str,
     exclude_columns: &[String],
     table: &str,
-) -> HashMap<String, RowMeta> {
-    let mut result = HashMap::with_capacity(maps.len());
+    duplicate_pk: DuplicatePkPolicy,
+) -> Result<HashMap<String, RowMeta>> {
+    let mut result: HashMap<String, RowMeta> = HashMap::with_capacity(maps.len());
     for row in maps {
         // Parity with core local.rs: a NULL rendered __pk (a NULL part in a
         // composite PK propagates through `||`) cannot key pk-based sync.
@@ -100,26 +108,27 @@ pub(crate) fn row_maps_to_metadata(
         let updated_at = extract_updated_at(row.get(timestamp_column));
         let content_hash = content_hash(row, column_order, exclude_columns, timestamp_column);
 
-        if let Some(prev) = result.insert(
+        // Parity with core local.rs: checked BEFORE the insert so a `Refuse`
+        // returns while metadata is still being built -- upstream of the diff
+        // and of every write, so no row is upserted (#269).
+        if let Some(prev) = result.get(&pk) {
+            if let Some(message) =
+                duplicate_pk.check(table, &pk, &prev.content_hash, &content_hash)?
+            {
+                web_sys::console::warn_1(&format!("smugglr: {}", message).into());
+            }
+        }
+
+        result.insert(
             pk.clone(),
             RowMeta {
                 pk_value: pk.clone(),
                 updated_at,
                 content_hash,
             },
-        ) {
-            // Two rows rendering to the same PK text means the PK is not unique
-            // as encoded -- the metadata map silently lost `prev`. Surface it.
-            web_sys::console::warn_1(
-                &format!(
-                    "smugglr: duplicate primary key {} in {} -- a row was overwritten in change metadata (prev hash {})",
-                    pk, table, prev.content_hash
-                )
-                .into(),
-            );
-        }
+        );
     }
-    result
+    Ok(result)
 }
 
 /// Canonicalize every declared BLOB column across `maps` from the backend's
@@ -218,6 +227,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use smugglr_core::error::SyncError;
     use wasm_bindgen_test::wasm_bindgen_test;
 
     #[wasm_bindgen_test]
@@ -255,7 +265,9 @@ mod tests {
             "updated_at",
             &[],
             "items",
-        );
+            DuplicatePkPolicy::default(),
+        )
+        .expect("single row cannot collide");
 
         assert_eq!(
             meta.get("k1").expect("row keyed by __pk").updated_at,
@@ -277,12 +289,82 @@ mod tests {
         b.insert("__pk".to_string(), Value::Null);
         b.insert("name".to_string(), Value::String("bob".to_string()));
 
-        let meta = row_maps_to_metadata(&[a, b], &["name".to_string()], "updated_at", &[], "items");
+        let meta = row_maps_to_metadata(
+            &[a, b],
+            &["name".to_string()],
+            "updated_at",
+            &[],
+            "items",
+            DuplicatePkPolicy::default(),
+        )
+        .expect("NULL __pk rows are skipped, so no duplicate can be detected");
 
         assert!(
             meta.is_empty(),
             "NULL-__pk rows must be skipped, not collapsed onto one key; got {} entries",
             meta.len()
+        );
+    }
+
+    /// Two row maps rendering the same `__pk`, the wasm mirror of the native
+    /// and plugin collision tests. All three builders must reach the same
+    /// verdict or the guard is transport-dependent -- which is the failure
+    /// shape #231 already hit on this exact code path.
+    fn colliding_maps() -> Vec<HashMap<String, Value>> {
+        let mut a = HashMap::new();
+        a.insert("__pk".to_string(), Value::String("1".to_string()));
+        a.insert("name".to_string(), Value::String("alice".to_string()));
+        let mut b = HashMap::new();
+        b.insert("__pk".to_string(), Value::String("1".to_string()));
+        b.insert("name".to_string(), Value::String("bob".to_string()));
+        vec![a, b]
+    }
+
+    #[wasm_bindgen_test]
+    fn duplicate_pk_refuses_by_default() {
+        // #269 wasm path. The browser adapters have no SyncConfig, so they take
+        // the default -- this pins that the default is Refuse, not Warn.
+        let err = row_maps_to_metadata(
+            &colliding_maps(),
+            &["name".to_string()],
+            "updated_at",
+            &[],
+            "items",
+            DuplicatePkPolicy::default(),
+        )
+        .expect_err("two rows sharing __pk must refuse");
+
+        match err {
+            SyncError::DuplicatePrimaryKey {
+                table,
+                pk,
+                first_hash,
+                second_hash,
+            } => {
+                assert_eq!(table, "items");
+                assert_eq!(pk, "1");
+                assert_ne!(first_hash, second_hash);
+            }
+            other => panic!("expected DuplicatePrimaryKey, got {other:?}"),
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn duplicate_pk_warn_policy_keeps_the_previous_behavior() {
+        let meta = row_maps_to_metadata(
+            &colliding_maps(),
+            &["name".to_string()],
+            "updated_at",
+            &[],
+            "items",
+            DuplicatePkPolicy::Warn,
+        )
+        .expect("warn must not stop the sync");
+
+        assert_eq!(
+            meta.len(),
+            1,
+            "warn collapses the collision, as it did before"
         );
     }
 }

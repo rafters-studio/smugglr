@@ -108,6 +108,31 @@ pub enum SyncError {
     #[error("Migrate error: {0}")]
     Migrate(#[from] crate::migrate::MigrateError),
 
+    /// Two rows in one table render the same `__pk` text (#269).
+    ///
+    /// smugglr keys every sync path by the rendered primary key, so a metadata
+    /// map can hold only one of them -- the second evicts the first, and the
+    /// evicted row becomes invisible to the diff. Under the globally-unique-PK
+    /// precondition that means two nodes minted the same key for different
+    /// logical rows, so the sync refuses before any row is upserted rather than
+    /// silently overwriting one with the other. Governed by
+    /// [`crate::config::SyncConfig::duplicate_pk`]; carries both content hashes
+    /// so the operator can identify which two rows collided.
+    #[error(
+        "duplicate primary key '{pk}' in table '{table}': two rows render the same __pk \
+         (content hashes {first_hash} and {second_hash}). smugglr matches rows by primary \
+         key, so continuing would silently drop one of them -- the cross-node data loss \
+         that globally-unique primary keys exist to prevent. No rows were written. Give \
+         the two rows distinct primary keys, or set [sync] duplicate_pk = \"warn\" to \
+         restore the previous overwrite-and-continue behavior."
+    )]
+    DuplicatePrimaryKey {
+        table: String,
+        pk: String,
+        first_hash: String,
+        second_hash: String,
+    },
+
     /// The migration ledger's chain-hash is broken -- an out-of-band
     /// `UPDATE`/`DELETE` altered or removed a `_smugglr_migrations` row. This is
     /// the resurrected `_journal.json` hand-edit failure the ledger exists to
@@ -183,6 +208,12 @@ impl SyncError {
             // failure) need a human decision -- classify as conflict (4), the
             // same bucket the sequencing doc reserves for the migrate bridge.
             SyncError::ConcurrentWrite | SyncError::Migrate(_) | SyncError::LedgerTampered(_) => 4,
+
+            // A duplicate `__pk` is data the operator must reconcile -- smugglr
+            // cannot pick a winner without discarding a row -- so it shares the
+            // conflict bucket (4) rather than reading as a config error. The
+            // remedy is to re-key the rows, not to edit smugglr.toml.
+            SyncError::DuplicatePrimaryKey { .. } => 4,
 
             SyncError::TableNotFound(_)
             | SyncError::RelayNotFound(_)
@@ -376,6 +407,25 @@ mod tests {
             .exit_code(),
             5
         );
+    }
+
+    #[test]
+    fn test_exit_code_duplicate_primary_key() {
+        // #269: a duplicate __pk needs a human to re-key a row -- smugglr cannot
+        // pick a winner without discarding data -- so it shares the conflict
+        // bucket (4). Pinned because exit_code() has a `_ => 1` arm: without an
+        // explicit case the variant would silently read as general/unknown.
+        let err = SyncError::DuplicatePrimaryKey {
+            table: "items".into(),
+            pk: "1".into(),
+            first_hash: "aaaa".into(),
+            second_hash: "bbbb".into(),
+        };
+        assert_eq!(err.exit_code(), 4);
+        // Re-running collides again on the same two rows, so retrying is never
+        // productive. `is_retryable` has a `_ => false` arm; pin the verdict so a
+        // future refactor cannot flip it into the retry loop.
+        assert!(!err.is_retryable());
     }
 
     #[test]
