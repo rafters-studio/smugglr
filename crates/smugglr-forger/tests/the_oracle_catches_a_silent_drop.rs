@@ -21,15 +21,17 @@
 //! Two arms that broke identically do not diverge. "No divergence" is therefore
 //! also what a bad schema or a mislocated probe produces, so before any
 //! comparison is trusted the arm nobody transformed is required to have held on
-//! all eight traits. That check lives here rather than in [`Report`] -- what a
-//! failure report should say is FR-FORGER-008's problem.
+//! all eight traits. That reading now lives on [`Report`] itself
+//! ([`unsound_baseline`](Report::unsound_baseline)), because a caller who has to
+//! remember to derive it is a caller who will one day not -- the assertion here
+//! delegates to it rather than re-deriving it.
 
 use rusqlite::Connection;
 
+use smugglr_forger::census;
 use smugglr_forger::error::BoxError;
 use smugglr_forger::fixture::{Backing, Fixture, Route};
 use smugglr_forger::oracle::{differential, Arm, Divergence, Outcome, Report};
-use smugglr_forger::registry::TraitCase;
 use smugglr_forger::schema::{Schema, Trait};
 
 /// smugglr's migration ledger, which exists in the transformed arm and not in
@@ -320,13 +322,7 @@ fn a_transformation_that_fails_is_reported_as_a_failure_and_not_as_a_divergence(
 /// than a merge -- and each probe still finds its own construct by reading the
 /// schema, which is the property that lets one schema carry all eight.
 fn every_trait() -> Schema {
-    let mut all = Schema::default();
-    for kind in Trait::ALL {
-        all.tables.extend(TraitCase::for_trait(kind).schema.tables);
-    }
-    all.validate()
-        .expect("the union of the case schemas is one SQLite would accept");
-    all
+    census::every_trait_schema()
 }
 
 #[test]
@@ -399,15 +395,16 @@ fn stored_ddl_after(statements: Option<&str>, table: &str) -> String {
 /// produce, and every comparison in this file would be an agreement between two
 /// wrong answers.
 fn assert_baseline_is_sound(report: &Report) {
-    for outcome in &report.traits {
-        assert_eq!(
-            outcome.from_scratch,
-            Outcome::Held,
-            "{:?} did not hold in the arm built from scratch, so nothing compared against it \
-             means anything",
-            outcome.kind
-        );
-    }
+    let unsound: Vec<(Trait, &Outcome)> = report
+        .unsound_baseline()
+        .into_iter()
+        .map(|outcome| (outcome.kind, &outcome.from_scratch))
+        .collect();
+    assert!(
+        unsound.is_empty(),
+        "these did not hold in the arm built from scratch, so nothing compared against it means \
+         anything: {unsound:?}"
+    );
 }
 
 /// The transformed arm ran the probe and the probe failed -- the construct is

@@ -30,6 +30,11 @@
 //!   where they part company.
 //! * [`corpus`] -- a failure written down as JSON and committed, so a defect
 //!   found once runs thereafter as an ordinary test input.
+//! * [`census`] -- what a run executed, counted per trait and held to a
+//!   committed floor, because an exit code cannot tell a clean run from an
+//!   empty one.
+//! * [`failure`] -- what a failure says: the trait, the before and the after,
+//!   and the schema that carries it as source a reader can paste.
 //!
 //! ```
 //! use smugglr_forger::fixture::{Backing, Fixture, Route};
@@ -50,15 +55,19 @@
 //! fixture.bring_to(Route::Schema(&target)).unwrap();
 //! ```
 
+pub mod census;
 pub mod corpus;
 pub mod error;
+pub mod failure;
 pub mod fixture;
 pub mod oracle;
 pub mod registry;
 pub mod schema;
 
+pub use census::{Anomaly, Baseline, Census, Shortfall};
 pub use corpus::Regression;
 pub use error::{BoxError, ForgeError, ProbeError, ValidationError};
+pub use failure::{builder_source, Finding, Rendered};
 pub use fixture::{Backing, Fixture, Route};
 pub use oracle::{differential, Arm, Divergence, Outcome, Report, TraitOutcome};
 pub use registry::TraitCase;

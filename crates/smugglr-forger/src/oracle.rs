@@ -134,6 +134,35 @@ pub enum Outcome {
 }
 
 impl Outcome {
+    /// What a probe said, as an outcome.
+    ///
+    /// The mapping is one-to-one and lives here rather than in each caller so
+    /// that two callers cannot disagree about what `Unseeded` means. The
+    /// [`census`](crate::census) runs probes outside the two arms -- against a
+    /// case's own database, and against an empty one -- and has to classify
+    /// them by the same rule the oracle uses, or the two would be reporting in
+    /// different currencies.
+    pub fn of(reported: Result<(), ProbeError>) -> Outcome {
+        match reported {
+            Ok(()) => Outcome::Held,
+            Err(ProbeError::Failed(message)) => Outcome::Broke(message),
+            Err(ProbeError::Unseeded(message)) => Outcome::NothingToObserve(message),
+            Err(ProbeError::Sqlite(error)) => Outcome::Erred(error.to_string()),
+        }
+    }
+
+    /// The outcome kind as one word, for a column in a run report. The message
+    /// is deliberately not in it: a table of outcomes is read for its shape,
+    /// and the wording belongs in [`failure`](crate::failure)'s prose.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Outcome::Held => "held",
+            Outcome::Broke(_) => "broke",
+            Outcome::NothingToObserve(_) => "nothing-to-observe",
+            Outcome::Erred(_) => "erred",
+        }
+    }
+
     /// Same *kind* of outcome, ignoring the message.
     ///
     /// The messages carry row counts, values and SQLite's own wording, and two
@@ -176,8 +205,9 @@ pub enum Divergence {
 /// The whole record is kept rather than only the disagreements, because "both
 /// arms broke identically" is not a divergence and is still something a caller
 /// needs to see -- it means the from-scratch arm is not a sound baseline, and
-/// the comparison underneath it proves nothing. Rendering any of this is
-/// FR-FORGER-008's problem, not this module's.
+/// the comparison underneath it proves nothing.
+/// [`unsound_baseline`](Self::unsound_baseline) is where that reading lives;
+/// [`failure`](crate::failure) is where it is rendered.
 #[derive(Debug, Clone)]
 pub struct Report {
     /// One record per [`Trait`], in [`Trait::ALL`] order.
@@ -223,6 +253,46 @@ impl Report {
     /// Whether the arms disagreed at all.
     pub fn diverged(&self) -> bool {
         !self.divergences().is_empty()
+    }
+
+    /// Every trait the arm nobody transformed did not hold on.
+    ///
+    /// # Why this is a query on the report rather than a divergence
+    ///
+    /// Two arms that broke identically do not diverge -- the comparison is on
+    /// the outcome kind, deliberately, because two arms wording the same
+    /// behavioural fact differently is not a finding. The cost of that choice
+    /// is that "no divergence" is also what a mislocated probe, a start schema
+    /// missing a case's tables, or a bad target schema produces. Whether the
+    /// baseline was sound is therefore the first thing anyone reading a clean
+    /// report needs, and until now it was derivable only by a caller who
+    /// thought to derive it. Every caller who did not think of it got the
+    /// false-clean this crate exists to prevent.
+    ///
+    /// It is not folded into [`divergences`](Self::divergences), and that is
+    /// the load-bearing half. A divergence says *the arms disagreed*, which is
+    /// a statement about the caller's transformation; an unsound baseline says
+    /// *the arms may agree for a bad reason*, which is a statement about the
+    /// measurement. A gate that reported the second as the first would go red
+    /// on runs where the transformation did nothing wrong, and a gate that
+    /// cries wolf is one people learn to bypass.
+    ///
+    /// Nor is it an `Err`. The report is still worth reading -- which trait
+    /// failed in the baseline is exactly what says whether the schemas or the
+    /// probes are at fault -- and [`ForgeError`] is reserved for a run that
+    /// could not produce a report at all.
+    pub fn unsound_baseline(&self) -> Vec<&TraitOutcome> {
+        self.traits
+            .iter()
+            .filter(|outcome| outcome.from_scratch != Outcome::Held)
+            .collect()
+    }
+
+    /// Whether the arm nobody transformed held on every trait. See
+    /// [`unsound_baseline`](Self::unsound_baseline) for why this is worth
+    /// asking separately from [`diverged`](Self::diverged).
+    pub fn baseline_is_sound(&self) -> bool {
+        self.unsound_baseline().is_empty()
     }
 
     /// What both arms said about one trait.
@@ -351,12 +421,7 @@ fn observe(
     if let Some(failure) = seed_failure {
         return Outcome::NothingToObserve(format!("the seed did not take: {failure}"));
     }
-    match case.probe_against(promised, conn) {
-        Ok(()) => Outcome::Held,
-        Err(ProbeError::Failed(message)) => Outcome::Broke(message),
-        Err(ProbeError::Unseeded(message)) => Outcome::NothingToObserve(message),
-        Err(ProbeError::Sqlite(error)) => Outcome::Erred(error.to_string()),
-    }
+    Outcome::of(case.probe_against(promised, conn))
 }
 
 /// The user tables in a database, by name, minus what the caller excluded.

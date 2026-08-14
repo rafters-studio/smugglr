@@ -45,3 +45,10 @@ thiserror = "2"
 # reads, which is the whole thing this reporting exists to prevent.
 name = "corpus_runs"
 harness = false
+
+[[test]]
+# Same reason, and it is the requirement rather than a nicety here: FR-FORGER-007
+# asks for the schemas exercised and the probes executed to be reported on a
+# *passing* run, which under the default harness is a report printed into a void.
+name = "execution_census"
+harness = false
