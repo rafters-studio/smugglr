@@ -76,6 +76,12 @@ pub(crate) fn parse_table_info(table: &str, columns: &[String], rows: &[Vec<Valu
 /// Convert result rows (each with a synthetic `__pk` column) into RowMeta
 /// entries keyed by primary key. Used by both full-scan and incremental
 /// metadata fetches.
+///
+/// Returns `Err` when two rows render the same `__pk` and `duplicate_pk` is
+/// [`DuplicatePkPolicy::Refuse`] (#269). Every wasm caller passes the default:
+/// the `[sync].duplicate_pk` knob is native-config-only, because the browser
+/// adapters take their options from JS and never see a `SyncConfig`, so the
+/// browser paths always take the safe default and refuse.
 pub(crate) fn row_maps_to_metadata(
     maps: &[HashMap<String, Value>],
     column_order: &[String],

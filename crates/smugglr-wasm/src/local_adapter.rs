@@ -114,9 +114,6 @@ impl LocalSqlDataSource {
         let mut maps = adapter_common::rows_to_maps(&result.columns, &result.rows);
         adapter_common::canonicalize_json_blobs(&mut maps, &info);
 
-        // The `[sync].duplicate_pk` knob is native-config-only -- the wasm
-        // adapters take their options from JS and never see a SyncConfig -- so
-        // the browser paths always take the safe default and refuse (#269).
         adapter_common::row_maps_to_metadata(
             &maps,
             &column_order,
@@ -190,9 +187,6 @@ impl DataSource for LocalSqlDataSource {
         let mut maps = adapter_common::rows_to_maps(&result.columns, &result.rows);
         adapter_common::canonicalize_json_blobs(&mut maps, &info);
 
-        // The `[sync].duplicate_pk` knob is native-config-only -- the wasm
-        // adapters take their options from JS and never see a SyncConfig -- so
-        // the browser paths always take the safe default and refuse (#269).
         adapter_common::row_maps_to_metadata(
             &maps,
             &column_order,
