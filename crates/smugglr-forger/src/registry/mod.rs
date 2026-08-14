@@ -113,7 +113,20 @@ impl TraitCase {
 
     /// Assert what the trait does, against the schema this case promised.
     pub fn probe(&self, conn: &Connection) -> Result<(), ProbeError> {
-        (self.probe)(&self.schema, conn)
+        self.probe_against(&self.schema, conn)
+    }
+
+    /// Assert what the trait does, against a schema the caller promises.
+    ///
+    /// The asymmetry described above is what makes this useful rather than
+    /// merely available: a probe interrogates a database it did not build, so
+    /// the schema it is handed is the promise, not a description of what is
+    /// there. A differential oracle needs exactly that -- both of its arms are
+    /// held to the *target* schema, and neither is judged against the schema it
+    /// happens to have been built from. [`probe`](Self::probe) is this with the
+    /// case's own schema as the promise.
+    pub fn probe_against(&self, promised: &Schema, conn: &Connection) -> Result<(), ProbeError> {
+        (self.probe)(promised, conn)
     }
 }
 

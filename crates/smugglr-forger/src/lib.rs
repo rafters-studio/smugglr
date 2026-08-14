@@ -25,6 +25,9 @@
 //!   connection, tear it down reliably including on panic.
 //! * [`registry`] -- one [`Trait`], one schema carrying it, one seed and one
 //!   probe, matched exhaustively so a trait without a probe does not compile.
+//! * [`oracle`] -- the differential comparison: seed and transform one arm,
+//!   build the other from scratch, hold both to the same promise and report
+//!   where they part company.
 //!
 //! ```
 //! use smugglr_forger::fixture::{Backing, Fixture, Route};
@@ -47,10 +50,12 @@
 
 pub mod error;
 pub mod fixture;
+pub mod oracle;
 pub mod registry;
 pub mod schema;
 
 pub use error::{BoxError, ForgeError, ProbeError, ValidationError};
 pub use fixture::{Backing, Fixture, Route};
+pub use oracle::{differential, Arm, Divergence, Outcome, Report, TraitOutcome};
 pub use registry::TraitCase;
 pub use schema::{Schema, Trait};
