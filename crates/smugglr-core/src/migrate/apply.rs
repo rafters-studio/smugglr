@@ -56,6 +56,17 @@
 //! rebuild emits a `tracing::warn!` when the table being rebuilt carries such
 //! constructs, so the loss is visible.
 //!
+//! **Generated columns** are the one item in that list the warning did not
+//! actually cover until #342, and the reason is worth keeping: `table_info` --
+//! the pragma the whole reconstruction introspects with -- omits them entirely,
+//! so they were never in the set of columns to rebuild and never in the set of
+//! constructs to warn about. They are found through `PRAGMA table_xinfo`
+//! instead, which reports them with `hidden` `2` (`VIRTUAL`) or `3` (`STORED`).
+//! That makes detection exact and does nothing for recovery: the generation
+//! *expression* is in no pragma at all, only in `sqlite_master.sql`, so
+//! preserving one through a rebuild means parsing the original `CREATE TABLE`
+//! text. This path warns and drops.
+//!
 //! Two things a foreign key can carry are **not** recovered, and they are named
 //! rather than left to the word "foreign keys" to imply. `MATCH` is absent from
 //! `foreign_key_list` entirely -- the pragma reports `NONE` even for a key
@@ -1262,6 +1273,20 @@ fn lost_constructs(
             lost.push(format!("UNIQUE({})", cols.join(", ")));
         }
     }
+    // Generated columns, which the module doc has always listed as
+    // unrecoverable and which nothing here detected until #342. Read from
+    // `table_xinfo` because `table_info` -- the pragma this whole rebuild
+    // introspects with -- does not return them at all, so they were never in
+    // the `kept` set, never in the new table body, and never in the copy
+    // projection. The loss was total and silent.
+    //
+    // The dropped column is excluded: a generated column that is itself being
+    // dropped is going away on purpose and is not a loss to warn about.
+    for (name, storage) in generated_columns(conn, table)? {
+        if name != column {
+            lost.push(format!("generated column {name:?} ({storage})"));
+        }
+    }
     for name in dropped_triggers {
         lost.push(format!("trigger {name:?} (its body references {column:?})"));
     }
@@ -1307,6 +1332,47 @@ fn lost_constructs(
         }
     }
     Ok(lost)
+}
+
+/// The generated columns of a table, as `(name, storage class)`.
+///
+/// `PRAGMA table_xinfo` rather than `table_info`, which is the whole point:
+/// `table_info` **omits generated columns entirely**, so the rebuild's own
+/// introspection cannot see them and a reader comparing `table_info` before and
+/// after a rebuild sees no difference either. That is what made smugglr#342
+/// leave no trace in the place anyone would look.
+///
+/// `hidden` is `2` for `VIRTUAL` and `3` for `STORED`. `1` is a virtual-table
+/// hidden column, which is a different thing and is deliberately not collected.
+///
+/// This is exact rather than an over-approximation, unlike the keyword scans
+/// [`lost_constructs`] uses for `CHECK` and `COLLATE`: it returns the column
+/// names and their storage classes, so the warning can say which columns and
+/// which kind, and a table with a column named `generated` cannot fool it.
+///
+/// What it does **not** give is the generation expression -- that is in no
+/// pragma, only in `sqlite_master.sql`. So this makes the loss detectable and
+/// does nothing toward making it recoverable.
+#[cfg(feature = "native")]
+fn generated_columns(
+    conn: &Connection,
+    table: &str,
+) -> Result<Vec<(String, &'static str)>, MigrateError> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_xinfo({})", quote_ident(table)))?;
+    let rows = stmt
+        .query_map([], |r| {
+            // cols: cid, name, type, notnull, dflt_value, pk, hidden
+            Ok((r.get::<_, String>(1)?, r.get::<_, i64>(6)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(name, hidden)| match hidden {
+            2 => Some((name, "VIRTUAL")),
+            3 => Some((name, "STORED")),
+            _ => None,
+        })
+        .collect())
 }
 
 /// Names of the `UNIQUE`-constraint auto-indexes (origin `'u'`) on a table.
@@ -2345,6 +2411,138 @@ mod tests {
             assert!(
                 !upper.contains("ON DELETE") && !upper.contains("ON UPDATE"),
                 "the rebuild wrote an action onto a key that declared none: {sql}"
+            );
+        }
+
+        /// #342: both storage classes of generated column are named in the
+        /// warned losses, having previously been invisible to everything.
+        ///
+        /// The rebuild introspects with `PRAGMA table_info`, which omits
+        /// generated columns entirely, so they never entered the kept set and
+        /// never reached the new table -- and a reader comparing `table_info`
+        /// before and after saw no difference, because they were never in it.
+        /// The module doc promised a warning for exactly this construct and it
+        /// was the one construct in that list nothing detected.
+        #[test]
+        fn a_generated_column_is_named_in_the_warned_losses() {
+            let conn = mem();
+            conn.execute_batch(
+                "CREATE TABLE t (
+                     id INTEGER PRIMARY KEY,
+                     n INTEGER,
+                     v INTEGER GENERATED ALWAYS AS (n * 2) VIRTUAL,
+                     s INTEGER GENERATED ALWAYS AS (n * 3) STORED,
+                     code TEXT UNIQUE
+                 );",
+            )
+            .unwrap();
+            let sql = table_sql(&conn, "t").unwrap();
+            let lost = lost_constructs(&conn, "t", "code", sql.as_deref(), &[]).unwrap();
+
+            // Both classes, each named, each saying which kind it was. A
+            // warning that said only "generated column(s)" would leave the
+            // operator to work out which of the two lost a computation and
+            // which lost stored values as well.
+            assert!(
+                lost.iter()
+                    .any(|l| l.contains("\"v\"") && l.contains("VIRTUAL")),
+                "the VIRTUAL generated column has to be named: {lost:?}"
+            );
+            assert!(
+                lost.iter()
+                    .any(|l| l.contains("\"s\"") && l.contains("STORED")),
+                "the STORED generated column has to be named: {lost:?}"
+            );
+        }
+
+        /// The column being dropped is not reported as a loss.
+        ///
+        /// Dropping a generated column on purpose is the operator's request,
+        /// not a construct the rebuild failed to carry, and warning about it
+        /// would train them to ignore the warning.
+        #[test]
+        fn a_generated_column_being_dropped_is_not_a_warned_loss() {
+            let conn = mem();
+            conn.execute_batch(
+                "CREATE TABLE t (
+                     id INTEGER PRIMARY KEY,
+                     n INTEGER,
+                     v INTEGER GENERATED ALWAYS AS (n * 2) VIRTUAL,
+                     code TEXT UNIQUE
+                 );",
+            )
+            .unwrap();
+            let sql = table_sql(&conn, "t").unwrap();
+            let lost = lost_constructs(&conn, "t", "v", sql.as_deref(), &[]).unwrap();
+            assert!(
+                !lost.iter().any(|l| l.contains("generated column")),
+                "the dropped column is not a loss: {lost:?}"
+            );
+        }
+
+        /// An ordinary table produces no generated-column warning.
+        ///
+        /// Cheap, and it is the direction a keyword scan of the DDL would have
+        /// got wrong: `table_xinfo` answers structurally, so a column named
+        /// `generated` or a `CHECK` mentioning `AS` cannot produce a false
+        /// positive the way `contains("GENERATED")` would.
+        #[test]
+        fn an_ordinary_table_reports_no_generated_column() {
+            let conn = mem();
+            conn.execute_batch(
+                "CREATE TABLE t (
+                     id INTEGER PRIMARY KEY,
+                     generated TEXT,
+                     n INTEGER CHECK (n > 0),
+                     code TEXT UNIQUE
+                 );",
+            )
+            .unwrap();
+            let sql = table_sql(&conn, "t").unwrap();
+            let lost = lost_constructs(&conn, "t", "code", sql.as_deref(), &[]).unwrap();
+            assert!(
+                !lost.iter().any(|l| l.contains("generated column")),
+                "a column named `generated` is not a generated column: {lost:?}"
+            );
+        }
+
+        /// The loss the warning is about, shown rather than asserted.
+        ///
+        /// Without this the tests above prove only that a string is produced.
+        /// This proves the string is about something: the rebuild really does
+        /// drop both classes, so the warning is the only signal there is.
+        #[test]
+        fn the_rebuild_really_does_drop_generated_columns() {
+            let conn = mem();
+            conn.execute_batch(
+                "CREATE TABLE t (
+                     id INTEGER PRIMARY KEY,
+                     n INTEGER,
+                     v INTEGER GENERATED ALWAYS AS (n * 2) VIRTUAL,
+                     s INTEGER GENERATED ALWAYS AS (n * 3) STORED,
+                     code TEXT UNIQUE
+                 );
+                 INSERT INTO t (id, n, code) VALUES (1, 21, 'k1');",
+            )
+            .unwrap();
+
+            let before = generated_columns(&conn, "t").unwrap();
+            assert_eq!(before.len(), 2, "two generated columns before: {before:?}");
+
+            apply(
+                &conn,
+                Op::DropColumn {
+                    table: "t".into(),
+                    column: "code".into(),
+                },
+            )
+            .unwrap();
+
+            let after = generated_columns(&conn, "t").unwrap();
+            assert!(
+                after.is_empty(),
+                "the rebuild is documented to drop generated columns; if it now keeps them, this \
+                 test and the warning it justifies are both wrong: {after:?}"
             );
         }
 
