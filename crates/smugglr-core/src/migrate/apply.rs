@@ -56,6 +56,13 @@
 //! carries such constructs, so the loss is visible. A rebuild driven by an
 //! *explicit* target schema (as reverse #274 / convert #280 will pass) does not
 //! have this gap.
+//!
+//! Explicit indexes and **triggers** are not in that list: the swap's
+//! `DROP TABLE` destroys both, and the rebuild replays their verbatim
+//! `sqlite_master` DDL afterwards (#336). The one exception is a trigger whose
+//! body mentions the dropped column -- SQLite would accept the `CREATE TRIGGER`
+//! and then fail every later write to the table -- so that trigger joins the
+//! warned-loss list instead of being replayed.
 
 use crate::migrate::{ClassifiedOp, Column, ColumnKind, Constraint, MigrateError, Op};
 
@@ -553,9 +560,19 @@ fn rebuild_dropping_column(
         }
     }
 
+    // Indexes and triggers do not survive the swap's DROP TABLE; collect the DDL
+    // to replay, and the triggers that cannot be replayed at all (#336).
+    let aux = aux_ddl_surviving_drop(conn, table, column)?;
+
     // Constructs the pragma/DDL reconstruction cannot recover are lost on this
     // rebuild; make the loss loud rather than silent (#273 MED#4).
-    let lost = lost_constructs(conn, table, column, orig_sql.as_deref())?;
+    let lost = lost_constructs(
+        conn,
+        table,
+        column,
+        orig_sql.as_deref(),
+        &aux.dropped_triggers,
+    )?;
     if !lost.is_empty() {
         tracing::warn!(
             "DROP COLUMN rebuild of {table:?} (dropping {column:?}) cannot reconstruct \
@@ -569,8 +586,6 @@ fn rebuild_dropping_column(
         .map(|c| (c.name.clone(), quote_ident(&c.name)))
         .collect();
 
-    let post_ddl = explicit_index_ddl_excluding(conn, table, column)?;
-
     let spec = RebuildSpec {
         table: table.to_string(),
         target: RebuildTarget::Fragments {
@@ -578,7 +593,7 @@ fn rebuild_dropping_column(
             without_rowid: false, // reconstruction does not recover WITHOUT ROWID
         },
         projection,
-        post_ddl,
+        post_ddl: aux.ddl,
     };
     rebuild_table(conn, &spec)
 }
@@ -889,7 +904,7 @@ fn rebuild_inner(conn: &Connection, spec: &RebuildSpec) -> Result<(), MigrateErr
         quote_ident(&spec.table)
     ))?;
 
-    // Recreate indexes / triggers the swap dropped.
+    // Recreate the indexes / triggers the swap dropped, in that order.
     for stmt in &spec.post_ddl {
         tx.execute_batch(stmt)?;
     }
@@ -1078,35 +1093,74 @@ fn table_sql(conn: &Connection, table: &str) -> Result<Option<String>, MigrateEr
     Ok(sql.flatten())
 }
 
-/// Blank out SQL string literals (`'...'`), quoted identifiers (`"..."`,
-/// `` `...` ``, `[...]`), and comments (`-- ...`, `/* ... */`) so a keyword scan
-/// sees only code. Each removed span becomes a single space; the rest is copied
-/// verbatim. Char-based (UTF-8 safe); doubled quotes escape.
+/// Scan `sql` for identifier-position tokens, calling `f(quoted, token)` on each
+/// bare word and each quoted identifier (`"x"`, `` `x` ``, `[x]`). String
+/// literals (`'...'`) and comments (`-- ...`, `/* ... */`) are skipped, never
+/// reported. Char-based (UTF-8 safe); a doubled quote escapes.
+///
+/// Returns as soon as `f` returns `true`, reporting whether it ever did. The
+/// `quoted` flag is the whole difference between this module's two keyword
+/// scans: [`sql_has_autoincrement`] wants bare tokens only (a table named
+/// `"autoincrement"` must not count), while [`sql_mentions_identifier`] wants
+/// both (a trigger body may write `NEW."email"`).
 #[cfg(feature = "native")]
-fn strip_sql_literals_and_comments(sql: &str) -> String {
-    let mut out = String::with_capacity(sql.len());
+fn any_sql_identifier(sql: &str, mut f: impl FnMut(bool, &str) -> bool) -> bool {
     let mut chars = sql.chars().peekable();
+    let mut bare = String::new();
+    let mut quoted = String::new();
     while let Some(c) = chars.next() {
+        // A bare identifier runs over ASCII word bytes plus any non-ASCII char
+        // (SQLite admits those unquoted).
+        if c.is_ascii_alphanumeric() || c == '_' || c == '$' || !c.is_ascii() {
+            bare.push(c);
+            continue;
+        }
+        if !bare.is_empty() {
+            if f(false, &bare) {
+                return true;
+            }
+            bare.clear();
+        }
         match c {
-            '\'' | '"' | '`' => {
+            '\'' => {
                 while let Some(n) = chars.next() {
-                    if n == c {
-                        if chars.peek() == Some(&c) {
+                    if n == '\'' {
+                        if chars.peek() == Some(&'\'') {
                             chars.next(); // doubled quote escapes
                             continue;
                         }
                         break;
                     }
                 }
-                out.push(' ');
+            }
+            '"' | '`' => {
+                quoted.clear();
+                while let Some(n) = chars.next() {
+                    if n == c {
+                        if chars.peek() == Some(&c) {
+                            chars.next();
+                            quoted.push(c);
+                            continue;
+                        }
+                        break;
+                    }
+                    quoted.push(n);
+                }
+                if f(true, &quoted) {
+                    return true;
+                }
             }
             '[' => {
+                quoted.clear();
                 for n in chars.by_ref() {
                     if n == ']' {
                         break;
                     }
+                    quoted.push(n);
                 }
-                out.push(' ');
+                if f(true, &quoted) {
+                    return true;
+                }
             }
             '-' if chars.peek() == Some(&'-') => {
                 chars.next();
@@ -1115,7 +1169,6 @@ fn strip_sql_literals_and_comments(sql: &str) -> String {
                         break;
                     }
                 }
-                out.push(' ');
             }
             '/' if chars.peek() == Some(&'*') => {
                 chars.next();
@@ -1126,12 +1179,11 @@ fn strip_sql_literals_and_comments(sql: &str) -> String {
                     }
                     prev = n;
                 }
-                out.push(' ');
             }
-            _ => out.push(c),
+            _ => {}
         }
     }
-    out
+    !bare.is_empty() && f(false, &bare)
 }
 
 /// Whether a `CREATE TABLE` statement declares `AUTOINCREMENT`. The keyword is
@@ -1143,9 +1195,28 @@ fn strip_sql_literals_and_comments(sql: &str) -> String {
 /// drop-column rebuild.
 #[cfg(feature = "native")]
 fn sql_has_autoincrement(sql: &str) -> bool {
-    strip_sql_literals_and_comments(sql)
-        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .any(|tok| tok.eq_ignore_ascii_case("AUTOINCREMENT"))
+    any_sql_identifier(sql, |quoted, tok| {
+        !quoted && tok.eq_ignore_ascii_case("AUTOINCREMENT")
+    })
+}
+
+/// Whether `sql` mentions `ident` as an identifier -- bare (`NEW.email`,
+/// `UPDATE OF email`) or quoted in any of SQLite's three forms (`"email"`,
+/// `` `email` ``, `[email]`) -- ignoring string literals and comments.
+/// ASCII-case-insensitive, as SQLite's own identifier comparison is.
+///
+/// Unlike [`sql_has_autoincrement`], which shares the same scan, a quoted
+/// identifier counts here: `NEW."email"` is a reference, whereas a table named
+/// `"autoincrement"` is not a declaration.
+///
+/// It is an over-approximation: a trigger body naming a *different* table's
+/// `email` column, or using `email` as an alias, matches. That direction is
+/// chosen. A false positive drops a trigger with a warning, which is
+/// recoverable; a false negative replays a trigger whose body no longer
+/// resolves, and every subsequent write to the table fails at prepare time.
+#[cfg(feature = "native")]
+fn sql_mentions_identifier(sql: &str, ident: &str) -> bool {
+    any_sql_identifier(sql, |_quoted, tok| tok.eq_ignore_ascii_case(ident))
 }
 
 /// Surviving constructs the `DROP COLUMN` reconstruction cannot recover, as
@@ -1158,12 +1229,18 @@ fn sql_has_autoincrement(sql: &str) -> bool {
 /// are found by a keyword scan of the original DDL -- an over-approximation (it
 /// can fire when the construct referenced only the dropped column), but a
 /// spurious warning is safer than a silent drop.
+///
+/// `dropped_triggers` are the triggers [`aux_ddl_surviving_drop`] decided it
+/// cannot replay (their bodies mention the dropped column). They are named here
+/// rather than warned at the replay site so the whole loss -- constraints and
+/// triggers alike -- reaches the operator as one message (#336).
 #[cfg(feature = "native")]
 fn lost_constructs(
     conn: &Connection,
     table: &str,
     column: &str,
     orig_sql: Option<&str>,
+    dropped_triggers: &[String],
 ) -> Result<Vec<String>, MigrateError> {
     let mut lost = Vec::new();
     for name in unique_constraint_indexes(conn, table)? {
@@ -1171,6 +1248,9 @@ fn lost_constructs(
         if !cols.is_empty() && !cols.iter().any(|c| c == column) {
             lost.push(format!("UNIQUE({})", cols.join(", ")));
         }
+    }
+    for name in dropped_triggers {
+        lost.push(format!("trigger {name:?} (its body references {column:?})"));
     }
     if let Some(sql) = orig_sql {
         let up = sql.to_ascii_uppercase();
@@ -1310,44 +1390,121 @@ fn explicit_indexes_referencing(
     column: &str,
 ) -> Result<Vec<String>, MigrateError> {
     let mut out = Vec::new();
-    for (name, _sql) in explicit_indexes(conn, table)? {
-        if index_columns(conn, &name)?.iter().any(|c| c == column) {
-            out.push(name);
+    for obj in aux_objects(conn, table)? {
+        if obj.kind == AuxKind::Index && index_columns(conn, &obj.name)?.iter().any(|c| c == column)
+        {
+            out.push(obj.name);
         }
     }
     Ok(out)
 }
 
-/// `CREATE INDEX` DDL for explicit indexes on `table` that do **not** reference
-/// `column` -- the set to recreate after a rebuild that drops `column`.
+/// The `sqlite_master` type of an auxiliary object attached to a table.
 #[cfg(feature = "native")]
-fn explicit_index_ddl_excluding(
+#[derive(PartialEq, Eq)]
+enum AuxKind {
+    /// An explicit `CREATE INDEX` (auto-indexes have no DDL and are excluded).
+    Index,
+    /// A `CREATE TRIGGER` fired on the table.
+    Trigger,
+}
+
+/// One explicit index or trigger attached to a table, with its verbatim DDL.
+#[cfg(feature = "native")]
+struct AuxObject {
+    kind: AuxKind,
+    name: String,
+    sql: String,
+}
+
+/// The auxiliary-object DDL that a rebuild dropping `column` can replay, plus
+/// the triggers it cannot.
+#[cfg(feature = "native")]
+struct AuxReplay {
+    /// Verbatim DDL to replay after the swap, indexes before triggers.
+    ddl: Vec<String>,
+    /// Names of triggers deliberately not replayed because their body mentions
+    /// `column`. The caller warns on these via [`lost_constructs`].
+    dropped_triggers: Vec<String>,
+}
+
+/// Split the explicit indexes and triggers on `table` into the DDL a rebuild
+/// dropping `column` replays and the triggers it must abandon.
+///
+/// An index is carried when `PRAGMA index_info` shows it does not index the
+/// dropped column; a trigger is carried when its DDL does not mention the
+/// dropped column as an identifier ([`sql_mentions_identifier`]).
+///
+/// A trigger that *does* mention the column cannot be carried: SQLite resolves a
+/// trigger body when the triggering statement is prepared, not at
+/// `CREATE TRIGGER` (see `create_trigger_does_not_resolve_body_columns`), so
+/// replaying it would succeed and then fail every subsequent write to the table
+/// with `no such column`. Abandoning it -- loudly -- keeps the table writable.
+#[cfg(feature = "native")]
+fn aux_ddl_surviving_drop(
     conn: &Connection,
     table: &str,
     column: &str,
-) -> Result<Vec<String>, MigrateError> {
-    let mut out = Vec::new();
-    for (name, sql) in explicit_indexes(conn, table)? {
-        if !index_columns(conn, &name)?.iter().any(|c| c == column) {
-            out.push(sql);
+) -> Result<AuxReplay, MigrateError> {
+    let mut replay = AuxReplay {
+        ddl: Vec::new(),
+        dropped_triggers: Vec::new(),
+    };
+    for obj in aux_objects(conn, table)? {
+        match obj.kind {
+            AuxKind::Index => {
+                if !index_columns(conn, &obj.name)?.iter().any(|c| c == column) {
+                    replay.ddl.push(obj.sql);
+                }
+            }
+            AuxKind::Trigger => {
+                if sql_mentions_identifier(&obj.sql, column) {
+                    replay.dropped_triggers.push(obj.name);
+                } else {
+                    replay.ddl.push(obj.sql);
+                }
+            }
         }
     }
-    Ok(out)
+    Ok(replay)
 }
 
-/// `(name, sql)` for every explicit (`CREATE INDEX`) index on a table.
+/// Every explicit index and trigger attached to a table, in `type, name` order
+/// (so indexes are replayed before triggers).
+///
+/// `sql IS NOT NULL` excludes the auto-indexes SQLite synthesizes for
+/// `PRIMARY KEY` / `UNIQUE`: they carry no DDL and reappear with the rebuilt
+/// table's own constraints. What remains is exactly the set a `DROP TABLE` of
+/// the original destroys -- which is why triggers belong here and not only in
+/// reverse's `aux_object_ddl` (#274), whose query this mirrors.
 #[cfg(feature = "native")]
-fn explicit_indexes(conn: &Connection, table: &str) -> Result<Vec<(String, String)>, MigrateError> {
+fn aux_objects(conn: &Connection, table: &str) -> Result<Vec<AuxObject>, MigrateError> {
     let mut stmt = conn.prepare(
-        "SELECT name, sql FROM sqlite_master \
-         WHERE type = 'index' AND tbl_name = ?1 AND sql IS NOT NULL",
+        "SELECT type, name, sql FROM sqlite_master \
+         WHERE type IN ('index', 'trigger') AND tbl_name = ?1 AND sql IS NOT NULL \
+         ORDER BY type, name",
     )?;
     let rows = stmt
         .query_map(params![table], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
+    Ok(rows
+        .into_iter()
+        .map(|(kind, name, sql)| AuxObject {
+            kind: if kind == "trigger" {
+                AuxKind::Trigger
+            } else {
+                AuxKind::Index
+            },
+            name,
+            sql,
+        })
+        .collect())
 }
 
 /// Column names indexed by a named index.
@@ -1974,6 +2131,173 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(idx, 1, "index on the surviving column must be recreated");
+        }
+
+        /// Rows written by the `audit` side-effect table the trigger tests use.
+        fn audit_rows(conn: &Connection) -> Vec<String> {
+            let mut stmt = conn
+                .prepare("SELECT note FROM audit ORDER BY rowid")
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        }
+
+        #[test]
+        fn drop_column_rebuild_keeps_the_trigger_firing() {
+            // #336: the swap's DROP TABLE destroys every trigger on the table, and
+            // the replay used to collect only indexes -- so an audit trigger went
+            // silently missing. Presence in sqlite_master is not the property that
+            // matters; FIRING is. Drop the UNIQUE `code` to force the rebuild.
+            let conn = mem();
+            conn.execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, note TEXT, code TEXT UNIQUE);
+                 CREATE TABLE audit (note TEXT);
+                 CREATE TRIGGER t_ai AFTER INSERT ON t
+                   BEGIN INSERT INTO audit(note) VALUES (NEW.note); END;",
+            )
+            .unwrap();
+
+            // Fire once BEFORE the rebuild, so a post-rebuild count of 1 cannot be
+            // confused with "the trigger never fired at all".
+            conn.execute(
+                "INSERT INTO t (id, note, code) VALUES (1, 'before', 'c1')",
+                [],
+            )
+            .unwrap();
+            assert_eq!(
+                audit_rows(&conn),
+                vec!["before"],
+                "trigger fires pre-rebuild"
+            );
+
+            apply(
+                &conn,
+                Op::DropColumn {
+                    table: "t".into(),
+                    column: "code".into(),
+                },
+            )
+            .unwrap();
+            assert_eq!(columns(&conn, "t"), vec!["id", "note"]);
+
+            // The behavioural assertion: a NEW row still produces the side effect.
+            conn.execute("INSERT INTO t (id, note) VALUES (2, 'after')", [])
+                .unwrap();
+            assert_eq!(
+                audit_rows(&conn),
+                vec!["before", "after"],
+                "the trigger must still FIRE after the rebuild, not merely exist"
+            );
+        }
+
+        #[test]
+        fn drop_column_rebuild_abandons_a_trigger_that_references_the_column() {
+            // #336 criterion 2: a trigger whose body names the dropped column
+            // cannot be replayed -- SQLite would accept the CREATE and then fail
+            // every later write. It is dropped, and named in the warned-loss list.
+            let conn = mem();
+            conn.execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, note TEXT, code TEXT UNIQUE);
+                 CREATE TABLE audit (note TEXT);
+                 CREATE TRIGGER t_code_ai AFTER INSERT ON t
+                   BEGIN INSERT INTO audit(note) VALUES (NEW.code); END;",
+            )
+            .unwrap();
+
+            // The loss is enumerated, so the shared warn! names the trigger.
+            let lost = lost_constructs(
+                &conn,
+                "t",
+                "code",
+                table_sql(&conn, "t").unwrap().as_deref(),
+                &aux_ddl_surviving_drop(&conn, "t", "code")
+                    .unwrap()
+                    .dropped_triggers,
+            )
+            .unwrap();
+            assert!(
+                lost.iter().any(|l| l.contains("t_code_ai")),
+                "the abandoned trigger must be named in the warned-loss list, got {lost:?}"
+            );
+
+            apply(
+                &conn,
+                Op::DropColumn {
+                    table: "t".into(),
+                    column: "code".into(),
+                },
+            )
+            .unwrap();
+
+            let n: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name='t_code_ai'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                n, 0,
+                "a trigger referencing the dropped column is not replayed"
+            );
+            // The point of abandoning it: the table stays writable.
+            conn.execute("INSERT INTO t (id, note) VALUES (2, 'after')", [])
+                .unwrap();
+            assert!(audit_rows(&conn).is_empty());
+        }
+
+        #[test]
+        fn create_trigger_does_not_resolve_body_columns() {
+            // The assumption the reference scan exists to cover, pinned against the
+            // sqlite rusqlite actually bundles: a trigger body is resolved when the
+            // triggering statement is PREPARED, not at CREATE TRIGGER. So sqlite
+            // cannot be used as the oracle for "can this trigger be replayed" --
+            // replaying a stale one succeeds and breaks every later write instead.
+            let conn = mem();
+            conn.execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, note TEXT);
+                 CREATE TABLE audit (note TEXT);",
+            )
+            .unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER t_ai AFTER INSERT ON t
+                   BEGIN INSERT INTO audit(note) VALUES (NEW.gone); END;",
+            )
+            .expect("CREATE TRIGGER accepts a body naming a column that does not exist");
+            let err = conn
+                .execute("INSERT INTO t (id, note) VALUES (1, 'x')", [])
+                .expect_err("the write is what fails, once the body is resolved");
+            assert!(
+                err.to_string().contains("no such column"),
+                "unexpected error: {err}"
+            );
+        }
+
+        #[test]
+        fn identifier_scan_sees_quoted_forms_and_ignores_literals() {
+            // Bare, dotted, and every quoting form count as a reference...
+            for body in [
+                "CREATE TRIGGER x AFTER INSERT ON t BEGIN SELECT NEW.email; END",
+                "CREATE TRIGGER x AFTER UPDATE OF email ON t BEGIN SELECT 1; END",
+                "CREATE TRIGGER x AFTER INSERT ON t BEGIN SELECT NEW.\"email\"; END",
+                "CREATE TRIGGER x AFTER INSERT ON t BEGIN SELECT NEW.`email`; END",
+                "CREATE TRIGGER x AFTER INSERT ON t BEGIN SELECT NEW.[email]; END",
+                "CREATE TRIGGER x AFTER INSERT ON t BEGIN SELECT NEW.EMAIL; END",
+            ] {
+                assert!(sql_mentions_identifier(body, "email"), "missed: {body}");
+            }
+            // ...while a string literal, a comment, and a merely-similar identifier
+            // do not.
+            for body in [
+                "CREATE TRIGGER x AFTER INSERT ON t BEGIN SELECT 'email'; END",
+                "CREATE TRIGGER x AFTER INSERT ON t BEGIN SELECT 1; END -- email",
+                "CREATE TRIGGER x AFTER INSERT ON t BEGIN /* email */ SELECT 1; END",
+                "CREATE TRIGGER x AFTER INSERT ON t BEGIN SELECT NEW.email_verified; END",
+            ] {
+                assert!(!sql_mentions_identifier(body, "email"), "false hit: {body}");
+            }
         }
 
         #[test]
