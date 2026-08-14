@@ -286,16 +286,68 @@ fn the_pasted_source_is_what_the_emitter_emits_today() {
 
 /// The text between this trait's markers in this file.
 fn block(kind: Trait) -> String {
-    let open = format!("// >>> {kind:?}\n");
+    block_in(THIS_FILE, kind)
+}
+
+/// The text between this trait's markers in `source`.
+///
+/// Split out from [`block`] so the line-ending test below can run the locating
+/// over a source this file cannot itself be checked out as.
+///
+/// The open marker is matched *without* its line ending, and the block starts at
+/// the next line. Spelling the needle as `// >>> {kind:?}\n` reads as harmless
+/// and is not: git checks this file out CRLF on Windows, so the marker is
+/// followed by `\r\n`, the `find` returns `None`, and the test panics claiming
+/// the block is missing from a file it is plainly in. [`collapsed`] already
+/// treats `\r` as whitespace, so only the locating was ever sensitive to this.
+fn block_in(source: &str, kind: Trait) -> String {
+    let open = format!("// >>> {kind:?}");
     let close = format!("// <<< {kind:?}");
-    let start = THIS_FILE
+    let marker = source
         .find(&open)
-        .unwrap_or_else(|| panic!("{kind:?} has no pasted block in this file"))
-        + open.len();
-    let end = THIS_FILE[start..]
+        .unwrap_or_else(|| panic!("{kind:?} has no pasted block in this file"));
+    let after = &source[marker + open.len()..];
+    let line_end = after
+        .find('\n')
+        .unwrap_or_else(|| panic!("{kind:?}'s open marker line never ends"));
+    // Nothing but the line ending may follow, so a trait whose name merely
+    // starts with another's cannot be located by the shorter one's marker.
+    assert!(
+        after[..line_end].trim().is_empty(),
+        "{kind:?}'s open marker does not end its line -- it is followed by {:?}",
+        &after[..line_end]
+    );
+    let start = marker + open.len() + line_end + 1;
+    let end = source[start..]
         .find(&close)
         .unwrap_or_else(|| panic!("{kind:?}'s pasted block is never closed"));
-    THIS_FILE[start..start + end].to_string()
+    source[start..start + end].to_string()
+}
+
+/// The blocks are found the same way whichever line ending this file arrives in.
+///
+/// CI runs on Windows, where git checks the file out CRLF, and this target read
+/// its own source with a needle that ended in a bare `\n` -- so it passed on the
+/// two platforms the author could run and failed on the third, reporting a
+/// missing block rather than a line-ending mismatch. That failure could not be
+/// reproduced on a checkout with LF endings, which is every checkout the author
+/// had, so the guard has to construct the other one rather than wait for it.
+#[test]
+fn the_blocks_are_found_the_same_way_under_crlf() {
+    // Normalise to LF first: rewriting `\n` in text that already held `\r\n`
+    // would produce `\r\r\n`, a shape no checkout ever hands us.
+    let crlf = THIS_FILE.replace("\r\n", "\n").replace('\n', "\r\n");
+    assert!(
+        crlf.contains("\r\n") && !crlf.contains("\r\r\n"),
+        "the CRLF copy this test rests on is not CRLF"
+    );
+    for kind in Trait::ALL {
+        assert_eq!(
+            collapsed(&block_in(&crlf, kind)),
+            collapsed(&block(kind)),
+            "{kind:?}'s block is read differently out of a CRLF checkout"
+        );
+    }
 }
 
 /// Every run of whitespace as one space, so indentation is not a difference.
