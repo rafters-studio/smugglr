@@ -27,13 +27,21 @@ rusqlite = { version = "0.34", features = ["bundled"] }
 # now and the file format costs nothing later.
 serde = { version = "1", features = ["derive"] }
 
+# Reading and writing committed regression fixtures is part of the library
+# rather than of its tests: the corpus runner is one caller of it, and a
+# consumer that records its own failing schema is another.
+serde_json = "1"
+
 # File-backed fixtures. The TempDir is owned by the fixture so removal cannot
 # outrun the connection close.
 tempfile = "3"
 
 thiserror = "2"
 
-[dev-dependencies]
-# Proves the model round-trips through a real serde format. Not needed to build
-# the crate -- reading and writing fixture files is FR-FORGER-009.
-serde_json = "1"
+[[test]]
+# The corpus runner brings its own main. It has to report the corpus size and
+# the time it took on every run, and libtest captures the output of a passing
+# test -- a report that only appears under `--nocapture` is a report nobody
+# reads, which is the whole thing this reporting exists to prevent.
+name = "corpus_runs"
+harness = false
