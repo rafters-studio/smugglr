@@ -25,6 +25,25 @@
 //! - `get_rows` - params: `{table, pk_values}`
 //! - `upsert_rows` - params: `{table, rows}`
 //! - `row_count` - params: `{table}`
+//!
+//! ## `upsert_rows`: what an absent column means
+//!
+//! A row object in `rows` is not required to carry every column the
+//! destination table has, and a column it does not mention must be **left
+//! alone** -- an existing row keeps its stored value for that column, and a new
+//! row takes the column's schema default. An absent key does not mean NULL, and
+//! an adapter must not derive its column list from the destination's schema (or
+//! from `rows[0]`) and then bind NULL for whatever the row is missing.
+//!
+//! smugglr strips `[sync].exclude_columns` from every row before it is sent, so
+//! an adapter that writes NULL for an absent column destroys the value the
+//! operator configured to stay off the wire -- and does it invisibly, because an
+//! excluded column is out of the content hash and nothing downstream compares
+//! it. That was #324 in smugglr's own native apply path.
+//!
+//! Rows within one `upsert_rows` call may carry different key sets. An adapter
+//! that builds one statement per batch must group by key set rather than take
+//! the first row's keys as the batch's column list.
 
 use crate::datasource::{DataSource, RowMeta, TableInfo};
 use crate::error::{Result, SyncError};

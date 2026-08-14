@@ -457,6 +457,182 @@ fn ordering_max_expr(qualifier: &str, cols: &[String]) -> String {
     format!("max({})", args.join(", "))
 }
 
+/// The conflict clause a [`UpsertGuard`] lowers to, once the destination
+/// table's ordering support is known.
+///
+/// Separate from the guard because [`UpsertGuard::NewerBy`] on a table that
+/// carries none of its ordering columns is indistinguishable from
+/// [`UpsertGuard::Replace`] at SQL-generation time, and collapsing the two here
+/// is what keeps the `ordering_unavailable` fallback from quietly missing a
+/// change made to the `Replace` shape. (#324)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConflictShape {
+    /// Overwrite an existing row unconditionally.
+    Overwrite,
+    /// Never touch an existing row.
+    Keep,
+    /// Overwrite only when the incoming ordering value is strictly greater.
+    Newer,
+}
+
+/// The destination columns one row is written over: the columns the table has,
+/// filtered to those the row actually carries, plus every primary-key column.
+///
+/// A column the row does not mention is left out of the statement entirely, so
+/// the destination keeps whatever it already stored there. Deriving this from
+/// the destination's `PRAGMA table_info` alone -- which is what this did before
+/// #324 -- bound an absent column as an explicit NULL and destroyed the stored
+/// value on every write arm that writes. `sync::transfer_rows` strips
+/// `[sync].exclude_columns` from every row it sends, so on `pull` that was
+/// silent local data loss.
+///
+/// Primary-key columns are forced in even when absent. They are the conflict
+/// target; omitting one would let SQLite supply a default (a fresh rowid, for
+/// an `INTEGER PRIMARY KEY`) and insert a new row rather than resolve against
+/// the intended one. Binding NULL, as before, is the conservative behavior.
+fn applied_columns<'a>(
+    cols: &[&'a str],
+    primary_key: &[String],
+    row: &HashMap<String, JsonValue>,
+) -> Vec<&'a str> {
+    cols.iter()
+        .copied()
+        .filter(|c| row.contains_key(*c) || primary_key.iter().any(|pk| pk == c))
+        .collect()
+}
+
+/// Build the upsert statement for one column set.
+///
+/// `apply_cols` covering every column of the table reproduces the pre-#324 SQL
+/// byte for byte, so a deployment with no `exclude_columns` -- where every row
+/// carries every column -- pays nothing and takes on none of the risks below.
+///
+/// A *subset* trades `INSERT OR REPLACE` for `ON CONFLICT(pk) DO UPDATE SET`
+/// over the carried columns, because `INSERT OR REPLACE` is a DELETE followed
+/// by an INSERT and therefore resets an unmentioned column to its schema
+/// default. Two things are given up on that path, which is why it is confined
+/// to rows that actually omit a column: `INSERT OR REPLACE` resolves a conflict
+/// on ANY uniqueness constraint while `ON CONFLICT(pk)` resolves only the
+/// primary key, and `INSERT OR REPLACE` fires DELETE triggers and
+/// `ON DELETE CASCADE` where `DO UPDATE` does not.
+fn build_upsert_sql(
+    table: &str,
+    info: &TableInfo,
+    apply_cols: &[&str],
+    shape: ConflictShape,
+    ordering: &[String],
+) -> String {
+    let col_list = apply_cols
+        .iter()
+        .map(|c| format!("\"{}\"", c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let placeholders = apply_cols
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // The conflict target must be the table's declared PRIMARY KEY columns.
+    // `table_info_inner` already rejects a table without one (`NoPrimaryKey`),
+    // so every table that reaches here has a target `ON CONFLICT` can bind to.
+    let pk_target = info
+        .primary_key
+        .iter()
+        .map(|c| format!("\"{}\"", c))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // The row carries every column the destination has, so nothing can be
+    // preserved by omission and the historical statement is exactly right.
+    let complete = apply_cols.len() == info.columns.len();
+
+    // Only non-PK columns are assigned: the PK columns are equal by definition
+    // of the conflict.
+    let assignments = apply_cols
+        .iter()
+        .filter(|c| !info.primary_key.iter().any(|pk| pk == *c))
+        .map(|c| format!("\"{0}\" = excluded.\"{0}\"", c))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // Three arms reach the same statement -- `KeepLocal`, and either of the
+    // writing shapes on a row that carries nothing but the primary key -- so the
+    // shape is written once.
+    let do_nothing = || {
+        format!(
+            "INSERT INTO \"{}\" ({}) VALUES ({}) ON CONFLICT({}) DO NOTHING",
+            table, col_list, placeholders, pk_target
+        )
+    };
+
+    match shape {
+        ConflictShape::Overwrite if complete => format!(
+            "INSERT OR REPLACE INTO \"{}\" ({}) VALUES ({})",
+            table, col_list, placeholders
+        ),
+        ConflictShape::Keep => do_nothing(),
+        // A row carrying nothing but the primary key has nothing to assign, and
+        // `DO UPDATE SET` with an empty assignment list is not valid SQL. There
+        // is also nothing to write: every non-PK column is being preserved.
+        // Such a row reports as `rejected` rather than `applied` -- the
+        // statement changes no rows, and the counters read the statement.
+        ConflictShape::Overwrite if assignments.is_empty() => do_nothing(),
+        ConflictShape::Overwrite => format!(
+            "INSERT INTO \"{}\" ({}) VALUES ({}) ON CONFLICT({}) DO UPDATE SET {}",
+            table, col_list, placeholders, pk_target, assignments
+        ),
+        ConflictShape::Newer => {
+            // Only the ordering columns THIS row carries contribute to the
+            // incoming value. SQLite resolves `excluded."c"` for a column left
+            // out of the INSERT to that column's schema DEFAULT, not to NULL
+            // (measured -- see `excluded_reads_the_schema_default_for_an_omitted_column`),
+            // so reading a stripped ordering column off `excluded` would let a
+            // `DEFAULT CURRENT_TIMESTAMP` win comparisons the pre-#324 NULL bind
+            // lost. The rotated-coalesce max is unchanged by dropping columns
+            // that would have been bound NULL, so this is exactly the pre-#324
+            // comparison.
+            let incoming_cols: Vec<String> = ordering
+                .iter()
+                .filter(|c| apply_cols.contains(&c.as_str()))
+                .cloned()
+                .collect();
+
+            // No ordering column survived the strip, so the row carries no
+            // ordering signal and must never displace a stored row -- which is
+            // what the `{incoming} IS NOT NULL` arm did when every ordering
+            // column was bound NULL. A new row is still inserted.
+            //
+            // The empty-assignment arm is the same reasoning as under
+            // `Overwrite`, and is deliberately confined to the subset path: a
+            // table whose every column is part of its primary key emits an
+            // empty `DO UPDATE SET` here, which SQLite rejects. That is a
+            // pre-existing defect of this arm, not one this change introduces,
+            // and leaving the complete path untouched is what keeps its SQL
+            // byte-identical.
+            if incoming_cols.is_empty() || (!complete && assignments.is_empty()) {
+                return do_nothing();
+            }
+
+            let incoming = ordering_max_expr("excluded", &incoming_cols);
+            let stored = ordering_max_expr(&format!("\"{}\"", table), ordering);
+            // An incoming row with no ordering value never displaces a stored
+            // row; a stored row with no ordering value never blocks one. Both
+            // arms are needed and both are symmetric across peers, so exactly
+            // one side of any pair accepts and the mesh quiesces.
+            format!(
+                "INSERT INTO \"{table}\" ({col_list}) VALUES ({placeholders}) \
+                 ON CONFLICT({pk_target}) DO UPDATE SET {assignments} \
+                 WHERE {incoming} IS NOT NULL \
+                 AND ({stored} IS NULL OR {incoming} > {stored})"
+            )
+        }
+    }
+}
+
+/// Rows of one batch bucketed by the destination columns they are written over.
+type ColumnGroups<'a> = Vec<(Vec<&'a str>, Vec<&'a HashMap<String, JsonValue>>)>;
+
 fn upsert_rows_guarded_inner(
     conn: &Connection,
     table: &str,
@@ -470,28 +646,12 @@ fn upsert_rows_guarded_inner(
     let info = table_info_inner(conn, table)?;
     let cols: Vec<&str> = info.columns.iter().map(|c| c.name.as_str()).collect();
 
-    let col_list = cols
-        .iter()
-        .map(|c| format!("\"{}\"", c))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let placeholders = cols.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
-
-    // The conflict target must be the table's declared PRIMARY KEY columns.
-    // `table_info_inner` already rejects a table without one (`NoPrimaryKey`),
-    // so every table that reaches here has a target `ON CONFLICT` can bind to.
-    let pk_target = info
-        .primary_key
-        .iter()
-        .map(|c| format!("\"{}\"", c))
-        .collect::<Vec<_>>()
-        .join(", ");
-
     // Ordering columns the table does not have cannot participate. If none of
     // them exist, there is no ordering signal and the guard degrades to
-    // Replace -- reported, never silent.
+    // Replace -- reported, never silent. Derived from the table's schema, so it
+    // is the same answer for every row in the batch.
     let mut ordering_unavailable = false;
-    let present: Vec<String> = match guard {
+    let ordering: Vec<String> = match guard {
         UpsertGuard::NewerBy(want) => {
             let present: Vec<String> = want
                 .iter()
@@ -506,53 +666,36 @@ fn upsert_rows_guarded_inner(
         _ => Vec::new(),
     };
 
-    let sql = match guard {
-        UpsertGuard::Replace => format!(
-            "INSERT OR REPLACE INTO \"{}\" ({}) VALUES ({})",
-            table, col_list, placeholders
-        ),
-        UpsertGuard::KeepLocal => format!(
-            "INSERT INTO \"{}\" ({}) VALUES ({}) ON CONFLICT({}) DO NOTHING",
-            table, col_list, placeholders, pk_target
-        ),
-        UpsertGuard::NewerBy(_) if ordering_unavailable => format!(
-            "INSERT OR REPLACE INTO \"{}\" ({}) VALUES ({})",
-            table, col_list, placeholders
-        ),
-        UpsertGuard::NewerBy(_) => {
-            // Only non-PK columns are assigned: the PK columns are equal by
-            // definition of the conflict.
-            let assignments = cols
-                .iter()
-                .filter(|c| !info.primary_key.iter().any(|pk| pk == *c))
-                .map(|c| format!("\"{0}\" = excluded.\"{0}\"", c))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let incoming = ordering_max_expr("excluded", &present);
-            let stored = ordering_max_expr(&format!("\"{}\"", table), &present);
-            // An incoming row with no ordering value never displaces a stored
-            // row; a stored row with no ordering value never blocks one. Both
-            // arms are needed and both are symmetric across peers, so exactly
-            // one side of any pair accepts and the mesh quiesces.
-            format!(
-                "INSERT INTO \"{table}\" ({col_list}) VALUES ({placeholders}) \
-                 ON CONFLICT({pk_target}) DO UPDATE SET {assignments} \
-                 WHERE {incoming} IS NOT NULL \
-                 AND ({stored} IS NULL OR {incoming} > {stored})"
-            )
-        }
+    let shape = match guard {
+        UpsertGuard::Replace => ConflictShape::Overwrite,
+        UpsertGuard::KeepLocal => ConflictShape::Keep,
+        UpsertGuard::NewerBy(_) if ordering_unavailable => ConflictShape::Overwrite,
+        UpsertGuard::NewerBy(_) => ConflictShape::Newer,
     };
 
-    debug!("Upserting {} rows into {}: {}", rows.len(), table, sql);
+    // A sender that strips columns strips them uniformly, so this is one group
+    // in practice -- but nothing in the trait promises it, and a batch mixing
+    // key sets must not be written under one row's column list.
+    let mut groups: ColumnGroups = Vec::new();
+    for row in rows {
+        let apply_cols = applied_columns(&cols, &info.primary_key, row);
+        match groups.iter_mut().find(|(k, _)| *k == apply_cols) {
+            Some((_, members)) => members.push(row),
+            None => groups.push((apply_cols, vec![row])),
+        }
+    }
 
     let tx = conn.unchecked_transaction()?;
     let mut applied = 0;
     let mut rejected = 0;
 
-    {
+    for (apply_cols, members) in &groups {
+        let sql = build_upsert_sql(table, &info, apply_cols, shape, &ordering);
+        debug!("Upserting {} rows into {}: {}", members.len(), table, sql);
+
         let mut stmt = tx.prepare(&sql)?;
-        for row in rows {
-            let params: Vec<JsonToSql> = cols
+        for row in members {
+            let params: Vec<JsonToSql> = apply_cols
                 .iter()
                 .map(|col| JsonToSql(row.get(*col).cloned().unwrap_or(JsonValue::Null)))
                 .collect();
@@ -1456,5 +1599,431 @@ mod tests {
             get_col0(&one_row_conn("x'01ff'")).unwrap(),
             JsonValue::from("01ff")
         );
+    }
+
+    // -- An absent column means "leave the destination's value alone" (#324) --
+
+    /// A table with one column an operator would put in `exclude_columns`, and
+    /// a stored row that already has a value there.
+    fn stripping_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE notes (
+                 id TEXT PRIMARY KEY,
+                 body TEXT,
+                 ssn TEXT,
+                 updated_at TEXT
+             );
+             INSERT INTO notes VALUES ('n1', 'old body', 'secret', '2026-01-01');",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// The row `sync::transfer_rows` produces after stripping `ssn`: newer,
+    /// changed, and missing exactly the excluded column.
+    fn stripped_row() -> HashMap<String, JsonValue> {
+        HashMap::from([
+            ("id".to_string(), JsonValue::from("n1")),
+            ("body".to_string(), JsonValue::from("new body")),
+            ("updated_at".to_string(), JsonValue::from("2026-02-01")),
+        ])
+    }
+
+    fn read_note(conn: &Connection, id: &str) -> (Option<String>, Option<String>) {
+        conn.query_row("SELECT body, ssn FROM notes WHERE id = ?", [id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn replace_leaves_a_column_the_row_omits_untouched() {
+        // The arm `DataSource::upsert_rows` uses unconditionally, and therefore
+        // the arm the directional pull path writes through. Before #324 this
+        // bound `ssn` as an explicit NULL and destroyed the local value.
+        let conn = stripping_conn();
+        let out =
+            upsert_rows_guarded_inner(&conn, "notes", &[stripped_row()], UpsertGuard::Replace)
+                .unwrap();
+        assert_eq!(out.applied, 1);
+
+        let (body, ssn) = read_note(&conn, "n1");
+        assert_eq!(body.as_deref(), Some("new body"), "carried column applies");
+        assert_eq!(
+            ssn.as_deref(),
+            Some("secret"),
+            "omitted column is preserved"
+        );
+    }
+
+    #[test]
+    fn newer_by_leaves_a_column_the_row_omits_untouched() {
+        let conn = stripping_conn();
+        let ordering = vec!["updated_at".to_string()];
+        let out = upsert_rows_guarded_inner(
+            &conn,
+            "notes",
+            &[stripped_row()],
+            UpsertGuard::NewerBy(&ordering),
+        )
+        .unwrap();
+        assert_eq!(out.applied, 1, "2026-02-01 is newer than 2026-01-01");
+        assert!(!out.ordering_unavailable);
+
+        let (body, ssn) = read_note(&conn, "n1");
+        assert_eq!(body.as_deref(), Some("new body"));
+        assert_eq!(
+            ssn.as_deref(),
+            Some("secret"),
+            "omitted column is preserved"
+        );
+    }
+
+    #[test]
+    fn newer_by_without_an_ordering_column_leaves_a_column_the_row_omits_untouched() {
+        // The `ordering_unavailable` fallback: `NewerBy` on a table carrying
+        // none of its ordering columns degrades to a blind overwrite. It is the
+        // easiest arm to miss and exactly where the protection would vanish
+        // without anyone noticing.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE notes (id TEXT PRIMARY KEY, body TEXT, ssn TEXT);
+             INSERT INTO notes VALUES ('n1', 'old body', 'secret');",
+        )
+        .unwrap();
+
+        let ordering = vec!["updated_at".to_string()];
+        let row = HashMap::from([
+            ("id".to_string(), JsonValue::from("n1")),
+            ("body".to_string(), JsonValue::from("new body")),
+        ]);
+        let out =
+            upsert_rows_guarded_inner(&conn, "notes", &[row], UpsertGuard::NewerBy(&ordering))
+                .unwrap();
+        assert!(
+            out.ordering_unavailable,
+            "the table has none of the ordering columns, so this IS the fallback"
+        );
+        assert_eq!(out.applied, 1);
+
+        let (body, ssn) = read_note(&conn, "n1");
+        assert_eq!(body.as_deref(), Some("new body"));
+        assert_eq!(
+            ssn.as_deref(),
+            Some("secret"),
+            "omitted column is preserved"
+        );
+    }
+
+    #[test]
+    fn keep_local_leaves_a_column_the_row_omits_untouched() {
+        let conn = stripping_conn();
+        let out =
+            upsert_rows_guarded_inner(&conn, "notes", &[stripped_row()], UpsertGuard::KeepLocal)
+                .unwrap();
+        assert_eq!(out.applied, 0);
+        assert_eq!(out.rejected, 1, "the guard declines the write entirely");
+
+        let (body, ssn) = read_note(&conn, "n1");
+        assert_eq!(body.as_deref(), Some("old body"), "the local row stands");
+        assert_eq!(ssn.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn newer_by_with_the_ordering_column_stripped_never_displaces_a_stored_row() {
+        // A row that carries no ordering value has no claim on the stored row.
+        // This is the pre-#324 behavior (every ordering column bound NULL made
+        // `{incoming} IS NOT NULL` false) and it must survive the subset path,
+        // where reading `excluded."updated_at"` would instead have produced the
+        // column's schema DEFAULT -- see the next test.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE notes (
+                 id TEXT PRIMARY KEY,
+                 body TEXT,
+                 ssn TEXT,
+                 updated_at TEXT DEFAULT '9999-01-01'
+             );
+             INSERT INTO notes VALUES ('n1', 'old body', 'secret', '2026-01-01');",
+        )
+        .unwrap();
+
+        let ordering = vec!["updated_at".to_string()];
+        let row = HashMap::from([
+            ("id".to_string(), JsonValue::from("n1")),
+            ("body".to_string(), JsonValue::from("new body")),
+        ]);
+        let out =
+            upsert_rows_guarded_inner(&conn, "notes", &[row], UpsertGuard::NewerBy(&ordering))
+                .unwrap();
+        assert_eq!(out.applied, 0);
+        assert_eq!(out.rejected, 1);
+
+        let (body, ssn) = read_note(&conn, "n1");
+        assert_eq!(
+            body.as_deref(),
+            Some("old body"),
+            "a DEFAULT '9999-01-01' must not become an ordering claim"
+        );
+        assert_eq!(ssn.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn newer_by_ignores_a_stripped_ordering_columns_default_when_another_survives() {
+        // The case the single-column test above cannot reach: two ordering
+        // columns, one stripped, one carried. Reading the stripped one off
+        // `excluded` yields its schema DEFAULT ('9999-01-01' here, and
+        // `DEFAULT CURRENT_TIMESTAMP` in the wild), which would beat any stored
+        // value and let a row with no real ordering claim overwrite a newer one.
+        // The incoming ordering value must be computed over the columns the row
+        // actually carries.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE notes (
+                 id TEXT PRIMARY KEY,
+                 body TEXT,
+                 ssn TEXT,
+                 updated_at TEXT DEFAULT '9999-01-01',
+                 deleted_at TEXT
+             );
+             INSERT INTO notes VALUES ('n1', 'old body', 'secret', '2026-06-01', NULL);",
+        )
+        .unwrap();
+
+        let ordering = vec!["updated_at".to_string(), "deleted_at".to_string()];
+        let row = HashMap::from([
+            ("id".to_string(), JsonValue::from("n1")),
+            ("body".to_string(), JsonValue::from("new body")),
+            ("deleted_at".to_string(), JsonValue::from("2026-01-01")),
+        ]);
+        let out =
+            upsert_rows_guarded_inner(&conn, "notes", &[row], UpsertGuard::NewerBy(&ordering))
+                .unwrap();
+        assert_eq!(out.applied, 0);
+        assert_eq!(
+            out.rejected, 1,
+            "incoming 2026-01-01 loses to stored 2026-06-01"
+        );
+
+        let (body, ssn) = read_note(&conn, "n1");
+        assert_eq!(body.as_deref(), Some("old body"));
+        assert_eq!(ssn.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn excluded_reads_the_schema_default_for_an_omitted_column() {
+        // The measured SQLite fact the `Newer` arm is built around: a column
+        // left out of the INSERT column list is still readable through
+        // `excluded`, and it reads as that column's schema DEFAULT rather than
+        // NULL. That is why the incoming ordering expression is computed over
+        // the columns the row actually carries instead of all of them.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (id TEXT PRIMARY KEY, v TEXT, ts TEXT DEFAULT '9999');
+             INSERT INTO t VALUES ('a', 'old', '1000');",
+        )
+        .unwrap();
+
+        let changed = conn
+            .execute(
+                "INSERT INTO t (\"id\", \"v\") VALUES (?, ?) \
+                 ON CONFLICT(\"id\") DO UPDATE SET \"v\" = excluded.\"v\" \
+                 WHERE excluded.\"ts\" IS NOT NULL",
+                rusqlite::params!["a", "new"],
+            )
+            .expect("excluded.<omitted column> is legal, not a prepare error");
+        assert_eq!(
+            changed, 1,
+            "excluded.\"ts\" is the DEFAULT '9999', not NULL -- so the guard passed"
+        );
+    }
+
+    #[test]
+    fn a_new_row_missing_a_column_takes_its_schema_default() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE notes (
+                 id TEXT PRIMARY KEY,
+                 body TEXT,
+                 ssn TEXT DEFAULT 'unset'
+             );",
+        )
+        .unwrap();
+
+        let row = HashMap::from([
+            ("id".to_string(), JsonValue::from("fresh")),
+            ("body".to_string(), JsonValue::from("hello")),
+        ]);
+        let out = upsert_rows_guarded_inner(&conn, "notes", &[row], UpsertGuard::Replace).unwrap();
+        assert_eq!(out.applied, 1);
+
+        let (body, ssn) = read_note(&conn, "fresh");
+        assert_eq!(body.as_deref(), Some("hello"));
+        assert_eq!(
+            ssn.as_deref(),
+            Some("unset"),
+            "no prior value existed, so the schema default destroys nothing"
+        );
+    }
+
+    #[test]
+    fn a_new_row_missing_a_not_null_column_errors_naming_the_table_and_column() {
+        // Not papered over: a NOT NULL column with no DEFAULT, excluded from a
+        // row that does not yet exist at the destination, still fails the
+        // insert. What matters is that the failure is legible.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE notes (id TEXT PRIMARY KEY, body TEXT, ssn TEXT NOT NULL);",
+        )
+        .unwrap();
+
+        let row = HashMap::from([
+            ("id".to_string(), JsonValue::from("fresh")),
+            ("body".to_string(), JsonValue::from("hello")),
+        ]);
+        let err = upsert_rows_guarded_inner(&conn, "notes", &[row], UpsertGuard::Replace)
+            .expect_err("a NOT NULL column with no default cannot be omitted from a new row");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("notes") && msg.contains("ssn"),
+            "the error must name the table and the column, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn rows_carrying_different_column_sets_group_by_column_set() {
+        // A stripping sender is uniform in practice, so this is one group in
+        // practice -- but nothing in the trait promises it, and writing a
+        // mixed batch under one row's column list would null what the other
+        // rows preserve.
+        let conn = stripping_conn();
+        conn.execute(
+            "INSERT INTO notes VALUES ('n2', 'old two', 'secret two', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+
+        let mut with_ssn = stripped_row();
+        with_ssn.insert("id".to_string(), JsonValue::from("n2"));
+        with_ssn.insert("ssn".to_string(), JsonValue::from("rewritten"));
+
+        let out = upsert_rows_guarded_inner(
+            &conn,
+            "notes",
+            &[stripped_row(), with_ssn],
+            UpsertGuard::Replace,
+        )
+        .unwrap();
+        assert_eq!(out.applied, 2);
+
+        assert_eq!(
+            read_note(&conn, "n1").1.as_deref(),
+            Some("secret"),
+            "the row that omitted ssn keeps its stored value"
+        );
+        assert_eq!(
+            read_note(&conn, "n2").1.as_deref(),
+            Some("rewritten"),
+            "the row that carried ssn writes it"
+        );
+    }
+
+    // -- SQL shape --
+
+    fn shape_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (id TEXT PRIMARY KEY, ts TEXT, v TEXT);")
+            .unwrap();
+        conn
+    }
+
+    #[test]
+    fn a_complete_row_emits_the_pre_324_sql_byte_for_byte() {
+        // The expected strings are transcribed from the pre-#324
+        // `upsert_rows_guarded_inner` (46ea374, local.rs:509-544), NOT generated
+        // from the builder under test -- generating them would make this
+        // circular. A deployment without `exclude_columns` sends every column
+        // and must keep the historical statement, so it takes on none of the
+        // `ON CONFLICT(pk)` trade-offs.
+        let conn = shape_conn();
+        let info = table_info_inner(&conn, "t").unwrap();
+        let all = ["id", "ts", "v"];
+        let ordering = vec!["ts".to_string()];
+
+        assert_eq!(
+            build_upsert_sql("t", &info, &all, ConflictShape::Overwrite, &[]),
+            "INSERT OR REPLACE INTO \"t\" (\"id\", \"ts\", \"v\") VALUES (?, ?, ?)"
+        );
+        assert_eq!(
+            build_upsert_sql("t", &info, &all, ConflictShape::Keep, &[]),
+            "INSERT INTO \"t\" (\"id\", \"ts\", \"v\") VALUES (?, ?, ?) \
+             ON CONFLICT(\"id\") DO NOTHING"
+        );
+        assert_eq!(
+            build_upsert_sql("t", &info, &all, ConflictShape::Newer, &ordering),
+            "INSERT INTO \"t\" (\"id\", \"ts\", \"v\") VALUES (?, ?, ?) \
+             ON CONFLICT(\"id\") DO UPDATE SET \"ts\" = excluded.\"ts\", \"v\" = excluded.\"v\" \
+             WHERE excluded.\"ts\" IS NOT NULL \
+             AND (\"t\".\"ts\" IS NULL OR excluded.\"ts\" > \"t\".\"ts\")"
+        );
+        // `NewerBy` with no usable ordering column lowers to Overwrite, which on
+        // the complete path is the same INSERT OR REPLACE as before.
+        assert_eq!(
+            build_upsert_sql("t", &info, &all, ConflictShape::Overwrite, &[]),
+            "INSERT OR REPLACE INTO \"t\" (\"id\", \"ts\", \"v\") VALUES (?, ?, ?)"
+        );
+    }
+
+    #[test]
+    fn a_row_omitting_a_column_emits_on_conflict_do_update() {
+        let conn = shape_conn();
+        let info = table_info_inner(&conn, "t").unwrap();
+        let ordering = vec!["ts".to_string()];
+
+        // `v` omitted: INSERT OR REPLACE would DELETE+INSERT and reset it.
+        let no_v = ["id", "ts"];
+        assert_eq!(
+            build_upsert_sql("t", &info, &no_v, ConflictShape::Overwrite, &[]),
+            "INSERT INTO \"t\" (\"id\", \"ts\") VALUES (?, ?) \
+             ON CONFLICT(\"id\") DO UPDATE SET \"ts\" = excluded.\"ts\""
+        );
+        assert_eq!(
+            build_upsert_sql("t", &info, &no_v, ConflictShape::Keep, &[]),
+            "INSERT INTO \"t\" (\"id\", \"ts\") VALUES (?, ?) ON CONFLICT(\"id\") DO NOTHING"
+        );
+        assert_eq!(
+            build_upsert_sql("t", &info, &no_v, ConflictShape::Newer, &ordering),
+            "INSERT INTO \"t\" (\"id\", \"ts\") VALUES (?, ?) \
+             ON CONFLICT(\"id\") DO UPDATE SET \"ts\" = excluded.\"ts\" \
+             WHERE excluded.\"ts\" IS NOT NULL \
+             AND (\"t\".\"ts\" IS NULL OR excluded.\"ts\" > \"t\".\"ts\")"
+        );
+
+        // The ordering column itself stripped: no incoming ordering signal, so
+        // the row may insert but must never displace.
+        let no_ts = ["id", "v"];
+        assert_eq!(
+            build_upsert_sql("t", &info, &no_ts, ConflictShape::Newer, &ordering),
+            "INSERT INTO \"t\" (\"id\", \"v\") VALUES (?, ?) ON CONFLICT(\"id\") DO NOTHING"
+        );
+
+        // Nothing but the primary key: nothing to assign, nothing to write.
+        let pk_only = ["id"];
+        assert_eq!(
+            build_upsert_sql("t", &info, &pk_only, ConflictShape::Overwrite, &[]),
+            "INSERT INTO \"t\" (\"id\") VALUES (?) ON CONFLICT(\"id\") DO NOTHING"
+        );
+    }
+
+    #[test]
+    fn a_primary_key_column_is_applied_even_when_the_row_omits_it() {
+        // The conflict target has to be bound. Omitting it would let SQLite
+        // supply a default -- a fresh rowid for an INTEGER PRIMARY KEY -- and
+        // insert a new row instead of resolving against the intended one.
+        let cols = ["id", "body", "ssn"];
+        let pk = vec!["id".to_string()];
+        let row = HashMap::from([("body".to_string(), JsonValue::from("x"))]);
+        assert_eq!(applied_columns(&cols, &pk, &row), vec!["id", "body"]);
     }
 }

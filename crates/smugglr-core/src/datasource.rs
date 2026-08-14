@@ -82,7 +82,34 @@ pub trait DataSource: Sync {
         pk_values: &[String],
     ) -> impl std::future::Future<Output = Result<Vec<HashMap<String, JsonValue>>>> + MaybeSend;
 
-    /// Insert or replace rows in the table. Returns the number of rows written.
+    /// Insert or update rows in the table. Returns the number of rows written.
+    ///
+    /// # What an absent column means
+    ///
+    /// A column a row map does not mention is **left alone**: an existing
+    /// destination row keeps whatever it already stored there, and a row that
+    /// does not yet exist takes that column's schema default. It does NOT mean
+    /// NULL.
+    ///
+    /// The distinction is load-bearing because `[sync].exclude_columns` strips
+    /// matching columns from every row before transfer (`sync::transfer_rows`),
+    /// so an implementation that writes NULL for an absent column destroys the
+    /// value the operator configured to stay off the wire -- silently, since an
+    /// excluded column is out of the content hash and nothing downstream
+    /// compares it. That was #324, on the `pull` path, where the destination is
+    /// the local database.
+    ///
+    /// **This is a contract on implementors, not a guarantee smugglr enforces
+    /// for every backend it ships.** `LocalDb` honors it as of #324. The
+    /// bundled http-sql adapter and the wasm adapters derive their column list
+    /// from `rows[0].keys()` and emit `INSERT OR REPLACE`, which SQLite
+    /// executes as DELETE+INSERT -- so a column absent from a row pushed to one
+    /// of those destinations is reset to its schema default there. Excluding a
+    /// column is not yet safe in the push direction.
+    ///
+    /// A column that is `NOT NULL` with no `DEFAULT` cannot be omitted from a
+    /// row that does not yet exist at the destination; that insert fails, and
+    /// the failure should name the table and the column.
     fn upsert_rows(
         &self,
         table: &str,

@@ -977,6 +977,141 @@ mod tests {
         }
     }
 
+    // Regression for #324: `pull` with `exclude_columns` set nulled the
+    // excluded column in the LOCAL database. `transfer_rows` strips the column
+    // from every row it sends, and on `pull` the destination is the local DB --
+    // which derived its column list from its own PRAGMA and bound the absent
+    // column as an explicit NULL. Silent, and every step reported success.
+    //
+    // The assertions read the destination row's contents after the pull, not
+    // the pull's own report. Nothing downstream compares an excluded column --
+    // it is out of the content hash by definition -- so a test that asserts
+    // "the sync succeeded" cannot see this failure at all.
+    #[cfg(feature = "native")]
+    mod pull_with_exclude_columns {
+        use super::super::{pull_table, NoProgress};
+        use crate::config::{BatchConfig, ConflictResolution};
+        use crate::diff::TableDiff;
+        use crate::local::LocalDb;
+        use rusqlite::Connection;
+        use tempfile::TempDir;
+
+        fn seed(path: &std::path::Path, rows: &[(&str, &str, &str, &str)]) {
+            let conn = Connection::open(path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE notes (
+                     id TEXT PRIMARY KEY,
+                     body TEXT,
+                     ssn TEXT DEFAULT 'unset',
+                     updated_at TEXT
+                 );",
+            )
+            .unwrap();
+            for (id, body, ssn, ts) in rows {
+                conn.execute(
+                    "INSERT INTO notes (id, body, ssn, updated_at) VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![id, body, ssn, ts],
+                )
+                .unwrap();
+            }
+        }
+
+        fn read(path: &std::path::Path, id: &str) -> (String, Option<String>) {
+            let conn = Connection::open(path).unwrap();
+            conn.query_row("SELECT body, ssn FROM notes WHERE id = ?", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap()
+        }
+
+        #[tokio::test]
+        async fn pull_does_not_null_the_local_value_of_an_excluded_column() {
+            let dir = TempDir::new().unwrap();
+            let local_path = dir.path().join("local.sqlite");
+            let remote_path = dir.path().join("remote.sqlite");
+            seed(
+                &local_path,
+                &[("n1", "local body", "local secret", "2026-01-01")],
+            );
+            seed(
+                &remote_path,
+                &[("n1", "remote body", "remote secret", "2026-02-01")],
+            );
+
+            let local = LocalDb::open(&local_path).unwrap();
+            let remote = LocalDb::open(&remote_path).unwrap();
+
+            let mut diff = TableDiff::new("notes");
+            diff.remote_newer.push("n1".to_string());
+
+            let result = pull_table(
+                &local,
+                &remote,
+                "notes",
+                &diff,
+                ConflictResolution::NewerWins,
+                &BatchConfig::default(),
+                &["ssn".to_string()],
+                false,
+                &NoProgress,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.rows_pulled, 1, "the row did transfer");
+            drop(local);
+
+            let (body, ssn) = read(&local_path, "n1");
+            assert_eq!(body, "remote body", "the carried columns applied");
+            assert_eq!(
+                ssn.as_deref(),
+                Some("local secret"),
+                "the excluded column's LOCAL value must survive the pull"
+            );
+        }
+
+        #[tokio::test]
+        async fn pulling_a_row_that_does_not_exist_locally_takes_the_schema_default() {
+            // The other half of #324: with no prior local row there is no value
+            // to destroy, so the excluded column landing at its schema default
+            // is correct rather than a loss. Pinned so a future change to the
+            // subset path cannot turn an insert into a rejection.
+            let dir = TempDir::new().unwrap();
+            let local_path = dir.path().join("local.sqlite");
+            let remote_path = dir.path().join("remote.sqlite");
+            seed(&local_path, &[]);
+            seed(
+                &remote_path,
+                &[("n2", "remote body", "remote secret", "2026-02-01")],
+            );
+
+            let local = LocalDb::open(&local_path).unwrap();
+            let remote = LocalDb::open(&remote_path).unwrap();
+
+            let mut diff = TableDiff::new("notes");
+            diff.remote_only.push("n2".to_string());
+
+            let result = pull_table(
+                &local,
+                &remote,
+                "notes",
+                &diff,
+                ConflictResolution::NewerWins,
+                &BatchConfig::default(),
+                &["ssn".to_string()],
+                false,
+                &NoProgress,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.rows_pulled, 1);
+            drop(local);
+
+            let (body, ssn) = read(&local_path, "n2");
+            assert_eq!(body, "remote body");
+            assert_eq!(ssn.as_deref(), Some("unset"), "schema default, not a loss");
+        }
+    }
+
     // Drive both push_all and pull_all through the shared `run_directional`
     // driver over two real LocalDb sources, pinning the observable contract the
     // refactor must preserve: same rows selected per direction, dry-run
