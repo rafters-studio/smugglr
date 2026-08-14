@@ -1093,110 +1093,35 @@ fn table_sql(conn: &Connection, table: &str) -> Result<Option<String>, MigrateEr
     Ok(sql.flatten())
 }
 
-/// Blank out SQL string literals (`'...'`), quoted identifiers (`"..."`,
-/// `` `...` ``, `[...]`), and comments (`-- ...`, `/* ... */`) so a keyword scan
-/// sees only code. Each removed span becomes a single space; the rest is copied
-/// verbatim. Char-based (UTF-8 safe); doubled quotes escape.
-#[cfg(feature = "native")]
-fn strip_sql_literals_and_comments(sql: &str) -> String {
-    let mut out = String::with_capacity(sql.len());
-    let mut chars = sql.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\'' | '"' | '`' => {
-                while let Some(n) = chars.next() {
-                    if n == c {
-                        if chars.peek() == Some(&c) {
-                            chars.next(); // doubled quote escapes
-                            continue;
-                        }
-                        break;
-                    }
-                }
-                out.push(' ');
-            }
-            '[' => {
-                for n in chars.by_ref() {
-                    if n == ']' {
-                        break;
-                    }
-                }
-                out.push(' ');
-            }
-            '-' if chars.peek() == Some(&'-') => {
-                chars.next();
-                for n in chars.by_ref() {
-                    if n == '\n' {
-                        break;
-                    }
-                }
-                out.push(' ');
-            }
-            '/' if chars.peek() == Some(&'*') => {
-                chars.next();
-                let mut prev = '\0';
-                for n in chars.by_ref() {
-                    if prev == '*' && n == '/' {
-                        break;
-                    }
-                    prev = n;
-                }
-                out.push(' ');
-            }
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
-/// Whether a `CREATE TABLE` statement declares `AUTOINCREMENT`. The keyword is
-/// only legal on the single `INTEGER PRIMARY KEY` rowid alias. It is matched as a
-/// bare token *outside* string literals, quoted identifiers, and comments, so a
-/// `DEFAULT 'autoincrement'`, a column named `autoincrement_flag`, or a
-/// `/* autoincrement */` comment does not spuriously mark the table -- which would
-/// wrongly synthesize a `sqlite_sequence` row and change schema semantics on a
-/// drop-column rebuild.
-#[cfg(feature = "native")]
-fn sql_has_autoincrement(sql: &str) -> bool {
-    strip_sql_literals_and_comments(sql)
-        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .any(|tok| tok.eq_ignore_ascii_case("AUTOINCREMENT"))
-}
-
-/// Whether `sql` mentions `ident` as an identifier -- bare (`NEW.email`,
-/// `UPDATE OF email`) or quoted in any of SQLite's three forms (`"email"`,
-/// `` `email` ``, `[email]`) -- ignoring string literals and comments.
-/// ASCII-case-insensitive, as SQLite's own identifier comparison is.
+/// Scan `sql` for identifier-position tokens, calling `f(quoted, token)` on each
+/// bare word and each quoted identifier (`"x"`, `` `x` ``, `[x]`). String
+/// literals (`'...'`) and comments (`-- ...`, `/* ... */`) are skipped, never
+/// reported. Char-based (UTF-8 safe); a doubled quote escapes.
 ///
-/// This cannot reuse [`strip_sql_literals_and_comments`], which blanks quoted
-/// identifiers along with string literals -- deliberately, so a table named
-/// `"autoincrement"` does not fool [`sql_has_autoincrement`]
-/// (`sql_has_autoincrement_ignores_literals_comments_and_identifiers`). Here a
-/// quoted identifier is exactly what must be seen.
-///
-/// It is an over-approximation: a trigger body naming a *different* table's
-/// `email` column, or using `email` as an alias, matches. That direction is
-/// chosen. A false positive drops a trigger with a warning, which is
-/// recoverable; a false negative replays a trigger whose body no longer
-/// resolves, and every subsequent write to the table fails at prepare time.
+/// Returns as soon as `f` returns `true`, reporting whether it ever did. The
+/// `quoted` flag is the whole difference between this module's two keyword
+/// scans: [`sql_has_autoincrement`] wants bare tokens only (a table named
+/// `"autoincrement"` must not count), while [`sql_mentions_identifier`] wants
+/// both (a trigger body may write `NEW."email"`).
 #[cfg(feature = "native")]
-fn sql_mentions_identifier(sql: &str, ident: &str) -> bool {
+fn any_sql_identifier(sql: &str, mut f: impl FnMut(bool, &str) -> bool) -> bool {
     let mut chars = sql.chars().peekable();
     let mut bare = String::new();
     let mut quoted = String::new();
     while let Some(c) = chars.next() {
-        // Bare identifier: ASCII word bytes, plus any non-ASCII char (SQLite
-        // admits those unquoted).
+        // A bare identifier runs over ASCII word bytes plus any non-ASCII char
+        // (SQLite admits those unquoted).
         if c.is_ascii_alphanumeric() || c == '_' || c == '$' || !c.is_ascii() {
             bare.push(c);
             continue;
         }
-        if bare.eq_ignore_ascii_case(ident) {
-            return true;
+        if !bare.is_empty() {
+            if f(false, &bare) {
+                return true;
+            }
+            bare.clear();
         }
-        bare.clear();
         match c {
-            // String literal: skipped entirely.
             '\'' => {
                 while let Some(n) = chars.next() {
                     if n == '\'' {
@@ -1208,7 +1133,6 @@ fn sql_mentions_identifier(sql: &str, ident: &str) -> bool {
                     }
                 }
             }
-            // Quoted identifier: the span itself is the identifier.
             '"' | '`' => {
                 quoted.clear();
                 while let Some(n) = chars.next() {
@@ -1222,7 +1146,7 @@ fn sql_mentions_identifier(sql: &str, ident: &str) -> bool {
                     }
                     quoted.push(n);
                 }
-                if quoted.eq_ignore_ascii_case(ident) {
+                if f(true, &quoted) {
                     return true;
                 }
             }
@@ -1234,7 +1158,7 @@ fn sql_mentions_identifier(sql: &str, ident: &str) -> bool {
                     }
                     quoted.push(n);
                 }
-                if quoted.eq_ignore_ascii_case(ident) {
+                if f(true, &quoted) {
                     return true;
                 }
             }
@@ -1259,7 +1183,40 @@ fn sql_mentions_identifier(sql: &str, ident: &str) -> bool {
             _ => {}
         }
     }
-    bare.eq_ignore_ascii_case(ident)
+    !bare.is_empty() && f(false, &bare)
+}
+
+/// Whether a `CREATE TABLE` statement declares `AUTOINCREMENT`. The keyword is
+/// only legal on the single `INTEGER PRIMARY KEY` rowid alias. It is matched as a
+/// bare token *outside* string literals, quoted identifiers, and comments, so a
+/// `DEFAULT 'autoincrement'`, a column named `autoincrement_flag`, or a
+/// `/* autoincrement */` comment does not spuriously mark the table -- which would
+/// wrongly synthesize a `sqlite_sequence` row and change schema semantics on a
+/// drop-column rebuild.
+#[cfg(feature = "native")]
+fn sql_has_autoincrement(sql: &str) -> bool {
+    any_sql_identifier(sql, |quoted, tok| {
+        !quoted && tok.eq_ignore_ascii_case("AUTOINCREMENT")
+    })
+}
+
+/// Whether `sql` mentions `ident` as an identifier -- bare (`NEW.email`,
+/// `UPDATE OF email`) or quoted in any of SQLite's three forms (`"email"`,
+/// `` `email` ``, `[email]`) -- ignoring string literals and comments.
+/// ASCII-case-insensitive, as SQLite's own identifier comparison is.
+///
+/// Unlike [`sql_has_autoincrement`], which shares the same scan, a quoted
+/// identifier counts here: `NEW."email"` is a reference, whereas a table named
+/// `"autoincrement"` is not a declaration.
+///
+/// It is an over-approximation: a trigger body naming a *different* table's
+/// `email` column, or using `email` as an alias, matches. That direction is
+/// chosen. A false positive drops a trigger with a warning, which is
+/// recoverable; a false negative replays a trigger whose body no longer
+/// resolves, and every subsequent write to the table fails at prepare time.
+#[cfg(feature = "native")]
+fn sql_mentions_identifier(sql: &str, ident: &str) -> bool {
+    any_sql_identifier(sql, |_quoted, tok| tok.eq_ignore_ascii_case(ident))
 }
 
 /// Surviving constructs the `DROP COLUMN` reconstruction cannot recover, as
