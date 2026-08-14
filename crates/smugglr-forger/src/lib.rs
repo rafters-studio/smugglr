@@ -23,6 +23,8 @@
 //!   a schema SQLite would reject.
 //! * [`fixture`] -- stand a database up on either backing, hand out a
 //!   connection, tear it down reliably including on panic.
+//! * [`registry`] -- one [`Trait`], one schema carrying it, one seed and one
+//!   probe, matched exhaustively so a trait without a probe does not compile.
 //!
 //! ```
 //! use smugglr_forger::fixture::{Backing, Fixture, Route};
@@ -45,8 +47,10 @@
 
 pub mod error;
 pub mod fixture;
+pub mod registry;
 pub mod schema;
 
-pub use error::{BoxError, ForgeError, ValidationError};
+pub use error::{BoxError, ForgeError, ProbeError, ValidationError};
 pub use fixture::{Backing, Fixture, Route};
+pub use registry::TraitCase;
 pub use schema::{Schema, Trait};

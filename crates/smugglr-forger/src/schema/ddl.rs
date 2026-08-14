@@ -222,7 +222,11 @@ fn conflict_clause(on_conflict: &Option<super::OnConflict>) -> String {
 
 /// Quote an identifier. Doubling an embedded quote is what keeps a column
 /// named `a"b` from ending the identifier early.
-fn quote(name: &str) -> String {
+///
+/// `pub(crate)` because probes build their SQL from names they read out of a
+/// [`Schema`], and a probe that quoted identifiers its own way would be a
+/// second implementation of this rule waiting to disagree with the first.
+pub(crate) fn quote(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
