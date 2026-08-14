@@ -1,0 +1,42 @@
+{
+  "provenance": "smugglr#344. A rebuild declares BLOB for a column that was declared with no type at all, and the promotion is certain and silent: BLOB affinity converts nothing, so every behavioural assertion in this case still passes and only the declared type gives it away. What it costs is in another crate -- rowhash::is_blob_column deliberately excludes an empty declared type because base64-decoding a genuine text value would corrupt it, and this migration carries the column into the class that gets decoded. Recorded 2026-08-14 from the TypelessColumn case with the type promoted.",
+  "trait": "TypelessColumn",
+  "schema": {
+    "tables": [
+      {
+        "name": "typeless",
+        "columns": [
+          {
+            "name": "id",
+            "decl_type": "Integer",
+            "constraints": [
+              {
+                "PrimaryKey": {
+                  "order": "Asc",
+                  "autoincrement": false,
+                  "on_conflict": null
+                }
+              }
+            ]
+          },
+          {
+            "name": "v",
+            "decl_type": "Blob",
+            "constraints": []
+          },
+          {
+            "name": "label",
+            "decl_type": "Text",
+            "constraints": []
+          }
+        ],
+        "constraints": [],
+        "without_rowid": false,
+        "strict": false,
+        "triggers": []
+      }
+    ]
+  },
+  "after_seed": [],
+  "expected_failure": "typeless.v declares the type Some(\"BLOB\"), and it was declared with none; a type invented for a typeless column survives every behavioural check on this path"
+}
