@@ -2,14 +2,21 @@
 members = [
     "crates/smugglr-core",
     "crates/smugglr",
+    "crates/smugglr-forger",
     "crates/smugglr-plugin-sdk",
     "crates/smugglr-wasm",
     "crates/smugglr-wire",
     "plugins/smugglr-http-sql",
 ]
+# smugglr-wasm is the only member held out: it is #![cfg(target_arch =
+# "wasm32")] and compiles to nothing on the host. smugglr-forger is a default
+# member because its fixture teardown is a Windows-specific claim, and CI's
+# three-OS `cargo test` job is default-members-scoped -- held out, its tests
+# would never run on the platform they exist to defend.
 default-members = [
     "crates/smugglr-core",
     "crates/smugglr",
+    "crates/smugglr-forger",
     "crates/smugglr-plugin-sdk",
     "crates/smugglr-wire",
     "plugins/smugglr-http-sql",
