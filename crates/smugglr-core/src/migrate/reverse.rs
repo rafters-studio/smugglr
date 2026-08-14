@@ -40,10 +40,27 @@
 //! ([`Preimage::Inline`], no relay) and **large payloads in a content-addressed
 //! store** ([`Preimage::Ref`], keyed by the SHA-256 of the payload, written
 //! through [`crate::stash::build_store`]). [`INLINE_MAX_BYTES`] pins the boundary
-//! where inline refuses and a relay becomes mandatory ([`store_preimage`]). A
-//! large payload's key is *read* from the ledger's forward-compat `preimage_ref`
-//! column ([`preimage_ref_of`], OQ2 "read-only"); **writing** that column is the
-//! driver's job (#296), out of scope here.
+//! where inline refuses and a relay becomes mandatory ([`store_preimage`]).
+//!
+//! The ledger's forward-compat `preimage_ref` column is **read-only from here**
+//! (OQ2) via [`preimage_ref_of`] -- and in 0.5.0 **nothing writes it**. No ledger
+//! setter for the column exists, and the forward driver (#296) hands the captured
+//! payload back in its apply outcome rather than stashing a key on the row, so the
+//! column stays NULL and [`preimage_ref_of`] returns `None` on every real ledger
+//! row. It is a reader waiting on a writer, kept so the column's meaning is fixed
+//! before something starts populating it (#326 corrected an earlier claim here
+//! that named #296 as the writer).
+//!
+//! # Capture is wired into the apply loop, not checked before it
+//!
+//! [`apply_with_capture`] is the sanctioned forward path for a manifest with any
+//! destructive op: it binds [`PreimageCapturer::capture_before`] as `apply_ops`'
+//! `pre_op` hook, so capture-then-mutate is structural per op rather than an
+//! ordering a caller has to remember. The manifest-level gate
+//! ([`crate::migrate::lint::enforce_preimage`]) necessarily runs *before* that
+//! loop and so cannot see a capture that does not exist yet; the "no mutation
+//! without a snapshot" guarantee lives in [`PreimageCapturer::capture_before`],
+//! which refuses a destructive op it cannot capture *before* the op runs.
 
 use crate::migrate::{ClassifiedOp, MigrateError, Op};
 use serde::{Deserialize, Serialize};
@@ -54,6 +71,8 @@ use crate::config::StashConfig;
 use crate::migrate::apply::{apply_ops, rebuild_to_schema, RebuildSpec, RebuildTarget};
 #[cfg(feature = "native")]
 use crate::migrate::ledger::{Election, Ledger, LedgerEntry};
+#[cfg(feature = "native")]
+use crate::migrate::lint::classify_op;
 #[cfg(feature = "native")]
 use crate::migrate::Preimage;
 #[cfg(feature = "native")]
@@ -366,11 +385,10 @@ fn captured_to_sql(v: &CapturedValue) -> SqlValue {
 /// [`apply_ops`](crate::migrate::apply::apply_ops): the hook fires *before* each
 /// op's own transaction, so [`Self::capture_before`] snapshots committed,
 /// pre-mutation state. Additive ops are ignored (their reverse carries no data).
+/// [`apply_with_capture`] does that wiring; prefer it over hand-binding the hook.
 ///
 /// ```ignore
-/// let mut cap = PreimageCapturer::new();
-/// apply_ops(conn, &up, &mut |op| cap.capture_before(conn, op))?;
-/// let payload = cap.into_payload();
+/// let payload = apply_with_capture(conn, &manifest.up)?;
 /// ```
 #[cfg(feature = "native")]
 #[derive(Debug, Default)]
@@ -389,11 +407,26 @@ impl PreimageCapturer {
     ///
     /// Must run **before** `op` mutates (it reads the current table). Additive
     /// ops carry no data, so they are skipped.
+    ///
+    /// This is where "a destructive op never mutates without a pre-image" is
+    /// actually enforced, and it is enforced write-ahead: driven as `apply_ops`'
+    /// `pre_op` hook, an `Err` here aborts before the op's own transaction opens,
+    /// so a destructive op whose pre-image cannot be captured never runs. The
+    /// manifest-level gate [`crate::migrate::lint::enforce_preimage`] cannot make
+    /// that guarantee -- it runs before this loop, when no capture exists yet.
+    ///
+    /// The final refusal is the reason the op match is not a bare catch-all: an
+    /// op that [`classify_op`] calls destructive but no arm above knows how to
+    /// snapshot is a data-loss hole, so it is refused rather than silently skipped
+    /// into the additive lane. Unreachable in 0.5.0 (`DropTable` and `DropColumn`
+    /// are the only destructive ops, and both are handled); it exists so adding a
+    /// destructive op without teaching capture about it fails loudly.
     pub fn capture_before(
         &mut self,
         conn: &Connection,
         op: &ClassifiedOp,
     ) -> Result<(), MigrateError> {
+        let captured_before = self.payload.tables.len();
         match &op.op {
             Op::DropColumn { table, column } => {
                 let capture = self.capture_drop_column(conn, table, column)?;
@@ -405,10 +438,22 @@ impl PreimageCapturer {
             }
             _ => {}
         }
+        if classify_op(&op.op).destructive && self.payload.tables.len() == captured_before {
+            return Err(MigrateError::Apply(format!(
+                "refusing to apply destructive op {:?}: pre-image capture does not know how to \
+                 snapshot it, so the loss would be irreversible",
+                op.op
+            )));
+        }
         Ok(())
     }
 
     /// Consume the capturer, yielding the accumulated pre-image.
+    ///
+    /// An empty payload is a legitimate outcome (no destructive op ran); so is a
+    /// capture with zero rows (a drop against an empty table loses nothing). What
+    /// is *not* legitimate -- a destructive op that ran with no capture -- cannot
+    /// reach here, because [`Self::capture_before`] refuses it before the mutation.
     pub fn into_payload(self) -> PreimagePayload {
         self.payload
     }
@@ -508,6 +553,43 @@ impl PreimageCapturer {
             rows,
         })
     }
+}
+
+/// Run a forward apply of `up` with pre-image capture wired in, returning what was
+/// captured.
+///
+/// This is [`apply_ops`] with [`PreimageCapturer::capture_before`] bound as its
+/// `pre_op` write-ahead hook -- not a second apply loop, the same one with the hook
+/// supplied. It exists so the ordering that makes a destructive apply reversible is
+/// **structural** instead of a convention each caller re-implements:
+///
+/// ```text
+/// per op:  capture pre-image (or refuse)  ->  mutate
+/// ```
+///
+/// Use it for any manifest whose `up` may contain a destructive op. A caller that
+/// binds its own `pre_op` -- to also log intent (#289), say -- must call
+/// `capture_before` from inside that hook; one that passes a no-op hook has opted
+/// out of reversibility, which is why the destructive forward path should come
+/// through here.
+///
+/// The returned payload is empty when nothing destructive ran. Errors propagate
+/// from capture (refusing before the op mutates) or from the op itself; on a
+/// mid-loop failure the already-applied ops stay applied, exactly as [`apply_ops`]
+/// documents. Ledger election and settlement are *not* here -- composing this with
+/// the ledger is the driver's job (#296).
+#[cfg(feature = "native")]
+pub fn apply_with_capture(
+    conn: &Connection,
+    up: &[ClassifiedOp],
+) -> Result<PreimagePayload, MigrateError> {
+    let mut capturer = PreimageCapturer::new();
+    {
+        let mut pre_op =
+            |op: &ClassifiedOp| -> Result<(), MigrateError> { capturer.capture_before(conn, op) };
+        apply_ops(conn, up, &mut pre_op)?;
+    }
+    Ok(capturer.into_payload())
 }
 
 /// Restore a captured pre-image: reconstruct the lost structure, then refill the
@@ -797,10 +879,21 @@ pub async fn load_preimage(
 
 /// The pre-image reference recorded on a ledger row, if any (OQ2, read-only).
 ///
-/// The forward driver (#296) *writes* `preimage_ref` when it stashes a large
-/// destructive pre-image; reverse only *reads* it here, resolving the stored key
-/// to a [`Preimage::Ref`] to feed [`load_preimage`]. `None` means the reverse's
-/// pre-image (if any) travels inline in the manifest instead.
+/// **Nothing writes `preimage_ref` in 0.5.0**, so this returns `None` for every
+/// row a 0.5.0 apply produces. The ledger exposes no setter for the column -- it
+/// appears in `ledger.rs`'s `CREATE TABLE` and in the `SELECT` projections, and in
+/// no write: [`Ledger::try_elect`]'s insert does not list it, so every row is born
+/// NULL and nothing updates it afterwards. The forward driver (#296) returns the
+/// captured payload in its apply outcome instead of stashing a key on the row.
+/// Until some component takes ownership of writing it, a `Ref` pre-image reaches a
+/// reverse by travelling on the manifest, not by being looked up here.
+///
+/// Kept as a reader anyway, and named as unwritten rather than deleted, so the
+/// column has one agreed interpretation -- the stored string is the
+/// content-addressed key of a [`Preimage::Ref`], feedable straight to
+/// [`load_preimage`] -- before anything starts populating it. An earlier version
+/// of this doc asserted #296 was the writer; it is not, and a doc naming an owner
+/// that does not do the thing is worse than silence (#326).
 #[cfg(feature = "native")]
 pub fn preimage_ref_of(entry: &LedgerEntry) -> Option<Preimage> {
     entry
@@ -1030,11 +1123,167 @@ mod tests {
     mod native {
         use super::*;
         use crate::migrate::apply::apply_ops;
+        use crate::migrate::generator;
         use crate::migrate::ledger::{Ledger, MigrationStatus};
+        use crate::migrate::lint::{enforce_preimage, lint_manifest};
+        use crate::migrate::{ChecksummedManifest, Flags, Manifest};
         use rusqlite::Connection;
 
         fn noop(_: &ClassifiedOp) -> Result<(), MigrateError> {
             Ok(())
+        }
+
+        // -- The honest destructive apply, end to end (#326) -----------------
+
+        /// The path that could not run before #326: author a destructive
+        /// migration the way the tooling authors one -- derived op classes, no
+        /// pre-image, because nothing has captured yet -- and drive it through the
+        /// whole forward sequence (seal, verify, lint, gate, apply-with-capture),
+        /// then reverse it from what the apply captured.
+        ///
+        /// The old gate refused this at the `enforce_preimage` line below, and the
+        /// only way past it was to paste an empty `Inline` placeholder -- which
+        /// applied the drop with no pre-image at all.
+        ///
+        /// The generator itself cannot author the destructive half: `generate`
+        /// emits only `CreateTable`/`CreateIndex` in 0.5.0. So the schema is stood
+        /// up by a real generated manifest and the drop is authored in exactly the
+        /// shape `generate` produces (`ClassifiedOp::new`, `preimage: None`, honest
+        /// `flags`).
+        #[test]
+        fn a_generator_shaped_destructive_migration_applies_captures_and_reverses() {
+            let conn = Connection::open_in_memory().unwrap();
+
+            // v1: a genuinely generated additive migration.
+            let created = generator::generate(
+                "create_contacts",
+                &["id:pk".to_string(), "email:text".to_string()],
+            )
+            .expect("generator scaffolds the create migration");
+            assert!(created.preimage.is_none());
+            let sealed = ChecksummedManifest::seal(created).unwrap();
+            sealed.verify().unwrap();
+            lint_manifest(&sealed.manifest).expect("a generated manifest lints clean");
+            enforce_preimage(&sealed.manifest).expect("an additive manifest needs no pre-image");
+            let captured = apply_with_capture(&conn, &sealed.manifest.up).unwrap();
+            assert!(
+                captured.is_empty(),
+                "an additive migration captures nothing"
+            );
+
+            conn.execute_batch(
+                "INSERT INTO contacts (id, email) VALUES ('c1', 'a@x'), ('c2', 'b@x');",
+            )
+            .unwrap();
+
+            // v2: the destructive migration, authored honestly -- and therefore
+            // carrying no pre-image, because the pre-image is captured during the
+            // apply this manifest has not had yet.
+            let drop = Manifest {
+                version: 2,
+                target_schema: String::new(),
+                up: vec![ClassifiedOp::new(Op::DropColumn {
+                    table: "contacts".into(),
+                    column: "email".into(),
+                })],
+                down: Vec::new(),
+                preimage: None,
+                flags: Flags {
+                    destructive: true,
+                    hash_rewriting: false,
+                },
+                author: None,
+            };
+            let sealed = ChecksummedManifest::seal(drop).unwrap();
+            sealed.verify().unwrap();
+            lint_manifest(&sealed.manifest).expect("an honest destructive manifest lints clean");
+            enforce_preimage(&sealed.manifest)
+                .expect("the gate must not demand a pre-image that only the apply can capture");
+
+            let payload = apply_with_capture(&conn, &sealed.manifest.up)
+                .expect("the destructive apply captures as it goes");
+
+            // The op really applied...
+            assert!(
+                table_info(&conn, "contacts")
+                    .unwrap()
+                    .iter()
+                    .all(|c| c.name != "email"),
+                "the column was actually dropped"
+            );
+
+            // ...and the pre-image it captured is real, not a placeholder: one
+            // capture, naming the dropped column, carrying both rows' values.
+            assert_eq!(payload.tables.len(), 1);
+            match &payload.tables[0] {
+                TablePreimage::Column {
+                    table,
+                    dropped,
+                    rows,
+                    ..
+                } => {
+                    assert_eq!(table, "contacts");
+                    assert_eq!(dropped, "email");
+                    assert_eq!(rows.len(), 2);
+                }
+                other => panic!("expected a Column capture, got {other:?}"),
+            }
+
+            // What the apply captured also satisfies the gate on its own terms --
+            // the same gate that refuses an empty placeholder accepts this.
+            let mut carried = sealed.manifest.clone();
+            carried.preimage = Some(Preimage::Inline {
+                rows: serde_json::to_value(&payload).unwrap(),
+            });
+            enforce_preimage(&carried).expect("a captured pre-image is not a placeholder");
+
+            // And the reverse is honest: the dropped data comes back.
+            restore_payload(&conn, &payload).unwrap();
+            let email = |id: &str| -> Option<String> {
+                conn.query_row(
+                    "SELECT email FROM contacts WHERE id = ?1",
+                    rusqlite::params![id],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .unwrap()
+            };
+            assert_eq!(email("c1").as_deref(), Some("a@x"));
+            assert_eq!(email("c2").as_deref(), Some("b@x"));
+        }
+
+        #[test]
+        fn apply_with_capture_snapshots_before_the_op_mutates() {
+            // The ordering apply_with_capture exists to make structural: the
+            // capture reads pre-mutation state, so a drop of a table whose rows are
+            // gone by capture time would come back empty. It does not.
+            let conn = Connection::open_in_memory().unwrap();
+            seed_users(&conn);
+            let payload = apply_with_capture(
+                &conn,
+                &[ClassifiedOp::new(Op::DropTable {
+                    table: "users".into(),
+                })],
+            )
+            .unwrap();
+            match payload.tables.as_slice() {
+                [TablePreimage::Table { table, rows, .. }] => {
+                    assert_eq!(table, "users");
+                    assert_eq!(
+                        rows.len(),
+                        2,
+                        "captured the rows the drop was about to lose"
+                    );
+                }
+                other => panic!("expected one Table capture, got {other:?}"),
+            }
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='users'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 0, "and the table is gone");
         }
 
         fn apply(conn: &Connection, op: Op) {
