@@ -909,13 +909,22 @@ fn literal(value: &str) -> String {
 
 /// A labelled paragraph, wrapped and hanging under its label.
 fn labelled(label: &str, body: &str) -> String {
-    let first = format!("    {label:<LABEL$}");
-    let wrapped = fill(body, first.len());
-    format!("{first}{}\n", wrapped.trim_start())
+    hanging(&format!("    {label:<LABEL$}"), body)
+}
+
+/// A prefix, then prose wrapped to [`WIDTH`] and hanging under it.
+///
+/// The prefix is written out verbatim, indentation and all, so a caller that
+/// lays its own label column out -- [`boundary`](crate::boundary) does -- gets
+/// the same wrapping as everything else here rather than a second
+/// implementation of it that disagrees at the margin.
+pub(crate) fn hanging(prefix: &str, body: &str) -> String {
+    let wrapped = fill(body, prefix.chars().count());
+    format!("{prefix}{}\n", wrapped.trim_start())
 }
 
 /// Wrap prose to [`WIDTH`], indenting every line by `hang`.
-fn fill(text: &str, hang: usize) -> String {
+pub(crate) fn fill(text: &str, hang: usize) -> String {
     let pad = " ".repeat(hang);
     let mut lines: Vec<String> = Vec::new();
     let mut line = pad.clone();
