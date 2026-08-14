@@ -36,14 +36,22 @@ INTERNAL_PREFIX = "smugglr"
 
 
 def workspace_version(meta: dict) -> str:
-    """The single version every workspace member shares.
+    """The single version every publishable workspace member shares.
 
-    Every member inherits `version.workspace = true`, so any member's
-    version is the workspace version -- but assert that rather than
-    trusting it, because a member that opts out is exactly the kind of
+    Publishable members inherit `version.workspace = true`, so any of
+    their versions is the workspace version -- but assert that rather
+    than trusting it, because one that opts out is exactly the kind of
     drift this script exists to catch.
+
+    `publish = false` members are excluded from the consensus, not
+    overlooked by it. Their versions never reach the registry and no req
+    is ever resolved against them, so a crate like smugglr-forger -- an
+    independent artifact that happens to live here, sitting at 0.1.0
+    while the workspace is at 0.5.x -- is not drift. It is the point.
     """
-    members = {p["name"]: p["version"] for p in meta["packages"]}
+    members = {
+        p["name"]: p["version"] for p in meta["packages"] if p.get("publish") != []
+    }
     versions = set(members.values())
     if len(versions) != 1:
         detail = ", ".join(f"{n} {v}" for n, v in sorted(members.items()))

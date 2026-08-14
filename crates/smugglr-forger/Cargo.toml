@@ -1,0 +1,39 @@
+[package]
+name = "smugglr-forger"
+description = "Manufactures SQLite schemas and the fixtures that prove them -- an oracle the implementation's author did not write"
+# NOT version.workspace = true. forger is an independent artifact that happens
+# to live in this workspace: it knows nothing about smugglr and must be
+# extractable without a redesign, so it carries its own version line and moves
+# on its own cadence. scripts/check-crate-versions.py skips publish = false
+# members for exactly this reason.
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Never shipped to crates.io from this workspace. `forger` is taken there by an
+# unrelated crate, and the name was never what preserved the extraction option
+# anyway -- the dependency direction is.
+publish = false
+
+[dependencies]
+# Pinned to the same minor as smugglr-core. Two rusqlite minors in one graph
+# means two libsqlite3-sys packages, both declaring `links = "sqlite3"`, which
+# is a cargo hard error rather than a warning.
+rusqlite = { version = "0.34", features = ["bundled"] }
+
+# The schema model is the fixture format (FR-FORGER-009), so it derives serde
+# now and the file format costs nothing later.
+serde = { version = "1", features = ["derive"] }
+
+# File-backed fixtures. The TempDir is owned by the fixture so removal cannot
+# outrun the connection close.
+tempfile = "3"
+
+thiserror = "2"
+
+[dev-dependencies]
+# Proves the model round-trips through a real serde format. Not needed to build
+# the crate -- reading and writing fixture files is FR-FORGER-009.
+serde_json = "1"

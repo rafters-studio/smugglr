@@ -66,6 +66,20 @@ jobs:
       # what `cargo publish` would actually ship.
       - run: python3 scripts/check-crate-versions.py
 
+  forger-boundary:
+    name: Forger boundary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # forger is an oracle only while it knows nothing about smugglr. Every
+      # other job here passes just as green with `smugglr-core` in forger's
+      # dependencies -- the code would compile, the tests would run, and the
+      # crate would quietly stop being extractable. This is the one check that
+      # reads the boundary itself.
+      - run: python3 scripts/check-forger-boundary.py
+
   test:
     name: Test
     runs-on: ${{ matrix.os }}
