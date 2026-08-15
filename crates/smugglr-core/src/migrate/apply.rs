@@ -1132,10 +1132,23 @@ impl ColInfo {
 /// Column names of a table, or an empty vec if the table does not exist.
 ///
 /// Unlike `local::table_info_inner`, this never errors on an absent or PK-less
-/// table -- exactly what the `ADD COLUMN` / `RENAME` idempotency prechecks need.
+/// table -- exactly what the `ADD COLUMN` / `RENAME` / `DROP COLUMN` idempotency
+/// prechecks need.
+///
+/// `table_xinfo` rather than `table_info`, because those prechecks ask "does
+/// this column exist" and `table_info` answers a narrower question: it omits
+/// generated columns entirely. The difference was reachable and silent (#389).
+/// `DROP COLUMN` naming a generated column found it absent, concluded the drop
+/// had already been applied, and returned `Ok(())` having dropped nothing -- a
+/// destructive op reporting success. `ADD COLUMN` and `RENAME` were wrong in
+/// the same direction for the same reason, if less visibly.
+///
+/// Returning generated columns is the correct answer to the question every
+/// caller is asking. `hidden` is deliberately not filtered on: a virtual-table
+/// hidden column is still a name that cannot be added twice.
 #[cfg(feature = "native")]
 fn raw_table_columns(conn: &Connection, table: &str) -> Result<Vec<String>, MigrateError> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", quote_ident(table)))?;
+    let mut stmt = conn.prepare(&format!("PRAGMA table_xinfo({})", quote_ident(table)))?;
     let cols = stmt
         .query_map([], |r| r.get::<_, String>(1))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2848,6 +2861,65 @@ mod tests {
                 "a preserved generated column recomputes from its base; these are the values a \
                  column that merely kept its old contents would not have"
             );
+        }
+
+        /// #389: dropping a generated column actually drops it.
+        ///
+        /// The idempotence precheck reads `raw_table_columns`, which used to
+        /// ask `table_info` -- a pragma that cannot see a generated column. So
+        /// the op found the column absent, concluded it had already been
+        /// applied, and returned `Ok(())` having dropped nothing. A destructive
+        /// op reporting success while doing nothing is worse than one that
+        /// fails: the next migration in the chain is written believing the
+        /// column is gone.
+        ///
+        /// Both storage classes, because they can reach different paths -- a
+        /// VIRTUAL column may be droppable by the direct `ALTER` where a STORED
+        /// one is refused and falls to the rebuild.
+        #[test]
+        fn dropping_a_generated_column_actually_drops_it() {
+            for (name, other) in [("v", "s"), ("s", "v")] {
+                let conn = mem();
+                conn.execute_batch(
+                    "CREATE TABLE t (
+                         id INTEGER PRIMARY KEY,
+                         n INTEGER,
+                         v INTEGER GENERATED ALWAYS AS (n * 2) VIRTUAL,
+                         s INTEGER GENERATED ALWAYS AS (n * 3) STORED
+                     );
+                     INSERT INTO t (id, n) VALUES (1, 7);",
+                )
+                .unwrap();
+
+                apply(
+                    &conn,
+                    Op::DropColumn {
+                        table: "t".into(),
+                        column: name.into(),
+                    },
+                )
+                .unwrap();
+
+                let left = columns_xinfo(&conn, "t");
+                assert!(
+                    !left.iter().any(|c| c == name),
+                    "dropping {name:?} left it in place: {left:?}"
+                );
+                // ...and the other generated column is still there, still
+                // computing. #387 is what makes that true; before it, dropping
+                // one would have taken the other with it.
+                assert!(
+                    left.iter().any(|c| c == other),
+                    "dropping {name:?} took {other:?} with it: {left:?}"
+                );
+                let still: i64 = conn
+                    .query_row(&format!("SELECT {other} FROM t WHERE id = 1"), [], |r| {
+                        r.get(0)
+                    })
+                    .unwrap();
+                let expected = if other == "v" { 14 } else { 21 };
+                assert_eq!(still, expected, "{other:?} stopped computing");
+            }
         }
 
         /// When the definition cannot be resolved, the rebuild falls back to
