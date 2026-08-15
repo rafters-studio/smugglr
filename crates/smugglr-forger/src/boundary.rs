@@ -354,13 +354,31 @@ impl Boundary {
                             declaration."
                     .to_string(),
             });
+        } else if on_update == [ReferentialAction::Restrict].into_iter().collect() {
+            // The one action left, and it is left for a different reason than
+            // the others were. CASCADE, SET NULL and SET DEFAULT went
+            // undeclared because nobody had written them yet (#374, #384);
+            // RESTRICT stays because declaring it would not buy an assertion.
+            // Saying "declared by no case schema" here would read as the first
+            // kind and invite someone to close it by adding a key, which would
+            // remove this line and add no coverage at all.
+            lines.push(Unexercised {
+                subject: Subject::OnUpdate,
+                statement: "RESTRICT, and not for want of a case. It is indistinguishable from \
+                            the NO ACTION default under immediate enforcement, exactly as on the \
+                            delete side, so declaring it would take this line away without \
+                            buying an assertion. The other three are declared and probed \
+                            (smugglr#374, smugglr#384)."
+                    .to_string(),
+            });
         } else if !on_update.is_empty() {
             lines.push(Unexercised {
                 subject: Subject::OnUpdate,
                 statement: format!(
-                    "{} -- declared by no case schema. CASCADE is probed (smugglr#374) and these \
-                     are not, which is the distinction worth keeping: a rebuild that drops ON \
-                     UPDATE SET NULL is silent by the same mechanism. smugglr#384.",
+                    "{} -- declared by no case schema. The rest are probed (smugglr#374, \
+                     smugglr#384) and these are not, which is the distinction worth keeping: a \
+                     rebuild that drops one of these is silent by the same mechanism that used to \
+                     drop the others.",
                     spell(&on_update)
                 ),
             });
@@ -621,15 +639,16 @@ mod tests {
             "the ForeignKeyWithAction case declares ON UPDATE CASCADE and its probe moves the \
              parent key to read it (#374), so the boundary does not claim it goes unexercised"
         );
-        let mut still_undeclared = declarable().into_iter().collect::<BTreeSet<_>>();
-        still_undeclared.remove(&ReferentialAction::Cascade);
         assert_eq!(
             boundary.undeclared_on_update(),
-            &still_undeclared,
-            "CASCADE is the only ON UPDATE action any case declares. The rest are undeclared and \
-             the boundary has to keep saying so -- a rebuild that drops ON UPDATE SET NULL is \
-             still silent, and the one action that is now covered must not be read as covering \
-             the family"
+            &[ReferentialAction::Restrict]
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            "RESTRICT is the only ON UPDATE action left undeclared, and it is left on purpose: it \
+             cannot be told apart from the NO ACTION default under immediate enforcement, so \
+             declaring it would remove the boundary line without adding an assertion. If this set \
+             grew, a case lost a declaration; if it emptied, someone declared RESTRICT and the \
+             boundary now claims coverage nothing can observe"
         );
     }
 

@@ -37,8 +37,8 @@ const THIS_FILE: &str = include_str!("the_emitted_schema_source_compiles.rs");
 #[rustfmt::skip]
 fn foreign_key_with_action() -> Schema {
     // >>> ForeignKeyWithAction
-    use smugglr_forger::schema::builder::{schema, table};
-    use smugglr_forger::schema::{ColumnType::*, ReferentialAction};
+    use smugglr_forger::schema::builder::{schema, table, Attr};
+    use smugglr_forger::schema::{ColumnType::*, DefaultValue, ReferentialAction};
 
     schema()
         .table(
@@ -74,6 +74,32 @@ fn foreign_key_with_action() -> Schema {
                 .col("label", Text, [])
                 .fk(["keeper_id"], "updating_keeper", ["id"])
                 .on_update(ReferentialAction::Cascade),
+        )
+        .table(
+            table("nulling_keeper")
+                .pk_int("id")
+                .col("label", Text, []),
+        )
+        .table(
+            table("nulling_child")
+                .pk_int("id")
+                .col("keeper_id", Integer, [])
+                .col("label", Text, [])
+                .fk(["keeper_id"], "nulling_keeper", ["id"])
+                .on_update(ReferentialAction::SetNull),
+        )
+        .table(
+            table("defaulting_keeper")
+                .pk_int("id")
+                .col("label", Text, []),
+        )
+        .table(
+            table("defaulting_child")
+                .pk_int("id")
+                .col("keeper_id", Integer, [Attr::Default(DefaultValue::Integer(59))])
+                .col("label", Text, [])
+                .fk(["keeper_id"], "defaulting_keeper", ["id"])
+                .on_update(ReferentialAction::SetDefault),
         )
         .build()
         .expect("a valid schema")
