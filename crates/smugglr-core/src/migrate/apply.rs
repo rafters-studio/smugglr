@@ -50,22 +50,29 @@
 //! `sqlite_master.sql`, which recovers column types, `NOT NULL`, defaults, the
 //! primary key (single-column rowid-alias **and** composite), foreign keys
 //! (**including composite**) with their `ON DELETE` / `ON UPDATE` referential
-//! actions, and `AUTOINCREMENT`. It still **cannot** recover `CHECK`
-//! constraints, table-level / surviving-column `UNIQUE`, column `COLLATE`,
-//! generated columns, or `WITHOUT ROWID`. Rather than drop those silently, the
-//! rebuild emits a `tracing::warn!` when the table being rebuilt carries such
-//! constructs, so the loss is visible.
+//! actions, `AUTOINCREMENT`, and **generated columns** with their expressions
+//! and storage classes. It still **cannot** recover `CHECK` constraints,
+//! table-level / surviving-column `UNIQUE`, column `COLLATE`, or
+//! `WITHOUT ROWID`. Rather than drop those silently, the rebuild emits a
+//! `tracing::warn!` when the table being rebuilt carries such constructs, so
+//! the loss is visible.
 //!
-//! **Generated columns** are the one item in that list the warning did not
-//! actually cover until #342, and the reason is worth keeping: `table_info` --
-//! the pragma the whole reconstruction introspects with -- omits them entirely,
-//! so they were never in the set of columns to rebuild and never in the set of
-//! constructs to warn about. They are found through `PRAGMA table_xinfo`
-//! instead, which reports them with `hidden` `2` (`VIRTUAL`) or `3` (`STORED`).
-//! That makes detection exact and does nothing for recovery: the generation
-//! *expression* is in no pragma at all, only in `sqlite_master.sql`, so
-//! preserving one through a rebuild means parsing the original `CREATE TABLE`
-//! text. This path warns and drops.
+//! **Generated columns** took three passes and the sequence explains the shape
+//! of the code. `table_info` -- the pragma the whole reconstruction introspects
+//! with -- omits them entirely, so they were never in the set of columns to
+//! rebuild *and never in the set of constructs to warn about*: the loss was
+//! total and silent (#342). They are found through `PRAGMA table_xinfo`, which
+//! reports them with `hidden` `2` (`VIRTUAL`) or `3` (`STORED`), and that made
+//! the loss loud. It did nothing for recovery, because the generation
+//! *expression* is in no pragma at all.
+//!
+//! Recovery therefore reads `sqlite_master.sql` and takes the column's whole
+//! declaration verbatim (#387), which brings the expression and anything else
+//! declared alongside it. That is a text split rather than a pragma read, so it
+//! is the one recovery here that can be *uncertain* -- and an uncertain one
+//! falls back to the warn-and-drop above rather than emitting a guess, for all
+//! of a table's generated columns or none. A wrong expression produces a table
+//! that is broken rather than merely diminished.
 //!
 //! Two things a foreign key can carry are **not** recovered, and they are named
 //! rather than left to the word "foreign keys" to imply. `MATCH` is absent from
@@ -551,6 +558,30 @@ fn rebuild_dropping_column(
         None
     };
 
+    // Generated columns the rebuild can carry through, by name (#387).
+    //
+    // `table_info` cannot see them, so without this they are absent from `kept`,
+    // from the new table and from the copy projection -- dropped entirely and,
+    // before #342, silently. What is recoverable is their *verbatim definition*
+    // from the original DDL, because the generation expression exists in no
+    // pragma.
+    //
+    // All or nothing: if any surviving generated column's definition cannot be
+    // located confidently, none are carried and the whole table falls back to
+    // the warn-and-drop this path did before. A rebuild that preserved some and
+    // dropped others would be a schema nobody asked for, and harder to reason
+    // about than either outcome on its own.
+    let generated = generated_columns(conn, table)?;
+    let surviving_generated: Vec<&(String, &'static str)> = generated
+        .iter()
+        .filter(|(name, _)| !name.eq_ignore_ascii_case(column))
+        .collect();
+    let preserved_generated: Option<Vec<(String, String)>> = if surviving_generated.is_empty() {
+        None
+    } else {
+        verbatim_definitions_for(orig_sql.as_deref(), &surviving_generated)
+    };
+
     let mut body: Vec<String> = kept
         .iter()
         .map(|c| {
@@ -565,6 +596,34 @@ fn rebuild_dropping_column(
             def
         })
         .collect();
+
+    // Put the preserved generated columns back where they were declared.
+    //
+    // Position matters to anyone reading the table with `SELECT *`, and
+    // appending them would silently reorder the schema on a path whose whole
+    // job is to change one thing. `table_xinfo` reports every column in
+    // declaration order, generated ones included, so walking it gives each
+    // surviving generated column the index it had -- counting only the columns
+    // that survive, since the dropped one shifts everything after it.
+    if let Some(preserved) = &preserved_generated {
+        let declared = table_xinfo_names(conn, table)?;
+        let mut at = 0usize;
+        for name in declared {
+            if name.eq_ignore_ascii_case(column) {
+                continue;
+            }
+            match preserved
+                .iter()
+                .find(|(generated, _)| generated.eq_ignore_ascii_case(&name))
+            {
+                Some((_, definition)) => {
+                    body.insert(at.min(body.len()), definition.clone());
+                    at += 1;
+                }
+                None => at += 1,
+            }
+        }
+    }
 
     if pk.len() > 1 {
         let cols = pk
@@ -590,13 +649,24 @@ fn rebuild_dropping_column(
 
     // Constructs the pragma/DDL reconstruction cannot recover are lost on this
     // rebuild; make the loss loud rather than silent (#273 MED#4).
-    let lost = lost_constructs(
+    let mut lost = lost_constructs(
         conn,
         table,
         column,
         orig_sql.as_deref(),
         &aux.dropped_triggers,
     )?;
+    // A generated column this rebuild is carrying through is not a loss, and
+    // saying it is would be worse than saying nothing: a warning that fires on
+    // work that succeeded is the kind operators learn to skip, which would cost
+    // the #342 warning its value on the cases where it is real (#387).
+    if let Some(preserved) = &preserved_generated {
+        lost.retain(|entry| {
+            !preserved
+                .iter()
+                .any(|(name, _)| entry.starts_with(&format!("generated column {name:?}")))
+        });
+    }
     if !lost.is_empty() {
         tracing::warn!(
             "DROP COLUMN rebuild of {table:?} (dropping {column:?}) cannot reconstruct \
@@ -1117,6 +1187,153 @@ fn table_sql(conn: &Connection, table: &str) -> Result<Option<String>, MigrateEr
     Ok(sql.flatten())
 }
 
+/// The verbatim text of each top-level item in a `CREATE TABLE`'s parenthesised
+/// list, paired with the identifier it starts with.
+///
+/// This is how #387 preserves a generated column: `PRAGMA table_xinfo` names one
+/// and gives its storage class, but the *generation expression* is in no pragma
+/// at all -- `sqlite_master.sql` is the only place `(n * 2)` exists. Taking the
+/// column's whole definition verbatim recovers the expression and everything
+/// else declared alongside it, without this function needing to understand any
+/// of it.
+///
+/// Returns `None` rather than a guess whenever the text cannot be split
+/// confidently: no parenthesised list, an unbalanced one, or an item with no
+/// leading identifier. **A wrong answer here produces a table that is broken
+/// rather than merely diminished**, so every uncertain case falls back to the
+/// caller's existing warn-and-drop behaviour.
+///
+/// Items include table-level constraints (`PRIMARY KEY (...)`, `FOREIGN KEY
+/// (...)`), which start with a keyword rather than a column name. They are
+/// returned too and the caller ignores them by looking up only names the pragma
+/// called generated -- with a duplicate-name check as the safety valve, since a
+/// column named `foreign` would otherwise collide with a `FOREIGN KEY` clause.
+#[cfg(feature = "native")]
+fn top_level_items(create_sql: &str) -> Option<Vec<(String, String)>> {
+    let mut depth = 0usize;
+    let mut open: Option<usize> = None;
+    let mut close: Option<usize> = None;
+    let mut splits: Vec<usize> = Vec::new();
+
+    let mut chars = create_sql.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        match c {
+            // Literals and quoted identifiers are skipped whole: a comma or a
+            // parenthesis inside one is text, not structure. A doubled quote
+            // escapes, as it does everywhere else in this module.
+            '\'' | '"' | '`' => {
+                while let Some((_, n)) = chars.next() {
+                    if n == c {
+                        if chars.peek().map(|(_, p)| *p) == Some(c) {
+                            chars.next();
+                            continue;
+                        }
+                        break;
+                    }
+                }
+            }
+            '[' if depth > 0 => {
+                for (_, n) in chars.by_ref() {
+                    if n == ']' {
+                        break;
+                    }
+                }
+            }
+            '-' if chars.peek().map(|(_, p)| *p) == Some('-') => {
+                for (_, n) in chars.by_ref() {
+                    if n == '\n' {
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek().map(|(_, p)| *p) == Some('*') => {
+                chars.next();
+                let mut prev = '\0';
+                for (_, n) in chars.by_ref() {
+                    if prev == '*' && n == '/' {
+                        break;
+                    }
+                    prev = n;
+                }
+            }
+            '(' => {
+                depth += 1;
+                if depth == 1 {
+                    open = Some(at);
+                }
+            }
+            ')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 && close.is_none() {
+                    close = Some(at);
+                }
+            }
+            ',' if depth == 1 => splits.push(at),
+            _ => {}
+        }
+    }
+
+    // An unbalanced list, or none at all, is not something to guess about.
+    if depth != 0 {
+        return None;
+    }
+    let (open, close) = (open?, close?);
+
+    let mut items = Vec::new();
+    let mut from = open + 1;
+    for cut in splits.iter().copied().chain(std::iter::once(close)) {
+        let text = create_sql.get(from..cut)?.trim();
+        from = cut + 1;
+        if text.is_empty() {
+            continue;
+        }
+        items.push((leading_identifier(text)?, text.to_string()));
+    }
+    Some(items)
+}
+
+/// The verbatim definition of each named column, or `None` if any of them
+/// cannot be resolved unambiguously.
+///
+/// All-or-nothing on purpose (#387): the caller uses this to decide whether to
+/// preserve generated columns at all, and preserving some while dropping others
+/// would produce a table neither the old behaviour nor the new one describes.
+///
+/// A name matching more than one top-level item is treated as unresolved rather
+/// than resolved to the first. That is the safety valve for a column named like
+/// a table-constraint keyword -- a generated column called `foreign` alongside a
+/// `FOREIGN KEY (...)` clause -- where picking either would be a guess.
+#[cfg(feature = "native")]
+fn verbatim_definitions_for(
+    create_sql: Option<&str>,
+    wanted: &[&(String, &'static str)],
+) -> Option<Vec<(String, String)>> {
+    let items = top_level_items(create_sql?)?;
+    let mut out = Vec::with_capacity(wanted.len());
+    for (name, _) in wanted {
+        let mut matches = items
+            .iter()
+            .filter(|(leading, _)| leading.eq_ignore_ascii_case(name));
+        let (_, definition) = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        out.push((name.clone(), definition.clone()));
+    }
+    Some(out)
+}
+
+/// The first identifier-position token of a column definition or constraint.
+#[cfg(feature = "native")]
+fn leading_identifier(item: &str) -> Option<String> {
+    let mut first = None;
+    any_sql_identifier(item, |_quoted, token| {
+        first = Some(token.to_string());
+        true
+    });
+    first
+}
+
 /// Scan `sql` for identifier-position tokens, calling `f(quoted, token)` on each
 /// bare word and each quoted identifier (`"x"`, `` `x` ``, `[x]`). String
 /// literals (`'...'`) and comments (`-- ...`, `/* ... */`) are skipped, never
@@ -1391,6 +1608,20 @@ pub(super) fn generated_columns(
             _ => None,
         })
         .collect())
+}
+
+/// Every column name of a table in declaration order, generated ones included.
+///
+/// `table_info` omits generated columns, so it cannot answer "where was this
+/// column declared" for them -- which is the question #387 needs in order to put
+/// a preserved one back at its original index rather than at the end.
+#[cfg(feature = "native")]
+fn table_xinfo_names(conn: &Connection, table: &str) -> Result<Vec<String>, MigrateError> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_xinfo({})", quote_ident(table)))?;
+    let names = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(names)
 }
 
 /// Names of the `UNIQUE`-constraint auto-indexes (origin `'u'`) on a table.
@@ -2544,13 +2775,33 @@ mod tests {
             );
         }
 
-        /// The loss the warning is about, shown rather than asserted.
+        /// Every column of a table in declaration order, generated ones
+        /// included -- which `columns` (via `table_info`) cannot report.
+        fn columns_xinfo(conn: &Connection, table: &str) -> Vec<String> {
+            let mut stmt = conn
+                .prepare(&format!("PRAGMA table_xinfo({})", quote_ident(table)))
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            rows
+        }
+
+        /// #387: both storage classes survive a rebuild, and still compute.
         ///
-        /// Without this the tests above prove only that a string is produced.
-        /// This proves the string is about something: the rebuild really does
-        /// drop both classes, so the warning is the only signal there is.
+        /// The inverse of the test that stood here for #342, which asserted the
+        /// rebuild dropped them and said in its own message that keeping them
+        /// would make it wrong. It does keep them now.
+        ///
+        /// Asserted behaviourally rather than by reading the DDL back: a column
+        /// can be declared `GENERATED ALWAYS AS` and hold a stale value if a
+        /// rebuild copied into it, which is smugglr#342's other half. Moving the
+        /// base and reading the generated column is the only assertion that
+        /// tells a preserved computation from a preserved declaration.
         #[test]
-        fn the_rebuild_really_does_drop_generated_columns() {
+        fn the_rebuild_carries_generated_columns_through() {
             let conn = mem();
             conn.execute_batch(
                 "CREATE TABLE t (
@@ -2564,9 +2815,6 @@ mod tests {
             )
             .unwrap();
 
-            let before = generated_columns(&conn, "t").unwrap();
-            assert_eq!(before.len(), 2, "two generated columns before: {before:?}");
-
             apply(
                 &conn,
                 Op::DropColumn {
@@ -2577,10 +2825,121 @@ mod tests {
             .unwrap();
 
             let after = generated_columns(&conn, "t").unwrap();
+            assert_eq!(
+                after,
+                vec![("v".to_string(), "VIRTUAL"), ("s".to_string(), "STORED")],
+                "both classes survive, and keep the class they were declared with"
+            );
+
+            // Declaration order is preserved, not appended-to-the-end. A
+            // `SELECT *` reader sees the same shape it saw before.
+            assert_eq!(columns_xinfo(&conn, "t"), vec!["id", "n", "v", "s"]);
+
+            // The computation survived, not just the declaration.
+            conn.execute("UPDATE t SET n = 5 WHERE id = 1", []).unwrap();
+            let (v, s): (i64, i64) = conn
+                .query_row("SELECT v, s FROM t WHERE id = 1", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .unwrap();
+            assert_eq!(
+                (v, s),
+                (10, 15),
+                "a preserved generated column recomputes from its base; these are the values a \
+                 column that merely kept its old contents would not have"
+            );
+        }
+
+        /// When the definition cannot be resolved, the rebuild falls back to
+        /// dropping the column with the warning rather than emitting a guess.
+        ///
+        /// The fallback has to be reachable or it is decoration, and this
+        /// reaches it through the ambiguity guard rather than by doctoring a
+        /// database: a generated column named `foreign` collides with the
+        /// `FOREIGN KEY` clause's leading token, so the name matches two
+        /// top-level items and neither can be picked without guessing.
+        ///
+        /// A wrong expression produces a table that is broken rather than
+        /// merely diminished, so this direction is the safe one.
+        #[test]
+        fn an_unresolvable_generated_column_falls_back_to_being_dropped() {
+            let conn = mem();
+            conn.execute_batch(
+                "CREATE TABLE p (id INTEGER PRIMARY KEY);
+                 CREATE TABLE t (
+                     id INTEGER PRIMARY KEY,
+                     n INTEGER,
+                     pid INTEGER,
+                     \"foreign\" INTEGER GENERATED ALWAYS AS (n * 2) VIRTUAL,
+                     code TEXT UNIQUE,
+                     FOREIGN KEY (pid) REFERENCES p(id)
+                 );",
+            )
+            .unwrap();
+            assert_eq!(generated_columns(&conn, "t").unwrap().len(), 1);
+
+            apply(
+                &conn,
+                Op::DropColumn {
+                    table: "t".into(),
+                    column: "code".into(),
+                },
+            )
+            .unwrap();
+
             assert!(
-                after.is_empty(),
-                "the rebuild is documented to drop generated columns; if it now keeps them, this \
-                 test and the warning it justifies are both wrong: {after:?}"
+                generated_columns(&conn, "t").unwrap().is_empty(),
+                "an unresolvable generated column is dropped, not guessed at"
+            );
+        }
+
+        /// The definition split survives the shapes that break a naive parse.
+        ///
+        /// Each of these is a case where splitting on commas, or matching
+        /// parentheses without tracking quoting, gets a different answer.
+        #[test]
+        fn top_level_items_survives_commas_and_parens_that_are_not_structure() {
+            let sql = "CREATE TABLE t (\n  \
+                 a INTEGER,\n  \
+                 b TEXT DEFAULT 'x, (y)',\n  \
+                 c INTEGER GENERATED ALWAYS AS ((n + 1) * (m - 2)) STORED,\n  \
+                 d TEXT, -- a trailing comment, with a comma\n  \
+                 \"e,f\" INTEGER,\n  \
+                 PRIMARY KEY (a, b)\n\
+                 )";
+            let items = top_level_items(sql).expect("this splits");
+            let names: Vec<&str> = items.iter().map(|(n, _)| n.as_str()).collect();
+            assert_eq!(names, vec!["a", "b", "c", "d", "e,f", "PRIMARY"]);
+
+            let (_, c) = items.iter().find(|(n, _)| n == "c").unwrap();
+            assert!(
+                c.contains("((n + 1) * (m - 2))"),
+                "the nested expression is kept whole: {c}"
+            );
+        }
+
+        /// An unbalanced or absent list is refused rather than guessed at.
+        #[test]
+        fn top_level_items_refuses_what_it_cannot_split() {
+            assert!(top_level_items("CREATE TABLE t (a INTEGER").is_none());
+            assert!(top_level_items("CREATE TABLE t").is_none());
+        }
+
+        /// A name that matches more than one item resolves to neither.
+        #[test]
+        fn a_name_matching_two_items_is_unresolved_rather_than_first_wins() {
+            let sql = "CREATE TABLE t (\"foreign\" INTEGER, pid INTEGER, \
+                       FOREIGN KEY (pid) REFERENCES p(id))";
+            let wanted = ("foreign".to_string(), "VIRTUAL");
+            assert!(
+                verbatim_definitions_for(Some(sql), &[&wanted]).is_none(),
+                "the column name collides with the FOREIGN KEY clause's leading token"
+            );
+
+            let missing = ("nope".to_string(), "STORED");
+            assert!(
+                verbatim_definitions_for(Some(sql), &[&missing]).is_none(),
+                "a name that matches nothing is unresolved, not skipped"
             );
         }
 
