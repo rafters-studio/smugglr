@@ -72,6 +72,15 @@
 //! leaves a real key on the rest (#273), and a verbatim declaration would bring
 //! its own `PRIMARY KEY` tag into a body about to be given one.
 //!
+//! That exception costs more than tag placement, and saying only "the key is
+//! derived" understates it. **A key column still loses everything the pragma
+//! cannot report**: an expression `DEFAULT` on one is still re-emitted without
+//! its parentheses and still fails the rebuild outright, a typeless key column
+//! still comes back `BLOB`, and a `COLLATE` on one is still dropped -- silently
+//! turning a case-insensitive key case-sensitive. Those are the same defects
+//! #396 and #344 name, surviving on the columns this fix does not reach.
+//! Recorded rather than implied, and filed as #401.
+//!
 //! The warning still over-reports `CHECK` and `COLLATE`, because
 //! `lost_constructs` finds them by a keyword scan over the whole table's DDL
 //! and cannot attribute them to a column -- so it cannot tell one that rode
@@ -701,6 +710,7 @@ fn rebuild_dropping_column(
     // Preserve foreign keys whose column set does not include the dropped one.
     // Composite FKs are reconstructed as a single grouped constraint; the whole
     // FK is dropped if ANY member column is the one being removed (#273 HIGH#2).
+    let mut inline_fk_consumed: std::collections::BTreeSet<String> = Default::default();
     for fk in reconstruct_foreign_keys(conn, table)? {
         if fk.references_column(column) {
             continue;
@@ -714,16 +724,27 @@ fn rebuild_dropping_column(
         //
         // A composite key cannot be inline, so this only ever applies to
         // single-column ones.
-        if fk.cols.len() == 1 {
+        if fk.cols.len() == 1 && !inline_fk_consumed.contains(&fk.cols[0].0) {
             let carried_inline = verbatim_ordinary.as_ref().is_some_and(|v| {
                 v.iter().any(|(name, definition)| {
                     name == &fk.cols[0].0
-                        && any_sql_identifier(definition, |quoted, token| {
-                            !quoted && token.eq_ignore_ascii_case("REFERENCES")
-                        })
+                        && inline_reference_target(definition)
+                            .is_some_and(|target| target.eq_ignore_ascii_case(&fk.parent_table))
                 })
             });
             if carried_inline {
+                // AT MOST ONE per column. SQLite accepts an inline REFERENCES
+                // *and* a table-level FOREIGN KEY on the same column, and
+                // `foreign_key_list` reports both -- but the verbatim
+                // declaration carries only the inline one, so skipping every
+                // row for that column dropped the table-level key silently.
+                //
+                // Found by an adversarial review, which is the second time this
+                // guard has been wrong in a different direction: first it
+                // duplicated a key, now it could lose one. A column definition
+                // can hold at most one inline REFERENCES, so consuming exactly
+                // one row is the rule rather than a heuristic.
+                inline_fk_consumed.insert(fk.cols[0].0.clone());
                 continue;
             }
         }
@@ -759,8 +780,20 @@ fn rebuild_dropping_column(
     // and cannot be attributed to a column, so there is nothing to match them
     // against. They stay over-reported, which is the direction the rest of
     // `lost_constructs` already errs in.
-    if let Some(preserved) = &preserved_generated {
-        let carried: Vec<&str> = preserved.iter().map(|(name, _)| name.as_str()).collect();
+    {
+        // Every column carried verbatim, generated or ordinary. The first
+        // version of this filter only considered generated ones while its own
+        // comment claimed it covered anything that rode through -- so a UNIQUE
+        // on a carried ORDINARY column was reported as dropped while the
+        // rebuilt table demonstrably still enforced it. That is not
+        // over-reporting, it is a false statement of loss, and an adversarial
+        // review caught the comment before a reader did.
+        let carried: Vec<&str> = preserved_generated
+            .iter()
+            .flatten()
+            .chain(verbatim_ordinary.iter().flatten())
+            .map(|(name, _)| name.as_str())
+            .collect();
         let mut carried_unique: Vec<String> = Vec::new();
         for index in unique_constraint_indexes(conn, table)? {
             let cols = index_columns(conn, &index)?;
@@ -1507,6 +1540,35 @@ fn contains_line_comment(sql: &str) -> bool {
         }
     }
     false
+}
+
+/// The table an inline `REFERENCES` in a column definition points at.
+///
+/// Matching the carried key by its PARENT rather than by position, because
+/// position is not a fact about the schema: `PRAGMA foreign_key_list` returns
+/// keys in reverse declaration order, so a column carrying both an inline key
+/// and a table-level one had the table-level row consumed and the inline one
+/// emitted a second time. Two keys, both pointing at the wrong place, from a
+/// guess about ordering.
+///
+/// The parent is the identifier following a bare `REFERENCES`. Quoted forms
+/// count as the target but not as the keyword, so a column named `references`
+/// cannot start a match.
+#[cfg(feature = "native")]
+fn inline_reference_target(definition: &str) -> Option<String> {
+    let mut seen_keyword = false;
+    let mut target = None;
+    any_sql_identifier(definition, |quoted, token| {
+        if seen_keyword {
+            target = Some(token.to_string());
+            return true;
+        }
+        if !quoted && token.eq_ignore_ascii_case("REFERENCES") {
+            seen_keyword = true;
+        }
+        false
+    });
+    target
 }
 
 /// The first identifier-position token of a column definition or constraint.
@@ -3366,6 +3428,126 @@ mod tests {
             );
             assert_eq!(computed, 5, "an arithmetic default is a number, not text");
             assert_eq!(plain, "x", "a literal default is unaffected");
+        }
+
+        /// A table-level foreign key sharing a column with an inline one is
+        /// not swallowed by the inline-key skip.
+        ///
+        /// SQLite accepts both on one column and `foreign_key_list` reports
+        /// both, but the verbatim declaration carries only the inline one. The
+        /// first version of the skip matched on the column and dropped every
+        /// row for it, losing the table-level key SILENTLY -- in a codepath
+        /// whose whole argument is that a silent drop is not bounded.
+        ///
+        /// Found by an adversarial review. A column definition can hold at most
+        /// one inline `REFERENCES`, so the skip consumes exactly one row.
+        #[test]
+        fn a_table_level_key_beside_an_inline_one_survives_the_rebuild() {
+            let conn = mem();
+            conn.execute_batch(
+                "CREATE TABLE p (id INTEGER PRIMARY KEY);
+                 CREATE TABLE q (id INTEGER PRIMARY KEY);
+                 CREATE TABLE t (
+                     id INTEGER PRIMARY KEY,
+                     a INTEGER REFERENCES p(id),
+                     code TEXT UNIQUE,
+                     FOREIGN KEY (a) REFERENCES q(id)
+                 );",
+            )
+            .unwrap();
+            let before: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM pragma_foreign_key_list('t')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(before, 2, "the table starts with both keys");
+
+            apply(
+                &conn,
+                Op::DropColumn {
+                    table: "t".into(),
+                    column: "code".into(),
+                },
+            )
+            .unwrap();
+
+            let after: Vec<String> = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT \"table\" FROM pragma_foreign_key_list('t') ORDER BY \"table\"",
+                    )
+                    .unwrap();
+                stmt.query_map([], |r| r.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+            };
+            assert_eq!(
+                after,
+                vec!["p".to_string(), "q".to_string()],
+                "both keys survive; the skip consumes the inline one only"
+            );
+        }
+
+        /// A UNIQUE carried on an ordinary column is not reported as dropped.
+        ///
+        /// The filter used to consider only generated columns while its comment
+        /// claimed it covered anything carried, so a constraint the rebuilt
+        /// table still enforced was announced as lost. That is a false
+        /// statement of loss rather than an over-report, and it is the failure
+        /// the #342 warning cannot afford if operators are to keep reading it.
+        #[test]
+        fn a_unique_carried_on_an_ordinary_column_is_not_warned() {
+            let conn = mem();
+            conn.execute_batch(
+                "CREATE TABLE t (
+                     id INTEGER PRIMARY KEY,
+                     u TEXT UNIQUE,
+                     code TEXT UNIQUE
+                 );
+                 INSERT INTO t (id, u, code) VALUES (1, 'a', 'k');",
+            )
+            .unwrap();
+
+            apply(
+                &conn,
+                Op::DropColumn {
+                    table: "t".into(),
+                    column: "code".into(),
+                },
+            )
+            .unwrap();
+
+            // Still enforced, so it was never lost.
+            assert!(
+                conn.execute("INSERT INTO t (id, u) VALUES (2, 'a')", [])
+                    .is_err(),
+                "the UNIQUE on the carried column still refuses a duplicate"
+            );
+
+            // ...and the loss list, filtered as the rebuild filters it, does
+            // not name it.
+            let sql = table_sql(&conn, "t").unwrap();
+            let mut lost = lost_constructs(&conn, "t", "code", sql.as_deref(), &[]).unwrap();
+            let carried = ["u"];
+            let mut carried_unique: Vec<String> = Vec::new();
+            for index in unique_constraint_indexes(&conn, "t").unwrap() {
+                let cols = index_columns(&conn, &index).unwrap();
+                if !cols.is_empty()
+                    && cols
+                        .iter()
+                        .all(|c| carried.iter().any(|n| n.eq_ignore_ascii_case(c)))
+                {
+                    carried_unique.push(format!("UNIQUE({})", cols.join(", ")));
+                }
+            }
+            lost.retain(|e| !carried_unique.iter().any(|u| u == e));
+            assert!(
+                !lost.iter().any(|l| l.contains("UNIQUE(u)")),
+                "a UNIQUE carried through is not a loss: {lost:?}"
+            );
         }
 
         /// #344: a rebuild leaves a typeless column typeless.
