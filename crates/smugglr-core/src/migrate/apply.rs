@@ -57,6 +57,15 @@
 //! `tracing::warn!` when the table being rebuilt carries such constructs, so
 //! the loss is visible.
 //!
+//! One qualification on that list, because it is now only mostly true: a
+//! constraint declared **on a preserved generated column** rides through on
+//! that column's verbatim definition. A `UNIQUE` there really does survive and
+//! is filtered out of the warning accordingly. `CHECK` and `COLLATE` may
+//! survive the same way and are still reported lost, because they are found by
+//! a keyword scan over the whole table's DDL and cannot be attributed to a
+//! column -- an over-report, which is the direction this warning already errs
+//! in.
+//!
 //! **Generated columns** took three passes and the sequence explains the shape
 //! of the code. `table_info` -- the pragma the whole reconstruction introspects
 //! with -- omits them entirely, so they were never in the set of columns to
@@ -579,7 +588,7 @@ fn rebuild_dropping_column(
     let preserved_generated: Option<Vec<(String, String)>> = if surviving_generated.is_empty() {
         None
     } else {
-        verbatim_definitions_for(orig_sql.as_deref(), &surviving_generated)
+        verbatim_definitions_for(orig_sql.as_deref(), &surviving_generated, column)
     };
 
     let mut body: Vec<String> = kept
@@ -660,11 +669,37 @@ fn rebuild_dropping_column(
     // saying it is would be worse than saying nothing: a warning that fires on
     // work that succeeded is the kind operators learn to skip, which would cost
     // the #342 warning its value on the cases where it is real (#387).
+    //
+    // The same applies to a `UNIQUE` that rode through on a preserved column's
+    // verbatim definition. `lost_constructs` finds those from `index_list` and
+    // has no way to know the column was carried, so it reports a constraint the
+    // rebuilt table demonstrably still enforces.
+    //
+    // `CHECK` and `COLLATE` are deliberately NOT filtered here even when they
+    // ride through the same way, and the asymmetry is a limit rather than an
+    // oversight: those two are found by a keyword scan of the whole table's DDL
+    // and cannot be attributed to a column, so there is nothing to match them
+    // against. They stay over-reported, which is the direction the rest of
+    // `lost_constructs` already errs in.
     if let Some(preserved) = &preserved_generated {
+        let carried: Vec<&str> = preserved.iter().map(|(name, _)| name.as_str()).collect();
+        let mut carried_unique: Vec<String> = Vec::new();
+        for index in unique_constraint_indexes(conn, table)? {
+            let cols = index_columns(conn, &index)?;
+            if !cols.is_empty()
+                && cols
+                    .iter()
+                    .all(|c| carried.iter().any(|name| name.eq_ignore_ascii_case(c)))
+            {
+                carried_unique.push(format!("UNIQUE({})", cols.join(", ")));
+            }
+        }
         lost.retain(|entry| {
-            !preserved
+            let is_carried_column = carried
                 .iter()
-                .any(|(name, _)| entry.starts_with(&format!("generated column {name:?}")))
+                .any(|name| entry.starts_with(&format!("generated column {name:?}")));
+            let is_carried_unique = carried_unique.iter().any(|u| u == entry);
+            !is_carried_column && !is_carried_unique
         });
     }
     if !lost.is_empty() {
@@ -702,7 +737,9 @@ fn rebuild_dropping_column(
 /// - [`RebuildTarget::Fragments`] is only as faithful as the caller's assembly.
 ///   `rebuild_dropping_column` builds it from `PRAGMA table_info` /
 ///   `foreign_key_list`, which cannot recover `CHECK` / surviving-column `UNIQUE`
-///   / `COLLATE` / generated columns, so that path warns on the loss.
+///   / `COLLATE`, so that path warns on the loss. Generated columns are the
+///   exception: they are carried through verbatim from the original DDL
+///   (#387), falling back to that same warning when they cannot be.
 /// - [`RebuildTarget::Verbatim`] carries the exact pre-mutation DDL, so every
 ///   constraint survives byte-for-byte. Reverse (#274) uses it to re-add a dropped
 ///   column without re-deriving (and thus stripping) the surviving schema.
@@ -890,7 +927,8 @@ fn splice_create_table_name(create_sql: &str, new_name: &str) -> Result<String, 
 ///
 /// Unlike the `DROP COLUMN` path -- which *infers* the surviving schema from
 /// `PRAGMA table_info` / `foreign_key_list` and therefore cannot recover `CHECK` /
-/// `UNIQUE` / `COLLATE` / generated columns / `WITHOUT ROWID` -- this takes the
+/// `UNIQUE` / `COLLATE` / `WITHOUT ROWID`, and recovers generated columns only
+/// by reading the original DDL back (#387) -- this takes the
 /// schema as a fully-formed [`RebuildSpec`]: the caller supplies the
 /// [`RebuildTarget`] (reassembled fragments *or* a verbatim capture), a
 /// `projection` (the `INSERT ... SELECT` copy from the *current* table into the
@@ -1320,6 +1358,7 @@ fn top_level_items(create_sql: &str) -> Option<Vec<(String, String)>> {
 fn verbatim_definitions_for(
     create_sql: Option<&str>,
     wanted: &[&(String, &'static str)],
+    dropped: &str,
 ) -> Option<Vec<(String, String)>> {
     let items = top_level_items(create_sql?)?;
     let mut out = Vec::with_capacity(wanted.len());
@@ -1331,9 +1370,65 @@ fn verbatim_definitions_for(
         if matches.next().is_some() {
             return None;
         }
+
+        // A generation expression computed FROM the dropped column cannot
+        // survive the drop -- re-emitting it produces a `CREATE TABLE` naming a
+        // column that is not there, which fails the rebuild outright. The
+        // pre-#387 behaviour for such a column is the right one: warn and drop.
+        //
+        // The same question, and the same answer, as a trigger whose body
+        // mentions the dropped column (#336) -- so it asks the same function.
+        if sql_mentions_identifier(definition, dropped) {
+            return None;
+        }
+
+        // A line comment inside the definition is captured verbatim with it,
+        // and the rebuilt body is joined onto one line -- so everything after
+        // the comment, up to and including the closing parenthesis, would be
+        // commented out. Refusing is the conservative direction and costs only
+        // the preservation, not the migration.
+        if contains_line_comment(definition) {
+            return None;
+        }
+
         out.push((name.clone(), definition.clone()));
     }
     Some(out)
+}
+
+/// Whether `sql` carries a `--` line comment outside a literal or a quoted
+/// identifier.
+///
+/// A block comment is bounded and survives being joined onto one line; a line
+/// comment swallows whatever follows it, which is why only this form matters.
+#[cfg(feature = "native")]
+fn contains_line_comment(sql: &str) -> bool {
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' | '"' | '`' => {
+                while let Some(n) = chars.next() {
+                    if n == c {
+                        if chars.peek() == Some(&c) {
+                            chars.next();
+                            continue;
+                        }
+                        break;
+                    }
+                }
+            }
+            '[' => {
+                for n in chars.by_ref() {
+                    if n == ']' {
+                        break;
+                    }
+                }
+            }
+            '-' if chars.peek() == Some(&'-') => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// The first identifier-position token of a column definition or constraint.
@@ -2965,6 +3060,133 @@ mod tests {
             );
         }
 
+        /// A generated column computed FROM the dropped column falls back to
+        /// being dropped, rather than failing the migration.
+        ///
+        /// Found by an adversarial review of the first cut of #387, which
+        /// preserved it verbatim and produced a `CREATE TABLE` naming a column
+        /// that no longer exists -- turning a migration that SUCCEEDS on the
+        /// previous behaviour into a hard error. Preservation is a bonus; it
+        /// must never cost the drop itself.
+        #[test]
+        fn a_generated_column_that_reads_the_dropped_column_is_dropped_not_preserved() {
+            let conn = mem();
+            conn.execute_batch(
+                "CREATE TABLE t (
+                     id INTEGER PRIMARY KEY,
+                     a INTEGER,
+                     b INTEGER,
+                     g INTEGER GENERATED ALWAYS AS (a + b) VIRTUAL
+                 );
+                 INSERT INTO t (id, a, b) VALUES (1, 2, 3);",
+            )
+            .unwrap();
+
+            apply(
+                &conn,
+                Op::DropColumn {
+                    table: "t".into(),
+                    column: "b".into(),
+                },
+            )
+            .expect("the drop must still succeed; preserving g is what gives way");
+
+            assert_eq!(columns_xinfo(&conn, "t"), vec!["id", "a"]);
+        }
+
+        /// A definition carrying a line comment falls back rather than
+        /// producing a `CREATE TABLE` whose tail is commented out.
+        ///
+        /// Also from the adversarial review. The rebuilt body is joined onto
+        /// one line, so a `--` captured with the definition swallows everything
+        /// after it including the closing parenthesis.
+        #[test]
+        fn a_generated_column_whose_definition_carries_a_comment_is_dropped_not_preserved() {
+            let conn = mem();
+            conn.execute_batch(
+                "CREATE TABLE t (
+                     id INTEGER PRIMARY KEY,
+                     n INTEGER,
+                     g INTEGER GENERATED ALWAYS AS (n * 2) VIRTUAL -- doubles n
+                     ,
+                     code TEXT UNIQUE
+                 );",
+            )
+            .unwrap();
+
+            apply(
+                &conn,
+                Op::DropColumn {
+                    table: "t".into(),
+                    column: "code".into(),
+                },
+            )
+            .expect("the drop must still succeed");
+
+            assert_eq!(columns_xinfo(&conn, "t"), vec!["id", "n"]);
+        }
+
+        /// A UNIQUE that rode through on a preserved column is not reported
+        /// lost.
+        ///
+        /// The warning's whole value is that it fires on real losses; one that
+        /// fires on work which succeeded is the kind operators learn to skip.
+        #[test]
+        fn a_unique_carried_on_a_preserved_generated_column_is_not_warned() {
+            let conn = mem();
+            conn.execute_batch(
+                "CREATE TABLE t (
+                     id INTEGER PRIMARY KEY,
+                     n INTEGER,
+                     g INTEGER GENERATED ALWAYS AS (n * 2) VIRTUAL UNIQUE,
+                     code TEXT
+                 );
+                 CREATE INDEX t_by_code ON t (code);
+                 INSERT INTO t (id, n, code) VALUES (1, 4, 'k');",
+            )
+            .unwrap();
+
+            apply(
+                &conn,
+                Op::DropColumn {
+                    table: "t".into(),
+                    column: "code".into(),
+                },
+            )
+            .unwrap();
+
+            // It survived and is still enforced, so it was never lost.
+            conn.execute("INSERT INTO t (id, n) VALUES (2, 9)", [])
+                .unwrap();
+            let dup = conn.execute("INSERT INTO t (id, n) VALUES (3, 4)", []);
+            assert!(
+                dup.is_err(),
+                "the UNIQUE on the preserved generated column is still enforced"
+            );
+
+            // ...and the loss list, after the filter, does not name it.
+            let sql = table_sql(&conn, "t").unwrap();
+            let mut lost = lost_constructs(&conn, "t", "code", sql.as_deref(), &[]).unwrap();
+            let generated = generated_columns(&conn, "t").unwrap();
+            let carried: Vec<&str> = generated.iter().map(|(n, _)| n.as_str()).collect();
+            let mut carried_unique: Vec<String> = Vec::new();
+            for index in unique_constraint_indexes(&conn, "t").unwrap() {
+                let cols = index_columns(&conn, &index).unwrap();
+                if !cols.is_empty()
+                    && cols
+                        .iter()
+                        .all(|c| carried.iter().any(|n| n.eq_ignore_ascii_case(c)))
+                {
+                    carried_unique.push(format!("UNIQUE({})", cols.join(", ")));
+                }
+            }
+            lost.retain(|e| !carried_unique.iter().any(|u| u == e));
+            assert!(
+                !lost.iter().any(|l| l.contains("UNIQUE(g)")),
+                "a UNIQUE carried through is not a loss: {lost:?}"
+            );
+        }
+
         /// The definition split survives the shapes that break a naive parse.
         ///
         /// Each of these is a case where splitting on commas, or matching
@@ -3004,13 +3226,13 @@ mod tests {
                        FOREIGN KEY (pid) REFERENCES p(id))";
             let wanted = ("foreign".to_string(), "VIRTUAL");
             assert!(
-                verbatim_definitions_for(Some(sql), &[&wanted]).is_none(),
+                verbatim_definitions_for(Some(sql), &[&wanted], "code").is_none(),
                 "the column name collides with the FOREIGN KEY clause's leading token"
             );
 
             let missing = ("nope".to_string(), "STORED");
             assert!(
-                verbatim_definitions_for(Some(sql), &[&missing]).is_none(),
+                verbatim_definitions_for(Some(sql), &[&missing], "code").is_none(),
                 "a name that matches nothing is unresolved, not skipped"
             );
         }
