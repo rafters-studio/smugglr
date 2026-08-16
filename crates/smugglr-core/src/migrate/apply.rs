@@ -2822,14 +2822,15 @@ mod tests {
         /// hand-written manifest, SQLite identifiers are case-insensitive, and
         /// a byte comparison warns that `"v"` was lost while dropping `"V"`.
         ///
-        /// **This calls `lost_constructs` directly because `apply` cannot
-        /// currently reach it with a generated column named.** `drop_column`'s
-        /// idempotence precheck reads `PRAGMA table_info`, which does not see
-        /// generated columns, so `DROP COLUMN` on one is a silent successful
-        /// no-op that never gets as far as a rebuild -- the same `table_info`
-        /// blindness as #342, one call earlier, filed separately. So this test
-        /// pins a guard that is correct and presently unreachable, and says so
-        /// rather than reading as coverage of a path that runs.
+        /// This calls `lost_constructs` directly rather than going through
+        /// `apply`, which is now a choice rather than a necessity. Until #389
+        /// it was the latter: `drop_column`'s idempotence precheck read
+        /// `PRAGMA table_info`, could not see a generated column, and no-oped
+        /// before any rebuild ran -- so this guard was correct and unreachable.
+        /// The precheck reads `table_xinfo` now and the path is live;
+        /// `dropping_a_generated_column_actually_drops_it` exercises it
+        /// end-to-end. This test stays at the unit level because what it pins
+        /// is the case folding, which is cheaper to assert directly.
         #[test]
         fn a_generated_column_being_dropped_is_not_a_warned_loss() {
             let conn = mem();
