@@ -86,6 +86,13 @@ const DOOMED: i64 = 1;
 const KEPT: i64 = 2;
 /// The base value the generated column doubles.
 const BASE: i64 = 21;
+/// Where the generated probe moves that base, and what the expression must
+/// then make of it. Same unit as the pair above: reading the column once
+/// cannot tell a generated column from an ordinary one holding the number a
+/// by-name copy computed into it, so this probe moves the input like the case
+/// in `cases.rs` does.
+const MOVED_BASE: i64 = 9;
+const MOVED_DOUBLED: i64 = 18;
 
 /// A generated column on a table that also declares a foreign key with a
 /// referential action.
@@ -140,39 +147,58 @@ fn generated_column_on_a_table_with_a_referential_action() -> Combination {
 /// The generated column still computes, on a table that also has a key.
 ///
 /// Reads the child of the parent the cascade does **not** take, so this holds
-/// whether or not the other probe has run.
+/// whether or not the other probe has run -- and moves that child's base
+/// afterwards, which the other probe does not read either.
 fn probe_generated_half(_schema: &Schema, conn: &Connection) -> Result<(), ProbeError> {
-    let doubled = count(
-        conn,
-        &format!(
-            "SELECT count(*) FROM {} WHERE {} = {} AND {} = {}",
-            quote("combined_child"),
-            quote("keeper_id"),
-            KEPT,
-            quote("doubled"),
-            BASE * 2
-        ),
-    )?;
-    if doubled != 1 {
-        let observed: Option<i64> = conn
-            .query_row(
-                &format!(
-                    "SELECT {} FROM {} WHERE {} = {KEPT}",
-                    quote("doubled"),
-                    quote("combined_child"),
-                    quote("keeper_id")
-                ),
-                [],
-                |row| row.get(0),
-            )
-            .ok();
+    let seeded = kept_child_doubles(conn)?;
+    if seeded != Some(BASE * 2) {
         return Err(ProbeError::Failed(format!(
-            "combined_child.doubled reads {observed:?} for a base of {BASE}, not {}; a generated \
+            "combined_child.doubled reads {seeded:?} for a base of {BASE}, not {}; a generated \
              column on a table that also carries a foreign key still has to compute",
             BASE * 2
         )));
     }
+
+    // Reading once proves the column holds the right number, not that it is
+    // still computing one. A rebuild copying by name SELECTS the virtual
+    // column, which computes it, and hands an ordinary column the value --
+    // which then never moves again. Moving the input is what separates them.
+    conn.execute(
+        &format!(
+            "UPDATE {} SET {} = {MOVED_BASE} WHERE {} = {KEPT}",
+            quote("combined_child"),
+            quote("base"),
+            quote("keeper_id")
+        ),
+        [],
+    )?;
+    let moved = kept_child_doubles(conn)?;
+    if moved != Some(MOVED_DOUBLED) {
+        return Err(ProbeError::Failed(format!(
+            "combined_child.doubled reads {moved:?} after its base moved to {MOVED_BASE}, not \
+             {MOVED_DOUBLED}; the value was copied but the computation was not, on a table that \
+             also carries a foreign key"
+        )));
+    }
     Ok(())
+}
+
+/// What the surviving child's generated column currently reads.
+///
+/// The value rather than a match count, because both assertions above want the
+/// number in their failure message anyway -- counting first and re-reading only
+/// on failure asked SQLite the same question twice to learn less.
+fn kept_child_doubles(conn: &Connection) -> Result<Option<i64>, ProbeError> {
+    Ok(conn.query_row(
+        &format!(
+            "SELECT {} FROM {} WHERE {} = {KEPT}",
+            quote("doubled"),
+            quote("combined_child"),
+            quote("keeper_id")
+        ),
+        [],
+        |row| row.get(0),
+    )?)
 }
 
 /// The referential action still cascades, on a table that also has a generated

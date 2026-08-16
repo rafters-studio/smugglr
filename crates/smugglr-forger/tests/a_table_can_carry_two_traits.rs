@@ -24,11 +24,32 @@ use smugglr_forger::schema::{Schema, TableConstraint, Trait};
 
 /// Stand a schema up, seed it, and run one probe.
 fn run(combination: &Combination, schema: &Schema, kind: Trait) -> Result<(), ProbeError> {
+    run_after(combination, schema, kind, &[])
+}
+
+/// The same, with statements applied after the seed.
+///
+/// A break is not always expressible in the schema. The one that matters here
+/// is an ordinary column *holding the value a by-name copy computed into it* --
+/// same schema as the value-less break, opposite reading -- and it needs a
+/// write to exist.
+fn run_after(
+    combination: &Combination,
+    schema: &Schema,
+    kind: Trait,
+    after: &[&str],
+) -> Result<(), ProbeError> {
     let mut fixture = Fixture::new(Backing::Memory).expect("fixture");
     fixture
         .bring_to(Route::Ddl(&schema.to_ddl()))
         .expect("the combined schema renders DDL SQLite accepts");
     combination.seed(fixture.conn()).expect("seed");
+    for statement in after {
+        fixture
+            .conn()
+            .execute_batch(statement)
+            .expect("the post-seed break applies");
+    }
     let probe = combination
         .probes()
         .iter()
@@ -100,6 +121,24 @@ fn a_probe_on_a_combined_table_asserts_only_its_own_construct() {
              {generated_reports:?}",
             combination.name
         );
+        // The break a rebuild actually produces: the generation is gone but the
+        // column holds the number a by-name copy computed into it. Without the
+        // probe's move-the-base step this reads correct forever, which is how
+        // an audit drove a by-name rebuild through the oracle and watched every
+        // trait hold.
+        let copied_reports = run_after(
+            &combination,
+            &generated_broken,
+            Trait::GeneratedVirtual,
+            &["UPDATE \"combined_child\" SET \"doubled\" = \"base\" * 2"],
+        );
+        assert!(
+            matches!(copied_reports, Err(ProbeError::Failed(_))),
+            "{}: a generated column re-created as an ordinary one holding the copied value is \
+             still broken; the probe said {copied_reports:?}",
+            combination.name
+        );
+
         let action_survives_generated_break =
             run(&combination, &generated_broken, Trait::ForeignKeyWithAction);
         assert!(

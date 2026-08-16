@@ -126,9 +126,11 @@ pub fn promise(kind: Trait) -> &'static str {
         }
         Trait::GeneratedVirtual => {
             "a GENERATED ALWAYS AS (...) VIRTUAL column computes its value on every read and \
-             stores nothing. Re-created as an ordinary column it occupies the same position and \
-             reads NULL, so anything copying rows by position either fails or writes into a \
-             column that refuses writes."
+             stores nothing. Re-created as an ordinary column it occupies the same position, and \
+             which way it goes wrong depends on how the rows are copied: by position it reads \
+             NULL, but by NAME the copy SELECTS the column, which computes it, so the ordinary \
+             column is handed the right number and keeps reading it after the input has moved. \
+             The second is the shape a rebuild actually produces and the one no row dump shows."
         }
         Trait::GeneratedStored => {
             "a GENERATED ALWAYS AS (...) STORED column recomputes when its inputs move. \
