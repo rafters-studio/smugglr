@@ -231,6 +231,24 @@ pub fn apply_migration(
     // Asked on the CHECKSUM, which is the migration's identity. A manifest with
     // a different checksum is a different migration and still takes the next
     // version -- this branch cannot swallow it, because it never matches.
+    //
+    // KNOWN BROKEN, #419: A REVERSED MIGRATION CAN NEVER BE RE-APPLIED. A
+    // reversal is a NEW ledgered step and leaves the reversed row byte-unchanged
+    // on purpose -- editing it would trip `verify_chain`, which is what
+    // `reverse.rs`'s module doc says and why. So the original manifest's success
+    // row is still here with its original checksum, and this branch finds it and
+    // refuses forever.
+    //
+    // Measured, both directions: with this branch, apply -> reverse -> re-apply
+    // reports AlreadyApplied at the original version; without it, the same
+    // sequence re-drives and the ops run.
+    //
+    // Not fixed here because there is no small fix: nothing in the ledger links
+    // a reversal to what it reversed, and adding a field to the reversed row is
+    // exactly what the chain hash forbids. `apply_compensating` has no
+    // production caller today, so this is a library-level regression rather than
+    // an operator-facing one -- and #274 will wire the CLI onto it, which is why
+    // #419 exists rather than a comment saying "future work".
     if let Some(applied) = Ledger::applied_version_of(conn, &sealed.checksum)? {
         return Ok(ApplyOutcome {
             version: applied,
