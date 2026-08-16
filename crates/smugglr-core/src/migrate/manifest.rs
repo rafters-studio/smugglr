@@ -186,7 +186,15 @@ pub enum Op {
         #[serde(default)]
         unique: bool,
     },
-    /// Drop an index (additive to invert -- the index definition is recreatable).
+    /// Drop an index.
+    ///
+    /// NOT invertible: the op carries only a name, so there is nothing to
+    /// recreate the index from. `reverse::structural_inverse` refuses it and
+    /// says so. This doc used to claim the definition was recreatable, which is
+    /// the opposite of what the engine does (#329).
+    ///
+    /// It is `Additive` below because it adds no data and needs no pre-image,
+    /// not because it can be undone.
     DropIndex { name: String },
     /// Rename a table.
     RenameTable { from: String, to: String },
@@ -206,7 +214,12 @@ pub enum Op {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OpClass {
-    /// Structurally reversible with no data carried (drop what was added).
+    /// Carries no data and needs no pre-image.
+    ///
+    /// Usually structurally reversible -- drop what was added -- but not
+    /// always: `DropIndex` is here because it loses no data, and it cannot be
+    /// inverted because the op does not carry the index definition (#329). The
+    /// axis is about what must be CAPTURED, not about what can be undone.
     Additive,
     /// Loses data unless a pre-image was captured first.
     Destructive,

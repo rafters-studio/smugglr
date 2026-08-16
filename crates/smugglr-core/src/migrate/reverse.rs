@@ -980,6 +980,34 @@ mod tests {
 
     // -- Structural inverse (pure, both feature sets) -----------------------
 
+    /// A `DropIndex` in an `up` list fails, and the failure says why (#329).
+    ///
+    /// The doc on the variant used to say the index definition was recreatable.
+    /// It is not -- the op carries only a name -- so this is the honest
+    /// behaviour and the doc now matches it.
+    ///
+    /// At the `additive_down_ops` level rather than on `structural_inverse`
+    /// alone, because the defect was that a hand-authored manifest passed every
+    /// gate and only failed here.
+    #[test]
+    fn a_drop_index_in_up_fails_and_names_the_missing_definition() {
+        let up = vec![
+            ClassifiedOp::new(Op::CreateTable {
+                table: "t".into(),
+                columns: vec![col("id", ColumnKind::Text)],
+                without_rowid: false,
+            }),
+            ClassifiedOp::new(Op::DropIndex { name: "idx".into() }),
+        ];
+
+        let err = additive_down_ops(&up).expect_err("a DropIndex in up has no inverse");
+        let said = err.to_string();
+        assert!(
+            said.contains("does not carry the index definition"),
+            "the refusal has to say why rather than merely refuse; it said {said:?}"
+        );
+    }
+
     #[test]
     fn create_table_inverts_to_drop_table() {
         let inv = structural_inverse(&Op::CreateTable {
