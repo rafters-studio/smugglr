@@ -183,14 +183,24 @@ fn a_misspelled_key_is_refused_rather_than_ignored() {
     // A fixture is hand-editable. `after_seeds` silently ignored would leave a
     // file that looks like it runs statements after the seed and does not, and
     // the fixture would be testing something other than what it says.
-    let json = recorded(cascade_lost(), Trait::ForeignKeyWithAction, "said".into())
-        .to_json()
-        .replace("\"after_seed\"", "\"after_seeds\"");
-
-    assert!(matches!(
-        Regression::from_json(&json),
-        Err(CorpusError::Parse(_))
-    ));
+    //
+    // #372 asked whether this test was vacuous. Measured: removing
+    // `deny_unknown_fields` from `Regression` fails it, so the guard is real.
+    //
+    // But NON-VACUOUS AND SPECIFIC ARE DIFFERENT PROPERTIES, and this asserted
+    // only `Err(Parse(_))` -- which any parse failure satisfies, including one
+    // that has nothing to do with the key. It read as though it had proved the
+    // field was guarded while proving something weaker.
+    //
+    // The form that does prove it was already in this file, one function below,
+    // written for the nested types in #368. The envelope now uses it too rather
+    // than keeping a second, laxer standard for the outer type.
+    refuses_the_misspelling(
+        cascade_lost(),
+        Trait::ForeignKeyWithAction,
+        "after_seed",
+        "after_seeds",
+    );
 }
 
 /// Misspell one key in a fixture's JSON and hand the result back to the parser,
