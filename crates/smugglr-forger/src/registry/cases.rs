@@ -49,6 +49,23 @@ const PROTECTED: i64 = 2;
 const RENUMBERED: i64 = 30;
 /// Where that key is expected to move to, and where its child should follow.
 const RENUMBERED_TO: i64 = 31;
+/// The parent key `ON UPDATE SET NULL` is expected to let move, cutting its
+/// child loose rather than carrying it.
+const NULLED: i64 = 40;
+/// Where that key moves to. Nothing should follow it there.
+const NULLED_TO: i64 = 41;
+/// The parent key `ON UPDATE SET DEFAULT` is expected to let move.
+const DEFAULTED: i64 = 50;
+/// Where that key moves to. Its child should not follow it there either.
+const DEFAULTED_TO: i64 = 51;
+/// The row an `ON UPDATE SET DEFAULT` child falls back to.
+///
+/// It has to be a parent row that *exists*: the action writes the column's
+/// declared default into the child, and a default naming a row that is not
+/// there turns the update into a foreign-key violation rather than a fallback.
+/// So this is both the column's `DEFAULT` and a seeded key, and the two cannot
+/// drift apart because the schema and the seed read the same constant.
+const FALLBACK: i64 = 59;
 
 pub(super) fn foreign_key_with_action() -> TraitCase {
     let schema = schema()
@@ -85,6 +102,31 @@ pub(super) fn foreign_key_with_action() -> TraitCase {
                 .fk(["keeper_id"], "updating_keeper", [KEY])
                 .on_update(ReferentialAction::Cascade),
         )
+        // SET NULL and SET DEFAULT get their own parents for the same reason
+        // CASCADE did: every arm of the probe moves or deletes a key, and two
+        // arms sharing a parent would depend on which ran first (#384).
+        .table(table("nulling_keeper").pk_int(KEY).col(LABEL, Text, []))
+        .table(
+            table("nulling_child")
+                .pk_int(KEY)
+                .col("keeper_id", Integer, [])
+                .col(LABEL, Text, [])
+                .fk(["keeper_id"], "nulling_keeper", [KEY])
+                .on_update(ReferentialAction::SetNull),
+        )
+        .table(table("defaulting_keeper").pk_int(KEY).col(LABEL, Text, []))
+        .table(
+            table("defaulting_child")
+                .pk_int(KEY)
+                .col(
+                    "keeper_id",
+                    Integer,
+                    [Attr::Default(DefaultValue::Integer(FALLBACK))],
+                )
+                .col(LABEL, Text, [])
+                .fk(["keeper_id"], "defaulting_keeper", [KEY])
+                .on_update(ReferentialAction::SetDefault),
+        )
         .build()
         .expect("the ForeignKeyWithAction case schema is valid");
 
@@ -103,7 +145,16 @@ pub(super) fn foreign_key_with_action() -> TraitCase {
                  INSERT INTO \"updating_keeper\" (\"{KEY}\", \"{LABEL}\") \
                    VALUES ({RENUMBERED}, 'its key moves and its child follows');
                  INSERT INTO \"updating_child\" (\"{KEY}\", \"keeper_id\", \"{LABEL}\") \
-                   VALUES (40, {RENUMBERED}, 'follows');"
+                   VALUES (400, {RENUMBERED}, 'follows');
+                 INSERT INTO \"nulling_keeper\" (\"{KEY}\", \"{LABEL}\") \
+                   VALUES ({NULLED}, 'its key moves and its child is cut loose');
+                 INSERT INTO \"nulling_child\" (\"{KEY}\", \"keeper_id\", \"{LABEL}\") \
+                   VALUES (410, {NULLED}, 'nulled');
+                 INSERT INTO \"defaulting_keeper\" (\"{KEY}\", \"{LABEL}\") \
+                   VALUES ({DEFAULTED}, 'its key moves and its child falls back'), \
+                          ({FALLBACK}, 'the row the child falls back to');
+                 INSERT INTO \"defaulting_child\" (\"{KEY}\", \"keeper_id\", \"{LABEL}\") \
+                   VALUES (420, {DEFAULTED}, 'defaulted');"
             ))?;
             Ok(())
         },
@@ -298,6 +349,153 @@ fn probe_foreign_key_with_action(schema: &Schema, conn: &Connection) -> Result<(
                 "{followed} row(s) of {} reference {moving}.{moving_key} = {RENUMBERED_TO} after \
                  that key moved from {RENUMBERED}; ON UPDATE CASCADE did not carry the child over",
                 child.name
+            )));
+        }
+    }
+
+    // ON UPDATE SET NULL and SET DEFAULT (#384). Each on its own parent again,
+    // so the three update arms are independent of the order they run in.
+    //
+    // These two are what makes the difference between covering the CASCADE
+    // action and covering the clause: they come off the same pragma column as
+    // CASCADE and are lost by the same mechanism, so a rebuild that dropped
+    // them was silent until there was something reading them.
+    moved_key_leaves(
+        conn,
+        schema,
+        ReferentialAction::SetNull,
+        NULLED,
+        NULLED_TO,
+        Landing::Null,
+    )?;
+    moved_key_leaves(
+        conn,
+        schema,
+        ReferentialAction::SetDefault,
+        DEFAULTED,
+        DEFAULTED_TO,
+        Landing::Value(FALLBACK),
+    )?;
+
+    Ok(())
+}
+
+/// Where a child is expected to end up when its parent's key moves out from
+/// under it.
+#[derive(Debug, Clone, Copy)]
+enum Landing {
+    /// `SET NULL`: the reference is cut rather than redirected.
+    Null,
+    /// `SET DEFAULT`: the reference falls back to the column's declared value.
+    Value(i64),
+}
+
+impl Landing {
+    /// The `WHERE` predicate that finds a child which landed correctly.
+    ///
+    /// Spelled as SQL rather than compared in Rust because `NULL` is not a
+    /// value that `=` matches -- reading the column back and comparing it to
+    /// `Some(x)` would make the `SET NULL` arm pass on a column that had been
+    /// left alone if the seed had happened to be NULL.
+    fn predicate(self, column: &str) -> String {
+        match self {
+            Landing::Null => format!("{column} IS NULL"),
+            Landing::Value(value) => format!("{column} = {value}"),
+        }
+    }
+
+    fn describe(self) -> String {
+        match self {
+            Landing::Null => "NULL".to_string(),
+            Landing::Value(value) => value.to_string(),
+        }
+    }
+}
+
+/// Move a parent key declared with `action`, and assert where its children
+/// landed.
+///
+/// Shared by the `SET NULL` and `SET DEFAULT` arms because they differ only in
+/// where the child is expected to end up. `CASCADE` is deliberately not routed
+/// through here: it asserts the child *followed the key*, which is a different
+/// shape from landing on a fixed value, and folding all three together would
+/// need a parameter that names the new key -- a helper longer than the two
+/// arms it replaced.
+fn moved_key_leaves(
+    conn: &Connection,
+    schema: &Schema,
+    action: ReferentialAction,
+    from: i64,
+    to: i64,
+    landing: Landing,
+) -> Result<(), ProbeError> {
+    let children = children_updating_with(schema, action);
+    if children.is_empty() {
+        return Err(ProbeError::Failed(format!(
+            "the schema handed to this probe declares no ON UPDATE {} foreign key, and the probe \
+             needs one to have anything to assert",
+            action.as_sql()
+        )));
+    }
+    let (parent, parent_key) = parent_of(children[0].1)?;
+
+    for (child, fk) in &children {
+        let child_column = child_column_of(fk)?;
+        let rows = count(
+            conn,
+            &format!(
+                "SELECT count(*) FROM {} WHERE {} = {from}",
+                quote(&child.name),
+                quote(child_column)
+            ),
+        )?;
+        if rows == 0 {
+            return Err(ProbeError::Unseeded(format!(
+                "{} has no row referencing {parent}.{parent_key} = {from}, so moving that key \
+                 would prove nothing either way",
+                child.name
+            )));
+        }
+    }
+
+    // The move has to be permitted before where the child landed means
+    // anything: with the action dropped the key cannot move at all, and
+    // asserting only the landing would report the wrong cause.
+    let moved = conn.execute(
+        &format!(
+            "UPDATE {} SET {} = {to} WHERE {} = {from}",
+            quote(parent),
+            quote(parent_key),
+            quote(parent_key)
+        ),
+        [],
+    );
+    if let Err(error) = moved {
+        return Err(ProbeError::Failed(format!(
+            "moving {parent}.{parent_key} from {from} to {to} was refused ({error}), and a child \
+             declared ON UPDATE {} does not refuse it -- the action was reconstructed as \
+             something else, or dropped, which leaves NO ACTION",
+            action.as_sql()
+        )));
+    }
+
+    for (child, fk) in &children {
+        let child_column = child_column_of(fk)?;
+        let landed = count(
+            conn,
+            &format!(
+                "SELECT count(*) FROM {} WHERE {}",
+                quote(&child.name),
+                landing.predicate(&quote(child_column))
+            ),
+        )?;
+        if landed != 1 {
+            return Err(ProbeError::Failed(format!(
+                "{landed} row(s) of {} hold {} after {parent}.{parent_key} moved from {from} to \
+                 {to}; ON UPDATE {} puts the child there and this one is somewhere else",
+                child.name,
+                landing.describe(),
+                action.as_sql()
             )));
         }
     }

@@ -124,6 +124,17 @@ fn breaks(kind: Trait) -> Vec<Break> {
             let mut dropped_update_action = schema();
             foreign_key_mut(&mut dropped_update_action, "updating_child").on_update = None;
 
+            // One break per action, not one for the clause. All four come off
+            // the same pragma column and are lost by the same mechanism, which
+            // is exactly why a single break feels sufficient and is not: each
+            // arm asserts a different landing, and only a break touching that
+            // arm's action can show it asserting anything (#384).
+            let mut dropped_set_null = schema();
+            foreign_key_mut(&mut dropped_set_null, "nulling_child").on_update = None;
+
+            let mut dropped_set_default = schema();
+            foreign_key_mut(&mut dropped_set_default, "defaulting_child").on_update = None;
+
             let mut dropped_key = schema();
             table_mut(&mut dropped_key, "restrict_child")
                 .constraints
@@ -141,6 +152,16 @@ fn breaks(kind: Trait) -> Vec<Break> {
                     "ON UPDATE CASCADE, leaving the key with the NO ACTION default -- the same \
                      loss as above, on the half of the clause that had no probe before #374",
                     dropped_update_action,
+                ),
+                Break::schema(
+                    "ON UPDATE SET NULL, so the parent key cannot move and the child is never \
+                     cut loose",
+                    dropped_set_null,
+                ),
+                Break::schema(
+                    "ON UPDATE SET DEFAULT, so the parent key cannot move and the child never \
+                     falls back to its declared default",
+                    dropped_set_default,
                 ),
                 Break::schema(
                     "the RESTRICT child's foreign key, dropped whole",

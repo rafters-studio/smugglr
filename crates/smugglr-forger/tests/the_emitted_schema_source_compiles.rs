@@ -37,8 +37,8 @@ const THIS_FILE: &str = include_str!("the_emitted_schema_source_compiles.rs");
 #[rustfmt::skip]
 fn foreign_key_with_action() -> Schema {
     // >>> ForeignKeyWithAction
-    use smugglr_forger::schema::builder::{schema, table};
-    use smugglr_forger::schema::{ColumnType::*, ReferentialAction};
+    use smugglr_forger::schema::builder::{schema, table, Attr};
+    use smugglr_forger::schema::{ColumnType::*, DefaultValue, ReferentialAction};
 
     schema()
         .table(
@@ -74,6 +74,32 @@ fn foreign_key_with_action() -> Schema {
                 .col("label", Text, [])
                 .fk(["keeper_id"], "updating_keeper", ["id"])
                 .on_update(ReferentialAction::Cascade),
+        )
+        .table(
+            table("nulling_keeper")
+                .pk_int("id")
+                .col("label", Text, []),
+        )
+        .table(
+            table("nulling_child")
+                .pk_int("id")
+                .col("keeper_id", Integer, [])
+                .col("label", Text, [])
+                .fk(["keeper_id"], "nulling_keeper", ["id"])
+                .on_update(ReferentialAction::SetNull),
+        )
+        .table(
+            table("defaulting_keeper")
+                .pk_int("id")
+                .col("label", Text, []),
+        )
+        .table(
+            table("defaulting_child")
+                .pk_int("id")
+                .col("keeper_id", Integer, [Attr::Default(DefaultValue::Integer(59))])
+                .col("label", Text, [])
+                .fk(["keeper_id"], "defaulting_keeper", ["id"])
+                .on_update(ReferentialAction::SetDefault),
         )
         .build()
         .expect("a valid schema")
@@ -316,25 +342,115 @@ fn block(kind: Trait) -> String {
 fn block_in(source: &str, kind: Trait) -> String {
     let open = format!("// >>> {kind:?}");
     let close = format!("// <<< {kind:?}");
-    let marker = source
-        .find(&open)
+    let marker = marker_alone_on_its_line(source, 0, &open)
         .unwrap_or_else(|| panic!("{kind:?} has no pasted block in this file"));
     let after = &source[marker + open.len()..];
     let line_end = after
         .find('\n')
         .unwrap_or_else(|| panic!("{kind:?}'s open marker line never ends"));
-    // Nothing but the line ending may follow, so a trait whose name merely
-    // starts with another's cannot be located by the shorter one's marker.
-    assert!(
-        after[..line_end].trim().is_empty(),
-        "{kind:?}'s open marker does not end its line -- it is followed by {:?}",
-        &after[..line_end]
-    );
     let start = marker + open.len() + line_end + 1;
-    let end = source[start..]
-        .find(&close)
+    let end = marker_alone_on_its_line(source, start, &close)
         .unwrap_or_else(|| panic!("{kind:?}'s pasted block is never closed"));
-    source[start..start + end].to_string()
+    source[start..end].to_string()
+}
+
+/// The offset of `marker` at or after `from`, counting only an occurrence that
+/// is alone on its line.
+///
+/// `find` takes the first occurrence that merely *starts* with the marker text,
+/// so a trait whose name prefixes another's -- `Trigger` against a future
+/// `TriggerBody` -- would be located by the longer one's marker and read the
+/// wrong block entirely.
+///
+/// Terminating the needle with a newline used to resolve that for free.
+/// smugglr#380 gave it up so the locating would survive a CRLF checkout, and
+/// replaced it with an assertion, which turned a resolvable case into a panic:
+/// correct blocks, correct markers, and a refusal. This takes the resolution
+/// back rather than the refusal (smugglr#383). Skipping is the right move over
+/// asserting because a longer marker sharing this one's prefix is not a
+/// malformed file, it is a different trait's block.
+fn marker_alone_on_its_line(source: &str, from: usize, marker: &str) -> Option<usize> {
+    source[from..]
+        .match_indices(marker)
+        .find_map(|(offset, _)| {
+            let at = from + offset;
+            let rest = &source[at + marker.len()..];
+            // The last line of a file may have no trailing newline, so an absent
+            // one means "to the end" rather than "no line".
+            let line_end = rest.find('\n').unwrap_or(rest.len());
+            rest[..line_end].trim().is_empty().then_some(at)
+        })
+}
+
+/// A marker whose text prefixes another's finds its own block, in either order.
+///
+/// No trait name in `Trait::ALL` prefixes another today, so this is a guard for
+/// the trait nobody has added yet -- and the registry's whole design is that a
+/// new variant cannot exist without someone pasting its emitted source into this
+/// file, which puts every future trait on this path.
+///
+/// Both orderings, so the answer is not right by luck of position.
+///
+/// The source is synthetic rather than this file, because the collision cannot
+/// be spelled with the traits that exist. `TriggerBody` is not a `Trait`; it
+/// does not need to be, since what is under test is the *text* matching.
+#[test]
+fn a_marker_that_prefixes_another_locates_its_own_block() {
+    let longer_first = "\
+// >>> TriggerBody
+the wrong block
+// <<< TriggerBody
+// >>> Trigger
+the right block
+// <<< Trigger
+";
+    assert_eq!(
+        collapsed(&block_in(longer_first, Trait::Trigger)),
+        "the right block",
+        "the shorter marker was located by the longer trait's opening"
+    );
+
+    let shorter_first = "\
+// >>> Trigger
+the right block
+// <<< Trigger
+// >>> TriggerBody
+the wrong block
+// <<< TriggerBody
+";
+    assert_eq!(
+        collapsed(&block_in(shorter_first, Trait::Trigger)),
+        "the right block",
+        "the block ran into the longer trait's"
+    );
+}
+
+/// A block whose close marker is missing is refused, not silently extended
+/// into the next trait's.
+///
+/// This is the case that earns the *close* marker its own resolution, and it is
+/// worth saying why the test above does not: in a well-formed file the blocks
+/// are sequential and non-overlapping, so the first `// <<< T` after a block's
+/// opening is always that block's own, and a plain `find` is correct. Measured,
+/// not reasoned -- reverting only the close half leaves the test above green.
+///
+/// A **missing** close is different, and it is what a botched paste actually
+/// leaves. With `find`, `// <<< Trigger` matches inside `// <<< TriggerBody`
+/// and the function returns a block running through the next trait's source,
+/// silently -- which surfaces as unexplained drift in the comparison test,
+/// pointing at the emitter rather than at the paste. Skipping markers that do
+/// not end their line turns that into the panic it should always have been.
+#[test]
+#[should_panic(expected = "Trigger's pasted block is never closed")]
+fn a_block_missing_its_close_marker_is_refused_rather_than_extended() {
+    let no_close_for_trigger = "\
+// >>> Trigger
+the right block
+// >>> TriggerBody
+the wrong block
+// <<< TriggerBody
+";
+    let _ = block_in(no_close_for_trigger, Trait::Trigger);
 }
 
 /// The blocks are found the same way whichever line ending this file arrives in.

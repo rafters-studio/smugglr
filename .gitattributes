@@ -1,0 +1,36 @@
+# Line endings are decided here, not by each machine's core.autocrlf.
+#
+# smugglr#382. A test in smugglr-forger read its own source to locate pasted
+# blocks and could not find them on Windows, because git checked the file out
+# CRLF there and the search needle ended in a bare newline. `main` was red on
+# one platform for three merges. That defect was fixed on its own terms in
+# smugglr#380 -- the locating is line-ending agnostic now, and its guard
+# constructs a CRLF copy in memory so the failure is reachable on every
+# platform. This file is the other half: it removes the state rather than
+# testing for it.
+#
+# Measured before adding: `git ls-files --eol` reported 188 files stored `i/lf`
+# and 2 stored `i/-text`, and zero stored CRLF or mixed. So this normalizes
+# nothing and produces no renormalization diff -- the blast radius that makes a
+# line-ending policy risky to introduce is, here, empty.
+
+# Everything git considers text is stored LF and checked out LF, on every
+# platform. `eol=lf` is the load-bearing half: `text=auto` alone would still
+# check out CRLF on Windows under the default `core.autocrlf`.
+* text=auto eol=lf
+
+# Binaries, named rather than left to detection. git already infers these two
+# (they are the `i/-text` pair above), and saying so means a future image
+# cannot be corrupted by a heuristic that guesses wrong on a file that happens
+# to contain no NUL byte early on.
+*.webp binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.db binary
+*.sqlite binary
+*.sqlite3 binary
