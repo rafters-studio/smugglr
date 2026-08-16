@@ -186,12 +186,50 @@ impl Ledger {
         Ok(v.map(|v| v as u64))
     }
 
+    /// The version at which this exact manifest already succeeded, if it did.
+    ///
+    /// The IDENTITY of a migration is its checksum, not the version the driver
+    /// assigned it or the one the manifest names -- #270's generator hardcodes
+    /// `version: 1` on everything it scaffolds, so the manifest's own number
+    /// says nothing. #325.
+    ///
+    /// `status = 'success'` is load-bearing rather than defensive. A `failed`
+    /// or expired-`pending` row carrying this same checksum must NOT match: it
+    /// has to fall through and be re-driven, which is the whole point of the
+    /// reclaim path. That filter also grew teeth with #328 -- before it, a
+    /// reclaimed row did not carry the checksum of the manifest that actually
+    /// ran, so a query without this clause would newly match rows it could not
+    /// have matched before.
+    ///
+    /// Lowest matching version rather than highest: if the same manifest
+    /// somehow succeeded twice, the first is where it was applied and the
+    /// second is the defect this function exists to prevent.
+    pub fn applied_version_of(conn: &Connection, checksum: &str) -> Result<Option<u64>> {
+        let v: Option<i64> = conn
+            .query_row(
+                &format!(
+                    "SELECT MIN(version) FROM \"{LEDGER_TABLE}\" \
+                     WHERE checksum = ?1 AND status = 'success'"
+                ),
+                [checksum],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(v.map(|v| v as u64))
+    }
+
     /// Attempt to elect this node as the applier of `version`.
     ///
     /// Transaction-free. The decision:
     /// - no row -> `INSERT` a pending, leased row; the `UNIQUE(version)` winner
     ///   returns [`Election::Won`], a race-loser re-reads and re-decides.
-    /// - `success` -> [`Election::AlreadyApplied`] (the skip-gate).
+    /// - `success` -> [`Election::AlreadyApplied`]. NOT the skip-gate for a
+    ///   re-run any more: since #325 the driver answers that before electing,
+    ///   by checksum, because a re-run is assigned a fresh version and would
+    ///   never collide here. This arm is now reached by a manifest that NAMES
+    ///   an already-applied version -- a hand-authored one, or a caller
+    ///   electing directly.
     /// - live-leased `pending` -> [`Election::HeldByOther`].
     /// - expired `pending` or `failed` -> reclaim via a compare-and-set `UPDATE`
     ///   (renews the lease); the CAS winner returns [`Election::Won`], a loser

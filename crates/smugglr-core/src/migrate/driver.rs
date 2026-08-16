@@ -113,6 +113,13 @@ impl Default for ApplyOptions {
 #[derive(Debug)]
 pub struct ApplyOutcome {
     /// The version the driver assigned and elected.
+    ///
+    /// One exception, and it is the useful answer rather than a quirk: on
+    /// [`Election::AlreadyApplied`] from a re-run this is the version the
+    /// manifest ALREADY SUCCEEDED AT, not the version this call would have
+    /// claimed. A caller asking "where does this migration live in the ledger"
+    /// gets the real answer, and there is no version this call claimed to
+    /// report (#325).
     pub version: u64,
     /// The **manifest's** checksum, copied from `sealed.checksum`. This is not
     /// re-read from the ledger row. Since #328 the two agree on the reclaim path --
@@ -207,6 +214,33 @@ pub fn apply_migration(
     let manifest = &sealed.manifest;
 
     Ledger::ensure_schema(conn)?;
+
+    // The same migration re-run is not a new migration (#325).
+    //
+    // Two correct decisions composed into a defect. #270's generator hardcodes
+    // `version: 1` on everything it scaffolds, so the manifest's self-reported
+    // version says nothing; #296's driver therefore assigns the version itself,
+    // as `current_version + 1`, which is right because honouring the manifest
+    // would make every migration in a project claim v1 forever.
+    //
+    // Neither step asked whether THIS EXACT MIGRATION had already been applied.
+    // So the increment fired unconditionally, a fresh version never collided
+    // with anything, and the election always won. `Election::AlreadyApplied`
+    // existed, was rendered by the CLI, and could not fire from this path.
+    //
+    // Asked on the CHECKSUM, which is the migration's identity. A manifest with
+    // a different checksum is a different migration and still takes the next
+    // version -- this branch cannot swallow it, because it never matches.
+    if let Some(applied) = Ledger::applied_version_of(conn, &sealed.checksum)? {
+        return Ok(ApplyOutcome {
+            version: applied,
+            checksum: sealed.checksum.clone(),
+            election: Election::AlreadyApplied,
+            classifications: Vec::new(),
+            preimage: None,
+        });
+    }
+
     let version = Ledger::current_version(conn)?.map_or(1, |v| v + 1);
 
     if opts.reconcile_preflight {
@@ -408,6 +442,85 @@ mod tests {
 
         assert_eq!(outcome.version, 2);
         assert_eq!(Ledger::current_version(&conn).unwrap(), Some(2));
+    }
+
+    #[test]
+    fn re_running_the_same_manifest_reports_already_applied_and_writes_no_second_row() {
+        // #325. The driver assigns `current_version + 1` unconditionally, so a
+        // re-run used to get a FRESH version, never collide with anything, and
+        // win the election -- making `Election::AlreadyApplied` unreachable from
+        // this path while the variant existed and the CLI rendered it.
+        //
+        // Two manifests are not enough to see this and that is why it survived:
+        // `driver_assigns_the_version_not_the_manifest` uses two DIFFERENT ones
+        // and is correct for what it tests. This drives the same one twice.
+        let conn = conn();
+        let sealed = manifest_with(vec![create_users()], None);
+
+        let first = apply_migration(&conn, &sealed, &ApplyOptions::default()).unwrap();
+        assert_eq!(first.election, Election::Won);
+        assert_eq!(first.version, 1);
+
+        let second = apply_migration(&conn, &sealed, &ApplyOptions::default()).unwrap();
+        assert_eq!(
+            second.election,
+            Election::AlreadyApplied,
+            "the same migration re-run is not a new migration"
+        );
+        assert_eq!(
+            second.version, 1,
+            "the reported version is where it actually landed, not the version this call would \
+             have claimed"
+        );
+
+        // The ledger's meaning is "which migrations have been applied", not
+        // "how many times someone ran apply". One row, still at v1.
+        assert_eq!(Ledger::current_version(&conn).unwrap(), Some(1));
+        assert_eq!(
+            Ledger::entries(&conn).unwrap().len(),
+            1,
+            "a re-run must not append a second row for the same migration"
+        );
+    }
+
+    #[test]
+    fn the_same_manifest_after_a_failure_re_drives_rather_than_reporting_already_applied() {
+        // The half that keeps #325's fix from swallowing the reclaim path. The
+        // checksum lookup is `status = 'success'` for this reason: a failed row
+        // carrying this same checksum has to fall through and be re-driven.
+        //
+        // Live in a way it was not when #325 was filed. Before #328 a reclaimed
+        // row did not carry the checksum of the manifest that actually ran, so
+        // a lookup missing that filter would now match rows it could not have
+        // matched then.
+        let conn = conn();
+        let sealed = manifest_with(
+            vec![
+                create_users(),
+                ClassifiedOp::new(Op::AddColumn {
+                    table: "ghosts".into(),
+                    column: col("boo", ColumnKind::Text),
+                }),
+            ],
+            None,
+        );
+
+        let err = apply_migration(&conn, &sealed, &ApplyOptions::default()).unwrap_err();
+        assert_eq!(err.exit_code(), 4);
+        assert_eq!(
+            Ledger::entry(&conn, 1).unwrap().unwrap().status,
+            MigrationStatus::Failed
+        );
+
+        // Same checksum, failed row. It must NOT be read as already applied.
+        let again = apply_migration(&conn, &sealed, &ApplyOptions::default()).unwrap_err();
+        assert_eq!(
+            again.exit_code(),
+            4,
+            "a failed migration re-run has to be re-driven and fail again, not be skipped as \
+             already applied"
+        );
+        assert_eq!(Ledger::current_version(&conn).unwrap(), None);
     }
 
     #[test]
