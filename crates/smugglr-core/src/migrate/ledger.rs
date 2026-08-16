@@ -231,7 +231,13 @@ impl Ledger {
                             return Ok(Election::HeldByOther);
                         }
                         // Expired pending -> a crashed applier. Reclaim it.
-                        if Self::reclaim_pending(conn, version, lease_secs)? {
+                        if Self::reclaim_pending(
+                            conn,
+                            version,
+                            checksum,
+                            &entry.prev_hash,
+                            lease_secs,
+                        )? {
                             return Ok(Election::Won);
                         }
                         // Someone reclaimed between our read and CAS; re-read.
@@ -240,7 +246,13 @@ impl Ledger {
                     MigrationStatus::Failed => {
                         // A failed apply is reclaimable and re-driven -- the gate
                         // skips only on success, never on row-existence.
-                        if Self::reclaim_failed(conn, version, lease_secs)? {
+                        if Self::reclaim_failed(
+                            conn,
+                            version,
+                            checksum,
+                            &entry.prev_hash,
+                            lease_secs,
+                        )? {
                             return Ok(Election::Won);
                         }
                         continue;
@@ -423,31 +435,56 @@ impl Ledger {
     /// Compare-and-set reclaim of an expired pending row. Returns whether this
     /// node won (exactly one row updated). The `WHERE` guard makes the CAS atomic
     /// without a transaction: only one racer can move the row off its old lease.
-    fn reclaim_pending(conn: &Connection, version: u64, lease_secs: i64) -> Result<bool> {
+    fn reclaim_pending(
+        conn: &Connection,
+        version: u64,
+        checksum: &str,
+        prev_hash: &str,
+        lease_secs: i64,
+    ) -> Result<bool> {
         let now = now_unix();
         let affected = conn.execute(
             &format!(
                 "UPDATE \"{LEDGER_TABLE}\"
-                 SET applied_at = ?1, lease_expires_at = ?2
-                 WHERE version = ?3 AND status = 'pending'
+                 SET applied_at = ?1, lease_expires_at = ?2, checksum = ?3, chain_hash = ?4
+                 WHERE version = ?5 AND status = 'pending'
                    AND (lease_expires_at IS NULL OR lease_expires_at < ?1)"
             ),
-            rusqlite::params![now, now + lease_secs, version as i64],
+            rusqlite::params![
+                now,
+                now + lease_secs,
+                checksum,
+                chain_hash(version, checksum, prev_hash),
+                version as i64
+            ],
         )?;
         Ok(affected == 1)
     }
 
     /// Compare-and-set reclaim of a failed row back to pending. Returns whether
     /// this node won.
-    fn reclaim_failed(conn: &Connection, version: u64, lease_secs: i64) -> Result<bool> {
+    fn reclaim_failed(
+        conn: &Connection,
+        version: u64,
+        checksum: &str,
+        prev_hash: &str,
+        lease_secs: i64,
+    ) -> Result<bool> {
         let now = now_unix();
         let affected = conn.execute(
             &format!(
                 "UPDATE \"{LEDGER_TABLE}\"
-                 SET status = 'pending', applied_at = ?1, lease_expires_at = ?2
-                 WHERE version = ?3 AND status = 'failed'"
+                 SET status = 'pending', applied_at = ?1, lease_expires_at = ?2,
+                     checksum = ?3, chain_hash = ?4
+                 WHERE version = ?5 AND status = 'failed'"
             ),
-            rusqlite::params![now, now + lease_secs, version as i64],
+            rusqlite::params![
+                now,
+                now + lease_secs,
+                checksum,
+                chain_hash(version, checksum, prev_hash),
+                version as i64
+            ],
         )?;
         Ok(affected == 1)
     }
@@ -481,6 +518,16 @@ impl Ledger {
 /// the entry (`version`, `checksum`) and the predecessor link feed the hash;
 /// mutable columns (status, lease, applied_at) and the forward-compat columns are
 /// deliberately excluded so legitimate transitions do not break the chain.
+///
+/// `checksum` is described as immutable and is *nearly* so: a reclaim rewrites
+/// it, together with this hash, so the row names the manifest that actually ran
+/// (#328). That is bounded rather than a hole in the chain, and the bound is a
+/// property rather than a convention -- a reclaimable row is always the tail,
+/// because the driver derives its version from `current_version`, which counts
+/// only `success`. A `pending` or `failed` row therefore blocks any higher
+/// version from existing, so there is never a successor whose `prev_hash` this
+/// could orphan. `a_reclaimable_row_has_no_successors_to_invalidate` asserts
+/// it rather than leaving it as reasoning.
 fn chain_hash(version: u64, checksum: &str, prev_hash: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(version.to_be_bytes());
@@ -849,5 +896,113 @@ mod tests {
         // v3 chains off v2, NOT the shared stale tail -- the fork is prevented.
         assert_ne!(entries[2].prev_hash, stale_tail);
         Ledger::verify_chain(&conn).unwrap();
+    }
+    /// #328: a reclaimed row records the checksum of the manifest that ran.
+    ///
+    /// The reachable sequence is ordinary fix-and-retry, not a race: apply a
+    /// manifest, have it fail, edit it, re-apply. `current_version` counts only
+    /// `success`, so the retry re-derives the same version, reclaims the failed
+    /// row and settles it -- and the row used to keep the FAILING manifest's
+    /// checksum while the database got the edited one.
+    ///
+    /// `verify_chain` did not catch it, which is the part that made it worse
+    /// than having no chain: it recomputes from the STORED checksum, so the row
+    /// was internally consistent and merely factually wrong. The mechanism
+    /// built to make tampering visible certified the incorrect identity.
+    #[test]
+    fn a_reclaimed_row_records_the_checksum_that_actually_ran() {
+        let conn = conn();
+
+        assert_eq!(
+            Ledger::try_elect(&conn, 1, "checksum_a", 300).unwrap(),
+            Election::Won
+        );
+        Ledger::mark_failed(&conn, 1).unwrap();
+
+        // The operator edits the manifest and re-applies.
+        assert_eq!(
+            Ledger::try_elect(&conn, 1, "checksum_b", 300).unwrap(),
+            Election::Won
+        );
+        Ledger::mark_success(&conn, 1).unwrap();
+
+        let entry = Ledger::entry(&conn, 1).unwrap().unwrap();
+        assert_eq!(
+            entry.checksum, "checksum_b",
+            "the ledger has to name the manifest that ran, not the one that failed"
+        );
+        Ledger::verify_chain(&conn).expect("the chain still verifies after an honest reclaim");
+    }
+
+    /// The same, for an expired pending row rather than a failed one.
+    ///
+    /// Both reclaim arms had the defect and both are fixed; testing one would
+    /// leave the other free to regress.
+    #[test]
+    fn a_reclaimed_expired_pending_row_records_the_checksum_that_actually_ran() {
+        let conn = conn();
+
+        assert_eq!(
+            Ledger::try_elect(&conn, 1, "checksum_a", 300).unwrap(),
+            Election::Won
+        );
+        // The applier that took this row crashed: its lease is in the past.
+        expire_lease(&conn, 1);
+
+        assert_eq!(
+            Ledger::try_elect(&conn, 1, "checksum_b", 300).unwrap(),
+            Election::Won
+        );
+        Ledger::mark_success(&conn, 1).unwrap();
+
+        let entry = Ledger::entry(&conn, 1).unwrap().unwrap();
+        assert_eq!(entry.checksum, "checksum_b");
+        Ledger::verify_chain(&conn).expect("the chain still verifies");
+    }
+
+    /// A reclaimable row is always the highest-versioned one, which is what
+    /// makes rewriting its `chain_hash` safe.
+    ///
+    /// This is the property the fix rests on, so it is asserted rather than
+    /// argued. `chain_hash` feeds the NEXT row's `prev_hash`, so rewriting a
+    /// row in the middle of a chain would invalidate everything after it. That
+    /// cannot arise: the driver derives its version as `current_version + 1`
+    /// and `current_version` counts only `success`, so a row that is `pending`
+    /// or `failed` blocks any higher version from ever being created.
+    ///
+    /// Without this, "reclaim overwrites the checksum" would be a change with
+    /// an unbounded blast radius instead of a bounded one.
+    #[test]
+    fn a_reclaimable_row_has_no_successors_to_invalidate() {
+        let conn = conn();
+
+        Ledger::try_elect(&conn, 1, "a", 300).unwrap();
+        Ledger::mark_success(&conn, 1).unwrap();
+        Ledger::try_elect(&conn, 2, "b", 300).unwrap();
+        Ledger::mark_failed(&conn, 2).unwrap();
+
+        // The observable version is still 1, so the next apply derives 2 --
+        // the failed row -- and there is nothing above it to invalidate.
+        assert_eq!(Ledger::current_version(&conn).unwrap(), Some(1));
+        let highest = Ledger::entries(&conn)
+            .unwrap()
+            .iter()
+            .map(|e| e.version)
+            .max()
+            .unwrap();
+        assert_eq!(
+            highest, 2,
+            "the reclaimable row is the tail of the chain; if a higher version could exist, \
+             rewriting this row's chain_hash would orphan it"
+        );
+
+        // And after the reclaim, the chain is still whole.
+        Ledger::try_elect(&conn, 2, "b_edited", 300).unwrap();
+        Ledger::mark_success(&conn, 2).unwrap();
+        Ledger::verify_chain(&conn).unwrap();
+        assert_eq!(
+            Ledger::entry(&conn, 2).unwrap().unwrap().checksum,
+            "b_edited"
+        );
     }
 }
