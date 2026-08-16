@@ -24,9 +24,16 @@
 //! real migrations and lets the marks fall out. A helper that hand-wrote a
 //! ledger row would be a fixture wearing a history's clothes, and every test
 //! built on it would be green about a database that never aged. That is why
-//! [`the_aged_database_is_actually_old`] exists: every other test here rests on
-//! that constructor, so the age it claims to produce is measured rather than
-//! trusted.
+//! [`the_aged_database_is_actually_old`] measures each mark rather than
+//! trusting the constructor to have produced it.
+//!
+//! What that test does NOT do is underwrite the others, and an adversarial
+//! review caught this file claiming it did: `AgedDatabase` has exactly one
+//! caller. The volume test and the chain test each build a fresh, historyless
+//! connection. So this file holds three properties in three tests -- volume,
+//! history, chain length -- and **no test holds volume and history at once**.
+//! That gap is real and named rather than papered over; closing it is a
+//! populated aged database, which is more than a comment fix.
 //!
 //! # One constraint discovered rather than assumed
 //!
@@ -417,11 +424,14 @@ fn seal(up: Vec<ClassifiedOp>) -> ChecksummedManifest {
 /// The constructor produced a database with a history, and each mark is checked
 /// rather than assumed.
 ///
-/// This test exists because every other test in this file rests on it. A helper
-/// that quietly produced a *young* database -- one whose migrations no-oped,
-/// whose rebuild never ran, whose failure silently succeeded -- would make
-/// everything downstream green for the wrong reason, which is the failure mode
-/// this whole crate was built to eliminate. So the age is a measurement.
+/// A helper that quietly produced a *young* database -- one whose migrations
+/// no-oped, whose failure silently succeeded -- would be a fixture wearing a
+/// history's clothes, and anything built on it would be green for the wrong
+/// reason. So the age is a measurement rather than a claim.
+///
+/// Each mark is asserted independently, which is stronger than it sounds and
+/// was verified as such: disabling any one of them fires ITS OWN assertion
+/// rather than some other one catching the fallout first.
 #[test]
 fn the_aged_database_is_actually_old() {
     let aged = AgedDatabase::build();
@@ -469,7 +479,19 @@ fn the_aged_database_is_actually_old() {
          database has never had a row deleted and is not aged in the way that matters"
     );
 
-    // -- a rebuild really rewrote the stored CREATE text -----------------
+    // -- the stored CREATE text was rewritten ----------------------------
+    //
+    // Narrower than it first read, and the narrowing came from an adversarial
+    // review. This asserts the stored text is no longer the text the table was
+    // authored with -- which is a real age mark -- and it does NOT prove a
+    // REBUILD produced it: SQLite's direct `ALTER ... DROP COLUMN` rewrites the
+    // stored CREATE too, so with the UNIQUE removed from the dropped column
+    // this assertion still passes while no rebuild runs.
+    //
+    // That the rebuild is the path a UNIQUE column takes is pinned where it can
+    // be pinned properly, in `migrate::apply`'s own unit tests
+    // (`drop_unique_column_falls_back_to_rebuild`), rather than inferred here
+    // from a side effect both paths share.
     let after = aged.ddl_of(ORDERS);
     assert_ne!(
         after, aged.ddl_before_rebuild,
@@ -593,13 +615,48 @@ fn a_populated_table_survives_a_rebuild_value_for_value() {
     }
 }
 
-/// Every row of a table as typed values, ordered so two dumps are comparable.
+/// One cell, compared exactly.
 ///
-/// `ValueRef` rather than a `String` rendering: the whole point is to notice a
-/// value whose TYPE changed -- an integer that came back as text, a blob that
-/// came back as a string -- and rendering both sides to text is exactly how
-/// that goes unnoticed.
-fn dump(conn: &Connection, table: &str, columns: &[&str]) -> Vec<Vec<rusqlite::types::Value>> {
+/// Not `rusqlite::types::Value`, and the difference is one variant. `Value`
+/// derives `PartialEq`, so its `Real` arm compares with `f64` `==` -- under
+/// which **`-0.0` equals `0.0`** and `NaN` equals nothing. Both are the wrong
+/// answer to the question this file asks: a rebuild that turned `-0.0` into
+/// `0.0` changed the bytes on disk and has to be caught.
+///
+/// Found by an adversarial review, which injected exactly that corruption and
+/// watched both value tests stay green -- while the corpus entry's own comment
+/// said "negative zero, which equals zero and is not it", describing the
+/// equality that defeated its detection.
+#[derive(Debug, PartialEq)]
+enum Cell {
+    Null,
+    Integer(i64),
+    /// The raw bits, so `-0.0` and `0.0` differ and a `NaN` equals itself.
+    Real(u64),
+    Text(String),
+    Blob(Vec<u8>),
+}
+
+impl From<rusqlite::types::Value> for Cell {
+    fn from(value: rusqlite::types::Value) -> Self {
+        use rusqlite::types::Value;
+        match value {
+            Value::Null => Cell::Null,
+            Value::Integer(n) => Cell::Integer(n),
+            Value::Real(f) => Cell::Real(f.to_bits()),
+            Value::Text(t) => Cell::Text(t),
+            Value::Blob(b) => Cell::Blob(b),
+        }
+    }
+}
+
+/// Every row of a table as typed cells, ordered so two dumps are comparable.
+///
+/// Typed rather than a `String` rendering: the whole point is to notice a value
+/// whose TYPE changed -- an integer that came back as text, a blob that came
+/// back as a string -- and rendering both sides to text is exactly how that
+/// goes unnoticed.
+fn dump(conn: &Connection, table: &str, columns: &[&str]) -> Vec<Vec<Cell>> {
     let list = columns
         .iter()
         .map(|c| format!("\"{c}\""))
@@ -611,7 +668,7 @@ fn dump(conn: &Connection, table: &str, columns: &[&str]) -> Vec<Vec<rusqlite::t
     let rows = stmt
         .query_map([], |r| {
             (0..columns.len())
-                .map(|i| r.get::<_, rusqlite::types::Value>(i))
+                .map(|i| r.get::<_, rusqlite::types::Value>(i).map(Cell::from))
                 .collect::<rusqlite::Result<Vec<_>>>()
         })
         .expect("the dump runs")
@@ -651,6 +708,52 @@ fn the_dump_notices_a_value_whose_type_changed() {
         "a blob is not the string with those bytes"
     );
     assert_ne!(left[2], right[2], "the empty string is not NULL");
+
+    // The case the first version of this test conspicuously did not include,
+    // and the one an adversary used to walk a corruption straight past it.
+    // `-0.0 == 0.0` under `f64`, so a dump comparing `rusqlite::types::Value`
+    // directly cannot tell a rebuild that flipped the sign bit from one that
+    // left it alone.
+    conn.execute_batch(
+        "CREATE TABLE signs (id INTEGER PRIMARY KEY, v REAL);
+         CREATE TABLE unsigns (id INTEGER PRIMARY KEY, v REAL);
+         INSERT INTO signs (id, v) VALUES (1, -0.0);
+         INSERT INTO unsigns (id, v) VALUES (1, 0.0);",
+    )
+    .unwrap();
+    // The case the first version of this test conspicuously did not include,
+    // and the one an adversary used to walk a corruption straight past it:
+    // `-0.0 == 0.0` under `f64`, so a dump comparing `rusqlite::types::Value`
+    // directly cannot tell a rebuild that flipped the sign bit from one that
+    // left it alone.
+    //
+    // Which column holds it turns out to matter, measured rather than assumed:
+    // REAL affinity NORMALISES negative zero to positive zero on the way in,
+    // and a column with no affinity preserves the sign bit. So the corpus keeps
+    // its negative zero in the typeless column, and this asserts both halves --
+    // the normalisation, so nobody "fixes" the corpus by moving it, and the
+    // preservation, which is what there is to corrupt.
+    conn.execute_batch(
+        "CREATE TABLE zeros (id INTEGER PRIMARY KEY, affine REAL, untyped);
+         INSERT INTO zeros (id, affine, untyped) VALUES (1, -0.0, -0.0);
+         INSERT INTO zeros (id, affine, untyped) VALUES (2, 0.0, 0.0);",
+    )
+    .unwrap();
+    let zeros = dump(&conn, "zeros", &["affine", "untyped"]);
+    assert_eq!(
+        zeros[0][0], zeros[1][0],
+        "REAL affinity normalises -0.0 to 0.0, so the affine column cannot hold the distinction"
+    );
+    assert_ne!(
+        zeros[0][1], zeros[1][1],
+        "a column with no affinity keeps the sign bit, and the dump has to see it -- this is the \
+         comparison `rusqlite::types::Value` gets wrong"
+    );
+    assert_eq!(
+        zeros[0][1],
+        Cell::Real(0x8000_0000_0000_0000),
+        "negative zero, by its bits rather than by an equality that cannot see it"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -669,7 +772,9 @@ fn the_dump_notices_a_value_whose_type_changed() {
 /// The comparison is by value and by schema. Schema alone would miss a chain
 /// that arrived at the right shape with the wrong contents; values alone would
 /// miss one that arrived at the right contents with a column declared
-/// differently.
+/// differently -- where "declared" means the whole `table_xinfo` row and not
+/// the name, because the first version of this test compared names and an
+/// adversary walked a type change past it.
 #[test]
 fn a_three_step_chain_arrives_where_a_direct_build_does() {
     let migrated = Connection::open_in_memory().unwrap();
@@ -691,6 +796,16 @@ fn a_three_step_chain_arrives_where_a_direct_build_does() {
         let sealed = seal(ops);
         apply_migration(&migrated, &sealed, &ApplyOptions::default())
             .unwrap_or_else(|error| panic!("step {step} ({what}) did not apply: {error}"));
+
+        // Put data in the column step 1 added, so the steps after it are
+        // carrying a populated added column rather than a column of NULLs. An
+        // adversary pointed out that `note` held NULL for every row through the
+        // whole chain, which means a rebuild mishandling an added column's
+        // VALUES had nothing to mishandle. Written here rather than in the seed
+        // because the column does not exist until this step has run.
+        if step == 1 {
+            fill_note(&migrated);
+        }
 
         let now = dump(&migrated, "payload", &untouched);
         assert_eq!(
@@ -717,10 +832,22 @@ fn a_three_step_chain_arrives_where_a_direct_build_does() {
     let direct = Connection::open_in_memory().unwrap();
     direct.execute_batch(FINAL_SCHEMA).unwrap();
     seed_chain_rows(&direct, false);
+    // The same `note` values the chained arm got after step 1, so the arms
+    // differ only in how they arrived.
+    fill_note(&direct);
 
     let cols = ["id", "ordinary", "untyped", "number", "chunk", "note"];
     let from_chain = dump(&migrated, "payload", &cols);
     let from_scratch = dump(&direct, "payload", &cols);
+
+    // The seeding landed. Without this the whole comparison below is vacuously
+    // true on two empty tables -- an adversary set the seed loop to `0..0` and
+    // watched this test stay green.
+    assert_eq!(
+        from_chain.len(),
+        CHAIN_ROWS as usize,
+        "the chained arm was not populated, so everything below compares nothing"
+    );
 
     assert_eq!(
         from_chain.len(),
@@ -738,14 +865,70 @@ fn a_three_step_chain_arrives_where_a_direct_build_does() {
         }
     }
 
-    // ...and at the same shape. `table_xinfo` rather than `table_info` so a
-    // generated column would be compared too.
+    // ...and at the same shape: name, declared type, NOT NULL, default, key
+    // position and storage class, per column, in order. `table_xinfo` rather
+    // than `table_info` so a generated column is compared too -- and the whole
+    // row rather than the name, so a column that arrived with the right name
+    // and the wrong TYPE is a difference.
+    //
+    // The DECLARED TYPE of a column the start schema left typeless is excluded,
+    // and this is a routed-around defect rather than a nicety. The rebuild
+    // promotes a typeless column to `BLOB` -- `raw_table_info` does it
+    // deliberately and says so in a comment -- so the chained arm declares
+    // `untyped BLOB` where the direct build has `untyped` with no type at all.
+    // That is smugglr#344, open, and this comparison found it end-to-end
+    // through the real engine the first time it was tightened.
+    //
+    // Everything else about those columns is still compared, and every field of
+    // every other column is. Asserting the divergence instead would go green on
+    // the day #344 is fixed and then fail as a regression, which is the trap
+    // this suite exists to avoid.
+    let shapes = |conn: &Connection| -> Vec<ColumnShape> {
+        declared_columns(conn, "payload")
+            .into_iter()
+            .map(|(name, ty, notnull, dflt, pk, hidden)| {
+                let ty = if TYPELESS_IN_START.contains(&name.as_str()) {
+                    String::from("<excluded: smugglr#344>")
+                } else {
+                    ty
+                };
+                (name, ty, notnull, dflt, pk, hidden)
+            })
+            .collect()
+    };
     assert_eq!(
-        declared_columns(&migrated, "payload"),
-        declared_columns(&direct, "payload"),
+        shapes(&migrated),
+        shapes(&direct),
         "the arms declare different columns"
     );
 }
+
+/// How many rows each arm of the chain carries.
+const CHAIN_ROWS: i64 = 500;
+
+/// Populate the column step 1 adds, identically in both arms.
+///
+/// Values from the corpus rather than a placeholder, so the added column is
+/// carrying the same shapes as everything else through the rebuild that
+/// follows.
+fn fill_note(conn: &Connection) {
+    for row in 0..CHAIN_ROWS {
+        let v = &ADVERSARIAL[((row as usize) + 3) % ADVERSARIAL.len()];
+        conn.execute_batch(&format!(
+            "UPDATE payload SET note = {} WHERE id = {row};",
+            v.literal
+        ))
+        .unwrap_or_else(|error| panic!("note on row {row} with {}: {error}", v.what));
+    }
+}
+
+/// Columns the start schema declares with no type at all.
+///
+/// Their declared type is excluded from the schema comparison because the
+/// rebuild promotes a typeless column to `BLOB` (smugglr#344, open). Named here
+/// rather than inline so the exclusion is one list a reader can check against
+/// the schema below.
+const TYPELESS_IN_START: [&str; 2] = ["untyped", "number"];
 
 /// The shape the chain starts from.
 const START_SCHEMA: &str = "CREATE TABLE payload (
@@ -811,7 +994,7 @@ fn chain() -> Vec<Vec<ClassifiedOp>> {
 /// Populate an arm identically. `with_forcer` is the only difference, because
 /// the pre-migration shape has a column the post-migration shape does not.
 fn seed_chain_rows(conn: &Connection, with_forcer: bool) {
-    for row in 0..500i64 {
+    for row in 0..CHAIN_ROWS {
         let a = &ADVERSARIAL[(row as usize) % ADVERSARIAL.len()];
         let b = &ADVERSARIAL[((row as usize) + 5) % ADVERSARIAL.len()];
         let sql = if with_forcer {
@@ -832,13 +1015,140 @@ fn seed_chain_rows(conn: &Connection, with_forcer: bool) {
     }
 }
 
-/// Declared columns in order, generated ones included.
-fn declared_columns(conn: &Connection, table: &str) -> Vec<String> {
+/// One column as the schema declares it: name, type, `NOT NULL`, default, key
+/// position, and `hidden` (which carries the generated storage class).
+type ColumnShape = (String, String, i64, Option<String>, i64, i64);
+
+/// Declared columns in order, generated ones included, as whole rows.
+///
+/// The whole row and not just the name. An adversarial review found the first
+/// version comparing names only, while its caller's comment claimed it would
+/// catch "a column declared differently" -- and proved the gap by giving `note`
+/// a different type in one arm and watching the test pass. The comment was the
+/// thing that was wrong; this is the version that makes it true.
+///
+/// `hidden` is included so a column that changed storage class -- ordinary to
+/// `STORED`, or `VIRTUAL` to ordinary -- is a difference too.
+fn declared_columns(conn: &Connection, table: &str) -> Vec<ColumnShape> {
     let mut stmt = conn
         .prepare(&format!("PRAGMA table_xinfo(\"{table}\")"))
         .unwrap();
-    stmt.query_map([], |r| r.get::<_, String>(1))
-        .unwrap()
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .unwrap()
+    stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, i64>(3)?,
+            r.get::<_, Option<String>>(4)?,
+            r.get::<_, i64>(5)?,
+            r.get::<_, i64>(6)?,
+        ))
+    })
+    .unwrap()
+    .collect::<rusqlite::Result<Vec<_>>>()
+    .unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// Volume and history at once
+// ---------------------------------------------------------------------------
+
+/// A database that is both populated and aged, migrated again.
+///
+/// The gap an adversarial review found in this file: volume lived in one test
+/// and history in another, and nothing migrated a database that had both. A
+/// rebuild copying thousands of rows out of a table whose `CREATE` text was
+/// already rewritten, whose ledger has a failed entry in it, and whose
+/// autoincrement sequence sits above `max(rowid)` is the case an operator
+/// actually has, and it was the one case not covered.
+///
+/// The assertion is by value, as everywhere else here, and the `sqlite_sequence`
+/// high-water mark is checked across the migration -- it is the one piece of
+/// state a rebuild has to carry deliberately rather than by copying rows, so a
+/// rebuild that dropped it would leave every later insert reusing keys the
+/// database has already issued.
+#[test]
+fn a_populated_aged_database_survives_another_migration() {
+    let mut aged = AgedDatabase::build();
+
+    // Volume, added to the database AFTER it aged, so the rows sit in a table
+    // that has already been through a rebuild and a failed migration.
+    for row in 0..2_000i64 {
+        let a = &ADVERSARIAL[(row as usize) % ADVERSARIAL.len()];
+        aged.conn
+            .execute(
+                &format!(
+                    "INSERT INTO {ORDERS} (customer_id, amount, {ADDED_IN_V1}) VALUES (1, ?1, {})",
+                    a.literal
+                ),
+                rusqlite::params![row],
+            )
+            .unwrap_or_else(|error| panic!("row {row} with {}: {error}", a.what));
+    }
+
+    let before = dump(
+        &aged.conn,
+        ORDERS,
+        &["id", "customer_id", "amount", ADDED_IN_V1],
+    );
+    assert_eq!(before.len(), 2_150, "150 aged rows plus 2,000 new ones");
+    let seq_before = aged.high_water(ORDERS);
+
+    // One more migration, on top of everything that already happened.
+    aged.apply_ok(
+        "v5 add a column to a populated, aged table",
+        vec![ClassifiedOp::new(Op::AddColumn {
+            table: ORDERS.into(),
+            column: Column {
+                name: "settled_at".into(),
+                kind: ColumnKind::Text,
+                constraints: Vec::new(),
+                tags: Vec::new(),
+            },
+        })],
+    );
+
+    let after = dump(
+        &aged.conn,
+        ORDERS,
+        &["id", "customer_id", "amount", ADDED_IN_V1],
+    );
+    assert_eq!(
+        after.len(),
+        before.len(),
+        "the migration changed the row count"
+    );
+    for (row, (was, now)) in before.iter().zip(after.iter()).enumerate() {
+        assert_eq!(
+            was, now,
+            "row {row} of {ORDERS} changed across a migration of a populated, aged database"
+        );
+    }
+
+    assert_eq!(
+        aged.high_water(ORDERS),
+        seq_before,
+        "the autoincrement high-water mark moved; later inserts would reuse issued keys"
+    );
+
+    // The history underneath is intact, and the failed entry was RECLAIMED
+    // rather than left alone -- which is the file's own stated constraint
+    // coming back around. `current_version` counts only `success`, so this
+    // migration re-derived the version the failed row held, found it, and
+    // settled it. Asserting the failure survived would have been asserting
+    // against the mechanism documented at the top of this file, and the first
+    // version of this test did exactly that and failed.
+    //
+    // This is the reclaim path, and it is where smugglr#328's checksum defect
+    // lives: the row settles `success` while still holding the checksum of the
+    // manifest that failed. Not asserted here, because a test pinning today's
+    // wrong checksum would go green on the day it is fixed and then fail.
+    Ledger::verify_chain(&aged.conn).expect("the chain still hashes across its entries");
+    let reclaimed = Ledger::entry(&aged.conn, aged.failed_version)
+        .expect("the ledger reads back")
+        .unwrap_or_else(|| panic!("version {} is missing entirely", aged.failed_version));
+    assert_eq!(
+        reclaimed.status,
+        MigrationStatus::Success,
+        "the version that held the failed entry was re-derived and reclaimed by this migration"
+    );
 }
