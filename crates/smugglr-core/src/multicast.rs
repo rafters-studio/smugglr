@@ -907,6 +907,23 @@ impl Gossip {
                     mismatch.push(col.clone());
                 }
                 Ok(_) => {}
+                // Swallowed on purpose, and NOT the #332/#415 pattern even
+                // though it looks like it. Written down because a reviewer
+                // checked and the next one should not have to.
+                //
+                // This runs only inside `on_delta`'s `Ok` arm, so the write has
+                // already succeeded and the table is known to exist with a
+                // usable key -- `TableNotFound` and `NoPrimaryKey` cannot reach
+                // here. `stored_storage_class` does not call `table_info`, so
+                // what is left is a raw SQLite error, and in practice one
+                // error: `ordering` comes from config and is never filtered
+                // against the table's real columns, so a configured column the
+                // table does not have fails the probe.
+                //
+                // That is expected rather than exceptional, and the probe is a
+                // diagnostic: it decides whether an `OrderingNote` mismatch
+                // warning is emitted, never whether a row is applied. Surfacing
+                // it would turn a config typo into a refused delta.
                 Err(e) => debug!("cannot probe '{}'.'{}': {}", table, col, e),
             }
         }
