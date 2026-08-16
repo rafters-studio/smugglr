@@ -88,6 +88,7 @@ use smugglr_forger::census::every_trait_schema;
 use smugglr_forger::error::BoxError;
 use smugglr_forger::fixture::Backing;
 use smugglr_forger::oracle::{differential, Outcome};
+use smugglr_forger::registry::Combination;
 use smugglr_forger::schema::builder::{schema, table};
 // Renamed on import: `smugglr_core::migrate::Column` is a manifest op's column
 // and this one is a schema model's. Two `Column`s in one file is a reader
@@ -433,4 +434,90 @@ fn after_the_migration(start: &Schema) -> Schema {
         .validate()
         .expect("the post-migration schema is one SQLite accepts");
     target
+}
+
+// ---------------------------------------------------------------------------
+// Two constructs on one table, through the real rebuild (#398)
+// ---------------------------------------------------------------------------
+
+/// A rebuild of a table carrying BOTH a generated column and a foreign key
+/// with a referential action.
+///
+/// Every defect this suite has closed lived on a table carrying one construct,
+/// because forger could not spell a table carrying two -- each case declares
+/// its construct on its own table and the every-trait schema concatenates
+/// them. #398 makes the combination expressible; this is the reason it was
+/// worth making.
+///
+/// The rebuild is where the two meet. `rebuild_dropping_column` inserts
+/// preserved generated columns at their declared index and appends
+/// reconstructed foreign keys after the column list, so they end up in one
+/// body -- and when #387 needed to know whether a preserved column could land
+/// after a table-level constraint, that question was answered by a reviewer
+/// building the table by hand.
+///
+/// Each construct is asserted by its own probe, so a failure names which one
+/// the rebuild got wrong rather than that something about the table changed.
+#[test]
+fn the_rebuild_preserves_two_constructs_that_share_a_table() {
+    for combination in Combination::all() {
+        // The `UNIQUE` column exists only to make SQLite refuse the direct
+        // `ALTER`, so the op falls through to the rebuild -- the same lever the
+        // other rebuild test here uses, and for the same reason.
+        let mut start = combination.schema.clone();
+        let child = start
+            .tables
+            .iter_mut()
+            .find(|t| t.name == "combined_child")
+            .expect("the combination declares combined_child");
+        child.columns.push(ForgedColumn {
+            name: REBUILD_FORCER.into(),
+            decl_type: Some(ColumnType::Text),
+            constraints: vec![ColumnConstraint::Unique(None)],
+        });
+        start
+            .validate()
+            .expect("the forced schema is one SQLite accepts");
+
+        let sealed = ChecksummedManifest::seal(Manifest {
+            version: 1,
+            target_schema: "opaque".into(),
+            up: vec![ClassifiedOp::new(Op::DropColumn {
+                table: "combined_child".into(),
+                column: REBUILD_FORCER.into(),
+            })],
+            down: Vec::new(),
+            preimage: None,
+            flags: Flags::default(),
+            author: None,
+        })
+        .expect("the manifest seals");
+
+        let mut fixture = smugglr_forger::fixture::Fixture::new(Backing::Memory).expect("fixture");
+        fixture
+            .bring_to(smugglr_forger::fixture::Route::Ddl(&start.to_ddl()))
+            .expect("the combined schema stands up");
+        combination.seed(fixture.conn()).expect("seed");
+
+        let outcome = apply_migration(fixture.conn(), &sealed, &ApplyOptions::default())
+            .unwrap_or_else(|error| {
+                panic!("{}: the migration did not apply: {error}", combination.name)
+            });
+        assert_eq!(
+            outcome.election,
+            Election::Won,
+            "{}: the driver has to have won its election, or it applied nothing",
+            combination.name
+        );
+
+        for (kind, probe) in combination.probes() {
+            probe(&combination.schema, fixture.conn()).unwrap_or_else(|error| {
+                panic!(
+                    "{}: after the real rebuild, {kind:?} did not hold on a table that also \
+                     carries the other construct: {error:?}",
+                    combination.name
+                )
+            });
+        }
+    }
 }
