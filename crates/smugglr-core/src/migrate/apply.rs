@@ -893,8 +893,17 @@ pub(crate) struct RebuildSpec {
     pub post_ddl: Vec<String>,
 }
 
-/// The temp table name used mid-rebuild. A single connection rebuilds one table
-/// at a time, and it is dropped-if-exists first, so a fixed name is safe.
+/// The temp table name used mid-rebuild.
+///
+/// A single connection rebuilds one table at a time, so a fixed name cannot
+/// COLLIDE with a concurrent rebuild. That was the whole argument, and this
+/// comment used to conclude "safe" from it -- which is a different claim, and a
+/// false one: the name can also be a table the USER owns, and the rebuild used
+/// to open with `DROP TABLE IF EXISTS` on it (#338).
+///
+/// It now refuses instead. The drop it replaced was defending a state that
+/// cannot occur: the rebuild runs inside one transaction and SQLite rolls DDL
+/// back, so a crash mid-rebuild leaves no temp table to clean up.
 #[cfg(feature = "native")]
 const REBUILD_TMP: &str = "_smugglr_rebuild_tmp";
 
@@ -1092,11 +1101,24 @@ fn rebuild_inner(conn: &Connection, spec: &RebuildSpec) -> Result<(), MigrateErr
 
     let tx = conn.unchecked_transaction()?;
 
-    // Fresh temp table with the desired schema.
-    tx.execute_batch(&format!(
-        "DROP TABLE IF EXISTS {}",
-        quote_ident(REBUILD_TMP)
-    ))?;
+    // Refuse rather than drop (#338). A `DROP TABLE IF EXISTS` here destroys a
+    // user table that happens to carry this name, silently, inside a migration
+    // that then reports success -- and nothing afterwards can tell an operator
+    // it happened, because the table is simply gone.
+    //
+    // Refusing rather than uniquifying the name, because the cleanup the drop
+    // provided is not needed: the whole rebuild is one transaction and SQLite
+    // rolls DDL back, so there is no crashed-mid-rebuild state that leaves a
+    // temp table behind. A unique name would buy nothing and cost the ability
+    // to say plainly what is in the way.
+    if table_exists(&tx, REBUILD_TMP)? {
+        return Err(MigrateError::Apply(format!(
+            "cannot rebuild {:?}: a table named {REBUILD_TMP:?} already exists. That name is \
+             smugglr's rebuild scratch space, and this migration will not drop a table it did \
+             not create. Rename or remove {REBUILD_TMP:?} and re-run.",
+            spec.table
+        )));
+    }
     let create = match &spec.target {
         RebuildTarget::Fragments {
             body,
@@ -2558,6 +2580,50 @@ mod tests {
             apply(&conn, drop()).unwrap();
             apply(&conn, drop()).unwrap(); // already gone: no-op
             assert_eq!(columns(&conn, "t"), vec!["id"]);
+        }
+
+        /// A user table at the rebuild's scratch name survives, and the
+        /// migration refuses instead of destroying it (#338).
+        ///
+        /// The rebuild opened with `DROP TABLE IF EXISTS _smugglr_rebuild_tmp`.
+        /// A table an operator happened to name that was destroyed silently,
+        /// inside a migration that reported success, with nothing afterwards to
+        /// tell them -- the table was simply gone.
+        ///
+        /// Asserts the ROW survives, not just the table. A refusal that left an
+        /// empty table behind would pass a table-exists check and still have
+        /// eaten the data.
+        #[test]
+        fn a_user_table_at_the_rebuild_temp_name_is_not_destroyed() {
+            let conn = mem();
+            conn.execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, code TEXT UNIQUE, name TEXT);
+                 INSERT INTO t VALUES (1, 'c1', 'n1');
+                 CREATE TABLE _smugglr_rebuild_tmp (keep TEXT);
+                 INSERT INTO _smugglr_rebuild_tmp VALUES ('irreplaceable');",
+            )
+            .unwrap();
+
+            // Dropping a UNIQUE column is the path that falls back to a rebuild.
+            let err = apply(
+                &conn,
+                Op::DropColumn {
+                    table: "t".into(),
+                    column: "code".into(),
+                },
+            )
+            .expect_err("the rebuild must refuse rather than drop a table it did not create");
+
+            let said = err.to_string();
+            assert!(
+                said.contains(REBUILD_TMP),
+                "the refusal has to name the table in the way; it said {said:?}"
+            );
+
+            let survived: String = conn
+                .query_row("SELECT keep FROM _smugglr_rebuild_tmp", [], |r| r.get(0))
+                .expect("the user's table and its row are still there");
+            assert_eq!(survived, "irreplaceable");
         }
 
         #[test]
