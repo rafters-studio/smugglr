@@ -269,6 +269,158 @@
         "triggers": []
       },
       {
+        "name": "delete_nulling_keeper",
+        "columns": [
+          {
+            "name": "id",
+            "decl_type": "Integer",
+            "constraints": [
+              {
+                "PrimaryKey": {
+                  "order": "Asc",
+                  "autoincrement": false,
+                  "on_conflict": null
+                }
+              }
+            ]
+          },
+          {
+            "name": "label",
+            "decl_type": "Text",
+            "constraints": []
+          }
+        ],
+        "constraints": [],
+        "without_rowid": false,
+        "strict": false,
+        "triggers": []
+      },
+      {
+        "name": "delete_nulling_child",
+        "columns": [
+          {
+            "name": "id",
+            "decl_type": "Integer",
+            "constraints": [
+              {
+                "PrimaryKey": {
+                  "order": "Asc",
+                  "autoincrement": false,
+                  "on_conflict": null
+                }
+              }
+            ]
+          },
+          {
+            "name": "keeper_id",
+            "decl_type": "Integer",
+            "constraints": []
+          },
+          {
+            "name": "label",
+            "decl_type": "Text",
+            "constraints": []
+          }
+        ],
+        "constraints": [
+          {
+            "ForeignKey": {
+              "columns": [
+                "keeper_id"
+              ],
+              "parent_table": "delete_nulling_keeper",
+              "parent_columns": [
+                "id"
+              ],
+              "on_delete": "SetNull",
+              "on_update": null
+            }
+          }
+        ],
+        "without_rowid": false,
+        "strict": false,
+        "triggers": []
+      },
+      {
+        "name": "delete_defaulting_keeper",
+        "columns": [
+          {
+            "name": "id",
+            "decl_type": "Integer",
+            "constraints": [
+              {
+                "PrimaryKey": {
+                  "order": "Asc",
+                  "autoincrement": false,
+                  "on_conflict": null
+                }
+              }
+            ]
+          },
+          {
+            "name": "label",
+            "decl_type": "Text",
+            "constraints": []
+          }
+        ],
+        "constraints": [],
+        "without_rowid": false,
+        "strict": false,
+        "triggers": []
+      },
+      {
+        "name": "delete_defaulting_child",
+        "columns": [
+          {
+            "name": "id",
+            "decl_type": "Integer",
+            "constraints": [
+              {
+                "PrimaryKey": {
+                  "order": "Asc",
+                  "autoincrement": false,
+                  "on_conflict": null
+                }
+              }
+            ]
+          },
+          {
+            "name": "keeper_id",
+            "decl_type": "Integer",
+            "constraints": [
+              {
+                "Default": {
+                  "Integer": 79
+                }
+              }
+            ]
+          },
+          {
+            "name": "label",
+            "decl_type": "Text",
+            "constraints": []
+          }
+        ],
+        "constraints": [
+          {
+            "ForeignKey": {
+              "columns": [
+                "keeper_id"
+              ],
+              "parent_table": "delete_defaulting_keeper",
+              "parent_columns": [
+                "id"
+              ],
+              "on_delete": "SetDefault",
+              "on_update": null
+            }
+          }
+        ],
+        "without_rowid": false,
+        "strict": false,
+        "triggers": []
+      },
+      {
         "name": "defaulting_keeper",
         "columns": [
           {

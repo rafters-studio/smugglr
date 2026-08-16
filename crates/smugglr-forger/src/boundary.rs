@@ -632,6 +632,22 @@ mod tests {
             "the ForeignKeyWithAction case declares ON DELETE CASCADE, so the boundary does not \
              claim it goes unexercised"
         );
+        // Pinned exactly, like the update side and for the same reason (#392):
+        // asserting only that CASCADE is absent would stay green over a build
+        // that had quietly lost SET NULL or SET DEFAULT.
+        // Empty, and the line disappears with it: #392 declared the last two,
+        // so every declarable ON DELETE action now has a case. RESTRICT is
+        // among them -- it is declared and probed, and the caveat that it
+        // cannot be told apart from the NO ACTION default lives on the
+        // `restrict` line, which is a statement about observability rather than
+        // about coverage. Pinned exactly rather than "does not contain
+        // CASCADE", which would stay green over a build that lost the others.
+        assert!(
+            boundary.undeclared_on_delete().is_empty(),
+            "every declarable ON DELETE action is declared by a case; anything here means one was \
+             lost: {:?}",
+            boundary.undeclared_on_delete()
+        );
         assert!(
             !boundary
                 .undeclared_on_update()
