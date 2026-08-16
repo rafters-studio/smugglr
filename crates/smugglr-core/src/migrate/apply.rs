@@ -1170,10 +1170,23 @@ impl ColInfo {
 /// Column names of a table, or an empty vec if the table does not exist.
 ///
 /// Unlike `local::table_info_inner`, this never errors on an absent or PK-less
-/// table -- exactly what the `ADD COLUMN` / `RENAME` idempotency prechecks need.
+/// table -- exactly what the `ADD COLUMN` / `RENAME` / `DROP COLUMN` idempotency
+/// prechecks need.
+///
+/// `table_xinfo` rather than `table_info`, because those prechecks ask "does
+/// this column exist" and `table_info` answers a narrower question: it omits
+/// generated columns entirely. The difference was reachable and silent (#389).
+/// `DROP COLUMN` naming a generated column found it absent, concluded the drop
+/// had already been applied, and returned `Ok(())` having dropped nothing -- a
+/// destructive op reporting success. `ADD COLUMN` and `RENAME` were wrong in
+/// the same direction for the same reason, if less visibly.
+///
+/// Returning generated columns is the correct answer to the question every
+/// caller is asking. `hidden` is deliberately not filtered on: a virtual-table
+/// hidden column is still a name that cannot be added twice.
 #[cfg(feature = "native")]
 fn raw_table_columns(conn: &Connection, table: &str) -> Result<Vec<String>, MigrateError> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", quote_ident(table)))?;
+    let mut stmt = conn.prepare(&format!("PRAGMA table_xinfo({})", quote_ident(table)))?;
     let cols = stmt
         .query_map([], |r| r.get::<_, String>(1))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2809,14 +2822,15 @@ mod tests {
         /// hand-written manifest, SQLite identifiers are case-insensitive, and
         /// a byte comparison warns that `"v"` was lost while dropping `"V"`.
         ///
-        /// **This calls `lost_constructs` directly because `apply` cannot
-        /// currently reach it with a generated column named.** `drop_column`'s
-        /// idempotence precheck reads `PRAGMA table_info`, which does not see
-        /// generated columns, so `DROP COLUMN` on one is a silent successful
-        /// no-op that never gets as far as a rebuild -- the same `table_info`
-        /// blindness as #342, one call earlier, filed separately. So this test
-        /// pins a guard that is correct and presently unreachable, and says so
-        /// rather than reading as coverage of a path that runs.
+        /// This calls `lost_constructs` directly rather than going through
+        /// `apply`, which is now a choice rather than a necessity. Until #389
+        /// it was the latter: `drop_column`'s idempotence precheck read
+        /// `PRAGMA table_info`, could not see a generated column, and no-oped
+        /// before any rebuild ran -- so this guard was correct and unreachable.
+        /// The precheck reads `table_xinfo` now and the path is live;
+        /// `dropping_a_generated_column_actually_drops_it` exercises it
+        /// end-to-end. This test stays at the unit level because what it pins
+        /// is the case folding, which is cheaper to assert directly.
         #[test]
         fn a_generated_column_being_dropped_is_not_a_warned_loss() {
             let conn = mem();
@@ -2943,6 +2957,65 @@ mod tests {
                 "a preserved generated column recomputes from its base; these are the values a \
                  column that merely kept its old contents would not have"
             );
+        }
+
+        /// #389: dropping a generated column actually drops it.
+        ///
+        /// The idempotence precheck reads `raw_table_columns`, which used to
+        /// ask `table_info` -- a pragma that cannot see a generated column. So
+        /// the op found the column absent, concluded it had already been
+        /// applied, and returned `Ok(())` having dropped nothing. A destructive
+        /// op reporting success while doing nothing is worse than one that
+        /// fails: the next migration in the chain is written believing the
+        /// column is gone.
+        ///
+        /// Both storage classes, because they can reach different paths -- a
+        /// VIRTUAL column may be droppable by the direct `ALTER` where a STORED
+        /// one is refused and falls to the rebuild.
+        #[test]
+        fn dropping_a_generated_column_actually_drops_it() {
+            for (name, other) in [("v", "s"), ("s", "v")] {
+                let conn = mem();
+                conn.execute_batch(
+                    "CREATE TABLE t (
+                         id INTEGER PRIMARY KEY,
+                         n INTEGER,
+                         v INTEGER GENERATED ALWAYS AS (n * 2) VIRTUAL,
+                         s INTEGER GENERATED ALWAYS AS (n * 3) STORED
+                     );
+                     INSERT INTO t (id, n) VALUES (1, 7);",
+                )
+                .unwrap();
+
+                apply(
+                    &conn,
+                    Op::DropColumn {
+                        table: "t".into(),
+                        column: name.into(),
+                    },
+                )
+                .unwrap();
+
+                let left = columns_xinfo(&conn, "t");
+                assert!(
+                    !left.iter().any(|c| c == name),
+                    "dropping {name:?} left it in place: {left:?}"
+                );
+                // ...and the other generated column is still there, still
+                // computing. #387 is what makes that true; before it, dropping
+                // one would have taken the other with it.
+                assert!(
+                    left.iter().any(|c| c == other),
+                    "dropping {name:?} took {other:?} with it: {left:?}"
+                );
+                let still: i64 = conn
+                    .query_row(&format!("SELECT {other} FROM t WHERE id = 1"), [], |r| {
+                        r.get(0)
+                    })
+                    .unwrap();
+                let expected = if other == "v" { 14 } else { 21 };
+                assert_eq!(still, expected, "{other:?} stopped computing");
+            }
         }
 
         /// When the definition cannot be resolved, the rebuild falls back to
