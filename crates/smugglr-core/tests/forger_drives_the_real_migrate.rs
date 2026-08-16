@@ -214,6 +214,28 @@ const UPDATE_FK_TABLE: &str = "updating_child";
 /// eight traits while the rebuild was red on three.
 const REBUILD_FORCER: &str = "rebuild_forcer";
 
+/// The tables the rebuild is forced over.
+///
+/// The two referential-action tables are #341's, and the two generated-column
+/// tables are here because nothing pointed the real engine at them. #387 made
+/// a rebuild carry generated columns through, and its assertions read
+/// `table_xinfo` -- a statement about the DECLARATION. Whether the column still
+/// COMPUTES after a real rebuild was asserted by a probe no engine-driven test
+/// ran over its table: `virtual_generated` and `stored_generated` had no
+/// `UNIQUE` column, so the direct `ALTER TABLE ... DROP COLUMN` succeeded and
+/// the rebuild never happened there.
+///
+/// Non-vacuity measured rather than argued: forcing `preserved_generated` to
+/// `None` -- the pre-#387 behaviour -- fails `GeneratedVirtual` here, so the
+/// rebuild provably runs over these tables and the carry-through is what keeps
+/// them green.
+const REBUILT_TABLES: [&str; 4] = [
+    FK_TABLE,
+    UPDATE_FK_TABLE,
+    "virtual_generated",
+    "stored_generated",
+];
+
 /// The rebuild reconstructs the referential actions it used to drop.
 ///
 /// This is #341's red-to-green flip, and it is deliberately *not* asserting
@@ -296,7 +318,7 @@ fn the_rebuild_path_preserves_the_referential_actions_it_reconstructs() {
 /// nullable and nothing seeds it, so it is invisible to every probe.
 fn every_trait_schema_with_a_rebuild_forcer() -> Schema {
     let mut start = every_trait_schema();
-    for name in [FK_TABLE, UPDATE_FK_TABLE] {
+    for name in REBUILT_TABLES {
         let table = start
             .tables
             .iter_mut()
@@ -326,8 +348,9 @@ fn the_rebuilding_migration() -> ChecksummedManifest {
     ChecksummedManifest::seal(Manifest {
         version: 1,
         target_schema: "opaque".into(),
-        up: vec![FK_TABLE, UPDATE_FK_TABLE]
-            .into_iter()
+        up: REBUILT_TABLES
+            .iter()
+            .copied()
             .map(|table| {
                 ClassifiedOp::new(Op::DropColumn {
                     table: table.into(),

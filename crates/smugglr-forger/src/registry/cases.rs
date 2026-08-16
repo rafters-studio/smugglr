@@ -756,6 +756,12 @@ fn require_foreign_keys_enforced(conn: &Connection) -> Result<(), ProbeError> {
 /// constants and the expression in the schema below are one unit.
 const VIRTUAL_BASE: i64 = 21;
 const VIRTUAL_DOUBLED: i64 = 42;
+/// Where the probe moves the base to, and what the expression must then make
+/// of it. Same unit as the pair above, and needed for the same reason the
+/// stored twin needs its own: reading the column once cannot tell a generated
+/// column from an ordinary one holding the number a rebuild copied into it.
+const VIRTUAL_MOVED_BASE: i64 = 9;
+const VIRTUAL_MOVED_DOUBLED: i64 = 18;
 
 pub(super) fn generated_virtual() -> TraitCase {
     let schema = schema()
@@ -798,8 +804,44 @@ pub(super) fn generated_virtual() -> TraitCase {
             if computed != Some(VIRTUAL_DOUBLED) {
                 return Err(ProbeError::Failed(format!(
                     "{}.{} reads {computed:?} for a base of {VIRTUAL_BASE}, not {VIRTUAL_DOUBLED}; \
-                     a virtual generated column that came back as an ordinary one stores nothing \
-                     and reads NULL",
+                     a virtual generated column that came back as an ordinary one and was never \
+                     written to stores nothing and reads NULL",
+                    table.name, column.name
+                )));
+            }
+
+            // The assertion the stored twin has always had and this one lacked,
+            // and the gap was not cosmetic: an audit drove a rebuild that
+            // copies the column by name -- `INSERT INTO new SELECT "doubled"
+            // ... FROM old` -- through the real oracle and every trait held.
+            // Selecting a VIRTUAL column COMPUTES it, so the copy materialises
+            // 42 into an ordinary column, and a probe that reads the value once
+            // sees exactly what it expects while the generation is gone.
+            //
+            // Reading once cannot separate a generated column from an ordinary
+            // one holding the number a rebuild put there. Moving the input and
+            // asking whether the column followed is the only thing that can.
+            conn.execute(
+                &format!(
+                    "UPDATE {} SET \"base\" = {VIRTUAL_MOVED_BASE} WHERE \"{KEY}\" = 1",
+                    quote(&table.name)
+                ),
+                [],
+            )?;
+            let moved: Option<i64> = conn.query_row(
+                &format!(
+                    "SELECT {} FROM {} WHERE \"{KEY}\" = 1",
+                    quote(&column.name),
+                    quote(&table.name)
+                ),
+                [],
+                |row| row.get(0),
+            )?;
+            if moved != Some(VIRTUAL_MOVED_DOUBLED) {
+                return Err(ProbeError::Failed(format!(
+                    "{}.{} still reads {moved:?} after its base moved to {VIRTUAL_MOVED_BASE}, not \
+                     {VIRTUAL_MOVED_DOUBLED}; the value was copied but the computation was not, \
+                     which is what a rebuild that selected the column by name leaves behind",
                     table.name, column.name
                 )));
             }

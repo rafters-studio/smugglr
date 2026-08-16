@@ -193,10 +193,30 @@ fn breaks(kind: Trait) -> Vec<Break> {
         Trait::GeneratedVirtual => {
             let mut ordinary = schema();
             drop_generated(&mut ordinary, "virtual_generated", "doubled");
-            vec![Break::schema(
-                "GENERATED ALWAYS AS (...) VIRTUAL, re-created as an ordinary column",
-                ordinary,
-            )]
+            let mut copied = schema();
+            drop_generated(&mut copied, "virtual_generated", "doubled");
+            vec![
+                Break::schema(
+                    "GENERATED ALWAYS AS (...) VIRTUAL, re-created as an ordinary column",
+                    ordinary,
+                ),
+                // The shape a real rebuild produces, and the one this trait's
+                // break table was missing. `INSERT INTO new SELECT "doubled"
+                // ... FROM old` SELECTS a virtual column, which computes it --
+                // so the copy materialises the right number into an ordinary
+                // column. An audit drove exactly this through the oracle and
+                // every trait held.
+                //
+                // Without it the break was WEAKER than the defect it stood for:
+                // it only ever produced a column reading NULL, which the probe
+                // caught for free, while the reachable defect reads 42 forever.
+                Break::schema(
+                    "GENERATED ALWAYS AS (...) VIRTUAL, re-created as an ordinary column holding \
+                     the value a by-name copy computes into it",
+                    copied,
+                )
+                .then(&["UPDATE \"virtual_generated\" SET \"doubled\" = \"base\" * 2"]),
+            ]
         }
 
         Trait::GeneratedStored => {
