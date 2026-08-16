@@ -60,11 +60,14 @@
 //! inside an open transaction.
 
 mod cases;
+mod combinations;
 
 use rusqlite::Connection;
 
 use crate::error::ProbeError;
 use crate::schema::{Column, Schema, Table, Trait};
+
+pub use combinations::Combination;
 
 /// Rows a seed writes. Takes only a connection: see the module docs.
 pub type SeedFn = fn(&Connection) -> Result<(), ProbeError>;

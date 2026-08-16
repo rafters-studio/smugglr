@@ -91,6 +91,26 @@ use crate::registry::TraitCase;
 use crate::schema::ddl::quote;
 use crate::schema::{ForeignKey, ReferentialAction, TableConstraint, Trait};
 
+/// The unordered trait pairs some combination puts on one table.
+///
+/// Read from [`Combination::all`] rather than written down, so the boundary
+/// line above cannot claim a pair is uncovered after someone covers it.
+fn covered_pairs() -> BTreeSet<(Trait, Trait)> {
+    let mut pairs = BTreeSet::new();
+    for combination in crate::registry::Combination::all() {
+        for (i, left) in combination.kinds.iter().enumerate() {
+            for right in combination.kinds.iter().skip(i + 1) {
+                pairs.insert(if left <= right {
+                    (*left, *right)
+                } else {
+                    (*right, *left)
+                });
+            }
+        }
+    }
+    pairs
+}
+
 /// The kind of identifier smugglr#340 needs rendered bare.
 ///
 /// Non-ASCII rather than a plain word on purpose. A [`quote`] that went
@@ -201,6 +221,18 @@ pub enum Subject {
     /// `ON DELETE` actions no case schema declares, so no probe asserts what
     /// dropping one would change. Derived from the case schemas.
     OnDelete,
+    /// Pairs of traits no combination puts on one table.
+    ///
+    /// Every [`TraitCase`] declares its construct on its own table, and the
+    /// every-trait schema concatenates those tables, so a schema carrying all
+    /// eight traits is eight single-construct tables. A defect that needs two
+    /// constructs to MEET -- and the rebuild emits columns, keys, generated
+    /// declarations and triggers into one body, so meeting is what they do --
+    /// is unreachable from a concatenation.
+    ///
+    /// Derived from what [`Combination::all`] declares, so covering a pair
+    /// removes it from this line without anyone editing prose. smugglr#398.
+    Combinations,
     /// `ON UPDATE` actions no case schema declares.
     ///
     /// `CASCADE` is no longer among them: the `ForeignKeyWithAction` case
@@ -270,6 +302,7 @@ impl Subject {
             Subject::Unrenderable => "unrenderable",
             Subject::Unobservable => "unobservable",
             Subject::Unreachable => "unreachable",
+            Subject::Combinations => "combinations",
         }
     }
 }
@@ -325,6 +358,25 @@ impl Boundary {
             lines.push(Unexercised {
                 subject: Subject::Adapters,
                 statement: format!("{} -- {}.", names(&unreached), mechanisms.join("; ")),
+            });
+        }
+
+        // Trait pairs: every unordered pair, minus the ones a combination puts
+        // on one table. Counted rather than listed -- 28 pairs is a number a
+        // reader can act on, where 27 names is a wall.
+        let covered = covered_pairs();
+        let total = Trait::ALL.len() * (Trait::ALL.len() - 1) / 2;
+        if covered.len() < total {
+            lines.push(Unexercised {
+                subject: Subject::Combinations,
+                statement: format!(
+                    "{} of {total} trait pairs. Each case declares its construct on its own \
+                     table, so the every-trait schema is a concatenation and two constructs never \
+                     meet -- which is where a rebuild does its work. {} covered so far. \
+                     smugglr#398.",
+                    total - covered.len(),
+                    covered.len()
+                ),
             });
         }
 
