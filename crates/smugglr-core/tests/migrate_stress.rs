@@ -871,34 +871,15 @@ fn a_three_step_chain_arrives_where_a_direct_build_does() {
     // row rather than the name, so a column that arrived with the right name
     // and the wrong TYPE is a difference.
     //
-    // The DECLARED TYPE of a column the start schema left typeless is excluded,
-    // and this is a routed-around defect rather than a nicety. The rebuild
-    // promotes a typeless column to `BLOB` -- `raw_table_info` does it
-    // deliberately and says so in a comment -- so the chained arm declares
-    // `untyped BLOB` where the direct build has `untyped` with no type at all.
-    // That is smugglr#344, open, and this comparison found it end-to-end
-    // through the real engine the first time it was tightened.
-    //
-    // Everything else about those columns is still compared, and every field of
-    // every other column is. Asserting the divergence instead would go green on
-    // the day #344 is fixed and then fail as a regression, which is the trap
-    // this suite exists to avoid.
-    let shapes = |conn: &Connection| -> Vec<ColumnShape> {
-        declared_columns(conn, "payload")
-            .into_iter()
-            .map(|(name, ty, notnull, dflt, pk, hidden)| {
-                let ty = if TYPELESS_IN_START.contains(&name.as_str()) {
-                    String::from("<excluded: smugglr#344>")
-                } else {
-                    ty
-                };
-                (name, ty, notnull, dflt, pk, hidden)
-            })
-            .collect()
-    };
+    // Every field of every column, with nothing excluded. An earlier version of
+    // this test excluded the DECLARED TYPE of a start-typeless column, because
+    // the rebuild promoted it to `BLOB` -- smugglr#344, which the same change
+    // that tightened this comparison went on to fix. The exclusion is gone
+    // rather than left in place: a routed-around defect that has been fixed and
+    // whose workaround stays is a test quietly asserting less than it can.
     assert_eq!(
-        shapes(&migrated),
-        shapes(&direct),
+        declared_columns(&migrated, "payload"),
+        declared_columns(&direct, "payload"),
         "the arms declare different columns"
     );
 }
@@ -921,14 +902,6 @@ fn fill_note(conn: &Connection) {
         .unwrap_or_else(|error| panic!("note on row {row} with {}: {error}", v.what));
     }
 }
-
-/// Columns the start schema declares with no type at all.
-///
-/// Their declared type is excluded from the schema comparison because the
-/// rebuild promotes a typeless column to `BLOB` (smugglr#344, open). Named here
-/// rather than inline so the exclusion is one list a reader can check against
-/// the schema below.
-const TYPELESS_IN_START: [&str; 2] = ["untyped", "number"];
 
 /// The shape the chain starts from.
 const START_SCHEMA: &str = "CREATE TABLE payload (
