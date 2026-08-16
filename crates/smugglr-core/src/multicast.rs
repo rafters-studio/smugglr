@@ -721,8 +721,11 @@ impl Gossip {
         }
         let rows = match local.get_rows(&w.table, &w.pks).await {
             Ok(r) => r,
-            Err(e) => {
-                warn!("cannot serve '{}': {}", w.table, e);
+            // The peer wants a table this node does not have. Serving nothing
+            // is the correct answer and `Served { rows: 0 }` states it
+            // truthfully. The schema is the user's (#415).
+            Err(SyncError::TableNotFound(_)) => {
+                debug!("cannot serve absent table '{}'; serving nothing", w.table);
                 return Ok((
                     GossipEvent::Served {
                         table: w.table,
@@ -731,6 +734,12 @@ impl Gossip {
                     Vec::new(),
                 ));
             }
+            // Anything else is a refusal or a fault, and reporting it as
+            // `Served { rows: 0 }` makes it indistinguishable from "the peer
+            // legitimately needed nothing" -- the same conflation #332 fixed in
+            // `on_digest`. `NoPrimaryKey` and a SQLite fault both reach here
+            // through `get_rows_inner`'s `table_info_inner` call.
+            Err(e) => return Err(e),
         };
         if rows.is_empty() {
             return Ok((
@@ -804,8 +813,24 @@ impl Gossip {
                             .await;
                     }
                 }
-                // Schema is the user's; a row for a missing table is dropped.
-                Err(e) => warn!("drop delta for table '{}': {}", d.table, e),
+                // Schema is the user's; a row for a table this node does not
+                // have is dropped. That is the ONLY benign cause, and the
+                // comment here used to name it while the arm caught everything
+                // (#415).
+                Err(SyncError::TableNotFound(_)) => {
+                    debug!("drop delta for absent table '{}'", d.table)
+                }
+                // Everything else surfaces. Reported as `Applied { rows: 0,
+                // rejected: 0 }` it is byte-identical to "there was nothing to
+                // apply", so a node whose table cannot take writes at all --
+                // `NoPrimaryKey` reaches here through
+                // `upsert_rows_guarded_inner`'s `table_info_inner` call --
+                // silently drops every live delta for that table forever, with
+                // a log line as the only trace. That is worse than #332's
+                // instance rather than milder: #332 pulled rows it should not
+                // have and this one stops converging while every event says it
+                // is fine.
+                Err(e) => return Err(e),
             }
         }
         // Deletes are parsed and dropped, never applied (#311). We no longer send
@@ -882,6 +907,23 @@ impl Gossip {
                     mismatch.push(col.clone());
                 }
                 Ok(_) => {}
+                // Swallowed on purpose, and NOT the #332/#415 pattern even
+                // though it looks like it. Written down because a reviewer
+                // checked and the next one should not have to.
+                //
+                // This runs only inside `on_delta`'s `Ok` arm, so the write has
+                // already succeeded and the table is known to exist with a
+                // usable key -- `TableNotFound` and `NoPrimaryKey` cannot reach
+                // here. `stored_storage_class` does not call `table_info`, so
+                // what is left is a raw SQLite error, and in practice one
+                // error: `ordering` comes from config and is never filtered
+                // against the table's real columns, so a configured column the
+                // table does not have fails the probe.
+                //
+                // That is expected rather than exceptional, and the probe is a
+                // diagnostic: it decides whether an `OrderingNote` mismatch
+                // warning is emitted, never whether a row is applied. Surfacing
+                // it would turn a config typo into a refused delta.
                 Err(e) => debug!("cannot probe '{}'.'{}': {}", table, col, e),
             }
         }
@@ -1706,6 +1748,85 @@ mod tests {
             Err(SyncError::NoPrimaryKey(table)) => assert_eq!(table, "users"),
             Err(other) => panic!("expected NoPrimaryKey, got {other:?}"),
             Ok((ev, _)) => panic!("expected the misconfiguration to surface, got event {ev:?}"),
+        }
+    }
+
+    /// A no-PK table surfaces on the SERVE path instead of answering "nothing".
+    ///
+    /// #415, the `on_want` half. Reporting `Served { rows: 0 }` for a table this
+    /// node cannot read makes the fault indistinguishable from "the peer
+    /// legitimately needed nothing", and the peer waits forever for rows that
+    /// are never coming.
+    ///
+    /// The Want is built by hand rather than driven from a digest, because the
+    /// digest path now refuses first (#332) and would never produce one against
+    /// this node.
+    #[tokio::test]
+    async fn a_no_primary_key_table_surfaces_on_want_instead_of_serving_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let a_path = dir.path().join("a.db").to_str().unwrap().to_string();
+        let b_path = dir.path().join("b.db").to_str().unwrap().to_string();
+
+        seed(&a_path, &[("1", "Alice")]);
+        rusqlite::Connection::open(&b_path)
+            .unwrap()
+            .execute_batch("CREATE TABLE users (id TEXT, name TEXT, updated_at TEXT);")
+            .unwrap();
+        let (a, _a_cfg, _a_local, b, b_cfg, b_local) = two_nodes(&a_path, &b_path).await;
+
+        let want = Body::Want(WantPacket {
+            source_id: a.instance_id.clone(),
+            table: "users".to_string(),
+            pks: vec!["1".to_string()],
+        });
+        let sealed = a.seal(want).unwrap();
+        let result = b.handle(&sealed, &b_local, &b_cfg).await;
+
+        match result {
+            Err(SyncError::NoPrimaryKey(table)) => assert_eq!(table, "users"),
+            Err(other) => panic!("expected NoPrimaryKey, got {other:?}"),
+            Ok((ev, _)) => panic!(
+                "a node that cannot read its own table must not answer as though it had \
+                 nothing to give; got {ev:?}"
+            ),
+        }
+    }
+
+    /// A no-PK table surfaces on the APPLY path instead of reporting zero rows.
+    ///
+    /// #415, the `on_delta` half and the one that matters most. Every error from
+    /// `upsert_rows_guarded` was reported as `Applied { rows: 0, rejected: 0 }`,
+    /// which is byte-identical to "there was nothing to apply". A node whose
+    /// table cannot take writes at all therefore dropped every live delta for
+    /// it, forever, while every event it emitted said it was healthy.
+    ///
+    /// Worse than #332 rather than milder: #332 pulled rows it should not have,
+    /// and this one stops converging while reporting success.
+    #[tokio::test]
+    async fn a_no_primary_key_table_surfaces_on_delta_instead_of_applying_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let a_path = dir.path().join("a.db").to_str().unwrap().to_string();
+        let b_path = dir.path().join("b.db").to_str().unwrap().to_string();
+
+        seed(&a_path, &[("1", "Alice")]);
+        rusqlite::Connection::open(&b_path)
+            .unwrap()
+            .execute_batch("CREATE TABLE users (id TEXT, name TEXT, updated_at TEXT);")
+            .unwrap();
+        let (a, _a_cfg, a_local, b, b_cfg, b_local) = two_nodes(&a_path, &b_path).await;
+
+        let rows = a_local.get_rows("users", &["1".to_string()]).await.unwrap();
+        assert_eq!(rows.len(), 1, "A has the row it is about to send");
+        let delta = only(a.delta_bodies("users", rows).unwrap());
+        let sealed = a.seal(delta).unwrap();
+        let result = b.handle(&sealed, &b_local, &b_cfg).await;
+
+        match result {
+            Err(SyncError::NoPrimaryKey(table)) => assert_eq!(table, "users"),
+            Err(other) => panic!("expected NoPrimaryKey, got {other:?}"),
+            Ok((ev, _)) => panic!(
+                "a node that silently drops every delta must not report an apply; got {ev:?}"
+            ),
         }
     }
 
