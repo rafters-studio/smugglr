@@ -135,6 +135,17 @@ fn breaks(kind: Trait) -> Vec<Break> {
             let mut dropped_set_default = schema();
             foreign_key_mut(&mut dropped_set_default, "defaulting_child").on_update = None;
 
+            // The delete side of the same two (#392), each with its own break
+            // for the same reason: four actions across two clauses come off the
+            // same pragma row, and only a break touching an arm's own action
+            // shows that arm asserting anything.
+            let mut dropped_delete_set_null = schema();
+            foreign_key_mut(&mut dropped_delete_set_null, "delete_nulling_child").on_delete = None;
+
+            let mut dropped_delete_set_default = schema();
+            foreign_key_mut(&mut dropped_delete_set_default, "delete_defaulting_child").on_delete =
+                None;
+
             let mut dropped_key = schema();
             table_mut(&mut dropped_key, "restrict_child")
                 .constraints
@@ -162,6 +173,15 @@ fn breaks(kind: Trait) -> Vec<Break> {
                     "ON UPDATE SET DEFAULT, so the parent key cannot move and the child never \
                      falls back to its declared default",
                     dropped_set_default,
+                ),
+                Break::schema(
+                    "ON DELETE SET NULL, so the parent cannot go and the child is never cut loose",
+                    dropped_delete_set_null,
+                ),
+                Break::schema(
+                    "ON DELETE SET DEFAULT, so the parent cannot go and the child never falls back \
+                     to its declared default",
+                    dropped_delete_set_default,
                 ),
                 Break::schema(
                     "the RESTRICT child's foreign key, dropped whole",

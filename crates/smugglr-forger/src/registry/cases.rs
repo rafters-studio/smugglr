@@ -66,6 +66,15 @@ const DEFAULTED_TO: i64 = 51;
 /// So this is both the column's `DEFAULT` and a seeded key, and the two cannot
 /// drift apart because the schema and the seed read the same constant.
 const FALLBACK: i64 = 59;
+/// The parent row `ON DELETE SET NULL` is expected to let go, cutting its child
+/// loose rather than taking it along.
+const DELETED_NULLING: i64 = 60;
+/// The parent row `ON DELETE SET DEFAULT` is expected to let go.
+const DELETED_DEFAULTING: i64 = 70;
+/// The row an `ON DELETE SET DEFAULT` child falls back to, on the same terms as
+/// [`FALLBACK`]: it has to exist, or the delete becomes a violation rather than
+/// a fallback.
+const DELETE_FALLBACK: i64 = 79;
 
 pub(super) fn foreign_key_with_action() -> TraitCase {
     let schema = schema()
@@ -114,6 +123,39 @@ pub(super) fn foreign_key_with_action() -> TraitCase {
                 .fk(["keeper_id"], "nulling_keeper", [KEY])
                 .on_update(ReferentialAction::SetNull),
         )
+        // The delete side of the same two actions (#392). Own parents again,
+        // for the third and fourth time and the same reason: every arm of this
+        // probe removes or moves a key.
+        .table(
+            table("delete_nulling_keeper")
+                .pk_int(KEY)
+                .col(LABEL, Text, []),
+        )
+        .table(
+            table("delete_nulling_child")
+                .pk_int(KEY)
+                .col("keeper_id", Integer, [])
+                .col(LABEL, Text, [])
+                .fk(["keeper_id"], "delete_nulling_keeper", [KEY])
+                .on_delete(ReferentialAction::SetNull),
+        )
+        .table(
+            table("delete_defaulting_keeper")
+                .pk_int(KEY)
+                .col(LABEL, Text, []),
+        )
+        .table(
+            table("delete_defaulting_child")
+                .pk_int(KEY)
+                .col(
+                    "keeper_id",
+                    Integer,
+                    [Attr::Default(DefaultValue::Integer(DELETE_FALLBACK))],
+                )
+                .col(LABEL, Text, [])
+                .fk(["keeper_id"], "delete_defaulting_keeper", [KEY])
+                .on_delete(ReferentialAction::SetDefault),
+        )
         .table(table("defaulting_keeper").pk_int(KEY).col(LABEL, Text, []))
         .table(
             table("defaulting_child")
@@ -154,7 +196,16 @@ pub(super) fn foreign_key_with_action() -> TraitCase {
                    VALUES ({DEFAULTED}, 'its key moves and its child falls back'), \
                           ({FALLBACK}, 'the row the child falls back to');
                  INSERT INTO \"defaulting_child\" (\"{KEY}\", \"keeper_id\", \"{LABEL}\") \
-                   VALUES (420, {DEFAULTED}, 'defaulted');"
+                   VALUES (420, {DEFAULTED}, 'defaulted');
+                 INSERT INTO \"delete_nulling_keeper\" (\"{KEY}\", \"{LABEL}\") \
+                   VALUES ({DELETED_NULLING}, 'it goes and its child is cut loose');
+                 INSERT INTO \"delete_nulling_child\" (\"{KEY}\", \"keeper_id\", \"{LABEL}\") \
+                   VALUES (430, {DELETED_NULLING}, 'nulled by delete');
+                 INSERT INTO \"delete_defaulting_keeper\" (\"{KEY}\", \"{LABEL}\") \
+                   VALUES ({DELETED_DEFAULTING}, 'it goes and its child falls back'), \
+                          ({DELETE_FALLBACK}, 'the row the child falls back to');
+                 INSERT INTO \"delete_defaulting_child\" (\"{KEY}\", \"keeper_id\", \"{LABEL}\") \
+                   VALUES (440, {DELETED_DEFAULTING}, 'defaulted by delete');"
             ))?;
             Ok(())
         },
@@ -376,6 +427,112 @@ fn probe_foreign_key_with_action(schema: &Schema, conn: &Connection) -> Result<(
         DEFAULTED_TO,
         Landing::Value(FALLBACK),
     )?;
+
+    // The same two actions on the delete side (#392). Separate from the update
+    // arms rather than folded in with a flag: one removes a parent and the
+    // other moves a key, and the shared part is only "assert where the child
+    // landed", which `Landing` already carries.
+    deleted_parent_leaves(
+        conn,
+        schema,
+        ReferentialAction::SetNull,
+        DELETED_NULLING,
+        Landing::Null,
+    )?;
+    deleted_parent_leaves(
+        conn,
+        schema,
+        ReferentialAction::SetDefault,
+        DELETED_DEFAULTING,
+        Landing::Value(DELETE_FALLBACK),
+    )?;
+
+    Ok(())
+}
+
+/// Delete a parent row declared with `action`, and assert where its children
+/// landed.
+///
+/// The delete-side twin of [`moved_key_leaves`]. They are two functions rather
+/// than one with a flag because the statement differs and so does what "the
+/// parent is gone" means -- one asserts the row was removed, the other that the
+/// key moved. What they genuinely share is [`Landing`], and that is shared.
+fn deleted_parent_leaves(
+    conn: &Connection,
+    schema: &Schema,
+    action: ReferentialAction,
+    parent_row: i64,
+    landing: Landing,
+) -> Result<(), ProbeError> {
+    let children = children_with(schema, action);
+    if children.is_empty() {
+        return Err(ProbeError::Failed(format!(
+            "the schema handed to this probe declares no ON DELETE {} foreign key, and the probe \
+             needs one to have anything to assert",
+            action.as_sql()
+        )));
+    }
+    let (parent, parent_key) = parent_of(children[0].1)?;
+
+    for (child, fk) in &children {
+        let child_column = child_column_of(fk)?;
+        let rows = count(
+            conn,
+            &format!(
+                "SELECT count(*) FROM {} WHERE {} = {parent_row}",
+                quote(&child.name),
+                quote(child_column)
+            ),
+        )?;
+        if rows == 0 {
+            return Err(ProbeError::Unseeded(format!(
+                "{} has no row referencing {parent}.{parent_key} = {parent_row}, so deleting that \
+                 parent would prove nothing either way",
+                child.name
+            )));
+        }
+    }
+
+    // The delete has to be permitted before the landing means anything: with
+    // the action dropped the parent cannot go at all, and asserting only where
+    // the child ended up would report the wrong cause.
+    let gone = conn.execute(
+        &format!(
+            "DELETE FROM {} WHERE {} = {parent_row}",
+            quote(parent),
+            quote(parent_key)
+        ),
+        [],
+    );
+    if let Err(error) = gone {
+        return Err(ProbeError::Failed(format!(
+            "deleting {parent}.{parent_key} = {parent_row} was refused ({error}), and a child \
+             declared ON DELETE {} does not refuse it -- the action was reconstructed as something \
+             else, or dropped, which leaves NO ACTION",
+            action.as_sql()
+        )));
+    }
+
+    for (child, fk) in &children {
+        let child_column = child_column_of(fk)?;
+        let landed = count(
+            conn,
+            &format!(
+                "SELECT count(*) FROM {} WHERE {}",
+                quote(&child.name),
+                landing.predicate(&quote(child_column))
+            ),
+        )?;
+        if landed != 1 {
+            return Err(ProbeError::Failed(format!(
+                "{landed} row(s) of {} hold {} after {parent}.{parent_key} = {parent_row} was \
+                 deleted; ON DELETE {} puts the child there and this one is somewhere else",
+                child.name,
+                landing.describe(),
+                action.as_sql()
+            )));
+        }
+    }
 
     Ok(())
 }

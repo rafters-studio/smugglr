@@ -89,6 +89,32 @@ fn foreign_key_with_action() -> Schema {
                 .on_update(ReferentialAction::SetNull),
         )
         .table(
+            table("delete_nulling_keeper")
+                .pk_int("id")
+                .col("label", Text, []),
+        )
+        .table(
+            table("delete_nulling_child")
+                .pk_int("id")
+                .col("keeper_id", Integer, [])
+                .col("label", Text, [])
+                .fk(["keeper_id"], "delete_nulling_keeper", ["id"])
+                .on_delete(ReferentialAction::SetNull),
+        )
+        .table(
+            table("delete_defaulting_keeper")
+                .pk_int("id")
+                .col("label", Text, []),
+        )
+        .table(
+            table("delete_defaulting_child")
+                .pk_int("id")
+                .col("keeper_id", Integer, [Attr::Default(DefaultValue::Integer(79))])
+                .col("label", Text, [])
+                .fk(["keeper_id"], "delete_defaulting_keeper", ["id"])
+                .on_delete(ReferentialAction::SetDefault),
+        )
+        .table(
             table("defaulting_keeper")
                 .pk_int("id")
                 .col("label", Text, []),
