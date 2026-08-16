@@ -265,32 +265,63 @@ impl Ledger {
         Ok(Election::HeldByOther)
     }
 
-    /// Mark a won version as successfully applied. Idempotent.
+    /// Mark a won version as successfully applied.
     ///
     /// Clears the lease and stamps the completion time. Leaves `version` and
     /// `checksum` untouched, so the chain-hash is unaffected.
+    ///
+    /// **Fenced on `pending`**, which is what makes it safe rather than merely
+    /// idempotent. Without the guard a node that stalled past its lease could
+    /// settle a row another applier had already taken and finished -- and after
+    /// #328 made a reclaim rewrite the row's `chain_hash`, that turned into a
+    /// permanent false tamper verdict rather than a stale checksum. See
+    /// [`Self::mark_failed`] for the sequence.
+    ///
+    /// A settle that finds the row in any other status affects no rows and
+    /// returns `Ok`: the caller has already lost the row, and saying so through
+    /// an error would turn a lost race into a failed migration.
     pub fn mark_success(conn: &Connection, version: u64) -> Result<()> {
         conn.execute(
             &format!(
                 "UPDATE \"{LEDGER_TABLE}\"
                  SET status = 'success', lease_expires_at = NULL, applied_at = ?1
-                 WHERE version = ?2"
+                 WHERE version = ?2 AND status = 'pending'"
             ),
             rusqlite::params![now_unix(), version as i64],
         )?;
         Ok(())
     }
 
-    /// Mark a won version as failed. Idempotent.
+    /// Mark a won version as failed.
     ///
     /// Clears the lease; the row stays reclaimable (a later [`Self::try_elect`]
     /// re-drives it). Leaves `version` and `checksum` untouched.
+    ///
+    /// **Fenced on `pending`.** Unfenced, this was the step that could put a
+    /// `failed` row *behind* a successor and brick the chain, on a sequence of
+    /// entirely ordinary calls:
+    ///
+    /// 1. v1 succeeds. Node A elects v2 and stalls past its lease.
+    /// 2. Node B reclaims the expired v2, applies it, settles it `success`.
+    /// 3. Node C elects v3, chaining onto v2's `chain_hash`.
+    /// 4. Node A wakes, its apply errors, and it settles v2 `failed` -- a row
+    ///    it no longer owns, now sitting behind v3.
+    /// 5. `current_version` falls back to 1, so the next honest run re-derives
+    ///    v2, reclaims it, and rewrites its `chain_hash` (#328) -- orphaning
+    ///    v3's `prev_hash`.
+    /// 6. `verify_chain` reports tampering, permanently, on a history in which
+    ///    nobody tampered.
+    ///
+    /// Found by an adversarial review of #328, which is also the change that
+    /// made step 5 destructive: before it, the same sequence left a stale
+    /// checksum and a chain that still verified. The guard makes step 4 a
+    /// no-op, so a stale node cannot demote a row it has lost.
     pub fn mark_failed(conn: &Connection, version: u64) -> Result<()> {
         conn.execute(
             &format!(
                 "UPDATE \"{LEDGER_TABLE}\"
                  SET status = 'failed', lease_expires_at = NULL
-                 WHERE version = ?1"
+                 WHERE version = ?1 AND status = 'pending'"
             ),
             rusqlite::params![version as i64],
         )?;
@@ -521,13 +552,28 @@ impl Ledger {
 ///
 /// `checksum` is described as immutable and is *nearly* so: a reclaim rewrites
 /// it, together with this hash, so the row names the manifest that actually ran
-/// (#328). That is bounded rather than a hole in the chain, and the bound is a
-/// property rather than a convention -- a reclaimable row is always the tail,
-/// because the driver derives its version from `current_version`, which counts
-/// only `success`. A `pending` or `failed` row therefore blocks any higher
-/// version from existing, so there is never a successor whose `prev_hash` this
-/// could orphan. `a_reclaimable_row_has_no_successors_to_invalidate` asserts
-/// it rather than leaving it as reasoning.
+/// (#328).
+///
+/// That is bounded by a reclaimable row being the tail of the chain -- the
+/// driver derives its version from `current_version`, which counts only
+/// `success`, so a `pending` or `failed` row is the highest one there is and
+/// has no successor whose `prev_hash` this could orphan.
+///
+/// **That bound is upheld rather than inherent, and #328 first claimed
+/// otherwise.** An adversarial review produced a sequence of ordinary calls in
+/// which a node stalled past its lease settled a row another applier had
+/// already finished, putting a `failed` row *behind* a successor -- after which
+/// the next honest reclaim rewrote that row's hash and `verify_chain` reported
+/// tampering forever. What holds the bound up is the `pending` fence on
+/// [`Ledger::mark_success`] and [`Ledger::mark_failed`], which makes a stale
+/// node's settle a no-op. `a_stale_node_cannot_demote_a_row_behind_its_successor`
+/// drives that sequence.
+///
+/// It is still a property of *this crate's* callers rather than of the table.
+/// `try_elect` is public and takes an explicit version, and `insert_pending`
+/// chains onto the highest **existing** row regardless of status, so an
+/// embedder inserting v(N+1) above a failed vN reaches the same orphaning. That
+/// is #404.
 fn chain_hash(version: u64, checksum: &str, prev_hash: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(version.to_be_bytes());
@@ -963,15 +1009,19 @@ mod tests {
     /// A reclaimable row is always the highest-versioned one, which is what
     /// makes rewriting its `chain_hash` safe.
     ///
-    /// This is the property the fix rests on, so it is asserted rather than
-    /// argued. `chain_hash` feeds the NEXT row's `prev_hash`, so rewriting a
-    /// row in the middle of a chain would invalidate everything after it. That
-    /// cannot arise: the driver derives its version as `current_version + 1`
-    /// and `current_version` counts only `success`, so a row that is `pending`
-    /// or `failed` blocks any higher version from ever being created.
+    /// `chain_hash` feeds the NEXT row's `prev_hash`, so rewriting a row in the
+    /// middle of a chain would invalidate everything after it. The driver
+    /// derives its version as `current_version + 1` and `current_version`
+    /// counts only `success`, so in an ordinary run a `pending` or `failed` row
+    /// is the tail.
     ///
-    /// Without this, "reclaim overwrites the checksum" would be a change with
-    /// an unbounded blast radius instead of a bounded one.
+    /// **This test observes that arrangement rather than establishing it**, and
+    /// its original doc said otherwise. An adversarial review found a sequence
+    /// where a stale node puts a `failed` row behind a successor, which this
+    /// test cannot see because it constructs its own history. What the property
+    /// actually rests on is the `pending` fence on the settles, and
+    /// `a_stale_node_cannot_demote_a_row_behind_its_successor` is where that is
+    /// driven.
     #[test]
     fn a_reclaimable_row_has_no_successors_to_invalidate() {
         let conn = conn();
@@ -1004,5 +1054,64 @@ mod tests {
             Ledger::entry(&conn, 2).unwrap().unwrap().checksum,
             "b_edited"
         );
+    }
+    /// A node that stalled past its lease cannot demote a row another applier
+    /// already finished -- which is what kept the chain whole.
+    ///
+    /// The sequence an adversarial review used to refute #328's safety
+    /// argument, driven here through the ledger API rather than argued about.
+    /// Every step is a call the driver itself makes.
+    ///
+    /// Before the `pending` fence this ended with `verify_chain` reporting
+    /// tampering permanently, on a history in which nobody tampered -- and it
+    /// was #328 that made it destructive, because before that a reclaim left
+    /// the chain alone and only the checksum was wrong.
+    #[test]
+    fn a_stale_node_cannot_demote_a_row_behind_its_successor() {
+        let conn = conn();
+
+        // v1 lands.
+        Ledger::try_elect(&conn, 1, "one", 300).unwrap();
+        Ledger::mark_success(&conn, 1).unwrap();
+
+        // Node A takes v2 and stalls past its lease.
+        assert_eq!(
+            Ledger::try_elect(&conn, 2, "a", 300).unwrap(),
+            Election::Won
+        );
+        expire_lease(&conn, 2);
+
+        // Node B reclaims it, applies, settles.
+        assert_eq!(
+            Ledger::try_elect(&conn, 2, "b", 300).unwrap(),
+            Election::Won
+        );
+        Ledger::mark_success(&conn, 2).unwrap();
+        assert_eq!(Ledger::current_version(&conn).unwrap(), Some(2));
+
+        // Node C chains v3 onto v2.
+        assert_eq!(
+            Ledger::try_elect(&conn, 3, "c", 300).unwrap(),
+            Election::Won
+        );
+        Ledger::mark_success(&conn, 3).unwrap();
+        Ledger::verify_chain(&conn).expect("the chain is whole before A wakes");
+
+        // Node A wakes and settles the row it lost. Fenced, so it does nothing.
+        Ledger::mark_failed(&conn, 2).unwrap();
+
+        let v2 = Ledger::entry(&conn, 2).unwrap().unwrap();
+        assert_eq!(
+            v2.status,
+            MigrationStatus::Success,
+            "a stale node settled a row it no longer owns; v2 is now behind v3 and the next \
+             reclaim will rewrite its chain_hash and orphan v3"
+        );
+        assert_eq!(
+            Ledger::current_version(&conn).unwrap(),
+            Some(3),
+            "the observable version did not fall back, so no honest run will re-derive v2"
+        );
+        Ledger::verify_chain(&conn).expect("and the chain is still whole afterwards");
     }
 }
