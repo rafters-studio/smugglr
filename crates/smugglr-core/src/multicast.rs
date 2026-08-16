@@ -642,27 +642,49 @@ impl Gossip {
 
         let local_hashes = match self.row_hashes(local, config, &d.table).await {
             Ok(h) => h,
-            // A duplicate `__pk` is a refusal, not a missing view, and the two
-            // must not share an arm. Treating it as empty would Want every row
-            // the peer advertises and apply them through `on_delta`, which
-            // bypasses the duplicate-`__pk` guard entirely (#269) and is not
-            // itself guarded until #278 -- so swallowing here would turn a
-            // refusal into a full-table pull down the one unguarded path, on
-            // the transport where cross-node key collisions actually originate.
-            // Propagate instead: `recv_and_handle`'s caller logs it at `warn`,
-            // matching how the emission side already reports (`digest_bodies`
-            // propagates with `?`), so a node stops pulling rather than
-            // silently stops advertising while still pulling.
-            Err(e @ SyncError::DuplicatePrimaryKey { .. }) => return Err(e),
-            // No local view (e.g. the table is absent on a late joiner) -> treat
-            // as empty so we want everything the peer advertises.
-            Err(e) => {
+            // The ONLY benign cause, and the reason this arm exists: the table
+            // is absent here and present on the peer. A late joiner, or one
+            // that has not created it yet. An empty local view is the correct
+            // reading -- want everything the peer advertises and converge.
+            // `missing_table_still_wants_everything_on_digest` pins it (#269).
+            Err(SyncError::TableNotFound(_)) => {
                 debug!(
-                    "no local hashes for '{}' ({}); treating as empty",
-                    d.table, e
+                    "no local table '{}'; treating as empty so we want everything",
+                    d.table
                 );
                 HashMap::new()
             }
+            // Everything else propagates, and there is deliberately no
+            // catch-all (#332). An error that is not "the table is not here"
+            // is a refusal or a fault, and neither one means "I have no rows".
+            // Reading it as an empty view Wants every row the peer advertises
+            // and applies them through `on_delta`, which bypasses the
+            // duplicate-`__pk` guard entirely (#269) and is not itself guarded
+            // until #278 -- so a misconfiguration becomes a full-table pull
+            // down the one unguarded path, on the transport where cross-node
+            // key collisions actually originate.
+            //
+            // What reaches here today, from `table_info_inner` and
+            // `get_row_metadata_inner`:
+            //   - NoPrimaryKey: the table exists and cannot be synced at all.
+            //     smugglr's identity IS the primary key. Full-pulling forever
+            //     while every status reads fine is the defect #332 names.
+            //   - DuplicatePrimaryKey: a refusal under `DuplicatePkPolicy`.
+            //   - a SQLite failure from the pragma or the scan: a fault, and a
+            //     node that cannot read its own rows must not conclude it has
+            //     none.
+            //
+            // Listed rather than matched individually so the compiler does not
+            // let a fourth cause inherit an arm chosen for the first three --
+            // but a new cause added to `table_info_inner` now refuses by
+            // DEFAULT and has to be argued into the benign arm above, which is
+            // the direction that fails safe.
+            //
+            // `recv_and_handle`'s caller logs this at `warn`, matching the
+            // emission side (`digest_bodies` propagates with `?`), so a node
+            // stops pulling rather than silently stopping advertising while
+            // still pulling.
+            Err(e) => return Err(e),
         };
 
         let want = want_set(&d.hashes, &local_hashes);
@@ -1630,6 +1652,60 @@ mod tests {
             }
             Err(other) => panic!("expected DuplicatePrimaryKey, got {other:?}"),
             Ok((ev, _)) => panic!("expected the refusal to surface, got event {ev:?}"),
+        }
+    }
+
+    /// A table with no primary key REFUSES instead of wanting every peer row.
+    ///
+    /// #332. This is the sibling of the duplicate-`__pk` case above and it was
+    /// left in the catch-all: `NoPrimaryKey` read as an empty local view, so a
+    /// node whose table cannot be synced at all Wanted everything the peer
+    /// advertised, forever, while every status read fine.
+    ///
+    /// The assertion is on the WANT PAYLOAD rather than on the event, because
+    /// the defect is that the wrong thing happens quietly -- an event count
+    /// would go green on a node that refused and pulled anyway.
+    #[tokio::test]
+    async fn a_no_primary_key_table_refuses_instead_of_wanting_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        let a_path = dir.path().join("a.db").to_str().unwrap().to_string();
+        let b_path = dir.path().join("b.db").to_str().unwrap().to_string();
+
+        seed(&a_path, &[("1", "Alice"), ("2", "Bob")]);
+        // B has the table and it has NO primary key. Distinct from the late
+        // joiner below, which does not have the table at all -- that one is
+        // benign and must keep converging.
+        rusqlite::Connection::open(&b_path)
+            .unwrap()
+            .execute_batch("CREATE TABLE users (id TEXT, name TEXT, updated_at TEXT);")
+            .unwrap();
+        let (a, a_cfg, a_local, b, b_cfg, b_local) = two_nodes(&a_path, &b_path).await;
+
+        let digest = only(a.digest_bodies(&a_local, &a_cfg).await.unwrap());
+        let sealed = a.seal(digest).unwrap();
+        let result = b.handle(&sealed, &b_local, &b_cfg).await;
+
+        let bodies = match &result {
+            Ok((_, out)) => out.clone(),
+            Err(_) => Vec::new(),
+        };
+        let wanted: Vec<String> = bodies
+            .iter()
+            .flat_map(|body| match body {
+                Body::Want(w) => w.pks.clone(),
+                _ => Vec::new(),
+            })
+            .collect();
+        assert!(
+            wanted.is_empty(),
+            "a table with no primary key cannot be synced at all, so the node must not \
+             request peer rows; wanted {wanted:?}"
+        );
+
+        match result {
+            Err(SyncError::NoPrimaryKey(table)) => assert_eq!(table, "users"),
+            Err(other) => panic!("expected NoPrimaryKey, got {other:?}"),
+            Ok((ev, _)) => panic!("expected the misconfiguration to surface, got event {ev:?}"),
         }
     }
 
