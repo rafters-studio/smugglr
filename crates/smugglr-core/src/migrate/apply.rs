@@ -57,14 +57,26 @@
 //! `tracing::warn!` when the table being rebuilt carries such constructs, so
 //! the loss is visible.
 //!
-//! One qualification on that list, because it is now only mostly true: a
-//! constraint declared **on a preserved generated column** rides through on
-//! that column's verbatim definition. A `UNIQUE` there really does survive and
-//! is filtered out of the warning accordingly. `CHECK` and `COLLATE` may
-//! survive the same way and are still reported lost, because they are found by
-//! a keyword scan over the whole table's DDL and cannot be attributed to a
-//! column -- an over-report, which is the direction this warning already errs
-//! in.
+//! That list is narrower than it reads, and one change is the reason rather
+//! than several. **Every surviving non-key column is carried verbatim from the
+//! original DDL** rather than re-derived from `PRAGMA table_info` (#396, #344),
+//! so anything declared ON a column comes with it: its `CHECK`, its `COLLATE`,
+//! its column-level `UNIQUE`, its expression `DEFAULT` complete with the
+//! parentheses the pragma drops, and its blank declared type where the pragma
+//! reports an empty string this path used to turn into `BLOB`. What is still
+//! genuinely unrecoverable is the **table-level** form of `CHECK` and `UNIQUE`,
+//! and `WITHOUT ROWID`.
+//!
+//! Key columns are the exception and stay derived. The primary key is rebuilt
+//! from the *surviving* key columns so that dropping one member of a composite
+//! leaves a real key on the rest (#273), and a verbatim declaration would bring
+//! its own `PRIMARY KEY` tag into a body about to be given one.
+//!
+//! The warning still over-reports `CHECK` and `COLLATE`, because
+//! `lost_constructs` finds them by a keyword scan over the whole table's DDL
+//! and cannot attribute them to a column -- so it cannot tell one that rode
+//! through from one that did not. Over-reporting is the direction this warning
+//! already errs in.
 //!
 //! **Generated columns** took three passes and the sequence explains the shape
 //! of the code. `table_info` -- the pragma the whole reconstruction introspects
@@ -591,9 +603,52 @@ fn rebuild_dropping_column(
         verbatim_definitions_for(orig_sql.as_deref(), &surviving_generated, column)
     };
 
+    // Ordinary columns are carried verbatim too, for the same reason generated
+    // ones are and with the same all-or-nothing fallback (#396, #344).
+    //
+    // `render_def` re-derives a column from `PRAGMA table_info`, and the pragma
+    // answers a narrower question than the derivation assumes -- twice over.
+    // It reports an expression `DEFAULT` WITHOUT the parentheses SQLite
+    // requires, so `DEFAULT ('a' || ')')` is re-emitted as a syntax error
+    // (#396). And it reports a typeless column's type as the empty string,
+    // which this path turns into `BLOB`, moving the column into the class
+    // `rowhash::is_blob_column` deliberately excludes (#344).
+    //
+    // The original declaration has neither problem, because it is what the
+    // author wrote. Taking it verbatim also carries `CHECK`, `COLLATE` and a
+    // column-level `UNIQUE` through, which the module doc used to list as
+    // unrecoverable.
+    //
+    // PRIMARY KEY columns are deliberately NOT carried verbatim. The key is
+    // derived from the *surviving* key columns so that dropping one member of a
+    // composite leaves a real key on the rest (#273), and a verbatim
+    // declaration would bring its own `PRIMARY KEY` tag into a body that is
+    // about to be given one.
+    let verbatim_ordinary: Option<Vec<(String, String)>> = {
+        let wanted: Vec<(String, &'static str)> = kept
+            .iter()
+            .filter(|c| c.pk == 0)
+            .map(|c| (c.name.clone(), "ordinary"))
+            .collect();
+        let refs: Vec<&(String, &'static str)> = wanted.iter().collect();
+        if refs.is_empty() {
+            None
+        } else {
+            verbatim_definitions_for(orig_sql.as_deref(), &refs, column)
+        }
+    };
+
     let mut body: Vec<String> = kept
         .iter()
         .map(|c| {
+            if c.pk == 0 {
+                if let Some(found) = verbatim_ordinary
+                    .as_ref()
+                    .and_then(|v| v.iter().find(|(name, _)| name == &c.name))
+                {
+                    return found.1.clone();
+                }
+            }
             let mut def = c.render_def();
             if Some(c.name.as_str()) == inline_pk {
                 def.push_str(" PRIMARY KEY");
@@ -647,9 +702,32 @@ fn rebuild_dropping_column(
     // Composite FKs are reconstructed as a single grouped constraint; the whole
     // FK is dropped if ANY member column is the one being removed (#273 HIGH#2).
     for fk in reconstruct_foreign_keys(conn, table)? {
-        if !fk.references_column(column) {
-            body.push(fk.render());
+        if fk.references_column(column) {
+            continue;
         }
+        // A single-column key may have been declared INLINE on the column, in
+        // which case carrying that column verbatim already brought it along and
+        // emitting it again here would give the rebuilt table two keys where
+        // the original had one. `foreign_key_list` does not say whether a key
+        // was inline or table-level, so the verbatim declaration is asked
+        // instead: if it names REFERENCES, the key came with it.
+        //
+        // A composite key cannot be inline, so this only ever applies to
+        // single-column ones.
+        if fk.cols.len() == 1 {
+            let carried_inline = verbatim_ordinary.as_ref().is_some_and(|v| {
+                v.iter().any(|(name, definition)| {
+                    name == &fk.cols[0].0
+                        && any_sql_identifier(definition, |quoted, token| {
+                            !quoted && token.eq_ignore_ascii_case("REFERENCES")
+                        })
+                })
+            });
+            if carried_inline {
+                continue;
+            }
+        }
+        body.push(fk.render());
     }
 
     // Indexes and triggers do not survive the swap's DROP TABLE; collect the DDL
@@ -3236,6 +3314,156 @@ mod tests {
                 verbatim_definitions_for(Some(sql), &[&missing], "code").is_none(),
                 "a name that matches nothing is unresolved, not skipped"
             );
+        }
+
+        /// #396: an expression DEFAULT keeps its parentheses through a
+        /// rebuild, so the CREATE TABLE is accepted.
+        ///
+        /// `PRAGMA table_info` reports `dflt_value` WITHOUT the parentheses
+        /// SQLite requires around an expression default, so re-deriving the
+        /// column emitted `DEFAULT 'a' || ')'` for a column declared
+        /// `DEFAULT ('a' || ')')` -- a syntax error that failed the rebuild
+        /// outright. Carrying the declaration verbatim has neither problem,
+        /// because it is what the author wrote.
+        ///
+        /// Asserted behaviourally: insert a row without the column and read
+        /// what landed. A DDL comparison would pass on a default that parses
+        /// and evaluates to something else.
+        #[test]
+        fn drop_column_rebuild_keeps_an_expression_default_working() {
+            let conn = mem();
+            conn.execute_batch(
+                "CREATE TABLE t (
+                     id INTEGER PRIMARY KEY,
+                     tricky TEXT DEFAULT ('a' || ')'),
+                     computed INTEGER DEFAULT (2 + 3),
+                     plain TEXT DEFAULT 'x',
+                     code TEXT UNIQUE
+                 );",
+            )
+            .unwrap();
+
+            apply(
+                &conn,
+                Op::DropColumn {
+                    table: "t".into(),
+                    column: "code".into(),
+                },
+            )
+            .expect("the rebuild must not be refused by its own DDL");
+
+            conn.execute("INSERT INTO t (id) VALUES (1)", []).unwrap();
+            let (tricky, computed, plain): (String, i64, String) = conn
+                .query_row(
+                    "SELECT tricky, computed, plain FROM t WHERE id = 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                tricky, "a)",
+                "the parenthesised expression default still evaluates"
+            );
+            assert_eq!(computed, 5, "an arithmetic default is a number, not text");
+            assert_eq!(plain, "x", "a literal default is unaffected");
+        }
+
+        /// #344: a rebuild leaves a typeless column typeless.
+        ///
+        /// `table_info` reports an empty declared type, and re-deriving the
+        /// column turned that into `BLOB` -- moving it into the class
+        /// `rowhash::is_blob_column` deliberately excludes, whose doc says
+        /// base64-decoding a genuine text value there would corrupt it.
+        ///
+        /// The declaration carries no type, so carrying it verbatim keeps the
+        /// column typeless without this path having to decide what an empty
+        /// type means.
+        #[test]
+        fn drop_column_rebuild_leaves_a_typeless_column_typeless() {
+            let conn = mem();
+            conn.execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, untyped, code TEXT UNIQUE);
+                 INSERT INTO t (id, untyped, code) VALUES (1, 'text', 'k1'), (2, 42, 'k2');",
+            )
+            .unwrap();
+
+            apply(
+                &conn,
+                Op::DropColumn {
+                    table: "t".into(),
+                    column: "code".into(),
+                },
+            )
+            .unwrap();
+
+            let declared: String = conn
+                .query_row(
+                    "SELECT type FROM pragma_table_info('t') WHERE name = 'untyped'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                declared, "",
+                "the column was declared with no type and a rebuild must not invent one"
+            );
+
+            // ...and it still stores each value as what it is, which is the
+            // behaviour the declared type was standing in for.
+            let kinds: Vec<String> = {
+                let mut stmt = conn
+                    .prepare("SELECT typeof(untyped) FROM t ORDER BY id")
+                    .unwrap();
+                stmt.query_map([], |r| r.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+            };
+            assert_eq!(
+                kinds,
+                vec!["text".to_string(), "integer".to_string()],
+                "a blank-affinity column stores each value as what it is"
+            );
+        }
+
+        /// A column-level constraint the module doc listed as unrecoverable
+        /// rides through on the verbatim declaration.
+        ///
+        /// Not a new capability so much as a consequence worth pinning: once a
+        /// column is carried as written, its `CHECK`, `COLLATE` and `UNIQUE`
+        /// come with it. The doc is corrected to match.
+        #[test]
+        fn drop_column_rebuild_carries_column_level_constraints() {
+            let conn = mem();
+            conn.execute_batch(
+                "CREATE TABLE t (
+                     id INTEGER PRIMARY KEY,
+                     amount INTEGER CHECK (amount > 0),
+                     tag TEXT COLLATE NOCASE,
+                     code TEXT UNIQUE
+                 );
+                 INSERT INTO t (id, amount, tag, code) VALUES (1, 5, 'Abc', 'k1');",
+            )
+            .unwrap();
+
+            apply(
+                &conn,
+                Op::DropColumn {
+                    table: "t".into(),
+                    column: "code".into(),
+                },
+            )
+            .unwrap();
+
+            assert!(
+                conn.execute("INSERT INTO t (id, amount) VALUES (2, -1)", [])
+                    .is_err(),
+                "the CHECK survived and still refuses"
+            );
+            let matched: i64 = conn
+                .query_row("SELECT count(*) FROM t WHERE tag = 'ABC'", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(matched, 1, "COLLATE NOCASE survived");
         }
 
         /// MATCH cannot be reconstructed, so it is warned about instead.
