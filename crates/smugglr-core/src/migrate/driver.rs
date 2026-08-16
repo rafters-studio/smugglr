@@ -115,10 +115,11 @@ pub struct ApplyOutcome {
     /// The version the driver assigned and elected.
     pub version: u64,
     /// The **manifest's** checksum, copied from `sealed.checksum`. This is not
-    /// re-read from the ledger row and is not always what the row holds: on a
-    /// reclaim the stored checksum is left at the previous manifest's value (see
-    /// [`apply_migration`]'s "Known gap"). Read the row via [`Ledger::entry`]
-    /// when you need the value the ledger actually recorded.
+    /// re-read from the ledger row. Since #328 the two agree on the reclaim path --
+    /// a reclaim now writes the reclaiming caller's checksum -- so this is the
+    /// value the ledger holds rather than merely the value that was applied.
+    /// Read the row via [`Ledger::entry`] if you need the recorded one as the
+    /// ledger's own answer rather than as this call's.
     pub checksum: String,
     /// The election result. Only [`Election::Won`] means this call applied ops.
     pub election: Election,
@@ -175,24 +176,28 @@ pub fn apply_migration_to_file(
 /// [`apply_ops`] exposes, firing before each op's own transaction so it snapshots
 /// committed, pre-mutation state.
 ///
-/// # Known gap: a reclaimed row keeps the previous manifest's checksum
+/// # A closed gap, and the one it left behind
 ///
-/// [`Ledger::try_elect`] writes `sealed.checksum` **only** on the fresh-`INSERT`
-/// path. Its two reclaim paths (`reclaim_pending` at `ledger.rs:426`,
-/// `reclaim_failed` at `ledger.rs:442`) take no checksum parameter and their
-/// `UPDATE`s never touch the `checksum` column. So the ordinary fix-and-retry
-/// loop -- apply, fail, edit the manifest, re-apply -- reclaims row `vN` and
-/// settles it `success` while the row still holds the **previous** manifest's
-/// checksum. [`Ledger::verify_chain`] cannot catch it, because the chain is
-/// recomputed from the *stored* checksum: the row is internally consistent and
-/// merely factually wrong, so the tamper-evidence certifies the divergence
-/// rather than flagging it.
+/// [`Ledger::try_elect`] used to write `sealed.checksum` **only** on the
+/// fresh-`INSERT` path, so the ordinary fix-and-retry loop -- apply, fail, edit
+/// the manifest, re-apply -- reclaimed row `vN` and settled it `success` while
+/// the row still held the *previous* manifest's checksum.
+/// [`Ledger::verify_chain`] could not catch it, because the chain is recomputed
+/// from the stored checksum: the row was internally consistent and merely
+/// factually wrong, so the tamper-evidence certified the divergence rather than
+/// flagging it. Closed by #328 -- both reclaim arms now write the reclaiming
+/// caller's checksum and recompute the row's chain-hash with it.
 ///
-/// This driver cannot close that from the outside -- a checksum-aware reclaim
-/// is the ledger's to own (#272) -- and papering over it here (re-`UPDATE`ing
-/// the checksum after winning) would rewrite a chain-hash input out of band and
-/// trip the very tamper check it is trying to keep honest. Recorded rather than
-/// worked around.
+/// What that traded into, recorded because it is the more interesting half:
+/// rewriting a row's chain-hash is safe only while a reclaimable row is the
+/// tail of the chain, and that is upheld by the `pending` fence on
+/// [`Ledger::mark_success`] and [`Ledger::mark_failed`] rather than being
+/// inherent. Without the fence a node stalled past its lease can settle a row
+/// another applier already finished, leaving a `failed` row behind a successor
+/// -- after which the next honest reclaim orphans that successor's `prev_hash`
+/// and `verify_chain` reports tampering permanently. The ledger's own docs
+/// carry the sequence.
+///
 pub fn apply_migration(
     conn: &Connection,
     sealed: &ChecksummedManifest,

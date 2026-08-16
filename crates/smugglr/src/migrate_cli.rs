@@ -102,9 +102,14 @@ struct ApplyOutput<'a> {
     version: u64,
     /// The **applied manifest's** content identity. This is the checksum of the
     /// file that was just applied, not a read-back of the ledger row's stored
-    /// value -- on a reclaimed row those diverge, because the ledger's reclaim
-    /// paths leave the stored checksum at the previous manifest's value (see
-    /// `driver::apply_migration`'s "Known gap", owned by #272).
+    /// value.
+    ///
+    /// Those used to diverge on a reclaimed row, because the ledger's reclaim
+    /// paths left the stored checksum at the previous manifest's value. #328
+    /// closed that: a reclaim now writes the reclaiming caller's checksum, so
+    /// the two agree. This field is still not a read-back, and the distinction
+    /// is kept rather than dropped -- it says what this run applied, which is
+    /// what a caller reading its own command's output is asking.
     checksum: &'a str,
     /// `won` (this run applied), `already_applied`, or `held_by_other`.
     election: &'static str,
