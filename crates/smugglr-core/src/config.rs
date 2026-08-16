@@ -446,8 +446,14 @@ fn default_exclude_tables() -> Vec<String> {
         "sqlite_sequence".to_string(),
         "_cf_KV".to_string(),
         "__drizzle_migrations".to_string(),
-        // migrate's own ledger (`migrate::ledger::LEDGER_TABLE`) -- control-plane
-        // apply-state, invisible to `validate` and app introspection/reset.
+        // migrate's own ledger -- control-plane apply-state, invisible to
+        // `validate` and app introspection/reset.
+        //
+        // A literal because `migrate::ledger` is native-gated and this module is
+        // not. Pinned to `LEDGER_TABLE` by
+        // `tests::the_excluded_ledger_name_is_the_ledger_name`, so a rename
+        // that misses this line is a red build rather than a ledger that shows
+        // up as user schema (#370).
         "_smugglr_migrations".to_string(),
     ]
 }
@@ -987,6 +993,34 @@ fn detect_local_db() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `default_exclude_tables` names the ledger by literal, and this is what
+    /// keeps that literal honest (#370).
+    ///
+    /// The duplication is deliberate rather than sloppy: `config` is not
+    /// native-gated and `migrate::ledger` is, so referencing the constant here
+    /// would drag the gate into this module or fail to compile without the
+    /// feature. That is a real constraint.
+    ///
+    /// What was NOT acceptable is the two strings being linked by a comment
+    /// alone. Renaming the ledger and missing this line would leave
+    /// `default_exclude_tables` no longer excluding the ledger, and the symptom
+    /// -- the ledger appearing as user schema in drift detection and in
+    /// forger's inventory comparison -- reads as a data problem rather than as
+    /// a stale constant.
+    ///
+    /// So the assertion lives on the side of the gate that can see both.
+    #[cfg(feature = "native")]
+    #[test]
+    fn the_excluded_ledger_name_is_the_ledger_name() {
+        assert!(
+            default_exclude_tables().contains(&crate::migrate::ledger::LEDGER_TABLE.to_string()),
+            "default_exclude_tables must exclude the ledger by its real name; it lists {:?} and \
+             the ledger is {:?}",
+            default_exclude_tables(),
+            crate::migrate::ledger::LEDGER_TABLE
+        );
+    }
 
     fn test_config_d1() -> Config {
         Config {
