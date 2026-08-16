@@ -31,10 +31,22 @@ use super::{count, one_column, text, TraitCase};
 /// Every case seeds through this column so a probe can say which row it means
 /// without depending on a rowid.
 const KEY: &str = "id";
-/// A plain column that carries no trait at all. It is here so that every case
-/// leaves at least one ordinary value on the far side of a transformation --
-/// FR-FORGER-004's surviving-column rule -- and so a rebuild that drops a
-/// column has something to drop that is not the construct under test.
+/// A plain column that carries no trait at all, so that every case leaves at
+/// least one ordinary value on the far side of a transformation --
+/// FR-FORGER-004's surviving-column rule.
+///
+/// IT IS NOT A TRIPWIRE, and this comment used to imply it was by saying a
+/// rebuild that drops a column "has something to drop that is not the construct
+/// under test". A rebuild of `cascade_child` without this column produces zero
+/// divergences and every trait Held: the oracle compares construct behaviour
+/// and table inventory, never column inventory, and this column is WRITTEN on
+/// every case table but READ BACK on only two -- `replace_absorbs`, where
+/// `probe_column_on_conflict` selects it to see which row survived, and
+/// `descending_key`, where `probe_descending_primary_key` uses it as the
+/// predicate for the row it inserted without a key.
+///
+/// Ordinary-column survival is on the boundary as [`Subject::ColumnSurvival`],
+/// which is where a reader goes to find out what a green run does not cover.
 const LABEL: &str = "label";
 
 // ---------------------------------------------------------------------------

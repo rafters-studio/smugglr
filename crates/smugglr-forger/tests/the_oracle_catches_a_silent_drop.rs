@@ -1,7 +1,10 @@
 //! Drop one construct on purpose, and watch the oracle say which one.
 //!
 //! This is the harness proving itself, and it is the same discipline the probe
-//! suite applies with its seventeen breaks. A differential oracle that reports
+//! suite applies with its break table. The count that used to stand here went
+//! stale by seventeen against twenty-three, which is the drift this crate
+//! polices, and no number belongs in prose that cannot read `breaks()` -- it
+//! lives in another test binary. A differential oracle that reports
 //! nothing is indistinguishable from one that cannot see, so each of the four
 //! constructs the requirement names is deliberately lost by a transformation
 //! here and the oracle is required to notice -- and to notice *that one*.
@@ -28,6 +31,7 @@
 
 use rusqlite::Connection;
 
+use smugglr_forger::boundary::{Boundary, Subject};
 use smugglr_forger::census;
 use smugglr_forger::error::BoxError;
 use smugglr_forger::fixture::{Backing, Fixture, Route};
@@ -214,6 +218,60 @@ fn a_faithful_rebuild_is_silent_even_though_its_stored_ddl_text_differs() {
     let report = run(FAITHFUL, &[LEDGER]);
     assert_baseline_is_sound(&report);
     assert_eq!(report.divergences(), Vec::new());
+}
+
+/// The boundary's `column survival` line, demonstrated rather than asserted.
+///
+/// A rebuild that carries every construct through and quietly leaves an
+/// ordinary column behind is silent. The differential compares construct
+/// behaviour and table inventory, never column inventory, and `label` carries
+/// no construct -- so no probe reads it on this table and nothing notices it is
+/// gone.
+///
+/// This is a hand-written boundary line, and the module's own rule is that such
+/// a line is pinned to something that demonstrates it. It exists because a Fable
+/// audit ran exactly this transformation and got zero divergences while
+/// `registry::cases`'s own comment implied the opposite -- that an ordinary
+/// column was there so a rebuild dropping one would be caught.
+///
+/// The assertion is deliberately two-sided. Silence alone would also be what a
+/// transformation that never ran produces, so the column is first shown to be
+/// really gone.
+#[test]
+fn a_rebuild_that_drops_an_ordinary_column_is_silent_and_the_boundary_says_so() {
+    const DROPS_LABEL: &str = r#"
+        CREATE TABLE "cascade_child_new" (
+            "id" INTEGER PRIMARY KEY,
+            "keeper_id" INTEGER REFERENCES "keeper"("id") ON DELETE CASCADE
+        );
+        INSERT INTO "cascade_child_new" ("id", "keeper_id")
+            SELECT "id", "keeper_id" FROM "cascade_child";
+        DROP TABLE "cascade_child";
+        ALTER TABLE "cascade_child_new" RENAME TO "cascade_child";
+    "#;
+
+    assert!(
+        !stored_ddl_after(Some(DROPS_LABEL), "cascade_child").contains("label"),
+        "this test's premise is that the column is really gone; if the transformation stopped \
+         dropping it, the silence below would prove nothing"
+    );
+
+    let report = run(DROPS_LABEL, &[LEDGER]);
+    assert_baseline_is_sound(&report);
+    assert_eq!(
+        report.divergences(),
+        Vec::new(),
+        "the oracle reported a dropped ordinary column, which would mean the boundary's column \
+         survival line has become a false claim and should be retracted"
+    );
+
+    assert!(
+        Boundary::of_this_build()
+            .statement(Subject::ColumnSurvival)
+            .is_some(),
+        "the boundary has to be making this claim while the blind spot is open; a build that \
+         closed it retracts the line, and this test then fails and asks to be deleted"
+    );
 }
 
 // ---------------------------------------------------------------------------

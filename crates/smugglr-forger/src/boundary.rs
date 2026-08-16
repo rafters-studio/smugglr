@@ -241,10 +241,12 @@ pub enum Subject {
     /// `smugglr_341_an_on_update_action_is_rediscovered` is the flipped form of
     /// the test that used to pin this as a blind spot.
     ///
-    /// The rest of the family stays here, and the distinction is the point: one
-    /// action having a probe is not the same as the clause having one. A rebuild
-    /// that drops `ON UPDATE SET NULL` is still silent, because no case declares
-    /// it and no probe reads it.
+    /// The distinction that keeps this line honest: one action having a probe is
+    /// not the same as the clause having one. `SET NULL` and `SET DEFAULT` were
+    /// the example of that, and they stopped being it -- smugglr#384 declared
+    /// and probed both, so they left this line the way `CASCADE` did. `RESTRICT`
+    /// is what remains, and for a different reason than any of them: see
+    /// [`Restrict`](Self::Restrict).
     OnUpdate,
     /// `ON DELETE RESTRICT`, which is declared and cannot be told apart from the
     /// default it differs from.
@@ -282,6 +284,21 @@ pub enum Subject {
     /// database and never a log, so it sees the loss and can never see whether
     /// anyone was told about it.
     Unobservable,
+    /// Ordinary columns, which the oracle never compares.
+    ///
+    /// The differential compares construct behaviour and table inventory. It
+    /// does not compare COLUMN inventory, so a rebuild that carries every
+    /// construct through and quietly leaves an ordinary column behind is
+    /// invisible: every probe reads the construct it is about, and no probe
+    /// reads a column that carries nothing.
+    ///
+    /// Named here because it was previously acknowledged only in
+    /// `smugglr-core`'s `migrate_stress.rs` -- a CONSUMER -- while forger's own
+    /// `LABEL` comment implied the opposite, that an ordinary column existed so
+    /// a rebuild dropping one would be caught. Demonstrated rather than
+    /// reasoned: a rebuild of `cascade_child` without its `label` column
+    /// produces zero divergences and every trait Held.
+    ColumnSurvival,
     /// Defects of a code path that never reaches a reconstruction.
     ///
     /// smugglr#347 is a defect of the direct `ALTER TABLE ... DROP COLUMN` path,
@@ -302,6 +319,7 @@ impl Subject {
             Subject::Unrenderable => "unrenderable",
             Subject::Unobservable => "unobservable",
             Subject::Unreachable => "unreachable",
+            Subject::ColumnSurvival => "column survival",
             Subject::Combinations => "combinations",
         }
     }
@@ -470,6 +488,15 @@ impl Boundary {
             subject: Subject::Unobservable,
             statement: "anything a log would have said -- forger reads a database, never a log. \
                         smugglr#342, smugglr#336."
+                .to_string(),
+        });
+
+        lines.push(Unexercised {
+            subject: Subject::ColumnSurvival,
+            statement: "an ordinary column that a rebuild leaves behind -- the differential \
+                        compares construct behaviour and table inventory, never column \
+                        inventory, so a rebuild that carries every construct through and drops a \
+                        column that carries none is silent."
                 .to_string(),
         });
 
