@@ -22,15 +22,15 @@ End-to-end examples covering the main ways people reach for smugglr. Each exampl
 
 | Example | What it shows |
 | ------- | ------------- |
-| [node-server-to-d1](./node-server-to-d1) | Node script reads a local SQLite file and `.push()`es it to D1. |
-| [node-auto-sync](./node-auto-sync) | `setInterval` wrapping `.sync()` with backoff on failure. |
+| [node-server-to-d1](./node-server-to-d1) | Node script reads a local SQLite file and `.push()`es it to an HTTP-SQL endpoint. Captured against the local endpoint that ships with it; D1 is the production variant. |
+| [node-auto-sync](./node-auto-sync) | A self-scheduling `.sync()` loop with backoff on a retryable failure and a clean `SIGTERM`. Captured with an injected 503. |
 
 ## Rust (`smugglr-core` library)
 
 | Example | What it shows |
 | ------- | ------------- |
-| [rust-tokio-service](./rust-tokio-service) | Embedded sync inside a long-running tokio service. Bypasses the CLI. |
-| [rust-custom-datasource](./rust-custom-datasource) | Implementing `DataSource` against a non-standard store. Explains content-hashed delta vs CDC. |
+| [rust-tokio-service](./rust-tokio-service) | `sync_all` inside a tokio service, `LocalDb` plus the `smugglr-http-sql` plugin against a local endpoint, with a shutdown that finishes the sync in flight. |
+| [rust-custom-datasource](./rust-custom-datasource) | Implementing `DataSource` against an in-memory store, with a visible conflict resolved by `newer_wins`. |
 
 ## Browser (`smugglr` npm + wa-sqlite)
 

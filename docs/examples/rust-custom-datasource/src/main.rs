@@ -4,7 +4,7 @@
 //! object-store JSON blob, a custom HTTP API). The trait surface is the same.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use anyhow::Result;
 use serde_json::Value as JsonValue;
@@ -36,37 +36,72 @@ impl Row {
     }
 }
 
+type Tables = HashMap<String, HashMap<String, Row>>;
+
 struct InMemoryStore {
-    tables: Mutex<HashMap<String, HashMap<String, Row>>>,
+    name: &'static str,
+    tables: Mutex<Tables>,
 }
 
 impl InMemoryStore {
-    fn new() -> Self {
+    fn new(name: &'static str) -> Self {
         Self {
+            name,
             tables: Mutex::new(HashMap::new()),
         }
     }
 
+    fn tables(&self) -> MutexGuard<'_, Tables> {
+        self.tables.lock().expect("store mutex poisoned")
+    }
+
     fn upsert(&self, table: &str, pk: &str, row: HashMap<String, JsonValue>) {
-        let mut tables = self.tables.lock().unwrap();
+        let mut tables = self.tables();
         let t = tables.entry(table.to_string()).or_default();
         t.insert(pk.to_string(), Row { data: row });
+    }
+
+    /// Render one table as `pk value @ updated_at` lines, sorted by primary key.
+    fn dump(&self, table: &str) {
+        let tables = self.tables();
+        let mut pks: Vec<&String> = tables
+            .get(table)
+            .map(|t| t.keys().collect())
+            .unwrap_or_default();
+        pks.sort();
+        for pk in pks {
+            let row = &tables[table][pk];
+            let field = |k: &str| row.data.get(k).and_then(|v| v.as_str()).unwrap_or("NULL");
+            println!(
+                "  {}: {} {} @ {}",
+                self.name,
+                pk,
+                field("value"),
+                field("updated_at")
+            );
+        }
     }
 }
 
 impl DataSource for InMemoryStore {
     async fn list_tables(&self) -> SmugglrResult<Vec<String>> {
-        Ok(self.tables.lock().unwrap().keys().cloned().collect())
+        Ok(self.tables().keys().cloned().collect())
     }
 
     async fn table_info(&self, table: &str) -> SmugglrResult<TableInfo> {
         // Schema is implicit in our store; we just declare {id, value, updated_at}.
+        let column = |name: &str, pk: bool| ColumnInfo {
+            name: name.into(),
+            col_type: "TEXT".into(),
+            notnull: pk,
+            pk,
+        };
         Ok(TableInfo {
             name: table.to_string(),
             columns: vec![
-                ColumnInfo { name: "id".into(), col_type: "TEXT".into(), notnull: true, pk: true },
-                ColumnInfo { name: "value".into(), col_type: "TEXT".into(), notnull: false, pk: false },
-                ColumnInfo { name: "updated_at".into(), col_type: "TEXT".into(), notnull: false, pk: false },
+                column("id", true),
+                column("value", false),
+                column("updated_at", false),
             ],
             primary_key: vec!["id".into()],
         })
@@ -78,7 +113,7 @@ impl DataSource for InMemoryStore {
         timestamp_column: &str,
         _exclude_columns: &[String],
     ) -> SmugglrResult<HashMap<String, RowMeta>> {
-        let tables = self.tables.lock().unwrap();
+        let tables = self.tables();
         let Some(t) = tables.get(table) else {
             return Ok(HashMap::new());
         };
@@ -106,7 +141,7 @@ impl DataSource for InMemoryStore {
         table: &str,
         pk_values: &[String],
     ) -> SmugglrResult<Vec<HashMap<String, JsonValue>>> {
-        let tables = self.tables.lock().unwrap();
+        let tables = self.tables();
         let Some(t) = tables.get(table) else {
             return Ok(Vec::new());
         };
@@ -121,48 +156,99 @@ impl DataSource for InMemoryStore {
         table: &str,
         rows: &[HashMap<String, JsonValue>],
     ) -> SmugglrResult<usize> {
-        let mut tables = self.tables.lock().unwrap();
+        // An incoming row may omit columns (see the trait doc on `upsert_rows`):
+        // a column the row does not mention keeps whatever the store already
+        // holds for it. Merging into the existing row honors that.
+        let mut tables = self.tables();
         let t = tables.entry(table.to_string()).or_default();
+        let mut written = 0;
         for row in rows {
-            let Some(pk) = row.get("id").and_then(|v| v.as_str()) else { continue };
-            t.insert(pk.to_string(), Row { data: row.clone() });
+            let Some(pk) = row.get("id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let existing = t.entry(pk.to_string()).or_insert_with(|| Row {
+                data: HashMap::new(),
+            });
+            existing.data.extend(row.clone());
+            written += 1;
         }
-        Ok(rows.len())
+        Ok(written)
     }
 
     async fn row_count(&self, table: &str) -> SmugglrResult<usize> {
-        Ok(self
-            .tables
-            .lock()
-            .unwrap()
-            .get(table)
-            .map(|t| t.len())
-            .unwrap_or(0))
+        Ok(self.tables().get(table).map_or(0, |t| t.len()))
     }
+}
+
+fn widget(id: &str, value: &str, updated_at: &str) -> HashMap<String, JsonValue> {
+    HashMap::from([
+        ("id".into(), JsonValue::String(id.into())),
+        ("value".into(), JsonValue::String(value.into())),
+        ("updated_at".into(), JsonValue::String(updated_at.into())),
+    ])
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let a = InMemoryStore::new();
-    let b = InMemoryStore::new();
+    let a = InMemoryStore::new("a");
+    let b = InMemoryStore::new("b");
 
-    // Seed both sides with overlapping but divergent data.
-    a.upsert("widgets", "w1", HashMap::from([
-        ("id".into(), JsonValue::String("w1".into())),
-        ("value".into(), JsonValue::String("alpha".into())),
-        ("updated_at".into(), JsonValue::String("2026-04-25T00:00:00Z".into())),
-    ]));
-    b.upsert("widgets", "w2", HashMap::from([
-        ("id".into(), JsonValue::String("w2".into())),
-        ("value".into(), JsonValue::String("beta".into())),
-        ("updated_at".into(), JsonValue::String("2026-04-25T00:00:01Z".into())),
-    ]));
+    // Seed both sides with overlapping but divergent data: w1 only on a, w2
+    // only on b, and w3 on both with b holding the newer edit.
+    a.upsert(
+        "widgets",
+        "w1",
+        widget("w1", "alpha", "2026-04-25T00:00:00Z"),
+    );
+    a.upsert(
+        "widgets",
+        "w3",
+        widget("w3", "gamma", "2026-04-25T00:00:00Z"),
+    );
+    b.upsert(
+        "widgets",
+        "w2",
+        widget("w2", "beta", "2026-04-25T00:00:01Z"),
+    );
+    b.upsert(
+        "widgets",
+        "w3",
+        widget("w3", "gamma-edited", "2026-04-25T00:00:05Z"),
+    );
 
-    println!("before: a={}, b={}", a.row_count("widgets").await?, b.row_count("widgets").await?);
+    println!(
+        "before: a={}, b={}",
+        a.row_count("widgets").await?,
+        b.row_count("widgets").await?
+    );
+    a.dump("widgets");
+    b.dump("widgets");
 
-    let config = Config::from_toml_str("")?;
-    sync_all(&a, &b, &config, Some(vec!["widgets".into()]), false, &NoProgress).await?;
+    // `newer_wins` compares `updated_at` when the content hashes differ. The
+    // default, `local_wins`, would keep a's copy of w3.
+    let config = Config::from_toml_str("[sync]\nconflict_resolution = \"newer_wins\"\n")?;
+    let results = sync_all(
+        &a,
+        &b,
+        &config,
+        Some(vec!["widgets".into()]),
+        false,
+        &NoProgress,
+    )
+    .await?;
+    for r in &results {
+        println!(
+            "sync:   {} pushed a->b={}, pulled b->a={}",
+            r.table, r.rows_pushed, r.rows_pulled
+        );
+    }
 
-    println!("after:  a={}, b={}", a.row_count("widgets").await?, b.row_count("widgets").await?);
+    println!(
+        "after:  a={}, b={}",
+        a.row_count("widgets").await?,
+        b.row_count("widgets").await?
+    );
+    a.dump("widgets");
+    b.dump("widgets");
     Ok(())
 }
