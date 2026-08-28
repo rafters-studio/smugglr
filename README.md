@@ -8,7 +8,7 @@
 
 Smuggle data between SQLite databases, Cloudflare D1, and S3-compatible stores. Fast. Stateless. Encrypted. Questionable life choices.
 
-> **Requirement — globally-unique primary keys.** smugglr's identity *is* the primary key. If your tables use `AUTOINCREMENT` or a bare `INTEGER PRIMARY KEY` rowid, two machines will both mint `id = 5` for different rows and last-received-wins silently eats one of them — guaranteed data loss, not an edge case. Use **UUIDv7**, or any globally-unique, k-sortable key. No GUID-ish keys, no smugglr: get into the 2020s or use a different tool. smugglr sanity-checks your schema on first run and refuses an incompatible one; `smugglr migrate` won't create old-style keys or let you keep them, and ships an `int → UUIDv7` conversion for existing databases.
+> **Requirement — globally-unique primary keys.** smugglr's identity *is* the primary key. If your tables use `AUTOINCREMENT` or a bare `INTEGER PRIMARY KEY` rowid, two machines will both mint `id = 5` for different rows and last-received-wins silently eats one of them — guaranteed data loss, not an edge case. Use **UUIDv7**, or any globally-unique, k-sortable key. No GUID-ish keys, no smugglr: get into the 2020s or use a different tool. smugglr checks your schema's key shapes on first run and, in 0.5.0, **warns** on an incompatible one with a manual `int -> UUIDv7` recipe; the hard refusal and the in-tool conversion for existing databases are planned ([#280](https://github.com/rafters-studio/smugglr/issues/280)) and are not in this release. `smugglr migrate new` defaults every key to `TEXT`; it does not yet refuse an explicit `int:pk`.
 
 ## Status: Beta (Kessel Run Certified)
 
@@ -118,6 +118,8 @@ smugglr broadcast           # LAN sync (peer discovery + encrypted deltas)
 smugglr snapshot            # Point-in-time full backup to stash storage
 smugglr snapshots           # List available snapshots
 smugglr restore <timestamp> # Disaster recovery from a snapshot
+smugglr migrate new         # Scaffold a schema migration manifest
+smugglr migrate apply       # Apply a manifest to a local SQLite database
 ```
 
 ### Options
@@ -300,7 +302,9 @@ conflict_resolution = "newer_wins"
 ordering_columns = ["created_at", "updated_at", "deleted_at"]
 
 [sync]
-# Skip large columns (embeddings, vectors) from broadcast
+# Keep large columns (embeddings, vectors) out of the content hash, so a change
+# confined to them does not churn the mesh. Out of the hash is not off the wire:
+# a row a peer requests still carries these columns until #322 lands.
 exclude_columns = ["*_embedding", "vector"]
 
 # UUIDv7 required for master-master sync
@@ -314,6 +318,36 @@ permissive node.
 ### Security model
 
 Designed for **known/trusted networks** (home LAN, office LAN). The pre-shared key prevents eavesdropping and tampering on the local subnet. This is not designed for hostile networks or the open internet. If you need that, run smugglr inside a WireGuard tunnel.
+
+## Schema Migrations
+
+`smugglr migrate` moves schema the way the rest of the tool moves rows: an inspectable manifest rather than a raw SQL string, a checksum, and a ledger that refuses to apply the same thing twice. New in 0.5.0.
+
+`migrate new` scaffolds a manifest from a Rails-style column spec and prints it to stdout. Keys default to `TEXT`, the shape the primary-key requirement above wants:
+
+```bash
+smugglr migrate new create_contacts id:pk email:text:pii hours:int > migrations/create_contacts.json
+```
+
+`migrate apply` takes the manifest and an explicit `--db`. It runs before any config is loaded, so a migration lands where you point it, never where a stale `config.toml` points. The ledger assigns the version and remembers the checksum:
+
+```
+$ smugglr migrate apply migrations/create_contacts.json --db ./app.db
+Applied migration v1 (1 op) -- checksum a9aa92922aff1717c1cf1853246d1fae66f36dd556f580fb75298759bd2d5e10
+
+$ smugglr migrate apply migrations/create_contacts.json --db ./app.db
+Migration v1 is already applied -- nothing to do
+```
+
+The ledger lives in `_smugglr_migrations` inside the target database: version, checksum, status, a lease for crash recovery, and a hash chain over prior rows (written on every apply; nothing verifies it on a production path yet, [#327](https://github.com/rafters-studio/smugglr/issues/327)). Each op is idempotent, so an apply interrupted mid-way converges on re-run instead of double-applying. Every op carries an `op_class`, additive or destructive, that the destructive-op lint checks, and a `drop_column` on SQLite goes through a guarded table rebuild that carries the surviving columns' definitions, indexes, and triggers across, with the known gaps tracked as [#401](https://github.com/rafters-studio/smugglr/issues/401), [#413](https://github.com/rafters-studio/smugglr/issues/413), and [#337](https://github.com/rafters-studio/smugglr/issues/337).
+
+What 0.5.0 does **not** do, stated so you do not go looking:
+
+- **No reverse from the CLI.** Rollback exists in the library (`smugglr-core::migrate::reverse`) and is not yet wired to a `migrate` subcommand.
+- **No recovery snapshot.** `--paranoid` warns instead of snapshotting until [#289](https://github.com/rafters-studio/smugglr/issues/289) lands.
+- **Local SQLite only.** The D1, Turso, and rqlite dialects generate statements but refuse to execute them ([#291](https://github.com/rafters-studio/smugglr/issues/291)).
+- **No `int -> UUIDv7` conversion** for existing tables ([#280](https://github.com/rafters-studio/smugglr/issues/280)), and `migrate new` does not refuse an explicit `int:pk`.
+- **No drift detection** against the ledger's recorded schema ([#290](https://github.com/rafters-studio/smugglr/issues/290)).
 
 ## Configuration
 
@@ -377,7 +411,7 @@ Pro tip: Create one token with both permissions. Fewer tokens to lose.
 
 Things we don't do (yet):
 
-- **Schema sync** - Run your migrations separately, we're data movers not DDL runners
+- **Schema sync across the wire** - `smugglr migrate` applies to a local SQLite file; it does not push schema to a remote, and sync itself never runs DDL. Run the same migration on both sides.
 - **Full-sync transactions** - Each batch is atomic, but the whole sync isn't. Re-run if interrupted.
 - **BLOB wizardry** - Binary data compared as hex strings. It works but it's not pretty.
 - **Tables without primary keys** - We need something to compare. Add a PK.
@@ -400,7 +434,7 @@ Check that column order and types match. NULL vs empty string will cause hash mi
 ## Development
 
 ```bash
-cargo test                       # Run the tests (224 and counting)
+cargo test                       # Run the tests
 cargo fmt                        # Format code
 cargo clippy --all-targets       # Lint (including tests)
 RUST_LOG=debug cargo run -- diff # Debug output
