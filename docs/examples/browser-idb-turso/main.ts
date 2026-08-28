@@ -1,6 +1,6 @@
 // Page UI: proxies button clicks into the worker via postMessage. The worker
-// owns wa-sqlite + smugglr because OPFS sync access handles are worker-only
-// in WebKit and Firefox.
+// owns wa-sqlite + smugglr. IndexedDB needs no worker; this example keeps
+// the same layout as the OPFS twin so the two differ only in the VFS.
 
 const tursoUrl = import.meta.env.VITE_TURSO_URL;
 const tursoToken = import.meta.env.VITE_TURSO_TOKEN;
