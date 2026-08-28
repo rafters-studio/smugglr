@@ -11,7 +11,8 @@
 import { createServer } from "node:http";
 import { DatabaseSync } from "node:sqlite";
 
-const db = new DatabaseSync(process.argv[2] ?? "./remote.sqlite");
+const dbPath = process.argv[2] ?? "./remote.sqlite";
+const db = new DatabaseSync(dbPath);
 const port = Number(process.argv[3] ?? 8765);
 let failNext = 0;
 
@@ -47,5 +48,5 @@ const server = createServer(async (req, res) => {
 });
 
 server.listen(port, "127.0.0.1", () => {
-  console.log(`http-sql endpoint on http://127.0.0.1:${port} (db: ${process.argv[2] ?? "./remote.sqlite"})`);
+  console.log(`http-sql endpoint on http://127.0.0.1:${port} (db: ${dbPath})`);
 });
