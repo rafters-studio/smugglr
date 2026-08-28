@@ -1,4 +1,4 @@
-// Tenant fence in front of D1.
+// Tenant guard in front of D1.
 //
 // Speaks D1's REST shape so a smugglr client using `profile: "d1"` can point
 // straight at this Worker's URL. The Worker authenticates the Bearer token,
@@ -77,8 +77,15 @@ function json(body: unknown, status = 200): Response {
 }
 
 // Rewrite the incoming SQL so the authenticated tenant cannot see or write
-// another tenant's rows. Three cases cover everything smugglr's d1 adapter emits.
-function enforce(
+// another tenant's rows. Three cases cover everything smugglr's d1 adapter
+// (crates/smugglr-wasm/src/fetch_adapter.rs) emits against the dest:
+//
+//   SELECT name FROM sqlite_master WHERE type='table' ...     table discovery
+//   PRAGMA table_info('notes')                                column + pk discovery
+//   SELECT *, CAST("id" AS TEXT) AS __pk FROM "notes" ...     row metadata
+//   SELECT * FROM "notes" WHERE CAST("id" AS TEXT) IN (?, ...) row fetch
+//   INSERT OR REPLACE INTO "notes" ("id", ...) VALUES (...)   push
+export function enforce(
   rawSql: string,
   params: unknown[],
   tenant: string,
@@ -86,14 +93,14 @@ function enforce(
   const sql = rawSql.trim().replace(/;\s*$/, "");
   const head = sql.slice(0, 32).toUpperCase();
 
-  // Passthrough: smugglr's connection ping and table discovery.
-  if (sql.toUpperCase() === "SELECT 1") return { sql, params };
+  // Passthrough: schema discovery reads no tenant rows.
   if (/FROM\s+SQLITE_MASTER/i.test(sql)) return { sql, params };
+  if (/^PRAGMA\s+TABLE_INFO\s*\(/i.test(sql)) return { sql, params };
 
   if (head.startsWith("SELECT")) {
-    // Wrap the query so we can filter without parsing it. Smugglr's d1 adapter
-    // emits queries like SELECT * FROM "notes" or SELECT *, pk_expr AS __pk
-    // FROM "notes"; the subquery preserves their projection.
+    // Wrap the query so we can filter without parsing it. Every row-reading
+    // SELECT the adapter emits projects the table's columns, so the subquery
+    // keeps tenant_id available to the outer WHERE.
     return {
       sql: `SELECT * FROM (${sql}) WHERE tenant_id = ?`,
       params: [...params, tenant],
@@ -107,7 +114,7 @@ function enforce(
     const cols = m[2].split(",").map((c) => c.trim().replace(/^"|"$/g, ""));
     const tenantIdx = cols.indexOf("tenant_id");
     if (tenantIdx < 0) {
-      throw new Error("INSERT must include tenant_id column for this fence");
+      throw new Error("INSERT must include tenant_id column for this guard");
     }
     if (params.length % cols.length !== 0) {
       throw new Error("param count not a multiple of column count");

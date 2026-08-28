@@ -1,9 +1,9 @@
-name = "smugglr-tenant-fence"
+name = "smugglr-tenant-guard"
 main = "src/index.ts"
 compatibility_date = "2025-01-01"
 
 # Bind the shared D1 database. Create it first with:
-#   npx wrangler d1 create smugglr_demo
+#   pnpm dlx wrangler d1 create smugglr_demo
 # then paste the returned database_id below.
 [[d1_databases]]
 binding = "DB"
