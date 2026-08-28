@@ -109,7 +109,7 @@ Tenant partitioning at the table level. Every row carries `tenant_id`; there is 
 
 The guard does what the client cannot. The browser is trusted enough to tag its own rows; the Worker is what stops a bad client from inserting rows tagged with someone else's id.
 
-The D1 profile is a contract. The Worker mimics D1's HTTP shape so the browser code is identical to a direct-to-D1 setup. Swap `VITE_GUARD_URL` for a real D1 endpoint and the client does not notice.
+The D1 profile is a contract. The Worker mimics D1's HTTP shape so the browser code is identical to a direct-to-D1 setup, which in 0.5.0 means it inherits D1's open defect as well; see Limits.
 
 Per-tenant OPFS isolation. Two tabs on the same origin do not collide because the OPFS filename embeds the tenant id.
 
@@ -140,5 +140,7 @@ Deletes do not replicate. Per #311, deletion propagates by no path in 0.5.0: a r
 The token map lives in plaintext `wrangler.toml [vars]`, and the tokens are compiled into the browser bundle. Use Workers secrets and a real auth flow in production.
 
 The Worker has no rate limiting, audit log, or per-tenant quota. Add them at the Worker layer if you need them.
+
+The `d1` profile in 0.5.0 reads its rows as its column list (#436): D1 returns rows as objects, the profile's `columns_path` is the same path as its `rows_path`, and a `SELECT name FROM sqlite_master` answer is taken as a list of column descriptors, so table discovery collapses. The guard returns the same shape, so until #436 lands this example is expected to stop at the first `list_tables`, against the guard or against D1 directly.
 
 This example was built but not run against a live Worker and D1; nobody maintaining it holds Cloudflare credentials. The build and the `enforce()` rewrites are verified, the round trip is not.
