@@ -1,0 +1,66 @@
+{
+  "manifest": {
+    "version": 1,
+    "target_schema": "",
+    "up": [
+      {
+        "op": {
+          "op": "create_table",
+          "table": "shippers",
+          "columns": [
+            {
+              "name": "id",
+              "kind": "text",
+              "constraints": [
+                {
+                  "constraint": "pk"
+                },
+                {
+                  "constraint": "not_null"
+                }
+              ]
+            },
+            {
+              "name": "company",
+              "kind": "text",
+              "constraints": [
+                {
+                  "constraint": "not_null"
+                }
+              ]
+            },
+            {
+              "name": "phone",
+              "kind": "text"
+            },
+            {
+              "name": "updated_at",
+              "kind": "int",
+              "constraints": [
+                {
+                  "constraint": "not_null"
+                }
+              ]
+            }
+          ],
+          "without_rowid": false
+        },
+        "op_class": "additive"
+      }
+    ],
+    "down": [
+      {
+        "op": {
+          "op": "drop_table",
+          "table": "shippers"
+        },
+        "op_class": "destructive"
+      }
+    ],
+    "flags": {
+      "destructive": false,
+      "hash_rewriting": false
+    }
+  },
+  "checksum": "78ef6eae8eac922753460c0261d06006446d1b951298b0c11b1b6d2171e2828e"
+}

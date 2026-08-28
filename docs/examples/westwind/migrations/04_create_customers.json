@@ -1,0 +1,90 @@
+{
+  "manifest": {
+    "version": 1,
+    "target_schema": "",
+    "up": [
+      {
+        "op": {
+          "op": "create_table",
+          "table": "customers",
+          "columns": [
+            {
+              "name": "id",
+              "kind": "text",
+              "constraints": [
+                {
+                  "constraint": "pk"
+                },
+                {
+                  "constraint": "not_null"
+                }
+              ]
+            },
+            {
+              "name": "code",
+              "kind": "text",
+              "constraints": [
+                {
+                  "constraint": "not_null"
+                },
+                {
+                  "constraint": "unique"
+                }
+              ]
+            },
+            {
+              "name": "company",
+              "kind": "text",
+              "constraints": [
+                {
+                  "constraint": "not_null"
+                }
+              ]
+            },
+            {
+              "name": "contact",
+              "kind": "text"
+            },
+            {
+              "name": "title",
+              "kind": "text"
+            },
+            {
+              "name": "city",
+              "kind": "text"
+            },
+            {
+              "name": "region",
+              "kind": "text"
+            },
+            {
+              "name": "updated_at",
+              "kind": "int",
+              "constraints": [
+                {
+                  "constraint": "not_null"
+                }
+              ]
+            }
+          ],
+          "without_rowid": false
+        },
+        "op_class": "additive"
+      }
+    ],
+    "down": [
+      {
+        "op": {
+          "op": "drop_table",
+          "table": "customers"
+        },
+        "op_class": "destructive"
+      }
+    ],
+    "flags": {
+      "destructive": false,
+      "hash_rewriting": false
+    }
+  },
+  "checksum": "c6447ae278a2e42d6b1cbf73e7e262ceac42b352b9ab77e483597f229b3f5942"
+}

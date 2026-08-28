@@ -1,0 +1,74 @@
+{
+  "manifest": {
+    "version": 1,
+    "target_schema": "",
+    "up": [
+      {
+        "op": {
+          "op": "create_table",
+          "table": "suppliers",
+          "columns": [
+            {
+              "name": "id",
+              "kind": "text",
+              "constraints": [
+                {
+                  "constraint": "pk"
+                },
+                {
+                  "constraint": "not_null"
+                }
+              ]
+            },
+            {
+              "name": "company",
+              "kind": "text",
+              "constraints": [
+                {
+                  "constraint": "not_null"
+                }
+              ]
+            },
+            {
+              "name": "contact",
+              "kind": "text"
+            },
+            {
+              "name": "city",
+              "kind": "text"
+            },
+            {
+              "name": "region",
+              "kind": "text"
+            },
+            {
+              "name": "updated_at",
+              "kind": "int",
+              "constraints": [
+                {
+                  "constraint": "not_null"
+                }
+              ]
+            }
+          ],
+          "without_rowid": false
+        },
+        "op_class": "additive"
+      }
+    ],
+    "down": [
+      {
+        "op": {
+          "op": "drop_table",
+          "table": "suppliers"
+        },
+        "op_class": "destructive"
+      }
+    ],
+    "flags": {
+      "destructive": false,
+      "hash_rewriting": false
+    }
+  },
+  "checksum": "846afb23867541c0aa5b1e51caf0422b3b6139fdd74be483053ee963ec0149a2"
+}

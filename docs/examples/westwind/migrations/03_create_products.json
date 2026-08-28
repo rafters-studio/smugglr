@@ -1,0 +1,138 @@
+{
+  "manifest": {
+    "version": 1,
+    "target_schema": "",
+    "up": [
+      {
+        "op": {
+          "op": "create_table",
+          "table": "products",
+          "columns": [
+            {
+              "name": "id",
+              "kind": "text",
+              "constraints": [
+                {
+                  "constraint": "pk"
+                },
+                {
+                  "constraint": "not_null"
+                }
+              ]
+            },
+            {
+              "name": "name",
+              "kind": "text",
+              "constraints": [
+                {
+                  "constraint": "not_null"
+                }
+              ]
+            },
+            {
+              "name": "supplier_id",
+              "kind": "text",
+              "constraints": [
+                {
+                  "constraint": "not_null"
+                }
+              ]
+            },
+            {
+              "name": "category_id",
+              "kind": "text",
+              "constraints": [
+                {
+                  "constraint": "not_null"
+                }
+              ]
+            },
+            {
+              "name": "unit",
+              "kind": "text"
+            },
+            {
+              "name": "unit_price",
+              "kind": "real",
+              "constraints": [
+                {
+                  "constraint": "not_null"
+                }
+              ]
+            },
+            {
+              "name": "in_stock",
+              "kind": "int",
+              "constraints": [
+                {
+                  "constraint": "not_null"
+                },
+                {
+                  "constraint": "default",
+                  "value": "0"
+                }
+              ]
+            },
+            {
+              "name": "discontinued",
+              "kind": "int",
+              "constraints": [
+                {
+                  "constraint": "not_null"
+                },
+                {
+                  "constraint": "default",
+                  "value": "0"
+                }
+              ]
+            },
+            {
+              "name": "updated_at",
+              "kind": "int",
+              "constraints": [
+                {
+                  "constraint": "not_null"
+                }
+              ]
+            }
+          ],
+          "without_rowid": false
+        },
+        "op_class": "additive"
+      },
+      {
+        "op": {
+          "op": "create_index",
+          "name": "idx_products_category_id",
+          "table": "products",
+          "columns": [
+            "category_id"
+          ],
+          "unique": false
+        },
+        "op_class": "additive"
+      }
+    ],
+    "down": [
+      {
+        "op": {
+          "op": "drop_index",
+          "name": "idx_products_category_id"
+        },
+        "op_class": "additive"
+      },
+      {
+        "op": {
+          "op": "drop_table",
+          "table": "products"
+        },
+        "op_class": "destructive"
+      }
+    ],
+    "flags": {
+      "destructive": false,
+      "hash_rewriting": false
+    }
+  },
+  "checksum": "d45e3062fb7d3ebfc9d2c1ddaf5b1bfa1f01832d8f7d5c68fa6608b8c3ed81c2"
+}

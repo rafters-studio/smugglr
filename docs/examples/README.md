@@ -2,12 +2,21 @@
 
 End-to-end examples covering the main ways people reach for smugglr. Each example has a self-contained `README.md` with prerequisites, setup, and the command(s) to run it.
 
+## The sample database
+
+| Example | What it shows |
+| ------- | ------------- |
+| [westwind](./westwind) | The sample every example below uses: eight tables, forty customers, three hundred and twenty orders, built by eight `smugglr migrate` manifests. `./make.sh` builds it; `./make.sh --empty` builds a target with the tables and no rows. |
+
 ## CLI
 
 | Example | What it shows |
 | ------- | ------------- |
-| [cli-d1-sync](./cli-d1-sync) | `config.toml` + `smugglr push/pull/sync` against Cloudflare D1. Hello-world. |
-| [cli-lan-broadcast](./cli-lan-broadcast) | Two laptops on the same subnet auto-syncing via UDP. Offline-tolerant ops demo. |
+| [cli-sqlite-to-sqlite](./cli-sqlite-to-sqlite) | Two local SQLite files, `push --dry-run`, `push`, `diff`. No credentials. The shortest path to real output. |
+| [cli-stash-file-relay](./cli-stash-file-relay) | `stash` from one database and `retrieve` into another through a `file://` relay. The S3 workflow with no S3. |
+| [cli-migrate](./cli-migrate) | `migrate new` scaffolds a manifest, `migrate apply` applies it and refuses to apply it twice. |
+| [cli-d1-sync](./cli-d1-sync) | `config.toml` + `smugglr push/pull/sync` against Cloudflare D1. Blocked in 0.5.0 by #429 and #430; the README says how. |
+| [cli-lan-broadcast](./cli-lan-broadcast) | Two machines on the same subnet converging over encrypted UDP multicast. |
 
 ## Node (`smugglr` npm)
 
@@ -33,6 +42,4 @@ End-to-end examples covering the main ways people reach for smugglr. Each exampl
 
 ## Notes on running these
 
-- **Network-dependent examples** (D1, Turso) describe the prerequisites (account, token, table) but obviously need your credentials to actually run. Code is verbatim what we use ourselves.
-- **Local-only examples** (LAN broadcast, Rust embedded, custom DataSource, browser OPFS against a local mock) are runnable as-is.
-- Every example uses only OSS-tier features. Nothing here depends on smugglr+/fence profiles.
+Every output block in these READMEs was pasted from a run of the 0.5.0 binary or package, and the command that produced it sits above it. An example that needs credentials (D1, Turso) says so in its prerequisites and shows no output it could not capture; an example with no network dependency (the three `cli-*` examples above the D1 one, the Rust examples, the LAN broadcast) runs as written. These directories are the source of truth for config shapes and CLI output: the README at the repository root and smugglr.dev copy their blocks from here, not the other way around.
