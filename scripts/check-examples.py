@@ -42,12 +42,15 @@ SETUP = {
         "../westwind/make.sh ./local.db",
         "../westwind/make.sh --empty ./backup.db",
     ],
+    # The README uses /tmp/smugglr-relay; the checker gives each run its own
+    # relay directory ($RELAY, under the scratch copy) so two runs cannot
+    # delete each other's relay mid-flight.
     "cli-stash-file-relay": [
-        "rm -rf /tmp/smugglr-relay && mkdir -p /tmp/smugglr-relay",
+        'mkdir -p "$RELAY"',
         "../westwind/make.sh ./machine-a.db",
         "../westwind/make.sh --empty ./machine-b.db",
-        "cp config.example.toml config-a.toml",
-        "sed 's/machine-a.db/machine-b.db/' config.example.toml > config-b.toml",
+        'sed "s#file:///tmp/smugglr-relay#file://$RELAY#" config.example.toml > config-a.toml',
+        "sed 's/machine-a.db/machine-b.db/' config-a.toml > config-b.toml",
     ],
     "cli-migrate": [
         "../westwind/make.sh ./westwind.db",
@@ -103,7 +106,7 @@ def run(cmd: str, cwd: str, smugglr: str) -> tuple[str, int]:
     shell=True is acceptable here: redirects and pipes in those blocks are
     part of what a reader types.
     """
-    env = dict(os.environ, SMUGGLR=smugglr)
+    env = dict(os.environ, SMUGGLR=smugglr, RELAY=os.path.join(cwd, "relay"))
     shell_cmd = re.sub(r"(?<![\w/])smugglr(?= )", smugglr, cmd)
     proc = subprocess.run(shell_cmd, shell=True, cwd=cwd, env=env, capture_output=True, text=True)
     return proc.stdout.strip("\n"), proc.returncode

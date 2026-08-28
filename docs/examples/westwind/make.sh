@@ -20,8 +20,16 @@ case "$out" in /*) ;; *) out="$PWD/$out" ;; esac
 rm -f "$out"
 # migrate apply opens read-write without create; the file must exist.
 sqlite3 "$out" "SELECT 1;" >/dev/null
+# Tracing goes to a file so a clean run stays quiet and a failed apply still
+# shows its reason.
+errlog="$(mktemp)"
+trap 'rm -f "$errlog"' EXIT
 for m in "$here"/migrations/*.json; do
-  "$smugglr" migrate apply "$m" --db "$out" 2>/dev/null
+  if ! "$smugglr" migrate apply "$m" --db "$out" 2>"$errlog"; then
+    echo "make.sh: migrate apply failed on $(basename "$m"):" >&2
+    cat "$errlog" >&2
+    exit 1
+  fi
 done
 if [ "$empty" = no ]; then
   sqlite3 "$out" < "$here/seed.sql"

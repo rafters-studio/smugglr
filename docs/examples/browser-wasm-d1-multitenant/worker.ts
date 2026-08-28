@@ -103,9 +103,15 @@ async function reset() {
     await sqlite3.close(db);
     db = null;
   }
+  // Only this tenant's file and its sidecars: other tenants' tabs share the
+  // origin, and their databases are theirs.
+  if (tenantId === null) return;
+  const own = `tenant-${tenantId}.db`;
   const root = await navigator.storage.getDirectory();
   for await (const entry of root.values()) {
-    await root.removeEntry(entry.name, { recursive: true });
+    if (entry.name === own || entry.name.startsWith(`${own}-`)) {
+      await root.removeEntry(entry.name, { recursive: true });
+    }
   }
 }
 
