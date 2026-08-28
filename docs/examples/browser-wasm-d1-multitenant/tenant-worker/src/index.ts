@@ -85,7 +85,7 @@ function json(body: unknown, status = 200): Response {
 //   SELECT *, CAST("id" AS TEXT) AS __pk FROM "notes" ...     row metadata
 //   SELECT * FROM "notes" WHERE CAST("id" AS TEXT) IN (?, ...) row fetch
 //   INSERT OR REPLACE INTO "notes" ("id", ...) VALUES (...)   push
-export function enforce(
+function enforce(
   rawSql: string,
   params: unknown[],
   tenant: string,
