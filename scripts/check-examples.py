@@ -107,6 +107,8 @@ def check(example: str, smugglr: str) -> bool:
             run(step, cwd, smugglr)
         ok = True
         for cmd, expected in blocks(readme):
+            # A mutation shown for its side effect prints nothing; run it so
+            # the next block sees the changed rows, and compare nothing.
             if cmd.startswith("sqlite3") and "UPDATE" in cmd:
                 run(cmd, cwd, smugglr)
                 continue
