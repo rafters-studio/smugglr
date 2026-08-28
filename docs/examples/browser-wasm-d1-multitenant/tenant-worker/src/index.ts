@@ -100,7 +100,12 @@ function enforce(
   if (head.startsWith("SELECT")) {
     // Wrap the query so we can filter without parsing it. Every row-reading
     // SELECT the adapter emits projects the table's columns, so the subquery
-    // keeps tenant_id available to the outer WHERE.
+    // keeps tenant_id available to the outer WHERE. None of them names
+    // tenant_id in its text, so a query that does is a client trying to
+    // alias a literal over the real column and defeat the outer filter.
+    if (/tenant_id/i.test(sql)) {
+      throw new Error("SELECT must not name tenant_id; the guard adds the filter");
+    }
     return {
       sql: `SELECT * FROM (${sql}) WHERE tenant_id = ?`,
       params: [...params, tenant],
@@ -115,6 +120,11 @@ function enforce(
     const tenantIdx = cols.indexOf("tenant_id");
     if (tenantIdx < 0) {
       throw new Error("INSERT must include tenant_id column for this guard");
+    }
+    // The adapter binds every value, so a params-less INSERT (INSERT ...
+    // SELECT) never reaches the per-row check below; refuse the shape.
+    if (params.length === 0 || /\bSELECT\b/i.test(sql)) {
+      throw new Error("INSERT must bind its rows as parameters; INSERT ... SELECT is not accepted");
     }
     if (params.length % cols.length !== 0) {
       throw new Error("param count not a multiple of column count");

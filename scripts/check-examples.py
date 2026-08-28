@@ -6,6 +6,13 @@ Every fenced block in an example README that starts with `$ smugglr ...` or
 example's setup and every such block in a scratch copy of the example
 directory and checks the claim.
 
+A block is a fence whose first line starts with `$ `; the command and its
+output share one fence, as every checked README writes them. A separate
+command fence followed by a bare output fence is not read, and an example
+whose README yields no readable block fails rather than passing empty.
+
+Every command must exit 0; the READMEs show no failing commands.
+
 Comparison is deliberately loose in two ways the binary forces. The text
 summary lists tables in map order, so lines are compared as sorted sets.
 JSON objects are parsed and their `tables` arrays sorted by name before
@@ -89,11 +96,17 @@ def normalize(text: str):
     return sorted(norm)
 
 
-def run(cmd: str, cwd: str, smugglr: str) -> str:
+def run(cmd: str, cwd: str, smugglr: str) -> tuple[str, int]:
+    """Run one README command in the example directory; return (stdout, exit code).
+
+    The commands come from this repository's own README files, which is why
+    shell=True is acceptable here: redirects and pipes in those blocks are
+    part of what a reader types.
+    """
     env = dict(os.environ, SMUGGLR=smugglr)
     shell_cmd = re.sub(r"(?<![\w/])smugglr(?= )", smugglr, cmd)
     proc = subprocess.run(shell_cmd, shell=True, cwd=cwd, env=env, capture_output=True, text=True)
-    return proc.stdout.strip("\n")
+    return proc.stdout.strip("\n"), proc.returncode
 
 
 def check(example: str, smugglr: str) -> bool:
@@ -104,15 +117,28 @@ def check(example: str, smugglr: str) -> bool:
         shutil.copytree(EXAMPLES, work, ignore=shutil.ignore_patterns("*.db", "node_modules", "target"))
         cwd = os.path.join(work, example)
         for step in SETUP.get(example, []):
-            run(step, cwd, smugglr)
+            _, code = run(step, cwd, smugglr)
+            if code != 0:
+                print(f"SETUP FAILED in {example}: {step} (exit {code})")
+                return False
         ok = True
-        for cmd, expected in blocks(readme):
+        found = list(blocks(readme))
+        if not found:
+            # A README the regex cannot read would otherwise pass vacuously.
+            print(f"NO BLOCKS in {example}: README has no `$ ...` fenced block the checker reads")
+            return False
+        for cmd, expected in found:
             # A mutation shown for its side effect prints nothing; run it so
             # the next block sees the changed rows, and compare nothing.
             if cmd.startswith("sqlite3") and "UPDATE" in cmd:
                 run(cmd, cwd, smugglr)
                 continue
-            got = run(cmd, cwd, smugglr)
+            got, code = run(cmd, cwd, smugglr)
+            # Every documented block succeeds; a README that shows a failing
+            # command is not a shape these examples use.
+            if code != 0:
+                ok = False
+                print(f"EXIT {code} in {example}: $ {cmd}")
             if normalize(got) != normalize(expected):
                 ok = False
                 print(f"MISMATCH in {example}: $ {cmd}")

@@ -14,7 +14,7 @@ Until #429 and #430 land, the config below is the shape the fix will honor, and 
 
 ## Prerequisites
 
-`smugglr` 0.5.0 on your PATH (`cargo install smugglr`, or the release binary), `smugglr-http-sql` on your PATH (`cargo install smugglr-http-sql`), a Cloudflare account with D1, a D1 database (`npx wrangler d1 create my-app`, or the dashboard), an API token with `D1:Edit` scope from <https://dash.cloudflare.com/profile/api-tokens>, and a local SQLite file whose tables also exist on D1.
+`smugglr` 0.5.0 on your PATH (`cargo install smugglr`, or the release binary), `smugglr-http-sql` on your PATH (`cargo install smugglr-http-sql`), a Cloudflare account with D1, a D1 database (`pnpm dlx wrangler d1 create my-app`, or the dashboard), an API token with `D1:Edit` scope from <https://dash.cloudflare.com/profile/api-tokens>, and a local SQLite file whose tables also exist on D1.
 
 ## Setup
 

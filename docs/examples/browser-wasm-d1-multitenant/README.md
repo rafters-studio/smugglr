@@ -125,7 +125,7 @@ Per-tenant OPFS isolation. Two tabs on the same origin do not collide because th
 | `INSERT OR REPLACE INTO "notes" (...) VALUES (...), (...)` | The column list is parsed, `tenant_id` located, and every row in the batched `VALUES` checked against the authenticated tenant. A mismatch rejects the whole batch. |
 | Anything else | Rejected. |
 
-The rewriter is naive on purpose; it exists to make the pattern visible. A production Worker would use prepared-statement enforcement, JWT claims for the tenant, and a real allowlist instead of a hardcoded token map.
+The rewriter is naive on purpose; it exists to make the pattern visible. Two bypasses that the string-wrapping approach invites are closed by refusal rather than by parsing: a SELECT whose text names `tenant_id` is rejected, because a client could otherwise alias a literal over the real column and make the outer `WHERE tenant_id = ?` a no-op, and an INSERT with no bound parameters or a nested SELECT is rejected, because the per-row tenant check runs over parameters and an `INSERT ... SELECT` would slip past it. Both refusals are blunt; a statement shape the adapter never sends is simply not served. Anything subtler than those two, a production Worker must handle with a real parser. A production Worker would use prepared-statement enforcement, JWT claims for the tenant, and a real allowlist instead of a hardcoded token map.
 
 ## Other clients
 
