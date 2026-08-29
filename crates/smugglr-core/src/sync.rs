@@ -433,22 +433,15 @@ pub async fn get_tables_to_sync<A: DataSource, B: DataSource>(
         }
     }
 
-    let local_candidates: Vec<String> = local_tables
-        .iter()
-        .filter(|t| config.should_sync_table(t))
-        .cloned()
-        .collect();
-    let remote_candidates: Vec<String> = remote_tables
-        .iter()
-        .filter(|t| config.should_sync_table(t))
-        .cloned()
-        .collect();
-    check_table_set(
-        &config.sync.tables,
-        &local_candidates,
-        &remote_candidates,
-        &syncable,
-    )?;
+    // The message names what each side actually has, unfiltered, so an
+    // operator reading "Remote tables: [...]" sees the remote, not the
+    // remote after their own config was applied to it. Sorted so two runs
+    // print the same message.
+    let mut local_all: Vec<String> = local_tables.iter().cloned().collect();
+    let mut remote_all: Vec<String> = remote_tables.iter().cloned().collect();
+    local_all.sort();
+    remote_all.sort();
+    check_table_set(&config.sync.tables, &local_all, &remote_all, &syncable)?;
 
     info!("Found {} tables to sync", syncable.len());
     Ok(syncable)
@@ -472,10 +465,10 @@ pub async fn get_tables_to_sync<A: DataSource, B: DataSource>(
 /// 4. Both sides have no tables at all: a warning and an empty set, because
 ///    there is nothing the operator could have meant.
 ///
-/// `local` and `remote` are the tables each side has after `exclude_tables`
-/// and the configured list are applied, so the message shows what smugglr
-/// considered. `syncable` is the resolved set (shared, with a primary key).
-/// Pure, so the wasm client applies the same rule.
+/// `local` and `remote` are every table each side reports, unfiltered, so the
+/// message describes the databases rather than the config's view of them.
+/// `syncable` is the resolved set (shared, passing the config, with a primary
+/// key). Pure, so the wasm client applies the same rule.
 pub fn check_table_set(
     configured: &[String],
     local: &[String],
@@ -712,8 +705,7 @@ mod tests {
         .unwrap_err();
         let msg = err.to_string();
         assert!(matches!(err, SyncError::Config(_)), "{msg}");
-        assert!(msg.contains("\"postz\""), "{msg}");
-        assert!(!msg.contains("\"users\" exist on neither"), "{msg}");
+        assert!(msg.contains("[\"postz\"] exist on neither side"), "{msg}");
     }
 
     #[test]
