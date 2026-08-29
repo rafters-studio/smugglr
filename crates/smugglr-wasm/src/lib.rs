@@ -378,12 +378,14 @@ async fn get_sync_tables(
         .into_iter()
         .collect();
 
+    let considered = |t: &String| {
+        (sync_config.tables.is_empty() || sync_config.tables.contains(t))
+            && !sync_config.exclude_tables.iter().any(|ex| ex == t)
+    };
+
     let mut tables = Vec::new();
     for t in source_tables.intersection(&dest_tables) {
-        if !sync_config.tables.is_empty() && !sync_config.tables.contains(t) {
-            continue;
-        }
-        if sync_config.exclude_tables.iter().any(|ex| ex == t) {
+        if !considered(t) {
             continue;
         }
         let info = source
@@ -395,6 +397,29 @@ async fn get_sync_tables(
         }
     }
     tables.sort();
+
+    // Same rule as the native engine (#438): an empty intersection with
+    // tables on either side is a configuration error, not a silent no-op.
+    let mut source_considered: Vec<String> = source_tables
+        .iter()
+        .filter(|t| considered(t))
+        .cloned()
+        .collect();
+    let mut dest_considered: Vec<String> = dest_tables
+        .iter()
+        .filter(|t| considered(t))
+        .cloned()
+        .collect();
+    source_considered.sort();
+    dest_considered.sort();
+    smugglr_core::sync::check_table_set(
+        &sync_config.tables,
+        &source_considered,
+        &dest_considered,
+        &tables,
+    )
+    .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
     Ok(tables)
 }
 
