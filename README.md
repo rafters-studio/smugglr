@@ -1,478 +1,352 @@
 <p align="center">
-  <img src="smugglr.webp" alt="Smugglr" width="400">
+  <img src="smugglr.webp" alt="smugglr" width="400">
 </p>
 
-# Smuggler
+# smugglr
 
-> "Look, I ain't in this for your revolution, and I'm not in it for you, Princess. I expect to be well paid. I'm in it for the money." - Han Solo
+sqlite sync engine. one rust binary. mit.
 
-Smuggle data between SQLite databases, Cloudflare D1, and S3-compatible stores. Fast. Stateless. Encrypted. Questionable life choices.
+If you're moving SQLite, smuggl it. Two SQLite files on one machine. Two machines on a LAN over encrypted UDP multicast. Any number of machines through an S3 relay. A hosted backend, D1, Turso, rqlite, Datasette, StarbaseDB, or SQLite Cloud, through one HTTP plugin with a profile per vendor. A browser or a Node process through the same engine compiled to WebAssembly. Content-hashed delta sync on every path, and since 0.5.0, schema migrations with a ledger that refuses to apply the same thing twice.
 
-> **Requirement — globally-unique primary keys.** smugglr's identity *is* the primary key. If your tables use `AUTOINCREMENT` or a bare `INTEGER PRIMARY KEY` rowid, two machines will both mint `id = 5` for different rows and last-received-wins silently eats one of them — guaranteed data loss, not an edge case. Use **UUIDv7**, or any globally-unique, k-sortable key. No GUID-ish keys, no smugglr: get into the 2020s or use a different tool. smugglr checks your schema's key shapes on first run and, in 0.5.0, **warns** on an incompatible one with a manual `int -> UUIDv7` recipe; the hard refusal and the in-tool conversion for existing databases are planned ([#280](https://github.com/rafters-studio/smugglr/issues/280)) and are not in this release. `smugglr migrate new` defaults every key to `TEXT`; it does not yet refuse an explicit `int:pk`.
+smugglr moves rows. It is not a database, and it does not reshape rows in transit.
 
-## Status: Beta (Kessel Run Certified)
+## The one requirement: globally unique primary keys
 
-Running in production at [huttspawn.com](https://huttspawn.com) since early 2026. Pluggable data source architecture. CI across Linux, macOS, and Windows. Checksummed releases with a one-line installer.
+smugglr's identity is the primary key. If a table uses `AUTOINCREMENT` or a bare `INTEGER PRIMARY KEY` rowid, two machines both mint `id = 5` for different rows and last-received-wins silently eats one of them: guaranteed data loss, not an edge case. Use UUIDv7, or any globally unique, k-sortable key. In 0.5.0 the first-run check warns on an incompatible schema and prints a manual recipe; the hard refusal and the in-tool `int -> UUIDv7` conversion are #280 and are not in this release. `smugglr migrate new` defaults every key to `TEXT`, which is the shape this wants.
 
-Not 1.0 yet -- the API surface may still shift. But the core sync engine is solid and battle-tested, with LAN broadcast sync, S3 relay, and agent-friendly JSON output.
+## Install
 
-There are [open issues](https://github.com/rafters-studio/smugglr/issues). We're shaving parsecs, not days.
+Two binaries. `smugglr` is the CLI. `smugglr-http-sql` is the plugin every hosted backend is reached through; SQLite-to-SQLite, the relay, LAN broadcast, and `migrate` do not need it.
 
-## What It Does
-
-Smuggler is a universal SQLite sync engine. It started as a way to sync local dev databases with Cloudflare D1, but now handles SQLite-to-SQLite, cross-machine LAN sync, and S3 relay workflows.
-
-- **Content hashing** - SHA256 comparison of actual row data, not just timestamps
-- **Delta sync** - Only moves rows that changed
-- **Bidirectional** - Push, pull, or both with configurable conflict resolution
-- **LAN broadcast sync** - masterless UDP multicast: every node broadcasts a content-hash digest, peers pull what they're missing, no coordinator -- two or two hundred nodes converge
-- **Agent-friendly** - `--output json` across all commands, structured exit codes for programmatic callers
-- **No state files** - Fresh comparison every run, no stale state to haunt you
-- **Pluggable backends** - `DataSource` trait abstracts any database backend
-- **Watch daemon** - Background sync on a configurable interval
-- **Column exclusion** - Skip embedding BLOBs and other large columns with glob patterns
-- **Automatic retries** - Exponential backoff with configurable limits for transient HTTP failures
-- **Batched writes** - Respects per-backend HTTP SQL parameter limits, splits large upserts automatically
-- **Table validation** - `--table` input validated against live schema before any SQL runs
-
-## Installation
-
-### Quick install (recommended)
-
-```bash
+```sh
 curl -fsSL https://raw.githubusercontent.com/rafters-studio/smugglr/main/install.sh | bash
 ```
 
-Detects your platform, downloads the right binary, verifies the SHA256 checksum, and installs to `~/.local/bin/`. Supports Linux x64, macOS x64, and macOS ARM64. Detects Rosetta 2 and installs the native arm64 binary.
+The installer detects the platform, verifies the SHA256, and installs to `~/.local/bin` on Linux x64 and macOS x64 and arm64. Release archives from 0.5.1 carry both binaries; the 0.5.0 archive carries only the CLI. With cargo:
 
-Install a specific version:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/rafters-studio/smugglr/main/install.sh | bash -s v0.1.2
+```sh
+cargo install smugglr
+cargo install smugglr-http-sql
 ```
 
-### Manual download
+Windows x64 has a release zip and the cargo path. Linux arm64 has no build yet.
 
-| Platform | Download |
-|----------|----------|
-| Linux x64 | [smugglr-linux-x64.tar.gz](https://github.com/rafters-studio/smugglr/releases/latest/download/smugglr-linux-x64.tar.gz) |
-| macOS x64 | [smugglr-macos-x64.tar.gz](https://github.com/rafters-studio/smugglr/releases/latest/download/smugglr-macos-x64.tar.gz) |
-| macOS ARM64 | [smugglr-macos-arm64.tar.gz](https://github.com/rafters-studio/smugglr/releases/latest/download/smugglr-macos-arm64.tar.gz) |
-| Windows x64 | [smugglr-windows-x64.zip](https://github.com/rafters-studio/smugglr/releases/latest/download/smugglr-windows-x64.zip) |
+## Show it running
 
-### From source
-
-```bash
-cargo install --git https://github.com/rafters-studio/smugglr
-```
-
-Requires Rust 1.75+.
-
-## Quick Start
-
-1. Copy the example config:
-
-```bash
-cp config.example.toml config.toml
-```
-
-2. Add your credentials (don't commit this file, genius):
+Everything below is copied from [`docs/examples/`](docs/examples/), where it was captured from the 0.5.0 binary against the [Westwind](docs/examples/westwind/) sample: eight tables, forty customers, three hundred and twenty orders. This is [`cli-sqlite-to-sqlite`](docs/examples/cli-sqlite-to-sqlite/), two files on one machine. `config.toml` is the whole configuration:
 
 ```toml
-cloudflare_account_id = "your-account-id"
-cloudflare_api_token = "your-api-token"
-database_id = "your-d1-database-id"
-local_db = ".wrangler/state/v3/d1/miniflare-D1DatabaseObject/xxx.sqlite"
-```
+local_db = "./local.db"
 
-3. Check if you can reach D1:
-
-```bash
-smugglr status
-```
-
-4. See what's different:
-
-```bash
-smugglr diff
-```
-
-5. Push your local changes (point of no return):
-
-```bash
-smugglr push
-```
-
-## Commands
-
-```
-smugglr status              # Can we phone home?
-smugglr diff                # What's different?
-smugglr push                # Local -> remote (YOLO)
-smugglr pull                # Remote -> local (safer YOLO)
-smugglr sync                # Bidirectional (push + pull in one shot)
-smugglr stash               # Local -> S3 relay (cross-machine sync)
-smugglr retrieve            # S3 relay -> Local (cross-machine sync)
-smugglr watch               # Daemon mode (sync on interval)
-smugglr broadcast           # LAN sync (peer discovery + encrypted deltas)
-smugglr snapshot            # Point-in-time full backup to stash storage
-smugglr snapshots           # List available snapshots
-smugglr restore <timestamp> # Disaster recovery from a snapshot
-smugglr migrate new         # Scaffold a schema migration manifest
-smugglr migrate apply       # Apply a manifest to a local SQLite database
-```
-
-### Options
-
-```
--c, --config <FILE>     Config file [default: config.toml]
--v, --verbose           See what's happening under the hood
--o, --output <FORMAT>   Output format: text or json [default: text]
---dry-run               Coward mode (just kidding, it's smart)
---table <NAME>          Sync one table only (validated against schema)
-```
-
-## How It Works
-
-For each table, Smuggler:
-
-1. Grabs all primary keys from both databases
-2. SHA256 hashes each row's content (excluding timestamp columns)
-3. When content differs, compares timestamps to determine which side is newer
-4. Sorts rows into buckets:
-
-| Bucket | What it means | Push | Pull |
-|--------|--------------|------|------|
-| `local_only` | You added it locally | Insert to D1 | - |
-| `remote_only` | Someone else added it | - | Insert locally |
-| `local_newer` | Your timestamp wins | Update D1 | - |
-| `remote_newer` | Their timestamp wins | - | Update local |
-| `content_differs` | Same timestamp, different data | Configurable | Configurable |
-| `identical` | Exactly the same | Skip | Skip |
-
-5. Batches writes to stay within D1's bind parameter limits (100 params per statement)
-6. Retries transient failures with exponential backoff
-
-### Why content hashing?
-
-Timestamps lie. Clocks drift. Bulk imports set everything to "now". Content hashing catches actual changes regardless of what the timestamps say.
-
-### Tables without timestamp columns
-
-Smuggler gracefully handles tables missing the configured timestamp column. Rows with different content land in the `content_differs` bucket and are resolved by your `conflict_resolution` setting. Use `local_wins` or `remote_wins` for deterministic behavior on these tables -- `newer_wins` will skip them since there's no timestamp to compare.
-
-## Architecture
-
-Smuggler's sync engine is built on the `DataSource` trait, which abstracts any database backend:
-
-```
-DataSource (trait)
-  |-- LocalDb          (rusqlite, synchronous)
-  |-- PluginDataSource (runtime-loaded external adapter, stdio protocol)
-```
-
-The diff engine (`diff_table`) and table resolution (`get_tables_to_sync`) are generic over any two `DataSource` implementations. Every remote backend -- D1, Turso, rqlite, Datasette, SQLiteCloud, StarbaseDB -- is reached through the `smugglr-http-sql` plugin. One plugin, profile-driven: adding a new remote target is a TOML config change, not a core recompile.
-
-## Cross-Machine Sync (Stash/Retrieve)
-
-Smuggler can sync your local SQLite database through an S3-compatible object store, enabling multiple dev machines to share state without going through D1.
-
-```
-Machine A                    S3/R2/GCS                  Machine B
-  local.sqlite  --stash-->  relay.sqlite  --retrieve-->  local.sqlite
-                <--retrieve--             <--stash--
-```
-
-### How it works
-
-Both sides are SQLite. Smuggler downloads the relay file from S3, opens it as a second `LocalDb`, and runs the same diff engine used for D1 sync. Only changed rows are transferred.
-
-- **`smugglr stash`** -- diffs local against the relay, applies changes to the relay, uploads it back to S3
-- **`smugglr retrieve`** -- downloads the relay from S3, diffs it against local, applies changes to local
-
-On first stash, Smuggler creates the relay from scratch and initializes its schema from the local database. ETag conditional writes prevent concurrent overwrites when multiple machines stash at the same time.
-
-### Stash configuration
-
-Add a `[stash]` section to your config (independent from D1 settings):
-
-```toml
-[stash]
-# S3-compatible URL to the relay file
-url = "s3://my-bucket/smugglr/relay.sqlite"
-
-# AWS credentials (optional if using instance roles or env vars)
-access_key_id = "AKIA..."
-secret_access_key = "..."
-region = "us-east-1"
-
-# Custom endpoint for Cloudflare R2, MinIO, etc.
-endpoint = "https://account-id.r2.cloudflarestorage.com"
-```
-
-Supported URL schemes:
-- `s3://bucket/path` -- Amazon S3 or any S3-compatible store (R2, MinIO)
-- `file:///absolute/path` -- Local filesystem (useful for testing)
-
-### Usage with automation
-
-Stash/retrieve pairs well with session hooks. For example, with [Legion](https://github.com/ssilvius/legion):
-
-```bash
-# SessionStart hook
-smugglr retrieve && legion reindex
-
-# SessionStop hook
-smugglr stash
-```
-
-## Browser Sync (npm)
-
-The sync engine compiles to WebAssembly and ships via the `smugglr` package on npm. Browser apps can run content-hashed delta sync against any http-sql-reachable target without a server in the middle.
-
-```ts
-import { Smugglr } from "smugglr";
-
-const s = await Smugglr.init({
-  source: { url: "https://my-db.turso.io", authToken: "tok", profile: "turso" },
-  dest:   { url: "https://api.cloudflare.com/...", authToken: "cf-tok", profile: "d1" },
-  sync:   { tables: ["users", "posts"], conflictResolution: "local_wins" },
-});
-
-await s.sync();
-s.dispose();
-```
-
-The package exports `Smugglr.init(config)` and the same verbs as the CLI: `.push()`, `.pull()`, `.sync()`, `.diff()`. All return typed results. The `./wasm` subpath export is available for consumers who need to control WASM binary loading directly (CDN URL, pre-fetched buffer, bundler import).
-
-The 0.4.0 release adds the runtime affordances a real browser app needs:
-
-- **Local SQLite (OPFS)** via `wa-sqlite`: pass `source: { type: "local", executor }` to sync a real SQLite database in the browser against any HTTP-SQL backend. Generic `SqlExecutor` contract -- swap wa-sqlite for the official sqlite-wasm, sql.js, better-sqlite3 in Node, or your own.
-- **`autoSync`**: opt-in hands-off triggers. Hydrate from dest when the local DB is empty on init, re-sync on `online` events, multi-tab safe via `navigator.locks`, exponential backoff on failure.
-- **Anonymous-first**: omit `dest` entirely to run with no network at all. Attach a dest later via `updateDest()` for the anonymous-to-account upgrade path.
-- **`updateAuth(token)` / `updateDest(dest)`**: token rotation and endpoint replacement without re-initializing the WASM module.
-- **`table-changed` events**: subscribe to per-table writes after pull/sync. The primitive `@smugglr/zustand` and `@smugglr/nanostores` build on for reactive state.
-- **`eraseLocal()`**: GDPR-shaped right-to-erasure helper. Empties every configured sync table locally; dest is the app's concern.
-
-See the [npm README](packages/smugglr/README.md) for the full API, OPFS setup, and bundle-size breakdown.
-
-## LAN Broadcast Sync
-
-Smuggler keeps SQLite databases in sync across machines on the same LAN with no relay, no cloud, and no coordinator. Every node runs the identical loop -- masterless UDP multicast gossip -- so two or two hundred nodes converge automatically. Membership is key possession: hold the shared key, you're on the network.
-
-```
-Machine A           multicast group 239.255.43.21 (encrypted)          Machine B
-  legion.db  <---- content-hash digest / pull / row, all multicast ---->  legion.db
-```
-
-### How it works
-
-1. `smugglr broadcast` joins the multicast group and, each interval, multicasts a `primary_key -> content_hash` digest of every synced table -- the heartbeat.
-2. A node that hears a digest covering rows it lacks (or hashes differently) multicasts a request for exactly those rows.
-3. Whoever holds them multicasts the rows; every listener applies idempotently, so one answer converges the whole group. Which side wins a same-key collision is `[broadcast].conflict_resolution` -- `remote_wins` (the default, last-received-wins) or `newer_wins`, which orders by timestamp. No CRDTs; UUIDv7 keys make concurrent divergence rare.
-4. Late joiners and partition rejoins converge through the same heartbeat -- no special case.
-5. All traffic is XChaCha20-Poly1305 encrypted with the pre-shared key. Lost packets are safe: applying a row twice is a no-op and the next heartbeat re-reconciles.
-
-This is masterless and peer-symmetric -- no primary, no leader, and no TCP between LAN peers. (Cross-process and cross-subnet sync, where multicast can't reach, use the separate TCP framing path.)
-
-### Broadcast configuration
-
-```toml
-[broadcast]
-port = 31337
-interval_secs = 30
-
-# 256-bit key, hex-encoded. Generate with: openssl rand -hex 32
-# ALL broadcast traffic is encrypted when this is set.
-secret = "your-256-bit-hex-key"
-
-# How a received row resolves against a local row with the same primary key.
-#   remote_wins (default) - the received row wins; last-received-wins
-#   newer_wins            - the row with the greater ordering value wins
-#   local_wins            - new rows arrive, existing rows are never overwritten
-# Scoped to [broadcast] on purpose: [sync].conflict_resolution defaults to
-# local_wins, and inheriting it here would silently stop every existing LAN
-# deployment from accepting peer rows.
-conflict_resolution = "newer_wins"
-
-# The ordering signal for newer_wins: max() across whichever of these columns
-# the table has. A LIST, because an ordering key is often a max over several --
-# a tombstone that stamps deleted_at without touching updated_at must still win.
-# Defaults to [ sync.timestamp_column ].
-ordering_columns = ["created_at", "updated_at", "deleted_at"]
+[target]
+type = "sqlite"
+database = "./backup.db"
 
 [sync]
-# Keep large columns (embeddings, vectors) out of the content hash, so a change
-# confined to them does not churn the mesh. Out of the hash is not off the wire:
-# a row a peer requests still carries these columns until #322 lands.
-exclude_columns = ["*_embedding", "vector"]
-
-# UUIDv7 required for master-master sync
-conflict_resolution = "uuid_v7_wins"
+tables = []
+timestamp_column = "updated_at"
+conflict_resolution = "local_wins"
 ```
 
-Both peers must opt into `newer_wins`; the policy is apply-side and is not
-negotiated on the wire, so a mesh with mixed settings converges toward the
-permissive node.
-
-### Security model
-
-Designed for **known/trusted networks** (home LAN, office LAN). The pre-shared key prevents eavesdropping and tampering on the local subnet. This is not designed for hostile networks or the open internet. If you need that, run smugglr inside a WireGuard tunnel.
-
-## Schema Migrations
-
-`smugglr migrate` moves schema the way the rest of the tool moves rows: an inspectable manifest rather than a raw SQL string, a checksum, and a ledger that refuses to apply the same thing twice. New in 0.5.0.
-
-`migrate new` scaffolds a manifest from a Rails-style column spec and prints it to stdout. Keys default to `TEXT`, the shape the primary-key requirement above wants:
-
-```bash
-smugglr migrate new create_contacts id:pk email:text:pii hours:int > migrations/create_contacts.json
-```
-
-`migrate apply` takes the manifest and an explicit `--db`. It runs before any config is loaded, so a migration lands where you point it, never where a stale `config.toml` points. The ledger assigns the version and remembers the checksum:
+A dry-run reads both sides, hashes every row, and reports what a push would write. Nothing is written.
 
 ```
-$ smugglr migrate apply migrations/create_contacts.json --db ./app.db
-Applied migration v1 (1 op) -- checksum a9aa92922aff1717c1cf1853246d1fae66f36dd556f580fb75298759bd2d5e10
+$ smugglr push --dry-run
+--- Push Summary ---
+  order_details: 788 rows
+  suppliers: 8 rows
+  employees: 9 rows
+  shippers: 3 rows
+  categories: 8 rows
+  products: 20 rows
+  customers: 40 rows
+  orders: 320 rows
 
-$ smugglr migrate apply migrations/create_contacts.json --db ./app.db
-Migration v1 is already applied -- nothing to do
+  (dry run - no actual changes made)
 ```
 
-The ledger lives in `_smugglr_migrations` inside the target database: version, checksum, status, a lease for crash recovery, and a hash chain over prior rows (written on every apply; nothing verifies it on a production path yet, [#327](https://github.com/rafters-studio/smugglr/issues/327)). Each op is idempotent, so an apply interrupted mid-way converges on re-run instead of double-applying. Every op carries an `op_class`, additive or destructive, that the destructive-op lint checks, and a `drop_column` on SQLite goes through a guarded table rebuild that carries the surviving columns' definitions, indexes, and triggers across, with the known gaps tracked as [#401](https://github.com/rafters-studio/smugglr/issues/401), [#413](https://github.com/rafters-studio/smugglr/issues/413), and [#337](https://github.com/rafters-studio/smugglr/issues/337).
+The push writes exactly what the dry-run described. Same counts; the lines come out in a different order because the summary iterates a map, so compare counts, not line positions.
 
-What 0.5.0 does **not** do, stated so you do not go looking:
+```
+$ smugglr push
+--- Push Summary ---
+  suppliers: 8 rows
+  products: 20 rows
+  employees: 9 rows
+  customers: 40 rows
+  order_details: 788 rows
+  categories: 8 rows
+  orders: 320 rows
+  shippers: 3 rows
+```
 
-- **No reverse from the CLI.** Rollback exists in the library (`smugglr-core::migrate::reverse`) and is not yet wired to a `migrate` subcommand.
-- **No recovery snapshot.** `--paranoid` warns instead of snapshotting until [#289](https://github.com/rafters-studio/smugglr/issues/289) lands.
-- **Local SQLite only.** The D1, Turso, and rqlite dialects generate statements but refuse to execute them ([#291](https://github.com/rafters-studio/smugglr/issues/291)).
-- **No `int -> UUIDv7` conversion** for existing tables ([#280](https://github.com/rafters-studio/smugglr/issues/280)), and `migrate new` does not refuse an explicit `int:pk`.
-- **No drift detection** against the ledger's recorded schema ([#290](https://github.com/rafters-studio/smugglr/issues/290)).
+A second push has nothing to move, because every content hash now matches.
+
+```
+$ smugglr push
+
+--- Push Summary ---
+  No changes to push
+```
+
+The text mode also writes timestamped `INFO` lines to stderr for every step, with or without `-v`; the blocks above are stdout.
+
+## Output for agents
+
+`--output json` is a global flag, so it goes before the command. It silences the tracing and prints one JSON object on stdout. Captured after touching six orders locally:
+
+```
+$ sqlite3 local.db "UPDATE orders SET freight = freight + 5, updated_at = updated_at + 60 WHERE ship_city = 'Dragonstone'"
+$ smugglr --output json push --dry-run
+{"command":"push","status":"dry_run","tables":[{"name":"suppliers","local_only":0,"remote_only":0,"local_newer":0,"remote_newer":0,"content_differs":0,"identical":8,"rows_to_push":0,"rows_to_pull":0},{"name":"categories","local_only":0,"remote_only":0,"local_newer":0,"remote_newer":0,"content_differs":0,"identical":8,"rows_to_push":0,"rows_to_pull":0},{"name":"orders","local_only":0,"remote_only":0,"local_newer":6,"remote_newer":0,"content_differs":0,"identical":314,"rows_to_push":6,"rows_to_pull":0},{"name":"shippers","local_only":0,"remote_only":0,"local_newer":0,"remote_newer":0,"content_differs":0,"identical":3,"rows_to_push":0,"rows_to_pull":0},{"name":"order_details","local_only":0,"remote_only":0,"local_newer":0,"remote_newer":0,"content_differs":0,"identical":788,"rows_to_push":0,"rows_to_pull":0},{"name":"customers","local_only":0,"remote_only":0,"local_newer":0,"remote_newer":0,"content_differs":0,"identical":40,"rows_to_push":0,"rows_to_pull":0},{"name":"employees","local_only":0,"remote_only":0,"local_newer":0,"remote_newer":0,"content_differs":0,"identical":9,"rows_to_push":0,"rows_to_pull":0},{"name":"products","local_only":0,"remote_only":0,"local_newer":0,"remote_newer":0,"content_differs":0,"identical":20,"rows_to_push":0,"rows_to_pull":0}],"total_rows_to_push":6,"total_rows_to_pull":0,"exit_code":0}
+
+$ smugglr --output json push
+{"command":"push","status":"ok","tables":[{"name":"orders","rows_pushed":6}]}
+
+$ smugglr --output json push
+{"command":"push","status":"ok","tables":[]}
+```
+
+The dry-run object carries every table and every bucket; the push object carries only the tables that moved, so an empty `tables` is a no-op. The exit code is the scripting contract.
+
+| Code | Meaning |
+| --- | --- |
+| 0 | success |
+| 1 | general error |
+| 2 | configuration error: fix the config, do not retry |
+| 3 | connection error: transient, safe to retry |
+| 4 | conflict: needs a human decision |
+| 5 | target not found |
+
+## How it works
+
+For each table smugglr reads every primary key from both sides and hashes each row's content, excluding the configured `timestamp_column`, `exclude_columns`, and `converge_columns`. Each value is hashed with a type tag, so NULL and the empty string differ, numbers are canonicalized, and declared BLOB columns fold to one encoding whichever backend rendered them. When two hashes differ the timestamps decide which side is newer. Every row lands in one bucket.
+
+| Bucket | Meaning | push | pull |
+| --- | --- | --- | --- |
+| `local_only` | added locally | insert | |
+| `remote_only` | added remotely | | insert |
+| `local_newer` | local timestamp wins | update | |
+| `remote_newer` | remote timestamp wins | | update |
+| `content_differs` | same timestamp, different content | by policy | by policy |
+| `identical` | equal | skip | skip |
+
+`conflict_resolution` settles `content_differs`: `local_wins` (the default), `remote_wins`, or `newer_wins`, which skips a row with no usable timestamp and says so once per table. Writes are upserts; nothing deletes. On the native path tables are written in whichever order the set iterates, which changes from run to run; the relay and the wasm client sort them. Timestamps lie, clocks drift, and bulk imports stamp everything "now", which is why the hash decides whether a row changed and the timestamp only decides which way it moves.
+
+## The shapes
+
+### Hosted backends through one plugin
+
+Every remote target goes through `smugglr-http-sql`, selected by `type = "plugin"` with the vendor named in `profile`. The plugin binary is `name = "http-sql"`; the profile is the backend. From [`cli-http-sql-turso`](docs/examples/cli-http-sql-turso/):
+
+```toml
+local_db = "./local.db"
+
+[target]
+type = "plugin"
+name = "http-sql"
+
+[target.config]
+profile = "turso"
+url = "https://my-db.turso.io"
+auth_token = "${TURSO_TOKEN}"
+```
+
+Profiles: `d1`, `turso`, `rqlite`, `datasette`, `sqlite-cloud`, `starbasedb`, `generic`, `http-sql`. Eight. A backend whose requests fit one of those shapes is a config change; a backend that speaks a new shape is a profile in the plugin. `${VAR}` and `${VAR:-default}` expand at load; an unset variable exits 2. The `d1` path is not working in 0.5.0; see Known limits.
+
+### A relay, for machines that cannot reach each other
+
+`stash` and `retrieve` sync through a SQLite file in an object store. From [`cli-stash-file-relay`](docs/examples/cli-stash-file-relay/), which runs the whole workflow through a `file://` URL:
+
+```toml
+local_db = "./machine-a.db"
+
+[stash]
+url = "file:///tmp/smugglr-relay/relay.sqlite"
+
+[sync]
+timestamp_column = "updated_at"
+conflict_resolution = "newer_wins"
+```
+
+```
+$ smugglr -c config-a.toml stash
+
+--- Stash Summary ---
+  categories: 8 rows
+  customers: 40 rows
+  employees: 9 rows
+  order_details: 788 rows
+  orders: 320 rows
+  products: 20 rows
+  shippers: 3 rows
+  suppliers: 8 rows
+```
+
+```
+$ smugglr -c config-b.toml retrieve
+
+--- Retrieve Summary ---
+  categories: 8 rows
+  customers: 40 rows
+  employees: 9 rows
+  order_details: 788 rows
+  orders: 320 rows
+  products: 20 rows
+  shippers: 3 rows
+  suppliers: 8 rows
+```
+
+```
+$ smugglr -c config-b.toml retrieve
+
+--- Retrieve Summary ---
+  No changes to retrieve
+```
+
+The relay is a SQLite file the diff engine syncs row by row in both commands. On S3 the upload is conditional on the ETag read at download, so two machines stashing at once cannot overwrite each other: the loser exits 4 and runs again. For S3 or R2, `url = "s3://bucket/path/relay.sqlite"` plus `access_key_id`, `secret_access_key`, `region`, and `endpoint`.
+
+### A LAN, with no coordinator
+
+`broadcast` keeps every machine on a subnet converged over UDP multicast. Each node multicasts a `primary_key -> content_hash` digest of its tables every interval, asks for the rows it lacks, and applies whatever arrives idempotently. No primary, no server, no internet. From [`cli-lan-broadcast`](docs/examples/cli-lan-broadcast/):
+
+```toml
+local_db = "./node.db"
+
+[sync]
+tables = []
+timestamp_column = "updated_at"
+
+[broadcast]
+secret = "REPLACE_WITH_OUTPUT_OF_openssl_rand_-hex_32"
+port = 31337
+interval_secs = 5
+conflict_resolution = "newer_wins"
+ordering_columns = ["updated_at"]
+```
+
+```
+$ smugglr broadcast
+ INFO Acquired PID lock: .smugglr-broadcast.pid (PID 30382)
+ INFO Starting masterless multicast sync (group 239.255.43.21, port 31999, interval 2s, instance peer-d, dry_run false)
+ INFO Opening local database: d.db
+ INFO Heartbeat #1: multicast 1 digest datagram(s)
+ INFO Heartbeat #2: multicast 1 digest datagram(s)
+```
+
+With `secret` set, every datagram is XChaCha20-Poly1305 with a fresh nonce, and a node with a different key sees only ciphertext it cannot open. Leave `secret` out and the node runs in the clear, accepting any well-formed datagram on the subnet, and warns once at start. `remote_wins`, the default, is last-received-wins and can leave two nodes holding different rows for one key; `newer_wins` orders on `ordering_columns` and is the only policy that converges under concurrent edits, and both nodes must set it. Two peers on one machine need distinct `instance_id` values and separate working directories, and a firewall that drops inbound multicast makes both of them look deaf. This is for networks you trust; on anything else, run it inside a tunnel.
+
+### A daemon
+
+`smugglr watch` runs a full sync every interval in the foreground, holds a `.smugglr.pid` lock, prints nothing to stdout in text mode, and emits one JSON line per tick under `--output json`. It stops on SIGINT after the tick in flight completes.
+
+### Snapshots
+
+`snapshot` copies the local database file into the stash store under a timestamped key; `snapshots` lists them; `restore <timestamp>` replaces the local file with the latest snapshot at or before that time after a `quick_check`. Both act on the local file only; neither touches a hosted target.
+
+## Schema migrations
+
+`smugglr migrate` moves schema the way the rest of the tool moves rows: an inspectable manifest instead of a raw SQL string, a checksum, and a ledger inside the database. `migrate new` scaffolds from a Rails-style column spec and prints to stdout; `migrate apply` takes the manifest and an explicit `--db`, before any config is loaded, so a migration lands where you point it. From [`cli-migrate`](docs/examples/cli-migrate/), adding one table to Westwind, whose own eight tables were built the same way:
+
+```
+$ smugglr migrate new create_bribes id:pk:notnull harbormaster:text amount:int paid_at:int > migrations/create_bribes.json
+```
+
+```
+$ smugglr migrate apply migrations/create_bribes.json --db ./westwind.db
+Applied migration v9 (1 op) -- checksum 62f1d23e0c3b34222075d7f99ed090c4971710642a5201af5ad51bdb99d90148
+```
+
+```
+$ smugglr migrate apply migrations/create_bribes.json --db ./westwind.db
+Migration v9 is already applied -- nothing to do
+```
+
+The ledger, `_smugglr_migrations`, assigns the version as `current + 1`, claims it before the first op runs, and settles it after; each op is idempotent, so an apply interrupted midway converges on re-run. What 0.5.0 does not do: no reverse from the CLI, no recovery snapshot (`--paranoid` warns, #289), local SQLite only (#291), no `int -> UUIDv7` conversion (#280), and `migrate new` does not yet refuse an explicit `int:pk` (#427).
+
+## Browser and Node
+
+The engine compiles to WebAssembly and ships as the `smugglr` package on npm, with `@smugglr/zustand` and `@smugglr/nanostores` on top of it. `Smugglr.init({source, dest, sync})`, then `.push()`, `.pull()`, `.sync()`, `.diff()`, all with `dryRun`; `on("table-changed")` after a pull writes rows; `updateAuth`, `updateDest`, `eraseLocal`, `dispose`. A local SQLite in the browser is a `SqlExecutor`, `createWaSqliteExecutor` for wa-sqlite on OPFS or IndexedDB, or your own for any runtime. `autoSync` hydrates on init, re-syncs on `online`, and serializes across tabs with a Web Lock; it is browser-only. From [`node-server-to-d1`](docs/examples/node-server-to-d1/), pushing Westwind through `better-sqlite3` to a local HTTP-SQL endpoint:
+
+```
+loaded smugglr wasm: 316800 bytes
+push complete: {"command":"push","status":"ok","tables":[{"name":"categories","rowsPushed":8},{"name":"customers","rowsPushed":40},{"name":"employees","rowsPushed":9},{"name":"order_details","rowsPushed":788},{"name":"orders","rowsPushed":320},{"name":"products","rowsPushed":20},{"name":"shippers","rowsPushed":3},{"name":"suppliers","rowsPushed":8}]}
+```
+
+In Node the wasm must be read from disk and handed to `setWasm` before `init()`, because the loader fetches a `file:` URL that Node's `fetch` refuses, and `setWasm` itself prints a wasm-bindgen deprecation warning while it does so (#437); the example shows the eight lines. The wasm is 316,800 bytes on disk and 126,497 gzipped in the published 0.5.0 package.
+
+## Embedding the engine
+
+`smugglr-core` is the crate the CLI wraps. `sync_all` takes two `DataSource` values, and implementing the trait against anything row-shaped is six methods. From [`rust-custom-datasource`](docs/examples/rust-custom-datasource/), an in-memory store on each side, divergent, then one call:
+
+```
+before: a=2, b=2
+  a: w1 alpha @ 2026-04-25T00:00:00Z
+  a: w3 gamma @ 2026-04-25T00:00:00Z
+  b: w2 beta @ 2026-04-25T00:00:01Z
+  b: w3 gamma-edited @ 2026-04-25T00:00:05Z
+sync:   widgets pushed a->b=1, pulled b->a=2
+after:  a=3, b=3
+  a: w1 alpha @ 2026-04-25T00:00:00Z
+  a: w2 beta @ 2026-04-25T00:00:01Z
+  a: w3 gamma-edited @ 2026-04-25T00:00:05Z
+  b: w1 alpha @ 2026-04-25T00:00:00Z
+  b: w2 beta @ 2026-04-25T00:00:01Z
+  b: w3 gamma-edited @ 2026-04-25T00:00:05Z
+```
+
+[`rust-tokio-service`](docs/examples/rust-tokio-service/) does the same inside a tokio loop against the plugin, with a shutdown that finishes the sync in flight.
+
+## Known limits in 0.5.0
+
+Each of these is a reader's first ten minutes, stated here so it is met in the docs and not in production.
+
+**D1 does not work from the CLI.** Three independent defects: the CLI hands the plugin the wrong keys and no URL (#429), the 0.5.0 archive and `cargo install smugglr` ship no plugin at all (#430, fixed for 0.5.1), and the `d1` profile reads its rows as its column list, so table discovery collapses on the plugin and wasm paths alike (#436). The npm example builds the D1 URL itself and works against a generic endpoint; against real D1 it hits #436. Until all three land, do not point this at D1 and expect rows.
+
+**`uuid_v7_wins` is `newer_wins`.** No code reads the key's timestamp; the variant orders on `timestamp_column` like `newer_wins` and prints a different warning (#431).
+
+**Retries never fire for hosted backends.** The engine's backoff is real, but the plugin reports every 429 and 5xx as permanent, so a rate limit ends a push on the first response with exit 1 (#432).
+
+**A snapshot can miss committed rows.** `snapshot` reads the database file with `std::fs::read`; on a WAL-mode database, rows still in the WAL are counted in the metadata and absent from the file (#433). Checkpoint first.
+
+**Table order ignores foreign keys.** The native path writes tables in set-iteration order and the relay and wasm paths alphabetically; none consults `foreign_key_list`, so on a target that enforces foreign keys a child table can land before its parent and be rejected (#435). Westwind declares no foreign keys for this reason.
+
+**Pointing at the wrong target looks like success.** An empty table intersection reports `status: ok` with an empty `tables` and exit 0 (#438).
+
+**`exclude_columns` leaves the hash on every path and leaves the wire on directional push and pull only.** On `stash`, `retrieve`, and a multicast peer's request, the column still travels (#322).
+
+**Deletes do not replicate on any path** (#311). Model a delete as a `deleted_at` column, which rides the upsert path and converges.
 
 ## Configuration
 
-```toml
-cloudflare_account_id = "abc123"
-cloudflare_api_token = "your-token-with-d1-permissions"
-database_id = "your-d1-uuid"
-local_db = "/path/to/local.sqlite"
-
-[sync]
-# Empty = sync all tables except excluded
-tables = []
-
-# Things you definitely don't want to sync
-exclude_tables = [
-    "sqlite_sequence",
-    "_cf_KV",
-    "__drizzle_migrations",
-]
-
-# Column for timestamp ordering when content differs
-timestamp_column = "updated_at"
-
-# When both sides changed: "local_wins", "remote_wins", "newer_wins", "uuid_v7_wins"
-conflict_resolution = "local_wins"
-
-# Columns to exclude from sync (glob patterns)
-exclude_columns = ["*_embedding", "vector"]
-
-# Retry settings for transient D1 failures
-max_retries = 5
-initial_retry_delay_ms = 100
-max_retry_delay_ms = 30000
-backoff_multiplier = 2.0
-
-# Batch settings for large tables
-batch_size = 100
-max_statement_bytes = 92160
-```
-
-### Finding Your Local D1 Database
-
-Wrangler hides it at:
-
-```
-.wrangler/state/v3/d1/miniflare-D1DatabaseObject/<hash>.sqlite
-```
-
-The hash is derived from your binding name. If you have multiple databases, may the Force be with you.
-
-### API Token
-
-Get one from [Cloudflare Dashboard](https://dash.cloudflare.com/profile/api-tokens):
-
-- D1:Read - for `diff`, `pull`, `status`
-- D1:Write - for `push`
-
-Pro tip: Create one token with both permissions. Fewer tokens to lose.
-
-## Limitations
-
-Things we don't do (yet):
-
-- **Schema sync across the wire** - `smugglr migrate` applies to a local SQLite file; it does not push schema to a remote, and sync itself never runs DDL. Run the same migration on both sides.
-- **Full-sync transactions** - Each batch is atomic, but the whole sync isn't. Re-run if interrupted.
-- **BLOB wizardry** - Binary data compared as hex strings. It works but it's not pretty.
-- **Tables without primary keys** - We need something to compare. Add a PK.
-- **Linux ARM64** - Not available yet. See [issues](https://github.com/rafters-studio/smugglr/issues) for updates.
-
-## Troubleshooting
-
-### "401 Unauthorized"
-Your token is expired or wrong. Make a new one.
-
-### "429 Too Many Requests"
-Smuggler retries automatically with exponential backoff. If you're still hitting rate limits, increase `initial_retry_delay_ms` or reduce `batch_size` in your config.
-
-### "Invalid table name"
-Smuggler validates `--table` input against your database schema before touching any SQL. If the table doesn't exist, you'll get a list of available tables. Run your migrations on both databases first. We don't create tables.
-
-### All rows show as "content_differs"
-Check that column order and types match. NULL vs empty string will cause hash mismatches.
-
-## Development
-
-```bash
-cargo test                       # Run the tests
-cargo fmt                        # Format code
-cargo clippy --all-targets       # Lint (including tests)
-RUST_LOG=debug cargo run -- diff # Debug output
-```
+`config.toml` in the working directory, or `-c <file>`. The sections are `local_db`, `[target]`, `[sync]`, `[stash]`, and `[broadcast]`; the annotated full file is [`config.example.toml`](config.example.toml), and every example directory carries the file it ran with. Defaults worth knowing: `timestamp_column = "updated_at"`, `conflict_resolution = "local_wins"`, `exclude_tables` covers `sqlite_sequence`, `_cf_KV`, `__drizzle_migrations`, and `_smugglr_migrations` and matches names exactly, `batch_size = 100`, `max_statement_bytes = 92160`, and `[broadcast]` at port 31337 every 30 seconds with `instance_id` defaulting to the hostname.
 
 ## Examples
 
-Runnable examples covering CLI, Node, Rust, and browser use cases live in [`docs/examples/`](docs/examples/). Each subdir has its own README, prerequisites, and source.
-
 | Surface | Example | What it shows |
-| ------- | ------- | ------------- |
-| CLI     | [cli-d1-sync](docs/examples/cli-d1-sync) | `smugglr push/pull/sync` against Cloudflare D1. |
-| CLI     | [cli-lan-broadcast](docs/examples/cli-lan-broadcast) | Two laptops auto-syncing via UDP on the same subnet. |
-| Node    | [node-server-to-d1](docs/examples/node-server-to-d1) | `Smugglr.init({source: local, dest: D1}).push()` from Node. |
-| Node    | [node-auto-sync](docs/examples/node-auto-sync) | Long-running sync loop with backoff and graceful shutdown. |
-| Rust    | [rust-tokio-service](docs/examples/rust-tokio-service) | Embedded sync inside a tokio service. |
-| Rust    | [rust-custom-datasource](docs/examples/rust-custom-datasource) | Implement `DataSource` against an in-memory store. |
-| Browser | [browser-opfs-turso](docs/examples/browser-opfs-turso) | wa-sqlite + OPFS, syncing to Turso. |
-| Browser | [browser-idb-turso](docs/examples/browser-idb-turso) | Same demo backed by IndexedDB instead of OPFS. |
+| --- | --- | --- |
+| Sample | [westwind](docs/examples/westwind) | The database every example uses, built by eight migrate manifests. |
+| CLI | [cli-sqlite-to-sqlite](docs/examples/cli-sqlite-to-sqlite) | Two local files, dry-run, push, diff, JSON. No credentials. |
+| CLI | [cli-stash-file-relay](docs/examples/cli-stash-file-relay) | stash and retrieve through a `file://` relay. |
+| CLI | [cli-migrate](docs/examples/cli-migrate) | A manifest scaffolded, applied, and refused the second time. |
+| CLI | [cli-lan-broadcast](docs/examples/cli-lan-broadcast) | Two machines converging over multicast. |
+| CLI | [cli-http-sql-turso](docs/examples/cli-http-sql-turso) | The plugin config shape every hosted backend uses. |
+| CLI | [cli-d1-sync](docs/examples/cli-d1-sync) | The D1 shape, and why 0.5.0 cannot complete it. |
+| Node | [node-server-to-d1](docs/examples/node-server-to-d1) | One push through the npm package to an HTTP-SQL endpoint. |
+| Node | [node-auto-sync](docs/examples/node-auto-sync) | A sync loop with backoff and a clean SIGTERM. |
+| Rust | [rust-tokio-service](docs/examples/rust-tokio-service) | The engine inside a tokio service against the plugin. |
+| Rust | [rust-custom-datasource](docs/examples/rust-custom-datasource) | `DataSource` against an in-memory store. |
+| Browser | [browser-opfs-turso](docs/examples/browser-opfs-turso), [browser-idb-turso](docs/examples/browser-idb-turso), [browser-wasm-d1-multitenant](docs/examples/browser-wasm-d1-multitenant) | wa-sqlite on OPFS or IndexedDB syncing to Turso; many browsers into one D1 behind a tenant guard. |
 
-## Related Projects
+Every block in this README is a substring of a file under `docs/examples/`, and CI checks that.
 
-Part of the [rafters-studio](https://github.com/rafters-studio) ecosystem. Built for [huttspawn.com](https://huttspawn.com) and the broader rafters portfolio.
+## Development
 
-## Contributing
+```sh
+cargo test --workspace
+cargo clippy --workspace -- -D warnings
+cargo fmt -- --check
+python3 scripts/check-examples.py --smugglr target/debug/smugglr
+```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). TL;DR:
-
-1. Fork it
-2. Branch it
-3. Fix it / Build it
-4. Test it
-5. PR it
-
-## License
-
-MIT. Do whatever you want. Not our fault if it deletes your production database.
-
----
-
-*"Never tell me the odds."*
+Running in production at [huttspawn.com](https://huttspawn.com) since early 2026. CI on Linux, macOS, and Windows. MIT.

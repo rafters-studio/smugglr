@@ -155,11 +155,37 @@ def check(example: str, smugglr: str) -> bool:
         return ok
 
 
+def readme_blocks_are_from_examples() -> bool:
+    """Every fenced block in the root README must be a substring of some file
+    under docs/examples/. The README copies; it never types. Blocks tagged
+    `sh` are commands a reader runs and are exempt; everything else is a
+    config or an output block and must have a source."""
+    readme = open(os.path.join(ROOT, "README.md")).read()
+    sources = []
+    for dp, _, fs in os.walk(EXAMPLES):
+        for f in fs:
+            if f.endswith((".md", ".toml", ".sql", ".json")):
+                sources.append(open(os.path.join(dp, f), errors="replace").read())
+    ok = True
+    for lang, body in re.findall(r"```([a-z]*)\n(.*?)```", readme, re.S):
+        if lang == "sh":
+            continue
+        if not any(body in s for s in sources):
+            ok = False
+            print("README block has no source under docs/examples/:")
+            print("    " + body.strip().split("\n")[0][:120])
+    print(f"{'ok' if ok else 'FAIL'}: README blocks are from docs/examples")
+    return ok
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--smugglr", default=shutil.which("smugglr") or "smugglr")
+    ap.add_argument("--readme", action="store_true", help="only check that README blocks come from docs/examples")
     ap.add_argument("examples", nargs="*", default=DEFAULT)
     args = ap.parse_args()
+    if args.readme:
+        return 0 if readme_blocks_are_from_examples() else 1
     results = [check(e, args.smugglr) for e in args.examples]
     return 0 if all(results) else 1
 

@@ -15,6 +15,7 @@ End-to-end examples covering the main ways people reach for smugglr. Each exampl
 | [cli-sqlite-to-sqlite](./cli-sqlite-to-sqlite) | Two local SQLite files, `push --dry-run`, `push`, `diff`. No credentials. The shortest path to real output. |
 | [cli-stash-file-relay](./cli-stash-file-relay) | `stash` from one database and `retrieve` into another through a `file://` relay. The S3 workflow with no S3. |
 | [cli-migrate](./cli-migrate) | `migrate new` scaffolds a manifest, `migrate apply` applies it and refuses to apply it twice. |
+| [cli-http-sql-turso](./cli-http-sql-turso) | The one config shape every hosted backend uses: `type = "plugin"`, `name = "http-sql"`, the vendor in `profile`. Needs a token; not run here. |
 | [cli-d1-sync](./cli-d1-sync) | `config.toml` + `smugglr push/pull/sync` against Cloudflare D1. Blocked in 0.5.0 by #429 and #430; the README says how. |
 | [cli-lan-broadcast](./cli-lan-broadcast) | Two machines on the same subnet converging over encrypted UDP multicast. |
 
