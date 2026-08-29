@@ -11,6 +11,9 @@ set -euo pipefail
 REPO="rafters-studio/smugglr"
 INSTALL_DIR="${HOME}/.local/bin"
 BINARY_NAME="smugglr"
+# The plugin every remote target is reached through. It ships in the same
+# archive as the CLI since v0.5.1 (#430); older archives carry only the CLI.
+PLUGIN_NAME="smugglr-http-sql"
 
 # Color support: only when stdout is a terminal.
 if [ -t 1 ]; then
@@ -276,6 +279,12 @@ main() {
   tar xzf "${archive_path}" -C "${TMPDIR_INSTALL}"
   mv "${TMPDIR_INSTALL}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
   chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
+  if [ -f "${TMPDIR_INSTALL}/${PLUGIN_NAME}" ]; then
+    mv "${TMPDIR_INSTALL}/${PLUGIN_NAME}" "${INSTALL_DIR}/${PLUGIN_NAME}"
+    chmod +x "${INSTALL_DIR}/${PLUGIN_NAME}"
+  else
+    warn "${version} ships without ${PLUGIN_NAME}; remote targets (D1, Turso, rqlite) need it. Install it with: cargo install ${PLUGIN_NAME}"
+  fi
 
   # PATH integration.
   ensure_path
@@ -287,6 +296,9 @@ main() {
     success "Installed ${installed_version} to ${INSTALL_DIR}/${BINARY_NAME}"
   else
     success "Installed Smugglr ${version} to ${INSTALL_DIR}/${BINARY_NAME}"
+  fi
+  if [ -x "${INSTALL_DIR}/${PLUGIN_NAME}" ]; then
+    success "Installed ${PLUGIN_NAME} to ${INSTALL_DIR}/${PLUGIN_NAME}"
   fi
 }
 

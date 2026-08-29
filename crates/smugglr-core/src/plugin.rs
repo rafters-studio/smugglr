@@ -322,6 +322,13 @@ impl DataSource for PluginDataSource {
 /// while the error message said `.smugglr`).
 const PLUGIN_HOME_SUBDIR: &str = ".smugglr/plugins";
 
+/// How to obtain the one plugin smugglr ships. Named in every "plugin not
+/// found" error, because the CLI alone reaches no hosted target and a reader
+/// who installed only `smugglr` has no other way to learn that (#430).
+pub(crate) const HTTP_SQL_INSTALL_HINT: &str =
+    "Get it with `cargo install smugglr-http-sql`, or from the \
+     release archive, which carries it beside `smugglr` since v0.5.1.";
+
 /// Resolve a plugin name to its binary path.
 ///
 /// Search order:
@@ -345,10 +352,22 @@ pub fn resolve_plugin_path(name: &str) -> Result<PathBuf> {
         return Ok(path);
     }
 
-    Err(SyncError::Plugin(format!(
-        "Plugin '{}' not found. Searched: ~/{}/{}, $PATH/{}",
-        name, PLUGIN_HOME_SUBDIR, binary_name, binary_name
-    )))
+    Err(SyncError::Plugin(not_found_message(name, &binary_name)))
+}
+
+/// The "plugin not found" text: where smugglr looked, and, for the one plugin
+/// smugglr ships, how to get it. Pure so the message can be tested without
+/// depending on what happens to be installed on the test machine.
+fn not_found_message(name: &str, binary_name: &str) -> String {
+    let hint = if name == "http-sql" {
+        format!(" {}", HTTP_SQL_INSTALL_HINT)
+    } else {
+        String::new()
+    };
+    format!(
+        "Plugin '{}' not found. Searched: ~/{}/{}, $PATH/{}.{}",
+        name, PLUGIN_HOME_SUBDIR, binary_name, binary_name, hint
+    )
 }
 
 fn find_in_path(name: &str) -> Option<PathBuf> {
@@ -375,6 +394,20 @@ mod tests {
         let err = result.unwrap_err();
         assert!(matches!(err, SyncError::Plugin(_)));
         assert!(err.to_string().contains("nonexistent-plugin-abc123"));
+    }
+
+    #[test]
+    fn not_found_names_how_to_get_the_shipped_plugin() {
+        // The plugin every remote target needs: the message must say how to
+        // obtain it, both ways (#430).
+        let msg = not_found_message("http-sql", "smugglr-http-sql");
+        assert!(msg.contains("cargo install smugglr-http-sql"), "{msg}");
+        assert!(msg.contains("release archive"), "{msg}");
+        assert!(msg.contains("~/.smugglr/plugins/smugglr-http-sql"), "{msg}");
+        // A third-party plugin gets the search paths and no smugglr-specific hint.
+        let other = not_found_message("acme", "smugglr-acme");
+        assert!(other.contains("$PATH/smugglr-acme"), "{other}");
+        assert!(!other.contains("cargo install"), "{other}");
     }
 
     #[test]
