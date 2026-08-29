@@ -43,20 +43,24 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      # Two binaries ship together: the CLI and the smugglr-http-sql plugin
+      # every remote target (D1, Turso, rqlite, ...) is reached through. A
+      # release that carried only the CLI could sync SQLite to SQLite and
+      # nothing hosted (#430).
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} -p smugglr -p smugglr-http-sql
 
       - name: Package (Unix)
         if: matrix.os != 'windows-latest'
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../${{ matrix.artifact }}.${{ matrix.ext }} smugglr
+          tar czf ../../../${{ matrix.artifact }}.${{ matrix.ext }} smugglr smugglr-http-sql
 
       - name: Package (Windows)
         if: matrix.os == 'windows-latest'
         run: |
           cd target/${{ matrix.target }}/release
-          7z a ../../../${{ matrix.artifact }}.${{ matrix.ext }} smugglr.exe
+          7z a ../../../${{ matrix.artifact }}.${{ matrix.ext }} smugglr.exe smugglr-http-sql.exe
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

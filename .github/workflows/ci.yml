@@ -151,3 +151,42 @@ jobs:
           name: playwright-report
           path: packages/smugglr/playwright-report
           retention-days: 7
+
+  plugin-layout:
+    name: Installed layout resolves the plugin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build both binaries
+        run: cargo build --release -p smugglr -p smugglr-http-sql
+      # The release archive and the installer place smugglr and
+      # smugglr-http-sql side by side (#430). Stage that layout and prove a
+      # plugin target resolves the plugin from PATH rather than failing with
+      # "not found". The endpoint is unreachable on purpose; the connection
+      # failing is fine, the plugin failing to resolve is not.
+      - name: Resolve the plugin from an installed layout
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          cp target/release/smugglr target/release/smugglr-http-sql "$HOME/.local/bin/"
+          export PATH="$HOME/.local/bin:$PATH"
+          sqlite3 local.db "CREATE TABLE t (id TEXT PRIMARY KEY NOT NULL, updated_at INTEGER NOT NULL);"
+          cat > layout.toml <<'TOML'
+          local_db = "./local.db"
+
+          [target]
+          type = "plugin"
+          name = "http-sql"
+
+          [target.config]
+          profile = "generic"
+          url = "http://127.0.0.1:9/sql"
+          TOML
+          out="$(smugglr -c layout.toml status 2>&1 || true)"
+          echo "$out"
+          case "$out" in
+            *"not found"*) echo "plugin did not resolve from PATH"; exit 1 ;;
+          esac
+          echo "$out" | grep -q "Target Plugin (http-sql)" || { echo "plugin target not reported"; exit 1; }
+

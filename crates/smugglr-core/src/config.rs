@@ -926,8 +926,12 @@ fn resolve_http_sql_plugin_path() -> Result<PathBuf> {
     }
     #[cfg(all(not(test), feature = "native"))]
     {
-        crate::plugin::resolve_plugin_path("http-sql")
-            .map_err(|_| SyncError::Config("d1 target requires the smugglr-http-sql plugin".into()))
+        crate::plugin::resolve_plugin_path("http-sql").map_err(|_| {
+            SyncError::Config(format!(
+                "d1 target requires the smugglr-http-sql plugin. {}",
+                crate::plugin::HTTP_SQL_INSTALL_HINT
+            ))
+        })
     }
     #[cfg(all(not(test), not(feature = "native")))]
     {
