@@ -325,7 +325,7 @@ const PLUGIN_HOME_SUBDIR: &str = ".smugglr/plugins";
 /// How to obtain the one plugin smugglr ships. Named in every "plugin not
 /// found" error, because the CLI alone reaches no hosted target and a reader
 /// who installed only `smugglr` has no other way to learn that (#430).
-pub const HTTP_SQL_INSTALL_HINT: &str =
+pub(crate) const HTTP_SQL_INSTALL_HINT: &str =
     "Get it with `cargo install smugglr-http-sql`, or from the \
      release archive, which carries it beside `smugglr` since v0.5.1.";
 
