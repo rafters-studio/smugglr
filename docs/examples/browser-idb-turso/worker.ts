@@ -4,44 +4,72 @@
 
 import SQLiteAsyncESMFactory from "wa-sqlite/dist/wa-sqlite-async.mjs";
 import * as SQLite from "wa-sqlite";
-// @ts-expect-error - wa-sqlite ships JS examples without .d.ts
 import { IDBBatchAtomicVFS } from "wa-sqlite/src/examples/IDBBatchAtomicVFS.js";
-import { Smugglr, createWaSqliteExecutor } from "smugglr";
+import {
+  Smugglr,
+  createWaSqliteExecutor,
+  type SqlExecutor,
+  type TableChangedEvent,
+} from "smugglr";
 
-let sqlite3: any = null;
+type SQLiteAPI = ReturnType<typeof SQLite.Factory>;
+
+// The IndexedDB database name doubles as the VFS name passed to open_v2.
+const IDB_NAME = "smugglr-demo";
+
+interface Request {
+  id: number;
+  op: "init" | "addRow" | "sync" | "reset";
+  args: unknown[];
+}
+
+// Replies carry the request id. Events carry no id; the page logs them.
+type Reply =
+  | { id: number; ok: true; result: unknown }
+  | { id: number; ok: false; error: string }
+  | { event: "table-changed"; detail: TableChangedEvent };
+
+let sqlite3: SQLiteAPI | null = null;
 let db: number | null = null;
+let executor: SqlExecutor | null = null;
 let smugglr: Smugglr | null = null;
+
+function post(reply: Reply) {
+  (self as unknown as Worker).postMessage(reply);
+}
 
 async function init(tursoUrl: string, tursoToken: string) {
   const module = await SQLiteAsyncESMFactory();
   sqlite3 = SQLite.Factory(module);
-  // IDBBatchAtomicVFS takes (idbDatabaseName, options) -- the IDB database is
-  // created on first use.
-  const vfs = await IDBBatchAtomicVFS.create("smugglr-demo", module);
+  // The constructor takes (idbDatabaseName, options); the IndexedDB database
+  // is created on first use.
+  const vfs = new IDBBatchAtomicVFS(IDB_NAME);
   sqlite3.vfs_register(vfs, true);
   db = await sqlite3.open_v2(
     "demo.db",
     SQLite.SQLITE_OPEN_READWRITE | SQLite.SQLITE_OPEN_CREATE,
-    "smugglr-demo",
+    IDB_NAME,
   );
 
-  const exe = createWaSqliteExecutor(sqlite3, db);
-  await exe.run(
+  executor = createWaSqliteExecutor(sqlite3, db);
+  await executor.run(
     "CREATE TABLE IF NOT EXISTS notes (id TEXT PRIMARY KEY, body TEXT, updated_at TEXT)",
     [],
   );
 
   smugglr = await Smugglr.init({
-    source: { type: "local", executor: exe },
+    source: { type: "local", executor },
     dest: { url: tursoUrl, authToken: tursoToken, profile: "turso" },
     sync: { tables: ["notes"], conflictResolution: "newer_wins" },
   });
+
+  // Fires once per table after pull or sync writes locally; push never emits.
+  smugglr.on("table-changed", (detail) => post({ event: "table-changed", detail }));
 }
 
 async function addRow(id: string, updatedAt: string) {
-  if (!sqlite3 || db === null) throw new Error("init() first");
-  const exe = createWaSqliteExecutor(sqlite3, db);
-  await exe.run(
+  if (!executor) throw new Error("init() first");
+  await executor.run(
     "INSERT INTO notes (id, body, updated_at) VALUES (?, ?, ?)",
     [id, `note created at ${updatedAt}`, updatedAt],
   );
@@ -57,19 +85,20 @@ async function reset() {
     smugglr.dispose();
     smugglr = null;
   }
+  executor = null;
   if (sqlite3 && db !== null) {
-    sqlite3.close(db);
+    await sqlite3.close(db);
     db = null;
   }
-  // Wipe the IDB database used by the VFS.
+  // Wipe the IndexedDB database the VFS wrote into.
   await new Promise<void>((resolve, reject) => {
-    const req = indexedDB.deleteDatabase("smugglr-demo");
+    const req = indexedDB.deleteDatabase(IDB_NAME);
     req.onsuccess = () => resolve();
     req.onerror = () => reject(req.error);
   });
 }
 
-self.addEventListener("message", async (ev: MessageEvent<{ id: number; op: string; args: unknown[] }>) => {
+self.addEventListener("message", async (ev: MessageEvent<Request>) => {
   const { id, op, args } = ev.data;
   try {
     let result: unknown;
@@ -78,11 +107,11 @@ self.addEventListener("message", async (ev: MessageEvent<{ id: number; op: strin
       case "addRow": result = await addRow(args[0] as string, args[1] as string); break;
       case "sync": result = await sync(); break;
       case "reset": result = await reset(); break;
-      default: throw new Error(`unknown op: ${op}`);
+      default: throw new Error(`unknown op: ${String(op)}`);
     }
-    (self as unknown as Worker).postMessage({ id, ok: true, result });
+    post({ id, ok: true, result });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    (self as unknown as Worker).postMessage({ id, ok: false, error: message });
+    post({ id, ok: false, error: message });
   }
 });

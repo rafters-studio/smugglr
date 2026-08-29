@@ -1,24 +1,36 @@
 # cli-lan-broadcast example config.
 #
-# Copy to config.toml on each machine. For nodes to sync, all that must match is:
-#   1. the same `secret` (the shared key IS membership + encryption), and
+# Copy to config.toml on each machine. For two nodes to sync, these must match:
+#   1. the same `secret`, and
 #   2. the same `port`, on the same subnet.
-# File paths do NOT need to match -- membership is key possession, not location.
+# File paths do not need to match; membership is key possession, not location.
 
 local_db = "./node.db"
 
 [sync]
-tables = []                       # empty = sync all non-excluded tables
-exclude_tables = ["sqlite_sequence"]
+tables = []
 timestamp_column = "updated_at"
-# Skip large columns (embeddings, blobs) from sync payloads. Lives under [sync].
+# Columns matching these globs leave the content hash, so an edit confined to
+# them does not churn the mesh. In 0.5.0 they still ride the wire when a peer
+# requests the row (#322); do not rely on this to keep a column private.
 exclude_columns = ["*_embedding", "vector"]
 
 [broadcast]
-# 256-bit key, hex-encoded (64 chars). MUST be byte-identical on every node.
+# 256-bit key, hex-encoded (64 chars). Byte-identical on every node.
 # Generate once and distribute securely: openssl rand -hex 32
+# Leave it out and the node still runs, unencrypted and unauthenticated,
+# accepting any well-formed datagram on the subnet. It warns once at start.
 secret = "REPLACE_WITH_OUTPUT_OF_openssl_rand_-hex_32"
 # UDP port for the multicast group. Same on every node.
 port = 31337
 # How often each node multicasts its content-hash digest (the heartbeat).
 interval_secs = 5
+# Which row wins when two nodes hold the same primary key with different
+# contents. remote_wins (the default) is last-received-wins; newer_wins
+# orders by ordering_columns and is the only policy that converges under
+# concurrent edits. Both nodes must set it; it is not negotiated on the wire.
+conflict_resolution = "newer_wins"
+ordering_columns = ["updated_at"]
+# Defaults to the hostname. Two nodes with the same id ignore each other,
+# so set it explicitly when running two peers on one machine.
+# instance_id = "laptop-a"

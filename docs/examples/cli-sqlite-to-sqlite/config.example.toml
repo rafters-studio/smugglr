@@ -1,0 +1,20 @@
+# cli-sqlite-to-sqlite example config.
+#
+# Copy to config.toml. Both sides are local SQLite files; nothing leaves the
+# machine and no credentials are involved. The same diff engine that drives
+# every hosted backend runs here, so this is the shortest path to seeing
+# what a dry-run and a push actually print.
+
+local_db = "./local.db"
+
+[target]
+type = "sqlite"
+database = "./backup.db"
+
+[sync]
+# Empty = every table except exclude_tables. Matching on exclude_tables is
+# exact, not glob.
+tables = []
+timestamp_column = "updated_at"
+# Local edits win when both sides changed the same row.
+conflict_resolution = "local_wins"

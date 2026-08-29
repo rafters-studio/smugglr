@@ -1,0 +1,15 @@
+# cli-stash-file-relay example config.
+#
+# Copy to config.toml on each machine. The relay is a SQLite file in an
+# object store; this example uses a file:// URL so it runs on one machine
+# with no credentials. Swap the url for s3://bucket/path/relay.sqlite (plus
+# access_key_id, secret_access_key, region, endpoint) for R2, S3, or MinIO.
+
+local_db = "./machine-a.db"
+
+[stash]
+url = "file:///tmp/smugglr-relay/relay.sqlite"
+
+[sync]
+timestamp_column = "updated_at"
+conflict_resolution = "newer_wins"

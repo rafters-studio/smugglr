@@ -1,0 +1,156 @@
+{
+  "manifest": {
+    "version": 1,
+    "target_schema": "",
+    "up": [
+      {
+        "op": {
+          "op": "create_table",
+          "table": "orders",
+          "columns": [
+            {
+              "name": "id",
+              "kind": "text",
+              "constraints": [
+                {
+                  "constraint": "pk"
+                },
+                {
+                  "constraint": "not_null"
+                }
+              ]
+            },
+            {
+              "name": "customer_id",
+              "kind": "text",
+              "constraints": [
+                {
+                  "constraint": "not_null"
+                }
+              ]
+            },
+            {
+              "name": "employee_id",
+              "kind": "text",
+              "constraints": [
+                {
+                  "constraint": "not_null"
+                }
+              ]
+            },
+            {
+              "name": "shipper_id",
+              "kind": "text",
+              "constraints": [
+                {
+                  "constraint": "not_null"
+                }
+              ]
+            },
+            {
+              "name": "order_date",
+              "kind": "text",
+              "constraints": [
+                {
+                  "constraint": "not_null"
+                }
+              ]
+            },
+            {
+              "name": "required_date",
+              "kind": "text"
+            },
+            {
+              "name": "shipped_date",
+              "kind": "text"
+            },
+            {
+              "name": "freight",
+              "kind": "real",
+              "constraints": [
+                {
+                  "constraint": "not_null"
+                },
+                {
+                  "constraint": "default",
+                  "value": "0"
+                }
+              ]
+            },
+            {
+              "name": "ship_city",
+              "kind": "text"
+            },
+            {
+              "name": "ship_region",
+              "kind": "text"
+            },
+            {
+              "name": "updated_at",
+              "kind": "int",
+              "constraints": [
+                {
+                  "constraint": "not_null"
+                }
+              ]
+            }
+          ],
+          "without_rowid": false
+        },
+        "op_class": "additive"
+      },
+      {
+        "op": {
+          "op": "create_index",
+          "name": "idx_orders_customer_id",
+          "table": "orders",
+          "columns": [
+            "customer_id"
+          ],
+          "unique": false
+        },
+        "op_class": "additive"
+      },
+      {
+        "op": {
+          "op": "create_index",
+          "name": "idx_orders_order_date",
+          "table": "orders",
+          "columns": [
+            "order_date"
+          ],
+          "unique": false
+        },
+        "op_class": "additive"
+      }
+    ],
+    "down": [
+      {
+        "op": {
+          "op": "drop_index",
+          "name": "idx_orders_order_date"
+        },
+        "op_class": "additive"
+      },
+      {
+        "op": {
+          "op": "drop_index",
+          "name": "idx_orders_customer_id"
+        },
+        "op_class": "additive"
+      },
+      {
+        "op": {
+          "op": "drop_table",
+          "table": "orders"
+        },
+        "op_class": "destructive"
+      }
+    ],
+    "flags": {
+      "destructive": false,
+      "hash_rewriting": false
+    }
+  },
+  "checksum": "4b5cce42abd1e797066f5bfbebf4a96a53f3e8ff62d3ab6d0ad91cc703cbd701"
+}

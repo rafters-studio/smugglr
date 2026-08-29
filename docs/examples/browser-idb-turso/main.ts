@@ -1,4 +1,12 @@
-// Identical proxy layer to browser-opfs-turso/main.ts.
+// Page UI: proxies button clicks into the worker via postMessage. The worker
+// owns wa-sqlite + smugglr. IndexedDB needs no worker; this example keeps
+// the same layout as the OPFS twin so the two differ only in the VFS.
+
+const tursoUrl = import.meta.env.VITE_TURSO_URL;
+const tursoToken = import.meta.env.VITE_TURSO_TOKEN;
+if (typeof tursoUrl !== "string" || typeof tursoToken !== "string") {
+  throw new Error("VITE_TURSO_URL and VITE_TURSO_TOKEN must be set in .env");
+}
 
 const worker = new Worker(new URL("./worker.ts", import.meta.url), {
   type: "module",
@@ -9,9 +17,17 @@ const append = (line: string) => {
   log.textContent = `${new Date().toISOString().slice(11, 23)}  ${line}\n${log.textContent}`;
 };
 
+type WorkerMessage =
+  | { id: number; ok: boolean; result?: unknown; error?: string }
+  | { event: string; detail: unknown };
+
 let nextId = 1;
 const pending = new Map<number, (v: unknown) => void>();
-worker.addEventListener("message", (ev: MessageEvent<{ id: number; ok: boolean; result?: unknown; error?: string }>) => {
+worker.addEventListener("message", (ev: MessageEvent<WorkerMessage>) => {
+  if ("event" in ev.data) {
+    append(`${ev.data.event}: ${JSON.stringify(ev.data.detail)}`);
+    return;
+  }
   const slot = pending.get(ev.data.id);
   if (!slot) return;
   pending.delete(ev.data.id);
@@ -26,7 +42,7 @@ function call(op: string, args: unknown[] = []) {
   });
 }
 
-await call("init", [import.meta.env.VITE_TURSO_URL, import.meta.env.VITE_TURSO_TOKEN]);
+await call("init", [tursoUrl, tursoToken]);
 append("ready");
 
 document.getElementById("add")!.addEventListener("click", async () => {

@@ -1,28 +1,36 @@
 # cli-d1-sync example config.
 #
-# Copy this file to config.toml and replace the placeholders.
-# The API token is read from the SMUGGLR_D1_TOKEN environment variable, so
-# this file is safe to commit.
-
-cloudflare_account_id = "your-32-char-account-id"
-cloudflare_api_token = "${SMUGGLR_D1_TOKEN}"
-database_id = "your-d1-database-uuid"
+# Copy to config.toml and replace the two ids. The API token is read from
+# the SMUGGLR_D1_TOKEN environment variable, so this file is safe to commit.
+#
+# In 0.5.0 this shape does not reach D1: see #429 (the core and the plugin
+# disagree on the config keys) and #430 (the smugglr-http-sql plugin is not
+# installed with smugglr). It is the shape the fix will honor.
 
 local_db = "./app.sqlite"
 
-[sync]
+[target]
+type = "d1"
+account_id = "your-32-char-account-id"
+database_id = "your-d1-database-uuid"
+api_token = "${SMUGGLR_D1_TOKEN}"
 
-# Sync everything except smugglr/wrangler bookkeeping tables.
+[sync]
+# Empty = every table except exclude_tables. The default exclude list already
+# holds sqlite_sequence, _cf_KV, __drizzle_migrations, _smugglr_migrations.
+# Matching is exact, not glob.
 tables = []
 exclude_tables = [
     "sqlite_sequence",
     "_cf_KV",
     "_cf_METADATA",
+    "__drizzle_migrations",
+    "_smugglr_migrations",
     "d1_migrations",
 ]
 
-# Most schemas keep an updated_at column; smugglr uses it as a tiebreaker.
+# Used as the tiebreaker when both sides changed a row.
 timestamp_column = "updated_at"
 
-# Local edits win over D1 -- typical dev -> prod workflow.
+# Local edits win over D1: the dev -> prod direction.
 conflict_resolution = "local_wins"

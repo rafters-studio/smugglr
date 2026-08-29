@@ -7,13 +7,15 @@
 
 const params = new URLSearchParams(location.search);
 const tenant = params.get("tenant") ?? "alice";
-const tenantToken = import.meta.env[`VITE_TENANT_TOKEN_${tenant.toUpperCase()}`];
-const fenceUrl = import.meta.env.VITE_FENCE_URL;
+const tokenVar = `VITE_TENANT_TOKEN_${tenant.toUpperCase()}`;
+const tenantToken = import.meta.env[tokenVar];
+const guardUrl = import.meta.env.VITE_GUARD_URL;
 
-if (!tenantToken) {
-  throw new Error(
-    `No VITE_TENANT_TOKEN_${tenant.toUpperCase()} in .env -- add a token for tenant "${tenant}".`,
-  );
+if (typeof tenantToken !== "string") {
+  throw new Error(`No ${tokenVar} in .env -- add a token for tenant "${tenant}".`);
+}
+if (typeof guardUrl !== "string") {
+  throw new Error("VITE_GUARD_URL must be set in .env");
 }
 
 document.getElementById("tenant-label")!.textContent = `[${tenant}]`;
@@ -28,9 +30,17 @@ const append = (line: string) => {
   log.textContent = `${new Date().toISOString().slice(11, 23)}  ${line}\n${log.textContent}`;
 };
 
+type WorkerMessage =
+  | { id: number; ok: boolean; result?: unknown; error?: string }
+  | { event: string; detail: unknown };
+
 let nextId = 1;
 const pending = new Map<number, (v: unknown) => void>();
-worker.addEventListener("message", (ev: MessageEvent<{ id: number; ok: boolean; result?: unknown; error?: string }>) => {
+worker.addEventListener("message", (ev: MessageEvent<WorkerMessage>) => {
+  if ("event" in ev.data) {
+    append(`${ev.data.event}: ${JSON.stringify(ev.data.detail)}`);
+    return;
+  }
   const slot = pending.get(ev.data.id);
   if (!slot) return;
   pending.delete(ev.data.id);
@@ -45,7 +55,7 @@ function call(op: string, args: unknown[] = []) {
   });
 }
 
-await call("init", [tenant, tenantToken, fenceUrl]);
+await call("init", [tenant, tenantToken, guardUrl]);
 append(`ready as tenant=${tenant}`);
 
 document.getElementById("add")!.addEventListener("click", async () => {

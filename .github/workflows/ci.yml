@@ -51,7 +51,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: shellcheck install.sh scripts/publish-crate.sh
+      - run: shellcheck install.sh scripts/publish-crate.sh docs/examples/westwind/make.sh docs/examples/westwind/scaffold.sh
+
+  examples:
+    name: Examples match their READMEs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the CLI
+        run: cargo build --release -p smugglr
+      # Every `$ smugglr ...` block in the credential-free CLI example READMEs
+      # is re-run against the built binary and compared (sorted lines; JSON
+      # parsed). A change to the CLI's output fails here instead of dating the
+      # docs silently. See scripts/check-examples.py.
+      - name: Run the examples
+        run: python3 scripts/check-examples.py --smugglr "$PWD/target/release/smugglr"
 
   versions:
     name: Crate versions

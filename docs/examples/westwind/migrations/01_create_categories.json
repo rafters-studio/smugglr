@@ -1,0 +1,69 @@
+{
+  "manifest": {
+    "version": 1,
+    "target_schema": "",
+    "up": [
+      {
+        "op": {
+          "op": "create_table",
+          "table": "categories",
+          "columns": [
+            {
+              "name": "id",
+              "kind": "text",
+              "constraints": [
+                {
+                  "constraint": "pk"
+                },
+                {
+                  "constraint": "not_null"
+                }
+              ]
+            },
+            {
+              "name": "name",
+              "kind": "text",
+              "constraints": [
+                {
+                  "constraint": "not_null"
+                },
+                {
+                  "constraint": "unique"
+                }
+              ]
+            },
+            {
+              "name": "description",
+              "kind": "text"
+            },
+            {
+              "name": "updated_at",
+              "kind": "int",
+              "constraints": [
+                {
+                  "constraint": "not_null"
+                }
+              ]
+            }
+          ],
+          "without_rowid": false
+        },
+        "op_class": "additive"
+      }
+    ],
+    "down": [
+      {
+        "op": {
+          "op": "drop_table",
+          "table": "categories"
+        },
+        "op_class": "destructive"
+      }
+    ],
+    "flags": {
+      "destructive": false,
+      "hash_rewriting": false
+    }
+  },
+  "checksum": "f40fed16bdb497a97d42a748a217ff175950ddcd4f5d34d007e0464fc5323f5f"
+}

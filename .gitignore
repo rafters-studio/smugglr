@@ -19,3 +19,8 @@ failed_rows.json
 .DS_Store
 Thumbs.db
 /crates/smugglr-wasm/pkg/
+
+# Example working files (created by running docs/examples/*)
+docs/examples/**/*.db
+docs/examples/**/config-*.toml
+docs/examples/cli-migrate/migrations/

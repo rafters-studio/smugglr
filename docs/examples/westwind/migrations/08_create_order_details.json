@@ -1,0 +1,121 @@
+{
+  "manifest": {
+    "version": 1,
+    "target_schema": "",
+    "up": [
+      {
+        "op": {
+          "op": "create_table",
+          "table": "order_details",
+          "columns": [
+            {
+              "name": "id",
+              "kind": "text",
+              "constraints": [
+                {
+                  "constraint": "pk"
+                },
+                {
+                  "constraint": "not_null"
+                }
+              ]
+            },
+            {
+              "name": "order_id",
+              "kind": "text",
+              "constraints": [
+                {
+                  "constraint": "not_null"
+                }
+              ]
+            },
+            {
+              "name": "product_id",
+              "kind": "text",
+              "constraints": [
+                {
+                  "constraint": "not_null"
+                }
+              ]
+            },
+            {
+              "name": "unit_price",
+              "kind": "real",
+              "constraints": [
+                {
+                  "constraint": "not_null"
+                }
+              ]
+            },
+            {
+              "name": "quantity",
+              "kind": "int",
+              "constraints": [
+                {
+                  "constraint": "not_null"
+                }
+              ]
+            },
+            {
+              "name": "discount",
+              "kind": "real",
+              "constraints": [
+                {
+                  "constraint": "not_null"
+                },
+                {
+                  "constraint": "default",
+                  "value": "0"
+                }
+              ]
+            },
+            {
+              "name": "updated_at",
+              "kind": "int",
+              "constraints": [
+                {
+                  "constraint": "not_null"
+                }
+              ]
+            }
+          ],
+          "without_rowid": false
+        },
+        "op_class": "additive"
+      },
+      {
+        "op": {
+          "op": "create_index",
+          "name": "idx_order_details_order_id",
+          "table": "order_details",
+          "columns": [
+            "order_id"
+          ],
+          "unique": false
+        },
+        "op_class": "additive"
+      }
+    ],
+    "down": [
+      {
+        "op": {
+          "op": "drop_index",
+          "name": "idx_order_details_order_id"
+        },
+        "op_class": "additive"
+      },
+      {
+        "op": {
+          "op": "drop_table",
+          "table": "order_details"
+        },
+        "op_class": "destructive"
+      }
+    ],
+    "flags": {
+      "destructive": false,
+      "hash_rewriting": false
+    }
+  },
+  "checksum": "282301d633321a5785ba012e5a176443fdc21981cb5c690dce9f24e18809bb6f"
+}
