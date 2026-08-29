@@ -131,7 +131,7 @@ For each table smugglr reads every primary key from both sides and hashes each r
 | `content_differs` | same timestamp, different content | by policy | by policy |
 | `identical` | equal | skip | skip |
 
-`conflict_resolution` settles `content_differs`: `local_wins` (the default), `remote_wins`, or `newer_wins`, which skips a row with no usable timestamp and says so once per table. Writes are upserts; nothing deletes. Tables are written in alphabetical order. Timestamps lie, clocks drift, and bulk imports stamp everything "now", which is why the hash decides whether a row changed and the timestamp only decides which way it moves.
+`conflict_resolution` settles `content_differs`: `local_wins` (the default), `remote_wins`, or `newer_wins`, which skips a row with no usable timestamp and says so once per table. Writes are upserts; nothing deletes. On the native path tables are written in whichever order the set iterates, which changes from run to run; the relay and the wasm client sort them. Timestamps lie, clocks drift, and bulk imports stamp everything "now", which is why the hash decides whether a row changed and the timestamp only decides which way it moves.
 
 ## The shapes
 
@@ -273,7 +273,7 @@ loaded smugglr wasm: 316800 bytes
 push complete: {"command":"push","status":"ok","tables":[{"name":"categories","rowsPushed":8},{"name":"customers","rowsPushed":40},{"name":"employees","rowsPushed":9},{"name":"order_details","rowsPushed":788},{"name":"orders","rowsPushed":320},{"name":"products","rowsPushed":20},{"name":"shippers","rowsPushed":3},{"name":"suppliers","rowsPushed":8}]}
 ```
 
-In Node the wasm must be read from disk and handed to `setWasm` before `init()`, because the loader fetches a `file:` URL that Node's `fetch` refuses (#437); the example shows the eight lines. The wasm is 316,800 bytes on disk and 126,497 gzipped in the published 0.5.0 package.
+In Node the wasm must be read from disk and handed to `setWasm` before `init()`, because the loader fetches a `file:` URL that Node's `fetch` refuses, and `setWasm` itself prints a wasm-bindgen deprecation warning while it does so (#437); the example shows the eight lines. The wasm is 316,800 bytes on disk and 126,497 gzipped in the published 0.5.0 package.
 
 ## Embedding the engine
 
@@ -309,7 +309,7 @@ Each of these is a reader's first ten minutes, stated here so it is met in the d
 
 **A snapshot can miss committed rows.** `snapshot` reads the database file with `std::fs::read`; on a WAL-mode database, rows still in the WAL are counted in the metadata and absent from the file (#433). Checkpoint first.
 
-**Tables are written alphabetically.** On a target that enforces foreign keys, a child table can land before its parent and be rejected (#435). Westwind declares no foreign keys for this reason.
+**Table order ignores foreign keys.** The native path writes tables in set-iteration order and the relay and wasm paths alphabetically; none consults `foreign_key_list`, so on a target that enforces foreign keys a child table can land before its parent and be rejected (#435). Westwind declares no foreign keys for this reason.
 
 **Pointing at the wrong target looks like success.** An empty table intersection reports `status: ok` with an empty `tables` and exit 0 (#438).
 
