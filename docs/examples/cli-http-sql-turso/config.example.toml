@@ -1,0 +1,24 @@
+# cli-http-sql-turso example config.
+#
+# Copy to config.toml. Every hosted backend is reached through the
+# smugglr-http-sql plugin: `name` is the plugin binary, and the backend is
+# chosen by `profile` under [target.config]. Swap the profile and the url for
+# rqlite, datasette, sqlite-cloud, starbasedb, or generic; the commands stay
+# the same. The token is read from the environment so this file can be
+# committed; an unset variable exits 2.
+
+local_db = "./local.db"
+
+[target]
+type = "plugin"
+name = "http-sql"
+
+[target.config]
+profile = "turso"
+url = "https://my-db.turso.io"
+auth_token = "${TURSO_TOKEN}"
+
+[sync]
+tables = []
+timestamp_column = "updated_at"
+conflict_resolution = "local_wins"

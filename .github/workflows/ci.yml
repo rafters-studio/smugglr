@@ -68,6 +68,10 @@ jobs:
       # docs silently. See scripts/check-examples.py.
       - name: Run the examples
         run: python3 scripts/check-examples.py --smugglr "$PWD/target/release/smugglr"
+      # The root README copies its blocks from docs/examples; a block with no
+      # source there was typed, and typed output is what #426 removed.
+      - name: README blocks come from the examples
+        run: python3 scripts/check-examples.py --readme
 
   versions:
     name: Crate versions
