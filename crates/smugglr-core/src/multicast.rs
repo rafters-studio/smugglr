@@ -324,6 +324,27 @@ pub struct Gossip {
     /// Configured ordering columns for `newer_wins` (empty = fall back to
     /// `[sync].timestamp_column` at apply time).
     ordering_columns: Vec<String>,
+    /// `[sync].exclude_columns`, glob-style patterns (see
+    /// [`column_excluded`](crate::config::column_excluded)).
+    ///
+    /// Stripped from every `Delta` this node sends -- both the `Want` answer
+    /// (`on_want` -> [`Gossip::delta_bodies`]) and a live write pushed through
+    /// [`Gossip::broadcast_delta`] -- so a column excluded to keep it off the
+    /// wire actually stays off the wire (#322 Part C). Not negotiated with
+    /// peers: every node in a mesh using `exclude_columns` must be configured
+    /// with the same list, exactly as they already must agree on it for the
+    /// content hash (see [`Gossip::row_hashes`]).
+    ///
+    /// Also must agree WITHIN one node: this list is captured once at
+    /// [`Gossip::bind`] and is independent of the `&Config` every call site
+    /// (`handle`, `digest_bodies`, `recv_and_handle`) takes separately. A node
+    /// bound with one `[sync].exclude_columns` and later handed a `Config`
+    /// carrying a different one strips one set here but hashes another in
+    /// [`Gossip::row_hashes`] -- the same permanent-churn failure Part B's diff
+    /// co-change exists to prevent (see `stash::sync_table`), reached from a
+    /// same-node source instead of a cross-peer one. Callers must bind and
+    /// call with the same `[sync].exclude_columns` throughout a node's life.
+    exclude_columns: Vec<String>,
     /// Per-table apply diagnostics, recorded once and readable via
     /// [`Gossip::ordering_notes`].
     notes: Arc<Mutex<HashMap<String, OrderingNote>>>,
@@ -359,7 +380,16 @@ pub struct OrderingNote {
 impl Gossip {
     /// Join the multicast group and prepare to gossip. Membership is the shared
     /// key in `broadcast` -- any node that can decrypt is on the network.
-    pub async fn bind(broadcast: &BroadcastConfig, group: Ipv4Addr) -> Result<Self> {
+    ///
+    /// `exclude_columns` is `[sync].exclude_columns`, not part of
+    /// `BroadcastConfig` -- passed separately because the two settings live in
+    /// different config sections but this node's every outgoing `Delta` must
+    /// honor both (#322 Part C).
+    pub async fn bind(
+        broadcast: &BroadcastConfig,
+        group: Ipv4Addr,
+        exclude_columns: &[String],
+    ) -> Result<Self> {
         let port = if broadcast.port == 0 {
             DEFAULT_PORT
         } else {
@@ -396,6 +426,7 @@ impl Gossip {
             replay: Arc::new(Mutex::new(ReplayGuard::new())),
             conflict_resolution: broadcast.conflict_resolution,
             ordering_columns: broadcast.ordering_columns.clone(),
+            exclude_columns: exclude_columns.to_vec(),
             notes: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -491,6 +522,15 @@ impl Gossip {
     /// Build delta datagrams for `rows` of `table` (a live write or a `Want`
     /// answer), each part given a unique seq so the replay guard dedupes.
     ///
+    /// Strips `self.exclude_columns` before packing, so both callers -- the
+    /// `Want` answer in `on_want` and the public [`Gossip::broadcast_delta`] --
+    /// share one strip rather than each needing its own (#322 Part C). No diff
+    /// co-change is needed the way stash's is (see `stash::sync_table`): the
+    /// digest already hashes over the union of `exclude_columns` and
+    /// `converge_columns` ([`Gossip::row_hashes`]), so an excluded column never
+    /// contributes to a content hash or a `Want`, and stripping it here cannot
+    /// make the mesh ask for the row again.
+    ///
     /// Always sends an empty `deletes` list. The wire field exists and
     /// [`crate::broadcast::split_delta`] still packs it, but no receiver applies
     /// deletes (see [`Gossip::broadcast_delta`]), so populating it here would put
@@ -500,6 +540,7 @@ impl Gossip {
         table: &str,
         upserts: Vec<HashMap<String, serde_json::Value>>,
     ) -> Result<Vec<Body>> {
+        let upserts = crate::stash::strip_excluded_columns(upserts, &self.exclude_columns);
         let parts = crate::broadcast::split_delta(
             &self.instance_id,
             0,
@@ -983,6 +1024,24 @@ mod tests {
         }
     }
 
+    /// Separate table (and column worth excluding) from `users`, for the #322
+    /// Part C `exclude_columns` tests -- so they cannot be affected by, or
+    /// affect, the fixture every other test in this module shares.
+    fn seed_people(path: &str, rows: &[(&str, &str, &str)]) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE people (id TEXT PRIMARY KEY, name TEXT, ssn TEXT, updated_at TEXT);",
+        )
+        .unwrap();
+        for (id, name, ssn) in rows {
+            conn.execute(
+                "INSERT INTO people VALUES (?1, ?2, ?3, '2026-01-01T00:00:00Z')",
+                [id, name, ssn],
+            )
+            .unwrap();
+        }
+    }
+
     fn count(path: &str) -> i64 {
         let conn = rusqlite::Connection::open(path).unwrap();
         conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
@@ -1196,7 +1255,7 @@ mod tests {
             &[("1", "b-older", "2026-02-01T00:00:00+00:00", None)],
         );
         let (a, a_cfg, a_local, b, b_cfg, b_local) =
-            two_nodes_with(&a_path, &b_path, None, None, legion_policy).await;
+            two_nodes_with(&a_path, &b_path, None, None, &[], legion_policy).await;
 
         // B advertises; A wants (hashes differ); B serves; A applies -- and
         // rejects, because B's row is older.
@@ -1257,7 +1316,7 @@ mod tests {
             &[("1", "tombstoned", stamp, Some("2026-06-01T00:00:00+00:00"))],
         );
         let (a, a_cfg, a_local, b, b_cfg, b_local) =
-            two_nodes_with(&a_path, &b_path, None, None, legion_policy).await;
+            two_nodes_with(&a_path, &b_path, None, None, &[], legion_policy).await;
 
         let digest = only(b.digest_bodies(&b_local, &b_cfg).await.unwrap());
         let (ev, out) = route(&b, digest, &a, &a_local, &a_cfg).await;
@@ -1298,7 +1357,7 @@ mod tests {
         );
         seed_ordered(&b_path, &[]);
         let (a, a_cfg, a_local, _b, _b_cfg, _b_local) =
-            two_nodes_with(&a_path, &b_path, None, None, legion_policy).await;
+            two_nodes_with(&a_path, &b_path, None, None, &[], legion_policy).await;
 
         // A hears a delta whose ordering column carries an integer Unix time
         // while A stores ISO-8601 text.
@@ -1474,7 +1533,7 @@ mod tests {
         key_a: Option<&str>,
         key_b: Option<&str>,
     ) -> (Gossip, Config, LocalDb, Gossip, Config, LocalDb) {
-        two_nodes_with(a_path, b_path, key_a, key_b, |_| {}).await
+        two_nodes_with(a_path, b_path, key_a, key_b, &[], |_| {}).await
     }
 
     /// The port every test binds on.
@@ -1487,16 +1546,23 @@ mod tests {
 
     /// Bind two gossip nodes. Keys are per node (they are what asymmetry tests
     /// vary); `tweak` is applied to both, for settings a converging mesh must
-    /// share -- the apply policy and its ordering columns.
+    /// share -- the apply policy and its ordering columns. `exclude_columns` is
+    /// likewise shared -- a real mesh must agree on it (see [`Gossip::bind`]'s
+    /// doc) -- and is threaded into both nodes' `Config` too, so a test that
+    /// reads `a_cfg.sync.exclude_columns` sees the same list `Gossip::bind` was
+    /// given.
     async fn two_nodes_with(
         a_path: &str,
         b_path: &str,
         key_a: Option<&str>,
         key_b: Option<&str>,
+        exclude_columns: &[String],
         tweak: impl Fn(&mut BroadcastConfig),
     ) -> (Gossip, Config, LocalDb, Gossip, Config, LocalDb) {
-        let a_cfg = cfg(a_path);
-        let b_cfg = cfg(b_path);
+        let mut a_cfg = cfg(a_path);
+        let mut b_cfg = cfg(b_path);
+        a_cfg.sync.exclude_columns = exclude_columns.to_vec();
+        b_cfg.sync.exclude_columns = exclude_columns.to_vec();
         let a_local = LocalDb::open(a_path).unwrap();
         let b_local = LocalDb::open(b_path).unwrap();
 
@@ -1516,8 +1582,8 @@ mod tests {
         tweak(&mut bc_b);
 
         let group = Ipv4Addr::new(239, 255, 99, 88);
-        let a = Gossip::bind(&bc_a, group).await.unwrap();
-        let b = Gossip::bind(&bc_b, group).await.unwrap();
+        let a = Gossip::bind(&bc_a, group, exclude_columns).await.unwrap();
+        let b = Gossip::bind(&bc_b, group, exclude_columns).await.unwrap();
         (a, a_cfg, a_local, b, b_cfg, b_local)
     }
 
@@ -1958,6 +2024,171 @@ mod tests {
                 SAFE_PACKET_SIZE
             );
         }
+    }
+
+    // -- #322 Part C: `exclude_columns` on the multicast Want/Delta path ----
+
+    /// Acceptance criterion 1: feeding a sealed `Want` datagram to
+    /// `Gossip::handle` -- free of socket I/O, per the doc on `handle` -- must
+    /// return `Delta` parts whose `upserts` maps do not carry the excluded key.
+    /// The assertion is on the payload, not on the event count.
+    #[tokio::test]
+    async fn want_response_strips_excluded_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let a_path = dir.path().join("a.db").to_str().unwrap().to_string();
+        let b_path = dir.path().join("b.db").to_str().unwrap().to_string();
+        seed_people(&a_path, &[("1", "alice", "123-45-6789")]);
+        seed_people(&b_path, &[]);
+        let (a, a_cfg, a_local, _b, _b_cfg, _b_local) =
+            two_nodes_with(&a_path, &b_path, None, None, &["ssn".to_string()], |_| {}).await;
+
+        let want = Body::Want(WantPacket {
+            source_id: "node-b".into(),
+            table: "people".into(),
+            pks: vec!["1".to_string()],
+        });
+        let sealed = a.seal(want).unwrap();
+        let (event, out) = a.handle(&sealed, &a_local, &a_cfg).await.unwrap();
+
+        assert!(
+            matches!(event, GossipEvent::Served { rows: 1, .. }),
+            "got {event:?}"
+        );
+        match only(out) {
+            Body::Delta(d) => {
+                assert_eq!(d.upserts.len(), 1);
+                assert!(
+                    !d.upserts[0].contains_key("ssn"),
+                    "a column excluded to keep it off the wire must not appear in the Want \
+                     answer's payload, got {:?}",
+                    d.upserts[0]
+                );
+                assert_eq!(
+                    d.upserts[0].get("name").and_then(|v| v.as_str()),
+                    Some("alice"),
+                    "a non-excluded column must still cross"
+                );
+            }
+            other => panic!("expected Delta, got {other:?}"),
+        }
+    }
+
+    /// Acceptance criterion 2: the public [`Gossip::broadcast_delta`] shares
+    /// `on_want`'s strip because both route through [`Gossip::delta_bodies`] --
+    /// this is the point of stripping there rather than in `on_want` alone (see
+    /// the doc on `delta_bodies`). Asserted directly against `delta_bodies`,
+    /// the same way `keyed_delta_parts_stay_under_mtu_when_sealed` inspects its
+    /// output above, rather than through a real socket send: `broadcast_delta`
+    /// itself returns only a row count, and this repo's established pattern
+    /// (see that test) is to open the packed body, not the network, when the
+    /// assertion is about payload content.
+    #[tokio::test]
+    async fn broadcast_delta_strips_excluded_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let a_path = dir.path().join("a.db").to_str().unwrap().to_string();
+        let b_path = dir.path().join("b.db").to_str().unwrap().to_string();
+        seed_people(&a_path, &[("1", "alice", "123-45-6789")]);
+        seed_people(&b_path, &[]);
+        let (a, _a_cfg, a_local, _b, _b_cfg, _b_local) =
+            two_nodes_with(&a_path, &b_path, None, None, &["ssn".to_string()], |_| {}).await;
+
+        let rows = a_local
+            .get_rows("people", &["1".to_string()])
+            .await
+            .unwrap();
+        let bodies = a.delta_bodies("people", rows).unwrap();
+        match only(bodies) {
+            Body::Delta(d) => {
+                assert_eq!(d.upserts.len(), 1);
+                assert!(
+                    !d.upserts[0].contains_key("ssn"),
+                    "broadcast_delta's packed body must not carry an excluded column, got {:?}",
+                    d.upserts[0]
+                );
+            }
+            other => panic!("expected Delta, got {other:?}"),
+        }
+    }
+
+    /// Acceptance criterion 4: an empty `exclude_columns` must leave datagrams
+    /// exactly as before -- no deployment without it pays anything.
+    #[tokio::test]
+    async fn empty_exclude_columns_leaves_delta_bodies_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let a_path = dir.path().join("a.db").to_str().unwrap().to_string();
+        let b_path = dir.path().join("b.db").to_str().unwrap().to_string();
+        seed_people(&a_path, &[("1", "alice", "123-45-6789")]);
+        seed_people(&b_path, &[]);
+        let (a, _a_cfg, a_local, _b, _b_cfg, _b_local) = two_nodes(&a_path, &b_path).await;
+
+        let rows = a_local
+            .get_rows("people", &["1".to_string()])
+            .await
+            .unwrap();
+        let bodies = a.delta_bodies("people", rows).unwrap();
+        match only(bodies) {
+            Body::Delta(d) => {
+                assert_eq!(
+                    d.upserts[0].get("ssn").and_then(|v| v.as_str()),
+                    Some("123-45-6789"),
+                    "with no exclude_columns configured, every column must still cross"
+                );
+            }
+            other => panic!("expected Delta, got {other:?}"),
+        }
+    }
+
+    /// Acceptance criterion 3: a `Want`/`Delta` round trip between two peers
+    /// with `exclude_columns` set must quiesce -- the second heartbeat must not
+    /// re-`Want` the same row. This is Part C's "no diff co-change needed"
+    /// claim (see the doc on `delta_bodies`): the digest already hashes over
+    /// `hash_excluded_columns`, so an excluded column never causes divergence.
+    #[tokio::test]
+    async fn exclude_columns_mesh_quiesces_after_one_exchange() {
+        let dir = tempfile::tempdir().unwrap();
+        let a_path = dir.path().join("a.db").to_str().unwrap().to_string();
+        let b_path = dir.path().join("b.db").to_str().unwrap().to_string();
+        seed_people(&a_path, &[("1", "alice", "123-45-6789")]);
+        seed_people(&b_path, &[]);
+        let (a, a_cfg, a_local, b, b_cfg, b_local) =
+            two_nodes_with(&a_path, &b_path, None, None, &["ssn".to_string()], |_| {}).await;
+
+        // Round 1: A's digest makes B want the row; A serves it (stripped); B
+        // applies.
+        let digest = only(a.digest_bodies(&a_local, &a_cfg).await.unwrap());
+        let (ev, out) = route(&a, digest, &b, &b_local, &b_cfg).await;
+        assert!(
+            matches!(ev, GossipEvent::Digest { wanted: 1, .. }),
+            "got {ev:?}"
+        );
+        let (ev, out) = route(&b, only(out), &a, &a_local, &a_cfg).await;
+        assert!(
+            matches!(ev, GossipEvent::Served { rows: 1, .. }),
+            "got {ev:?}"
+        );
+        let (ev, _out) = route(&a, only(out), &b, &b_local, &b_cfg).await;
+        assert!(
+            matches!(
+                ev,
+                GossipEvent::Applied {
+                    rows: 1,
+                    rejected: 0,
+                    ..
+                }
+            ),
+            "got {ev:?}"
+        );
+
+        // Round 2: same digest, no intervening write. B must not want row "1"
+        // again -- the excluded ssn column never entered B's content hash, so
+        // it cannot register as a divergence.
+        let digest = only(a.digest_bodies(&a_local, &a_cfg).await.unwrap());
+        let (ev, out) = route(&a, digest, &b, &b_local, &b_cfg).await;
+        assert!(
+            matches!(ev, GossipEvent::Digest { wanted: 0, .. }),
+            "the mesh must quiesce after one exchange, got {ev:?}"
+        );
+        assert!(out.is_empty(), "a quiesced digest must produce no Want");
     }
 
     // Live multicast smoke test: proves bind/join/send/recv over a real socket.

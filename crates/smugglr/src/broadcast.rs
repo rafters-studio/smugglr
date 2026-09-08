@@ -60,7 +60,12 @@ pub async fn run_broadcast(
 
     if dry_run {
         // Advertise nothing, apply nothing -- just report what we would gossip.
-        let gossip = Gossip::bind(broadcast_config, DEFAULT_GROUP).await?;
+        let gossip = Gossip::bind(
+            broadcast_config,
+            DEFAULT_GROUP,
+            &config.sync.exclude_columns,
+        )
+        .await?;
         let bodies = gossip.digest_bodies(&local, config).await?;
         info!(
             "Dry run: would multicast {} digest datagram(s); not sending, not applying",
@@ -69,7 +74,14 @@ pub async fn run_broadcast(
         return Ok(());
     }
 
-    let gossip = Arc::new(Gossip::bind(broadcast_config, DEFAULT_GROUP).await?);
+    let gossip = Arc::new(
+        Gossip::bind(
+            broadcast_config,
+            DEFAULT_GROUP,
+            &config.sync.exclude_columns,
+        )
+        .await?,
+    );
 
     // Continuous listener. A masterless node keeps gossiping through transient
     // errors, so a recv failure is logged, never fatal.

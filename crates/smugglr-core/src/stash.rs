@@ -4,7 +4,7 @@
 //! The `retrieve` command downloads the relay and syncs it with the local database.
 //! Both use the existing diff engine since both sides are SQLite.
 
-use crate::config::{StashConfig, SyncConfig};
+use crate::config::{column_excluded, StashConfig, SyncConfig};
 use crate::datasource::DataSource;
 use crate::diff::diff_table;
 use crate::error::{Result, SyncError};
@@ -13,11 +13,38 @@ use crate::sync::SyncResult;
 use object_store::path::Path as ObjectPath;
 use object_store::PutMode;
 use object_store::{ObjectStore, PutOptions, PutPayload};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use tempfile::NamedTempFile;
 use tracing::{debug, info, warn};
 use url::Url;
+
+/// Strip excluded columns from row data before it lands at the destination.
+///
+/// Mirrors `sync::strip_excluded_columns` (private to that module) rather than
+/// sharing it -- `sync.rs` carries concurrent work in flight and is out of
+/// scope for this change (#322 Parts B and C). `pub(crate)` so
+/// [`crate::multicast::Gossip::delta_bodies`] shares THIS copy instead of
+/// duplicating it a third time -- one shared definition between the two
+/// modules that need it, rather than one per module. Returns rows unchanged
+/// if `exclude_columns` is empty (fast path).
+pub(crate) fn strip_excluded_columns(
+    rows: Vec<HashMap<String, serde_json::Value>>,
+    exclude_columns: &[String],
+) -> Vec<HashMap<String, serde_json::Value>> {
+    if exclude_columns.is_empty() {
+        return rows;
+    }
+
+    rows.into_iter()
+        .map(|row| {
+            row.into_iter()
+                .filter(|(col, _)| !column_excluded(col, exclude_columns))
+                .collect()
+        })
+        .collect()
+}
 
 /// Build an `ObjectStore` client and object path from the stash config URL.
 ///
@@ -235,14 +262,19 @@ async fn sync_table<S: DataSource, D: DataSource>(
     label: &str,
     set_count: impl FnOnce(&mut SyncResult, usize),
 ) -> Result<SyncResult> {
-    // Stash operations still pass EMPTY exclusion lists. The `SyncConfig` is now
-    // in scope, so this is a deliberate hold rather than a plumbing limit:
-    // honoring `exclude_columns` here needs the transfer side sorted out first,
-    // because the apply path binds NULL for an absent column inside
-    // `INSERT OR REPLACE` -- stripping a column on this path would null the
-    // destination's value rather than leave it stale. That is #322's call, not
-    // a line to flip here.
-    let diff = diff_table(source, dest, table, &sync.timestamp_column, &[], &[]).await?;
+    // #322 Part B: the diff hashes over the same excluded/converged column set
+    // the directional path uses, so a stripped column never causes permanent
+    // churn -- both sides omit it from the content hash, so identical rows
+    // still hash identical once the value never crosses the wire.
+    let diff = diff_table(
+        source,
+        dest,
+        table,
+        &sync.timestamp_column,
+        &sync.exclude_columns,
+        &sync.converge_columns,
+    )
+    .await?;
     diff.warn_unresolved_conflicts(sync.conflict_resolution);
 
     let (stats, detail) = if dry_run {
@@ -290,6 +322,17 @@ async fn sync_table<S: DataSource, D: DataSource>(
         warn!("No rows found in source for sync");
         return Ok(result);
     }
+
+    // #322 Part A made an absent column safe to omit at the destination (a
+    // `LocalDb` -- the only kind either `stash` or `retrieve` ever writes to,
+    // see the note on `sync_table`'s callers) -- keeps the destination's
+    // stored value instead of nulling it. Stripping here is what turns the
+    // excluded column back into an absence rather than a present NULL: the
+    // relay otherwise carries every value the operator excluded it to avoid
+    // sending, and a NULL fetched back from the relay would overwrite the
+    // local value on `retrieve` even with Part A landed, since Part A's rule
+    // only fires on an absent column.
+    let rows = strip_excluded_columns(rows, &sync.exclude_columns);
 
     let count = dest.upsert_rows(table, &rows).await?;
     set_count(&mut result, count);
@@ -772,6 +815,202 @@ mod tests {
         // Verify local has all 3 rows now
         let items = read_items(&local_path);
         assert_eq!(items.len(), 3);
+    }
+
+    // -- #322 Part B: `exclude_columns` on the stash/retrieve path --------
+
+    /// A schema with a column worth excluding, separate from `items` so these
+    /// tests cannot be affected by (or accidentally affect) the fixture every
+    /// other test in this module shares.
+    fn create_people_db(path: &Path, rows: &[(i64, &str, Option<&str>, &str)]) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS people (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                ssn TEXT,
+                updated_at TEXT
+            )",
+        )
+        .unwrap();
+
+        for (id, name, ssn, updated_at) in rows {
+            conn.execute(
+                "INSERT OR REPLACE INTO people (id, name, ssn, updated_at) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![id, name, ssn, updated_at],
+            )
+            .unwrap();
+        }
+    }
+
+    /// Read `(id, name, ssn, updated_at)` from `people`, opened read-only so the
+    /// helper can inspect a relay file without taking a lock a concurrent test
+    /// might hold.
+    fn read_people(path: &Path) -> Vec<(i64, String, Option<String>, String)> {
+        let conn =
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id, name, ssn, updated_at FROM people ORDER BY id")
+            .unwrap();
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap()
+    }
+
+    /// Acceptance criterion 1: after `stash` with `exclude_columns = ["ssn"]`,
+    /// opening the relay file directly shows no `ssn` value for the pushed row
+    /// -- the assertion is on the relay's own contents, not on the sync
+    /// succeeding.
+    #[tokio::test]
+    async fn stash_strips_excluded_columns_from_the_relay_file() {
+        let dir = TempDir::new().unwrap();
+        let local_path = dir.path().join("local.sqlite");
+        let relay_dir = dir.path().join("relay_store");
+        std::fs::create_dir_all(&relay_dir).unwrap();
+
+        create_people_db(
+            &local_path,
+            &[(1, "alpha", Some("123-45-6789"), "2024-01-01")],
+        );
+
+        let sync = SyncConfig {
+            exclude_columns: vec!["ssn".to_string()],
+            ..sync_cfg(ConflictResolution::LocalWins)
+        };
+
+        let results = stash(
+            &stash_config_for(&relay_dir),
+            &sync,
+            local_path.to_str().unwrap(),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results[0].rows_pushed, 1);
+
+        let relay_path = relay_dir.join("relay.sqlite");
+        let rows = read_people(&relay_path);
+        assert_eq!(
+            rows,
+            vec![(1, "alpha".to_string(), None, "2024-01-01".to_string())],
+            "the ssn value pushed to keep it off the wire must not be openable in the relay file"
+        );
+    }
+
+    /// Acceptance criterion 2, and the direction the issue calls out as the one
+    /// that matters most: `retrieve` from a relay whose `ssn` column holds NULL
+    /// (as it would after a peer stashed with the same `exclude_columns`) must
+    /// leave the LOCAL `ssn` unchanged, not overwrite it with the relay's NULL.
+    /// Part A's absent-column rule alone cannot save this direction -- see the
+    /// issue's "Dependencies" note on Part B -- because `get_rows` returns the
+    /// relay's `ssn` PRESENT with value NULL; only stripping it in `sync_table`
+    /// turns that back into an absence Part A's rule can act on.
+    #[tokio::test]
+    async fn retrieve_leaves_local_value_unchanged_when_relay_column_is_excluded() {
+        let dir = TempDir::new().unwrap();
+        let local_path = dir.path().join("local.sqlite");
+        let relay_dir = dir.path().join("relay_store");
+        std::fs::create_dir_all(&relay_dir).unwrap();
+        let relay_path = relay_dir.join("relay.sqlite");
+
+        // Local holds a real ssn value.
+        create_people_db(
+            &local_path,
+            &[(1, "alpha", Some("123-45-6789"), "2024-01-01")],
+        );
+        // The relay's copy is newer on an included column (so it pulls) but its
+        // ssn is NULL, exactly as a peer stashing with the same exclude list
+        // would leave it.
+        create_people_db(&relay_path, &[(1, "alpha-updated", None, "2024-02-01")]);
+
+        let sync = SyncConfig {
+            exclude_columns: vec!["ssn".to_string()],
+            ..sync_cfg(ConflictResolution::LocalWins)
+        };
+
+        let results = retrieve(
+            &stash_config_for(&relay_dir),
+            &sync,
+            local_path.to_str().unwrap(),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results[0].rows_pulled, 1, "the newer relay row must pull");
+
+        let rows = read_people(&local_path);
+        assert_eq!(
+            rows,
+            vec![(
+                1,
+                "alpha-updated".to_string(),
+                Some("123-45-6789".to_string()),
+                "2024-02-01".to_string()
+            )],
+            "name must pull from the newer relay row, but ssn must survive the pull untouched"
+        );
+    }
+
+    /// Acceptance criterion 3: two consecutive `stash` runs with no intervening
+    /// local write must not churn. This is the failure the issue's "Why the
+    /// diff co-change is not optional" section describes: stripping without
+    /// also excluding the column from the diff's content hash means the local
+    /// row's real ssn and the relay's stripped NULL never hash equal, and every
+    /// run re-pushes the row forever.
+    #[tokio::test]
+    async fn stash_with_exclude_columns_does_not_churn_on_a_second_run() {
+        let dir = TempDir::new().unwrap();
+        let local_path = dir.path().join("local.sqlite");
+        let relay_dir = dir.path().join("relay_store");
+        std::fs::create_dir_all(&relay_dir).unwrap();
+
+        create_people_db(
+            &local_path,
+            &[(1, "alpha", Some("123-45-6789"), "2024-01-01")],
+        );
+
+        let sync = SyncConfig {
+            exclude_columns: vec!["ssn".to_string()],
+            ..sync_cfg(ConflictResolution::LocalWins)
+        };
+
+        let first = stash(
+            &stash_config_for(&relay_dir),
+            &sync,
+            local_path.to_str().unwrap(),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first[0].rows_pushed, 1);
+
+        let second = stash(
+            &stash_config_for(&relay_dir),
+            &sync,
+            local_path.to_str().unwrap(),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            second[0].rows_pushed, 0,
+            "no local write happened between runs -- a second stash must report zero rows, \
+             not re-push the row because the diff hashed the column it excluded"
+        );
     }
 
     /// Build a local db whose `items` table holds two DISTINCT rows rendering
