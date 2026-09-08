@@ -109,29 +109,31 @@ pub struct SyncConfig {
     /// Column name patterns to exclude from sync entirely (glob-style:
     /// "*_embedding", "vector").
     ///
-    /// These are stripped from the content hash, and from the rows that cross the
-    /// wire **on the directional push/pull path**. Use for values that are
-    /// derived, huge, or recomputed per node -- embeddings being the motivating
-    /// case. If you need a column kept out of the hash but still *synced*, that
-    /// is [`SyncConfig::converge_columns`], not this.
+    /// These are stripped from the content hash, and from the rows that cross
+    /// the wire, on every transport: the directional push/pull path, `stash` /
+    /// `retrieve` (the S3-compatible relay), and `[broadcast]` multicast `Want`
+    /// responses (#322). Use for values that are derived, huge, or recomputed
+    /// per node -- embeddings being the motivating case. If you need a column
+    /// kept out of the hash but still *synced*, that is
+    /// [`SyncConfig::converge_columns`], not this.
     ///
-    /// # Stripping is NOT universal across transports -- do not read this as a
-    /// privacy guarantee
+    /// # The destination guarantee holds only for a native SQLite destination
     ///
-    /// Only the directional path applies it. Two transports fetch and ship whole
-    /// rows without consulting this list, so a column excluded here still leaves
-    /// the machine on them:
+    /// A column this list strips is absent from the row an adapter receives,
+    /// never present-as-NULL. A native SQLite destination (`LocalDb`) leaves an
+    /// absent column's existing value alone (#324) -- so on `pull_table` into
+    /// local SQLite, `retrieve` into local SQLite, and multicast apply, the
+    /// stripped value neither crosses the wire nor gets clobbered locally.
     ///
-    /// - **`stash` / `retrieve`** -- rows go to the S3-compatible relay unfiltered.
-    /// - **`[broadcast]` multicast `Want` responses** -- a peer that asks for rows
-    ///   receives every column (AEAD-sealed to the cluster key, but decrypted and
-    ///   persisted by any peer holding it).
-    ///
-    /// Both predate `converge_columns` and are tracked separately; they are named
-    /// here because the natural reading of "excluded from sync" is "never leaves
-    /// the machine," and on those two paths that is currently false. If you are
-    /// excluding a column for confidentiality rather than for size or
-    /// recomputability, do not rely on this field alone today.
+    /// That guarantee is specific to `LocalDb`. A directional push to the
+    /// bundled http-sql adapter (D1, Turso, rqlite, Datasette, SQLiteCloud,
+    /// StarbaseDB) or to a third-party plugin adapter still nulls the column at
+    /// the far end: those adapters derive their column list from the row (or
+    /// the destination's own schema) rather than honoring an absent key, and
+    /// emit `INSERT OR REPLACE`, which SQLite executes as DELETE+INSERT --
+    /// resetting an omitted column to its schema default. See
+    /// [`crate::datasource::DataSource::upsert_rows`] for the full contract and
+    /// which backends do not yet meet it.
     #[serde(default)]
     pub exclude_columns: Vec<String>,
 
