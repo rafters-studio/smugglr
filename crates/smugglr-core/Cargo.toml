@@ -1,0 +1,22 @@
+[package]
+name = "smugglr-core"
+description = "The smugglr sync engine: content-hashed delta sync for SQLite."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+# Default is the portable, WASM-compatible surface: the engine and its traits,
+# with no filesystem, network, or SQLite bindings compiled in.
+default = []
+# Full native stack (local SQLite, HTTP transport, relay, broadcast). Added as
+# the spec defines each capability.
+native = []
+
+[dependencies]
+
+[lints]
+workspace = true

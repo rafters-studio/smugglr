@@ -1,0 +1,19 @@
+[package]
+name = "smugglr"
+description = "smugglr: a SQLite sync engine. One binary, any backend."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "smugglr"
+path = "src/main.rs"
+
+[dependencies]
+smugglr-core = { workspace = true, features = ["native"] }
+
+[lints]
+workspace = true
