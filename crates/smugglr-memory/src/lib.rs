@@ -138,8 +138,14 @@ impl Memory {
         }
         let path = self.folder.join(LAST);
         let next = self.folder.join("last.next");
-        fs::write(&next, text).map_err(io(&next))?;
-        fs::rename(&next, &path).map_err(io(&path))
+        // The new file's data reaches the disk before the rename, and the
+        // rename before save returns, so a power cut leaves the old memory
+        // or the new, never an empty file.
+        let mut file = fs::File::create(&next).map_err(io(&next))?;
+        file.write_all(text.as_bytes()).map_err(io(&next))?;
+        file.sync_all().map_err(io(&next))?;
+        fs::rename(&next, &path).map_err(io(&path))?;
+        sync_folder(&self.folder).map_err(io(&self.folder))
     }
 }
 
@@ -267,6 +273,18 @@ impl Memory {
             _ => Ok(()),
         }
     }
+}
+
+/// Flushes a folder's entries (a rename into it) to disk. Windows cannot
+/// open a folder as a file, so there the step is skipped.
+#[cfg(unix)]
+fn sync_folder(folder: &Path) -> io::Result<()> {
+    fs::File::open(folder)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_folder(_: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 fn hex(bytes: &[u8]) -> String {
