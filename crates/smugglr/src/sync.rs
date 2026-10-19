@@ -97,7 +97,7 @@ pub fn sync(
         let (to_target, to_source): (Vec<Write>, Vec<Write>) = writes
             .into_iter()
             .partition(|write| write.side == Side::Target);
-        let mut mismatched = carry(
+        let (mut mismatched, mut written) = carry(
             &table,
             &mut *source,
             &mut *target,
@@ -106,7 +106,7 @@ pub fn sync(
             &last,
             &mut next,
         )?;
-        mismatched.extend(carry(
+        let (more, also) = carry(
             &table,
             &mut *target,
             &mut *source,
@@ -114,7 +114,15 @@ pub fn sync(
             &memory,
             &last,
             &mut next,
-        )?);
+        )?;
+        mismatched.extend(more);
+        written.extend(also);
+        // The record counts only the rows written.
+        let wrote = Plan::Move {
+            writes: written,
+            memory: next.clone(),
+        };
+        done.insert(table.name.clone(), record::table(&wrote, false));
         if !mismatched.is_empty() {
             // Not done: the table keeps its old memory.
             unmatched = true;
@@ -238,7 +246,7 @@ fn check_shape(ours: &[Table], theirs: &[Table], source: &str, target: &str) -> 
 
 /// Journals and writes `writes` in `to`, with `from`'s copy of each row,
 /// reads back the rows written and returns the keys of those that do not
-/// match what was written.
+/// match what was written, and the writes that were made.
 fn carry(
     table: &Table,
     from: &mut dyn Place,
@@ -247,7 +255,7 @@ fn carry(
     journal: &Memory,
     last: &Hashes,
     memory: &mut Hashes,
-) -> Result<Vec<Vec<String>>, Error> {
+) -> Result<(Vec<Vec<String>>, Vec<Write>), Error> {
     let changes = changes(table, from, writes)?;
     let journaled: Vec<Write> = writes
         .iter()
@@ -273,7 +281,7 @@ fn carry(
         .filter(|write| wrote.contains(&write.key))
         .collect();
     let read_back = read_hashes(table, to, &wrote)?;
-    Ok(not_read_back(&written, &read_back))
+    Ok((not_read_back(&written, &read_back), written))
 }
 
 /// A row's key, from its columns in column order.
