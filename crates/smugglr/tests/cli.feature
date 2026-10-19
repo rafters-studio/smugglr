@@ -12,3 +12,9 @@ Feature: smugglr sync on the command line
     Given two places where the source's orders table has rows the target lacks
     When the agent runs smugglr sync on them without --json
     Then the output names orders with its status and counts in text
+
+  @criterion-01a14bed-6a79-7543-91fd-005d8c496793 @module-front-ends
+  Scenario: no ignore flag
+    Given the smugglr CLI
+    When the agent runs smugglr sync --help
+    Then the help lists no flag for ignoring tables

@@ -2,10 +2,11 @@
 
 use std::process::ExitCode;
 
-use smugglr::{Options, sync};
+use smugglr::{Config, Options, sync};
 use smugglr_core::record::{Record, Table};
 
-/// Exit status for a usage error, or a place smugglr refuses.
+/// Exit status for a usage error, a config smugglr cannot read, or a place
+/// smugglr refuses.
 const USAGE: u8 = 2;
 
 /// Exit status for a run that wrote something and is not done.
@@ -18,6 +19,7 @@ const HELP: &str = "usage: smugglr sync <source> <target> [--dryrun] [--json]";
 struct Sync {
     places: Vec<String>,
     json: bool,
+    help: bool,
     options: Options,
 }
 
@@ -29,7 +31,11 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Some((command, rest)) if command == "sync" => match parse(rest) {
-            Ok(command) => sync_once(&command),
+            Ok(command) if command.help => {
+                println!("{HELP}");
+                ExitCode::SUCCESS
+            }
+            Ok(command) => sync_once(command),
             Err(err) => usage(&err),
         },
         Some(_) => usage("smugglr knows one command: sync"),
@@ -47,18 +53,34 @@ fn parse(args: &[String]) -> Result<Sync, String> {
         match arg.as_str() {
             "--json" => command.json = true,
             "--dryrun" => command.options.dryrun = true,
+            "--help" | "-h" => command.help = true,
             flag if flag.starts_with("--") => return Err(format!("unknown flag {flag}")),
             place => command.places.push(place.to_owned()),
         }
     }
-    if command.places.len() == 2 {
+    if command.help || command.places.len() == 2 {
         Ok(command)
     } else {
         Err("smugglr sync takes two places, the source and the target".to_owned())
     }
 }
 
-fn sync_once(command: &Sync) -> ExitCode {
+fn sync_once(mut command: Sync) -> ExitCode {
+    // The tables to ignore come from the config, never from a flag.
+    let dir = command
+        .options
+        .config_dir
+        .clone()
+        .or_else(smugglr_memory::config_dir);
+    if let Some(dir) = dir {
+        match Config::load(&dir) {
+            Ok(config) => command.options.ignore = config.ignore,
+            Err(err) => {
+                eprintln!("{err}");
+                return ExitCode::from(USAGE);
+            }
+        }
+    }
     let [source, target] = command.places.as_slice() else {
         return usage("smugglr sync takes two places");
     };
