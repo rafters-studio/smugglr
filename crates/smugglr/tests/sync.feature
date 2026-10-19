@@ -30,3 +30,9 @@ Feature: one sync between two places, with places and memory as they are
     Given a local file synced with two different places, one sync each
     When the agent looks in smugglr's config directory
     Then it holds one folder for each of the two pairs
+
+  @criterion-01a14bed-60a6-78b2-99ee-8f0c7ca5bc64 @module-places
+  Scenario: a read-back that does not match is not done
+    Given a target that keeps a written row differently from how it was written
+    When the agent runs smugglr sync on the source and that target
+    Then smugglr exits 4

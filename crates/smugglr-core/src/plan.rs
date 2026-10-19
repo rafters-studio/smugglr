@@ -129,6 +129,18 @@ pub fn plan(source: &Hashes, target: &Hashes, memory: &Hashes, mode: SyncMode) -
     }
 }
 
+/// The keys of `writes` whose rows, read back after writing, do not hash to
+/// what was written (FR-SMUGGLR-064): `read_back` is each written row's hash
+/// as its place now holds it, a deleted row absent.
+#[must_use]
+pub fn not_read_back(writes: &[Write], read_back: &Hashes) -> Vec<Vec<String>> {
+    writes
+        .iter()
+        .filter(|write| read_back.get(&write.key).copied() != write.to)
+        .map(|write| write.key.clone())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Hashes, Plan, SyncMode, plan};

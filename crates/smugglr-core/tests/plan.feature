@@ -72,3 +72,9 @@ Feature: what changed, from each key's last hash per pair, and --sync-mode (FR-S
     Given two places synced before, and a row of notes since edited in both
     When the agent runs smugglr sync on them with --sync-mode source --json
     Then the record does not contain the word wins
+
+  @criterion-01a14bed-60a6-78b2-99ee-8f1fa96b7d2a @module-smugglr-core
+  Scenario: the mismatched row is named
+    Given a target that keeps a written row differently from how it was written
+    When the agent runs smugglr sync --json on the source and that target
+    Then the record names that row's table and key
