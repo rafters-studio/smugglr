@@ -400,3 +400,109 @@ fn exits_4(world: &World) -> Result<(), String> {
         code => Err(format!("smugglr exited {code:?}{}", stderr(world))),
     }
 }
+
+#[given("two places where the source has rows the target lacks")]
+fn source_has_rows(world: &World) -> Result<(), String> {
+    world
+        .source
+        .set(world.place("source.db", &format!("{NOTES}; {THREE_NOTES}"))?);
+    world.target.set(world.place("target.db", NOTES)?);
+    Ok(())
+}
+
+#[when("the agent runs smugglr sync on them and the run is done")]
+fn sync_done(world: &World) -> Result<(), String> {
+    let output = world.sync(&["--json"])?;
+    let said = String::from_utf8_lossy(&output.stdout);
+    if output.status.success() && said.contains("\"done\"") {
+        Ok(())
+    } else {
+        Err(format!("the run is not done: {said}{}", stderr(world)))
+    }
+}
+
+/// Every file under `dir`, with its contents.
+fn files_under(dir: &std::path::Path) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let mut files = Vec::new();
+    let entries = std::fs::read_dir(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            files.extend(files_under(&path)?);
+        } else {
+            let bytes = std::fs::read(&path).map_err(|err| format!("{}: {err}", path.display()))?;
+            files.push((path.display().to_string(), bytes));
+        }
+    }
+    Ok(files)
+}
+
+#[then("smugglr's own files hold no copy of the run's record")]
+fn record_not_kept(world: &World) -> Result<(), String> {
+    let files = files_under(&world.config()?)?;
+    if files.is_empty() {
+        return Err("smugglr kept no files at all".to_owned());
+    }
+    // Words only the record holds.
+    let marks = ["to_target", "moved", "status", "deleted_in_target"];
+    for (path, bytes) in files {
+        let text = String::from_utf8_lossy(&bytes);
+        if let Some(mark) = marks.iter().find(|mark| text.contains(**mark)) {
+            return Err(format!("{path} holds {mark:?} from the record"));
+        }
+    }
+    Ok(())
+}
+
+/// Each place's rows and marks, to tell whether a run wrote anything.
+fn snapshot(world: &World) -> Result<String, String> {
+    let (source, target) = places(world)?;
+    let rows = |path: &str| rows_of(path, "SELECT * FROM notes ORDER BY id");
+    Ok(format!(
+        "{:?}",
+        [
+            rows(&source)?,
+            marks(&source)?,
+            rows(&target)?,
+            marks(&target)?
+        ]
+    ))
+}
+
+/// #512's dry run through the real sync: `smugglr sync --dryrun` writes
+/// nothing to either place and keeps no memory.
+#[test]
+fn a_real_dry_run_writes_nothing_and_keeps_no_memory() -> Result<(), String> {
+    let world = World::default();
+    world
+        .source
+        .set(world.place("source.db", &format!("{NOTES}; {THREE_NOTES}"))?);
+    world.target.set(world.place(
+        "target.db",
+        &format!("{NOTES}; INSERT INTO notes VALUES ('t1', 'only here', 4)"),
+    )?);
+    let before = snapshot(&world)?;
+    let output = world.sync(&["--dryrun", "--json"])?;
+    let said = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() || !said.contains("\"preview\"") || !said.contains("would move") {
+        return Err(format!("the dry run printed {said}{}", stderr(&world)));
+    }
+    let after = snapshot(&world)?;
+    if before != after {
+        return Err(format!("a place changed: before {before}, after {after}"));
+    }
+    let config = world.config()?;
+    let kept = if config.exists() {
+        files_under(&config)?
+    } else {
+        Vec::new()
+    };
+    if kept.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "the dry run kept {:?}",
+            kept.iter().map(|(p, _)| p).collect::<Vec<_>>()
+        ))
+    }
+}

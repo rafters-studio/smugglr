@@ -31,6 +31,10 @@ pub(crate) struct Pair {
     watched: Slot<(String, Vec<String>)>,
     /// The target keeps each written row with its text upper-cased.
     alters: Slot<bool>,
+    /// Both places as they were before the last run.
+    before: Slot<(Tables, Tables)>,
+    /// Ids of rows a scenario added.
+    added: Slot<Vec<String>>,
 }
 
 #[fixture]
@@ -58,11 +62,17 @@ fn hashes(rows: &Rows) -> Hashes {
 /// One run: plan each table from both sides' hashes and memory, write, and
 /// make the record.
 fn run(pair: &Pair, mode: SyncMode) -> Result<(), String> {
+    run_as(pair, mode, false)
+}
+
+/// One run, or with `dryrun` what it would do, writing nothing.
+fn run_as(pair: &Pair, mode: SyncMode, dryrun: bool) -> Result<(), String> {
     let mut source = pair.source.take().ok_or("no source")?;
     let mut target = pair.target.take().ok_or("no target")?;
     let mut memory = pair.memory.take().unwrap_or_default();
     let alters = pair.alters.get().unwrap_or(false);
-    let mut record = Record::default();
+    pair.before.set((source.clone(), target.clone()));
+    let mut tables = BTreeMap::new();
     let empty = Rows::new();
     let names: Vec<String> = source.keys().cloned().collect();
     for name in names {
@@ -73,10 +83,13 @@ fn run(pair: &Pair, mode: SyncMode) -> Result<(), String> {
             &last,
             mode,
         );
-        if let Plan::Move {
-            writes,
-            memory: next,
-        } = &planned
+        if let (
+            Plan::Move {
+                writes,
+                memory: next,
+            },
+            false,
+        ) = (&planned, dryrun)
         {
             for write in writes {
                 let (from, to) = match write.side {
@@ -109,16 +122,14 @@ fn run(pair: &Pair, mode: SyncMode) -> Result<(), String> {
                 mismatched.extend(not_read_back(&written, &held));
             }
             if !mismatched.is_empty() {
-                record
-                    .tables
-                    .insert(name, record::not_read_back(mismatched));
+                tables.insert(name, record::not_read_back(mismatched));
                 continue;
             }
             memory.insert(name.clone(), next.clone());
         }
-        record.tables.insert(name, record::table(&planned));
+        tables.insert(name, record::table(&planned, dryrun));
     }
-    let json = record.json();
+    let json = Record::new(tables, dryrun).json();
     pair.record
         .set(serde_json::from_str(&json).map_err(|err| format!("the record is not JSON: {err}"))?);
     pair.json.set(json);
@@ -405,4 +416,209 @@ fn agent_syncs_json_on_target(pair: &Pair) -> Result<(), String> {
 fn names_table_and_key(pair: &Pair) -> Result<(), String> {
     let (table, _) = pair.watched.get().ok_or("no row watched")?;
     holds_key(&entry(pair, &table)?, "not_read_back", &watched_key(pair)?)
+}
+
+/// Adds `count` new orders to the source, remembering their ids.
+fn new_orders(pair: &Pair, count: usize) -> Result<(), String> {
+    let ids: Vec<String> = (1..=count).map(|i| format!("new-order-{i:02}")).collect();
+    change(&pair.source, "orders", |rows| {
+        for id in &ids {
+            rows.insert(key(id), row(id, "new"));
+        }
+    })?;
+    pair.added.set(ids);
+    Ok(())
+}
+
+#[given("two places where the source has rows the target lacks")]
+fn source_has_rows(pair: &Pair) -> Result<(), String> {
+    synced(pair)?;
+    new_orders(pair, 3)
+}
+
+#[given("two places where the source's orders table has rows the target lacks")]
+fn source_orders_has_rows(pair: &Pair) -> Result<(), String> {
+    source_has_rows(pair)
+}
+
+#[given("two places where the source has rows the target lacks and nothing else differs")]
+fn only_new_rows(pair: &Pair) -> Result<(), String> {
+    source_has_rows(pair)
+}
+
+#[given("two places where only new rows move in orders")]
+fn only_new_orders(pair: &Pair) -> Result<(), String> {
+    source_has_rows(pair)
+}
+
+#[given("two places where the source's orders table has 41 rows the target lacks")]
+fn forty_one_orders(pair: &Pair) -> Result<(), String> {
+    synced(pair)?;
+    new_orders(pair, 41)
+}
+
+#[given("two places whose notes table holds the same rows in both")]
+fn notes_in_step(pair: &Pair) -> Result<(), String> {
+    synced(pair)
+}
+
+#[given(
+    "two places where orders has rows to move and notes has a row changed in both places since the last sync"
+)]
+fn orders_move_notes_stop(pair: &Pair) -> Result<(), String> {
+    notes_stop_orders_move(pair)
+}
+
+#[given("two places whose only differences are rows changed in both places since the last sync")]
+fn only_both_sides(pair: &Pair) -> Result<(), String> {
+    synced(pair)?;
+    edited_in_both(pair)
+}
+
+#[given("two places synced before, and a row of orders since edited in the source only")]
+fn order_edited_in_source(pair: &Pair) -> Result<(), String> {
+    synced(pair)?;
+    change(&pair.source, "orders", |rows| {
+        rows.insert(key("o1"), row("o1", "edited"));
+    })?;
+    watch(pair, "orders", "o1");
+    Ok(())
+}
+
+#[given("two places synced before, and a row of orders since deleted in the source")]
+fn order_deleted_in_source(pair: &Pair) -> Result<(), String> {
+    synced(pair)?;
+    change(&pair.source, "orders", |rows| {
+        rows.remove(&key("o1"));
+    })?;
+    watch(pair, "orders", "o1");
+    Ok(())
+}
+
+#[when("the agent runs smugglr sync on them with --dryrun")]
+fn agent_dry_runs(pair: &Pair) -> Result<(), String> {
+    run_as(pair, SyncMode::Stop, true)
+}
+
+#[when("the agent runs smugglr sync on them with --dryrun --json")]
+fn agent_dry_runs_json(pair: &Pair) -> Result<(), String> {
+    run_as(pair, SyncMode::Stop, true)
+}
+
+#[then("neither place has changed")]
+fn neither_changed(pair: &Pair) -> Result<(), String> {
+    let (source, target) = pair.before.get().ok_or("no run")?;
+    let now = (
+        pair.source.get().ok_or("no source")?,
+        pair.target.get().ok_or("no target")?,
+    );
+    if now == (source, target) {
+        Ok(())
+    } else {
+        Err(format!("a place changed: {now:?}"))
+    }
+}
+
+fn status_of(pair: &Pair, table: &str, want: &str) -> Result<(), String> {
+    let entry = entry(pair, table)?;
+    match entry.get("status").and_then(Value::as_str) {
+        Some(status) if status == want => Ok(()),
+        _ => Err(format!("{table} is not {want}: {entry}")),
+    }
+}
+
+#[then("the record gives orders the status would move")]
+fn orders_would_move(pair: &Pair) -> Result<(), String> {
+    status_of(pair, "orders", "would move")
+}
+
+#[then("the record gives notes the status in step")]
+fn notes_in_step_status(pair: &Pair) -> Result<(), String> {
+    status_of(pair, "notes", "in step")
+}
+
+fn run_status(pair: &Pair, want: &str) -> Result<(), String> {
+    let record = pair.record.get().ok_or("no record")?;
+    match record.get("status").and_then(Value::as_str) {
+        Some(status) if status == want => Ok(()),
+        _ => Err(format!("the run is not {want}: {record}")),
+    }
+}
+
+#[then("the record's run status is preview")]
+fn run_preview(pair: &Pair) -> Result<(), String> {
+    run_status(pair, "preview")
+}
+
+#[then("the record's run status is done")]
+fn run_done(pair: &Pair) -> Result<(), String> {
+    run_status(pair, "done")
+}
+
+#[then("the record's run status is stopped in part")]
+fn run_stopped_in_part(pair: &Pair) -> Result<(), String> {
+    run_status(pair, "stopped in part")
+}
+
+#[then("the record's run status is stopped")]
+fn run_stopped(pair: &Pair) -> Result<(), String> {
+    run_status(pair, "stopped")
+}
+
+#[then(
+    "the record's entry for orders carries to_target, to_source, deleted_in_target, deleted_in_source, overwritten_in_target and overwritten_in_source"
+)]
+fn six_fields(pair: &Pair) -> Result<(), String> {
+    let orders = entry(pair, "orders")?;
+    let fields = [
+        "to_target",
+        "to_source",
+        "deleted_in_target",
+        "deleted_in_source",
+        "overwritten_in_target",
+        "overwritten_in_source",
+    ];
+    match fields.iter().find(|field| orders.get(**field).is_none()) {
+        None => Ok(()),
+        Some(field) => Err(format!("orders carries no {field}: {orders}")),
+    }
+}
+
+#[then("the record lists no key of those 41 rows")]
+fn no_new_keys(pair: &Pair) -> Result<(), String> {
+    let json = pair.json.get().ok_or("no record")?;
+    let added = pair.added.get().ok_or("no rows added")?;
+    let orders = entry(pair, "orders")?;
+    if orders.get("to_target").and_then(Value::as_u64) != Some(41) {
+        return Err(format!("orders did not count 41 rows: {orders}"));
+    }
+    match added.iter().find(|id| json.contains(id.as_str())) {
+        None => Ok(()),
+        Some(id) => Err(format!("the record lists {id}: {json}")),
+    }
+}
+
+#[then("the record's overwritten_in_target for orders is empty")]
+fn orders_overwritten_empty(pair: &Pair) -> Result<(), String> {
+    let orders = entry(pair, "orders")?;
+    match orders
+        .get("overwritten_in_target")
+        .and_then(Value::as_array)
+    {
+        Some(keys)
+            if keys.is_empty() && orders.get("to_target").and_then(Value::as_u64) == Some(1) =>
+        {
+            Ok(())
+        }
+        _ => Err(format!("orders: {orders}")),
+    }
+}
+
+#[then("the record's deleted_in_target for orders holds that row's key")]
+fn orders_deleted_in_target(pair: &Pair) -> Result<(), String> {
+    holds_key(
+        &entry(pair, "orders")?,
+        "deleted_in_target",
+        &watched_key(pair)?,
+    )
 }
