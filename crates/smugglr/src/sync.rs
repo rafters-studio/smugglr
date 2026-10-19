@@ -20,6 +20,8 @@ pub struct Options {
     pub sync_mode: SyncMode,
     /// Show what the sync would do, and write nothing.
     pub dryrun: bool,
+    /// The tables the run is limited to; empty is every table.
+    pub tables: Vec<String>,
 }
 
 /// Why a sync could not run.
@@ -54,13 +56,17 @@ pub fn sync(
         None => smugglr_memory::config_dir().ok_or(Error::NoConfigDir)?,
     };
     let mut memory = Memory::open(&config, source.address(), target.address())?;
-    let tables = source.tables()?;
-    check_shape(
-        &tables,
-        &target.tables()?,
-        source.address(),
-        target.address(),
-    )?;
+    let named = |table: &Table| options.tables.is_empty() || options.tables.contains(&table.name);
+    let tables: Vec<Table> = source.tables()?.into_iter().filter(named).collect();
+    let theirs: Vec<Table> = target.tables()?.into_iter().filter(named).collect();
+    check_shape(&tables, &theirs, source.address(), target.address())?;
+    if let Some(name) = options
+        .tables
+        .iter()
+        .find(|name| !tables.iter().any(|table| &table.name == *name))
+    {
+        return Err(Error::Shape(format!("neither place has a table {name}")));
+    }
     finish_cut_off_run(&mut memory, &tables, source, target, options.dryrun)?;
     let mut done = BTreeMap::new();
     let mut unmatched = false;

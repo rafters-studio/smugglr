@@ -22,6 +22,13 @@ pub(crate) struct World {
     pub(crate) output: Slot<Output>,
     /// The key (`id`) of the row the scenario watches.
     pub(crate) watched: Slot<String>,
+    /// Two copies of a pair of places, each as (source, target).
+    pub(crate) copies: Slot<Vec<(String, String)>>,
+    /// What each copy's sync printed.
+    pub(crate) records: Slot<Vec<String>>,
+    /// Each line a watching smugglr printed, with the seconds since it
+    /// started.
+    pub(crate) lines: Slot<Vec<(f64, String)>>,
 }
 
 #[fixture]
@@ -30,6 +37,10 @@ pub(crate) fn world() -> World {
 }
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+/// Three notes rows.
+pub(crate) const THREE_NOTES: &str = "INSERT INTO notes VALUES ('n1', 'first', 1), ('n2', 'second', 2), \
+     ('n3', 'third', 3)";
 
 /// The orders table some scenarios' places hold.
 pub(crate) const ORDERS: &str = "CREATE TABLE orders (id TEXT PRIMARY KEY, item TEXT)";
