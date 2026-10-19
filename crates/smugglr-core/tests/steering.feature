@@ -18,9 +18,3 @@ Feature: --sync-mode last and the steering column (FR-SMUGGLR-068)
     Given a config naming modified as the steering column for orders only, and a row of orders changed in both places with a later modified in the target
     When the agent runs smugglr sync on them with --sync-mode last
     Then the source's row holds the target's values
-
-  @criterion-01a14bed-72a8-7b31-abbd-3d0d1302b90c @module-smugglr-core
-  Scenario: the error comes before any write
-    Given two places with rows to move, whose orders table has no steering column named in the config
-    When the agent runs smugglr sync on them with --sync-mode last
-    Then neither place has changed

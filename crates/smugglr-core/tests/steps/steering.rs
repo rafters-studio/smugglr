@@ -7,7 +7,7 @@ use smugglr_core::plan::SyncMode;
 use smugglr_core::steering::Steering;
 
 use crate::plan_steps::{
-    Pair, Rows, Tables, change, entry, holds_key, key, new_orders, run, synced, watch, watched_key,
+    Pair, Rows, Tables, change, entry, holds_key, key, run, watch, watched_key,
 };
 
 /// An orders row: its id, item and steering value.
@@ -95,20 +95,6 @@ fn per_table_later_in_target(pair: &Pair) -> Result<(), String> {
         "2026-10-01T10:00:00Z",
         "2026-10-01T11:00:00Z",
     )
-}
-
-#[given(
-    "two places with rows to move, whose orders table has no steering column named in the config"
-)]
-fn rows_to_move_without_steering(pair: &Pair) -> Result<(), String> {
-    synced(pair)?;
-    new_orders(pair, 3)?;
-    // notes steers; orders has none named.
-    pair.steering.set(Steering {
-        all: None,
-        tables: [("notes".to_owned(), "body".to_owned())].into(),
-    });
-    Ok(())
 }
 
 #[when("the agent runs smugglr sync on them with --sync-mode last")]

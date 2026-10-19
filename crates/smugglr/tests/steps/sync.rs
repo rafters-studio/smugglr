@@ -1156,3 +1156,21 @@ fn real_files_refused_for_want_of_steering_keep_nothing() -> Result<(), String> 
         ))
     }
 }
+
+#[given(
+    "two places with rows to move, whose orders table has no steering column named in the config"
+)]
+fn rows_to_move_without_steering(world: &World) -> Result<(), String> {
+    world.source.set(world.place(
+        "source.db",
+        &format!("{NOTES}; {THREE_NOTES}; {ORDERS}; INSERT INTO orders VALUES ('o1', 'tent')"),
+    )?);
+    world
+        .target
+        .set(world.place("target.db", &format!("{NOTES}; {ORDERS}"))?);
+    // notes steers; orders has none named.
+    crate::cli::config(world, "[tables.notes]\nsteering = \"created_at\"\n")?;
+    // The shape steps' "neither place has changed" compares this snapshot.
+    world.watched.set(crate::shape::snapshot(world)?);
+    Ok(())
+}

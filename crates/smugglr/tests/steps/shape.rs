@@ -128,10 +128,14 @@ fn run_stopped(world: &World) -> Result<(), String> {
 
 #[then("neither place has changed")]
 fn nothing_changed(world: &World) -> Result<(), String> {
-    // The run reached the places and said what it did, so nothing changing
-    // is its doing, not a failure to start.
+    // The run reached the places and said what it did, or refused for want
+    // of a steering column, so nothing changing is its doing, not a failure
+    // to start.
     let output = world.output.get().ok_or("smugglr was not run")?;
-    if !String::from_utf8_lossy(&output.stdout).starts_with("smugglr sync:") {
+    let refused = output.status.code() == Some(2)
+        && String::from_utf8_lossy(&output.stderr)
+            .contains("--sync-mode last needs a steering column for:");
+    if !refused && !String::from_utf8_lossy(&output.stdout).starts_with("smugglr sync:") {
         return Err(format!(
             "smugglr printed no record, saying {:?}",
             String::from_utf8_lossy(&output.stderr)

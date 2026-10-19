@@ -126,3 +126,9 @@ Feature: one sync between two places, with places and memory as they are
     Given no max_wire setting, and two places never synced with each other whose rows weigh more than 100 MB
     When the agent runs smugglr sync on them
     Then smugglr exits 5
+
+  @criterion-01a14bed-72a8-7b31-abbd-3d0d1302b90c @module-smugglr-core
+  Scenario: the error comes before any write
+    Given two places with rows to move, whose orders table has no steering column named in the config
+    When the agent runs smugglr sync on them with --sync-mode last
+    Then neither place has changed

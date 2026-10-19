@@ -232,7 +232,7 @@ fn run_as(pair: &Pair, mode: SyncMode, dryrun: bool) -> Result<(), String> {
 }
 
 /// Two places holding the same notes and orders, synced once.
-pub(crate) fn synced(pair: &Pair) -> Result<(), String> {
+fn synced(pair: &Pair) -> Result<(), String> {
     let notes: Rows = [("n1", "first"), ("n2", "second")]
         .into_iter()
         .map(|(id, body)| (key(id), row(id, body)))
@@ -515,7 +515,7 @@ fn names_table_and_key(pair: &Pair) -> Result<(), String> {
 }
 
 /// Adds `count` new orders to the source, remembering their ids.
-pub(crate) fn new_orders(pair: &Pair, count: usize) -> Result<(), String> {
+fn new_orders(pair: &Pair, count: usize) -> Result<(), String> {
     let ids: Vec<String> = (1..=count).map(|i| format!("new-order-{i:02}")).collect();
     change(&pair.source, "orders", |rows| {
         for id in &ids {
