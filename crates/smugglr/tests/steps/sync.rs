@@ -10,10 +10,7 @@ use smugglr_place::{Error, Key, LocalFile, Place, Table};
 
 use rstest_bdd_macros::{given, then, when};
 
-use crate::setup::{NOTES, ORDERS, World, note, rows_of, sql_on};
-
-const THREE_NOTES: &str = "INSERT INTO notes VALUES ('n1', 'first', 1), ('n2', 'second', 2), \
-     ('n3', 'third', 3)";
+use crate::setup::{NOTES, ORDERS, THREE_NOTES, World, note, rows_of, sql_on};
 
 /// A service smugglr does not know: tables of rows held in this program,
 /// reached through an adapter written outside smugglr. It cannot run the
