@@ -15,7 +15,7 @@ pub(crate) fn unquote(text: &str) -> Result<Value, Error> {
         return Ok(Value::Text(inner.replace("''", "'")));
     }
     if let Some(hex) = text.strip_prefix("X'").and_then(|t| t.strip_suffix('\'')) {
-        if !hex.is_ascii() || hex.len() % 2 != 0 {
+        if !hex.is_ascii() || !hex.len().is_multiple_of(2) {
             return Err(invalid());
         }
         return (0..hex.len())

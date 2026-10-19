@@ -1156,7 +1156,11 @@ dependencies = [
  "rstest",
  "rstest-bdd",
  "rstest-bdd-macros",
+ "rusqlite",
  "smugglr-core",
+ "smugglr-memory",
+ "smugglr-place",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1167,6 +1171,14 @@ dependencies = [
  "rstest",
  "rstest-bdd",
  "rstest-bdd-macros",
+]
+
+[[package]]
+name = "smugglr-memory"
+version = "0.1.0"
+dependencies = [
+ "smugglr-core",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

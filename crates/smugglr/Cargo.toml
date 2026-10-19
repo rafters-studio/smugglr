@@ -8,14 +8,21 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "smugglr"
 path = "src/main.rs"
 
 [dependencies]
 smugglr-core = { workspace = true }
+smugglr-memory = { workspace = true }
+smugglr-place = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
+rusqlite = { workspace = true }
 rstest = { workspace = true }
 rstest-bdd = { workspace = true }
 rstest-bdd-macros = { workspace = true }
