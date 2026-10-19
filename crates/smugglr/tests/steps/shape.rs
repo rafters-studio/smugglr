@@ -128,7 +128,15 @@ fn run_stopped(world: &World) -> Result<(), String> {
 
 #[then("neither place has changed")]
 fn nothing_changed(world: &World) -> Result<(), String> {
-    world.output.get().ok_or("smugglr was not run")?;
+    // The run reached the places and said what it did, so nothing changing
+    // is its doing, not a failure to start.
+    let output = world.output.get().ok_or("smugglr was not run")?;
+    if !String::from_utf8_lossy(&output.stdout).starts_with("smugglr sync:") {
+        return Err(format!(
+            "smugglr printed no record, saying {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
     let before = world.watched.get().ok_or("no snapshot taken")?;
     let after = snapshot(world)?;
     if before == after {
