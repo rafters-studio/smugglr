@@ -5,8 +5,9 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use smugglr_core::change::{Change, Op};
-use smugglr_core::plan::{Hashes, Plan, Side, SyncMode, Write, plan};
+use smugglr_core::plan::{Hashes, Plan, Side, SyncMode, Write, not_read_back, plan};
 use smugglr_core::record::{self, Record};
+use smugglr_core::row_hash::row_hash;
 use smugglr_memory::Memory;
 use smugglr_place::{Place, Table};
 
@@ -76,7 +77,7 @@ pub fn sync(
         let (to_target, to_source): (Vec<Write>, Vec<Write>) = writes
             .into_iter()
             .partition(|write| write.side == Side::Target);
-        carry(
+        let mut mismatched = carry(
             &table,
             &mut *source,
             &mut *target,
@@ -84,14 +85,20 @@ pub fn sync(
             &last,
             &mut next,
         )?;
-        carry(
+        mismatched.extend(carry(
             &table,
             &mut *target,
             &mut *source,
             &to_source,
             &last,
             &mut next,
-        )?;
+        )?);
+        if !mismatched.is_empty() {
+            // Not done: the table keeps its old memory.
+            done.tables
+                .insert(table.name.clone(), record::not_read_back(mismatched));
+            continue;
+        }
         memory.set_table(&table.name, next);
     }
     memory.save()?;
@@ -124,9 +131,11 @@ fn check_shape(ours: &[Table], theirs: &[Table], source: &str, target: &str) -> 
     Ok(())
 }
 
-/// Writes `writes` in `to`, with `from`'s copy of each row. A row gone from
-/// `from` since its hash was read is not written, and its key keeps its
-/// `last` hash in memory, so the next run finds it missing on that side.
+/// Writes `writes` in `to`, with `from`'s copy of each row, reads the rows
+/// back and returns the keys of those that do not match what was written. A
+/// row gone from `from` since its hash was read is not written, and its key
+/// keeps its `last` hash in memory, so the next run finds it missing on that
+/// side.
 fn carry(
     table: &Table,
     from: &mut dyn Place,
@@ -134,7 +143,7 @@ fn carry(
     writes: &[Write],
     last: &Hashes,
     memory: &mut Hashes,
-) -> Result<(), Error> {
+) -> Result<Vec<Vec<String>>, Error> {
     let changes = changes(table, from, writes)?;
     for write in writes {
         if !changes.iter().any(|change| change.key == write.key) {
@@ -145,17 +154,38 @@ fn carry(
         }
     }
     to.write(table, &changes)?;
-    Ok(())
+    let written: Vec<Write> = writes
+        .iter()
+        .filter(|write| changes.iter().any(|change| change.key == write.key))
+        .cloned()
+        .collect();
+    let keys: Vec<Vec<String>> = written.iter().map(|write| write.key.clone()).collect();
+    let read_back: Hashes = to
+        .rows(table, &keys)?
+        .into_iter()
+        .filter_map(|row| {
+            let columns: Vec<&str> = row.iter().map(String::as_str).collect();
+            Some((key_of(table, &row)?, row_hash(&columns)))
+        })
+        .collect();
+    Ok(not_read_back(&written, &read_back))
+}
+
+/// A row's key, from its columns in column order.
+fn key_of(table: &Table, row: &[String]) -> Option<Vec<String>> {
+    table
+        .key
+        .iter()
+        .map(|column| {
+            let i = table.columns.iter().position(|c| c == column)?;
+            row.get(i).cloned()
+        })
+        .collect()
 }
 
 /// The Changes for `writes`, with values read from `from`, the other side;
 /// a write whose row `from` no longer holds is left out.
 fn changes(table: &Table, from: &mut dyn Place, writes: &[Write]) -> Result<Vec<Change>, Error> {
-    let positions: Vec<usize> = table
-        .key
-        .iter()
-        .filter_map(|column| table.columns.iter().position(|c| c == column))
-        .collect();
     let wanted: Vec<Vec<String>> = writes
         .iter()
         .filter(|write| write.op != Op::Down)
@@ -164,13 +194,7 @@ fn changes(table: &Table, from: &mut dyn Place, writes: &[Write]) -> Result<Vec<
     let mut rows: BTreeMap<Vec<String>, Vec<String>> = from
         .rows(table, &wanted)?
         .into_iter()
-        .filter_map(|row| {
-            let key = positions
-                .iter()
-                .map(|&i| row.get(i).cloned())
-                .collect::<Option<Vec<String>>>()?;
-            Some((key, row))
-        })
+        .filter_map(|row| Some((key_of(table, &row)?, row)))
         .collect();
     Ok(writes
         .iter()

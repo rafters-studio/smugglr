@@ -9,7 +9,7 @@ use rstest_bdd::Slot;
 use rstest_bdd_macros::{ScenarioState, given, then, when};
 use serde_json::Value;
 use smugglr_core::change::Op;
-use smugglr_core::plan::{Hashes, Plan, Side, SyncMode, plan};
+use smugglr_core::plan::{Hashes, Plan, Side, SyncMode, not_read_back, plan};
 use smugglr_core::record::{self, Record};
 use smugglr_core::row_hash::row_hash;
 
@@ -29,6 +29,8 @@ pub(crate) struct Pair {
     record: Slot<Value>,
     json: Slot<String>,
     watched: Slot<(String, Vec<String>)>,
+    /// The target keeps each written row with its text upper-cased.
+    alters: Slot<bool>,
 }
 
 #[fixture]
@@ -59,6 +61,7 @@ fn run(pair: &Pair, mode: SyncMode) -> Result<(), String> {
     let mut source = pair.source.take().ok_or("no source")?;
     let mut target = pair.target.take().ok_or("no target")?;
     let mut memory = pair.memory.take().unwrap_or_default();
+    let alters = pair.alters.get().unwrap_or(false);
     let mut record = Record::default();
     let empty = Rows::new();
     let names: Vec<String> = source.keys().cloned().collect();
@@ -89,11 +92,27 @@ fn run(pair: &Pair, mode: SyncMode) -> Result<(), String> {
                     (Op::Down, _) => {
                         rows.remove(&write.key);
                     }
-                    (_, Some(copy)) => {
+                    (_, Some(mut copy)) => {
+                        if alters && write.side == Side::Target {
+                            copy = copy.iter().map(|c| c.to_uppercase()).collect();
+                        }
                         rows.insert(write.key.clone(), copy);
                     }
                     (_, None) => return Err("no row to copy".to_owned()),
                 }
+            }
+            // Read back what was written, each side's rows as it holds them.
+            let mut mismatched = Vec::new();
+            for (side, place) in [(Side::Target, &target), (Side::Source, &source)] {
+                let written: Vec<_> = writes.iter().filter(|w| w.side == side).cloned().collect();
+                let held = hashes(place.get(&name).unwrap_or(&empty));
+                mismatched.extend(not_read_back(&written, &held));
+            }
+            if !mismatched.is_empty() {
+                record
+                    .tables
+                    .insert(name, record::not_read_back(mismatched));
+                continue;
             }
             memory.insert(name.clone(), next.clone());
         }
@@ -364,4 +383,26 @@ fn no_wins(pair: &Pair) -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+#[given("a target that keeps a written row differently from how it was written")]
+fn altering_target(pair: &Pair) -> Result<(), String> {
+    synced(pair)?;
+    pair.alters.set(true);
+    change(&pair.source, "notes", |rows| {
+        rows.insert(key("n3"), row("n3", "third"));
+    })?;
+    watch(pair, "notes", "n3");
+    Ok(())
+}
+
+#[when("the agent runs smugglr sync --json on the source and that target")]
+fn agent_syncs_json_on_target(pair: &Pair) -> Result<(), String> {
+    run(pair, SyncMode::Stop)
+}
+
+#[then("the record names that row's table and key")]
+fn names_table_and_key(pair: &Pair) -> Result<(), String> {
+    let (table, _) = pair.watched.get().ok_or("no row watched")?;
+    holds_key(&entry(pair, &table)?, "not_read_back", &watched_key(pair)?)
 }

@@ -371,3 +371,32 @@ fn stderr(world: &World) -> String {
         )
     })
 }
+
+#[given("a target that keeps a written row differently from how it was written")]
+fn altering_target(world: &World) -> Result<(), String> {
+    let source = world.place("source.db", &format!("{NOTES}; {THREE_NOTES}"))?;
+    let target = world.place(
+        "target.db",
+        &format!(
+            "{NOTES}; CREATE TRIGGER shout AFTER INSERT ON notes BEGIN \
+             UPDATE notes SET body = upper(NEW.body) WHERE id = NEW.id; END"
+        ),
+    )?;
+    world.source.set(source);
+    world.target.set(target);
+    Ok(())
+}
+
+#[when("the agent runs smugglr sync on the source and that target")]
+fn sync_on_that_target(world: &World) -> Result<(), String> {
+    world.sync(&[]).map(|_| ())
+}
+
+#[then("smugglr exits 4")]
+fn exits_4(world: &World) -> Result<(), String> {
+    let output = world.output.get().ok_or("smugglr was not run")?;
+    match output.status.code() {
+        Some(4) => Ok(()),
+        code => Err(format!("smugglr exited {code:?}{}", stderr(world))),
+    }
+}
