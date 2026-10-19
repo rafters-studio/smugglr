@@ -43,16 +43,23 @@ pub enum Decision {
     Apply,
     /// The row here is already at the change's `to`: leave it.
     Skip,
+    /// The place has its own pending change of the row from the same
+    /// `from` to a different `to`: the row changed in both places, and
+    /// `--sync-mode` says what happens.
+    Conflict,
     /// The row here matches neither: the change waits.
     Hold,
 }
 
 /// Decides a change against the hash of its row here (`None` when the place
-/// holds no row for the key).
+/// holds no row for the key) and the place's own pending change of the same
+/// row, if it has one.
 #[must_use]
-pub fn decide(change: &Change, here: Option<[u8; 16]>) -> Decision {
+pub fn decide(change: &Change, here: Option<[u8; 16]>, pending: Option<&Change>) -> Decision {
     if change.to == here {
         Decision::Skip
+    } else if pending.is_some_and(|own| own.from == change.from && own.to != change.to) {
+        Decision::Conflict
     } else if change.from == here {
         Decision::Apply
     } else {
@@ -60,9 +67,32 @@ pub fn decide(change: &Change, here: Option<[u8; 16]>) -> Decision {
     }
 }
 
+/// What a change from `from` to `to` does to its row.
+#[must_use]
+pub fn op(from: Option<[u8; 16]>, to: Option<[u8; 16]>) -> Op {
+    match (from, to) {
+        (_, None) => Op::Down,
+        (None, Some(_)) => Op::Up,
+        (Some(_), Some(_)) => Op::Upsert,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Change, Decision, Op, decide};
+
+    #[test]
+    fn the_same_from_with_a_different_to_is_a_conflict() {
+        let own = change(Some([1; 16]), Some([3; 16]));
+        assert_eq!(
+            decide(
+                &change(Some([1; 16]), Some([2; 16])),
+                Some([3; 16]),
+                Some(&own)
+            ),
+            Decision::Conflict
+        );
+    }
 
     fn change(from: Option<[u8; 16]>, to: Option<[u8; 16]>) -> Change {
         Change {
@@ -78,7 +108,7 @@ mod tests {
     #[test]
     fn a_change_matching_neither_hash_waits() {
         assert_eq!(
-            decide(&change(Some([1; 16]), Some([2; 16])), Some([3; 16])),
+            decide(&change(Some([1; 16]), Some([2; 16])), Some([3; 16]), None),
             Decision::Hold
         );
     }

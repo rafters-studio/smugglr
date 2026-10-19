@@ -55,43 +55,71 @@ pub(crate) fn row(table: &Table) -> String {
     )
 }
 
-/// Writes one row, every column a parameter in column order.
-pub(crate) fn upsert(table: &Table) -> String {
+/// Inserts one row only where its key holds none (a change whose `from` is
+/// no row); every column a parameter in column order.
+pub(crate) fn insert(table: &Table) -> String {
     let columns: Vec<String> = table.columns.iter().map(|c| ident(c)).collect();
     let params: Vec<String> = (1..=columns.len()).map(|i| format!("?{i}")).collect();
-    let key: Vec<String> = table.key.iter().map(|c| ident(c)).collect();
-    let set: Vec<String> = table
-        .columns
-        .iter()
-        .filter(|column| !table.key.contains(column))
-        .map(|column| format!("{0} = excluded.{0}", ident(column)))
-        .collect();
-    let action = if set.is_empty() {
-        "NOTHING".to_owned()
-    } else {
-        format!("UPDATE SET {}", set.join(", "))
-    };
     format!(
-        "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT ({}) DO {action}",
+        "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT DO NOTHING",
         ident(&table.name),
         columns.join(", "),
-        params.join(", "),
-        key.join(", ")
+        params.join(", ")
     )
 }
 
-/// Deletes one row, by key.
+/// The row's hash is the change's `from`: parameter `?{n}`.
+fn at_from(table: &Table, n: usize) -> String {
+    format!("{ROW_HASH}({}) = ?{n}", quoted(&table.columns))
+}
+
+/// Updates one row only where it is still at the change's `from`: every
+/// column a parameter in column order, then `from`.
+pub(crate) fn update(table: &Table) -> String {
+    let position =
+        |column: &String| table.columns.iter().position(|c| c == column).unwrap_or(0) + 1;
+    let mut set: Vec<String> = table
+        .columns
+        .iter()
+        .filter(|column| !table.key.contains(column))
+        .map(|column| format!("{} = ?{}", ident(column), position(column)))
+        .collect();
+    if set.is_empty() {
+        // Every column is in the key; the row's values are its key.
+        set = table
+            .key
+            .iter()
+            .map(|c| format!("{0} = {0}", ident(c)))
+            .collect();
+    }
+    let key: Vec<String> = table
+        .key
+        .iter()
+        .map(|column| format!("{} IS ?{}", ident(column), position(column)))
+        .collect();
+    format!(
+        "UPDATE {} SET {} WHERE {} AND {}",
+        ident(&table.name),
+        set.join(", "),
+        key.join(" AND "),
+        at_from(table, table.columns.len() + 1)
+    )
+}
+
+/// Deletes one row only where it is still at the change's `from`: by key,
+/// then `from`.
 pub(crate) fn delete(table: &Table) -> String {
     format!(
-        "DELETE FROM {} WHERE {}",
+        "DELETE FROM {} WHERE {} AND {}",
         ident(&table.name),
-        by_key(&table.key, 1)
+        by_key(&table.key, 1),
+        at_from(table, table.key.len() + 1)
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ident, upsert};
+    use super::{ident, update};
     use crate::Table;
 
     #[test]
@@ -100,16 +128,16 @@ mod tests {
     }
 
     #[test]
-    fn upsert_sets_every_column_outside_the_key() {
+    fn update_sets_every_column_outside_the_key_only_at_from() {
         let table = Table {
             name: "notes".to_owned(),
             columns: vec!["id".to_owned(), "body".to_owned()],
             key: vec!["id".to_owned()],
         };
         assert_eq!(
-            upsert(&table),
-            "INSERT INTO \"notes\" (\"id\", \"body\") VALUES (?1, ?2) \
-             ON CONFLICT (\"id\") DO UPDATE SET \"body\" = excluded.\"body\""
+            update(&table),
+            "UPDATE \"notes\" SET \"body\" = ?2 WHERE \"id\" IS ?1 \
+             AND smugglr_row_hash(quote(\"id\"), quote(\"body\")) = ?3"
         );
     }
 }
