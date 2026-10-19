@@ -66,3 +66,21 @@ Feature: one sync between two places, with places and memory as they are
     Given two places with rows to move
     When the agent runs smugglr sync on them and the run is done
     Then smugglr's files hold no smugglr.sync journal
+
+  @criterion-01a14bed-7cc2-7a31-be37-607bc718af88 @module-places
+  Scenario: a local file and an HTTP-SQL service
+    Given a local file and a service that speaks HTTP-SQL, where the file has rows the service lacks
+    When the agent runs smugglr sync on them
+    Then the service holds the same rows as the file
+
+  @criterion-01a14bed-7cc2-7a31-be37-60931d9b1352 @module-places
+  Scenario: big integers arrive whole
+    Given a service that speaks HTTP-SQL holding a row with the integer 9007199254740993, and a local file without it
+    When the agent runs smugglr sync on the service and the file
+    Then the file's row holds 9007199254740993
+
+  @criterion-01a14bed-7cc2-7a31-be37-60a4293b3636 @module-places
+  Scenario: the largest integer arrives whole
+    Given a service that speaks HTTP-SQL holding a row with the integer 9223372036854775807, and a local file without it
+    When the agent runs smugglr sync on the service and the file
+    Then the file's row holds 9223372036854775807
