@@ -19,13 +19,14 @@ const NOT_DONE: u8 = 4;
 const WATCH_SECONDS: u64 = 60;
 
 const HELP: &str = "usage: smugglr sync <source> <target> [--dryrun] [--json] \
-     [--sync-type direct|hub] [--sync-mode stop|source|target] [--table <name>]... \
+     [--sync-type direct] [--sync-mode stop|source|target] [--table <name>]... \
      [--watch [seconds]]
 
 The first place named is the source, the second the target.
   --dryrun                 show what the sync would do; write nothing
   --json                   print the record as JSON
-  --sync-type direct|hub   how the places connect; direct is the default
+  --sync-type direct       how the places connect; direct is the default
+                           (hub, multi and mesh are not built yet)
   --sync-mode stop|source|target
                            what happens to a row changed in both places: stop
                            (the default) names it, source keeps the source's
@@ -83,11 +84,11 @@ fn parse(args: &[String]) -> Result<Sync, String> {
             "--dryrun" => command.options.dryrun = true,
             "--table" => command.options.tables.push(value("--table")?),
             "--sync-type" => match value("--sync-type")?.as_str() {
-                "direct" | "hub" => {}
-                "multi" | "mesh" => {
-                    return Err("--sync-type multi and mesh are not built yet".to_owned());
+                "direct" => {}
+                kind @ ("hub" | "multi" | "mesh") => {
+                    return Err(format!("--sync-type {kind} is not built yet"));
                 }
-                other => return Err(format!("--sync-type {other}: use direct or hub")),
+                other => return Err(format!("--sync-type {other}: use direct")),
             },
             "--sync-mode" => {
                 command.options.sync_mode = match value("--sync-mode")?.as_str() {
