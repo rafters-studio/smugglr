@@ -1,28 +1,28 @@
 //! Before any row is read, the shapes of the two places are compared
 //! (FR-SMUGGLR-070); smugglr never changes a shape.
 
-use smugglr_core::shape::{self, Column, LEDGER, Mismatch, Shape, TableShape};
+use smugglr_core::shape::{self, Column, Mismatch, Shape, TableShape};
 use smugglr_place::{Place, Table};
 
 use crate::sync::Error;
 
 /// A place's shape: its ledger's latest migration and its tables, the
-/// ledger's own table left out.
+/// ledger's own among them, so a ledger in one place only is a table that
+/// place alone holds.
 fn shape_of(place: &mut dyn Place, tables: &[Table]) -> Result<Shape, Error> {
     Ok(Shape {
         ledger: place.ledger()?,
         tables: tables
             .iter()
-            .filter(|table| table.name != LEDGER)
             .map(|table| TableShape {
                 name: table.name.clone(),
                 columns: table
                     .columns
                     .iter()
-                    .zip(&table.types)
-                    .map(|(name, kind)| Column {
+                    .enumerate()
+                    .map(|(i, name)| Column {
                         name: name.clone(),
-                        kind: kind.clone(),
+                        kind: table.types.get(i).cloned().unwrap_or_default(),
                     })
                     .collect(),
             })
