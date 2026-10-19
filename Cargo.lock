@@ -150,6 +150,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "crate-map"
+version = "0.1.0"
+dependencies = [
+ "cargo_metadata",
+ "rstest",
+ "rstest-bdd",
+ "rstest-bdd-macros",
+]
+
+[[package]]
 name = "crypto-common"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

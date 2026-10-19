@@ -1,3 +1,5 @@
 [toolchain]
 channel = "stable"
 components = ["rustfmt", "clippy"]
+# smugglr-core compiles to WASM; the crate-map scenarios build it for this target.
+targets = ["wasm32-unknown-unknown"]

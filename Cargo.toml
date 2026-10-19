@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = ["crates/*", "tools/crate-map"]
 
 [workspace.package]
 version = "0.1.0"
@@ -17,6 +17,8 @@ smugglr-core = { path = "crates/smugglr-core", version = "0.1.0" }
 rstest = "0.28"
 rstest-bdd = "0.6"
 rstest-bdd-macros = "0.6"
+# Reads `cargo metadata` for the crate-map check (tools/crate-map).
+cargo_metadata = "0.23"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
