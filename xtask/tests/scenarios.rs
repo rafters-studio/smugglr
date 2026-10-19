@@ -1,4 +1,4 @@
-//! Acceptance-scenario runner for the `crate-map` crate.
+//! Acceptance-scenario runner for the `xtask` crate.
 //!
 //! `scenarios!` discovers every `.feature` file under `tests/` and emits one
 //! test per scenario. Step definitions must compile into this binary.
@@ -8,10 +8,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use cargo_metadata::{Metadata, MetadataCommand};
-use crate_map::{Violation, check};
 use rstest::fixture;
 use rstest_bdd::Slot;
 use rstest_bdd_macros::{ScenarioState, given, scenarios, then, when};
+use xtask::crate_map::{Violation, check};
 
 #[derive(Debug, Default, ScenarioState)]
 struct Check {
@@ -24,7 +24,7 @@ fn state() -> Check {
 }
 
 fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
 }
 
 fn metadata(root: &Path) -> Result<Metadata, String> {

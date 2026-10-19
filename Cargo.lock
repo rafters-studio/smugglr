@@ -150,16 +150,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crate-map"
-version = "0.1.0"
-dependencies = [
- "cargo_metadata",
- "rstest",
- "rstest-bdd",
- "rstest-bdd-macros",
-]
-
-[[package]]
 name = "crypto-common"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1535,6 +1525,16 @@ checksum = "3f3fd376f71958b862e7afb20cfe5a22830e1963462f3a17f49d82a6c1d1f42d"
 dependencies = [
  "bitflags",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "xtask"
+version = "0.1.0"
+dependencies = [
+ "cargo_metadata",
+ "rstest",
+ "rstest-bdd",
+ "rstest-bdd-macros",
 ]
 
 [[package]]

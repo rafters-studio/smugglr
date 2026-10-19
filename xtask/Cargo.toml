@@ -1,6 +1,6 @@
 [package]
-name = "crate-map"
-description = "Holds the smugglr workspace to its crate map (NFR-SMUGGLR-009)."
+name = "xtask"
+description = "The smugglr repository's own tooling; first job: the crate-map check (NFR-SMUGGLR-009)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
