@@ -47,7 +47,7 @@ pub struct Ledger {
 }
 
 /// A place's shape: its ledger's latest migration, when it carries migratr's
-/// ledger, and its tables, the ledger's own left out.
+/// ledger, and its tables.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Shape {
     /// The latest migration in the place's ledger; `None` without one.
