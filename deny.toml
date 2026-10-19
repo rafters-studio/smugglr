@@ -16,6 +16,10 @@ allow = [
     "ISC",
     "Unicode-3.0",
     "Zlib",
+    # Current choice 2026-10-19 (#504): webpki-roots, the root certificates
+    # ureq's rustls uses so the HTTP-SQL place reaches https services, is
+    # under this permissive licence; revisable.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
 

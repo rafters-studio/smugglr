@@ -12,12 +12,14 @@
 //! Rows travel as SQLite's `quote()` text of each column, so every value,
 //! integers beyond 2^53 included, is read without loss.
 
+pub mod http_sql;
 pub mod local_file;
 mod queries;
 mod value;
 
 use smugglr_core::change::Change;
 
+pub use http_sql::HttpSql;
 pub use local_file::LocalFile;
 
 /// What a place says when it cannot do what was asked.
@@ -117,7 +119,7 @@ const OTHER_ENGINES: &[&str] = &[
 ];
 
 /// Opens the place an address names: a path or `file://` URL is a local
-/// file.
+/// file, and an `http://` or `https://` URL a service that speaks HTTP-SQL.
 ///
 /// # Errors
 /// [`Error::OtherEngine`] for a database that is not SQLite,
@@ -127,6 +129,11 @@ pub fn open(address: &str) -> Result<Box<dyn Place>, Error> {
     match address.split_once("://") {
         None => Ok(Box::new(LocalFile::open(address)?)),
         Some(("file", path)) => Ok(Box::new(LocalFile::open(path)?)),
+        Some((scheme, _))
+            if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") =>
+        {
+            Ok(Box::new(HttpSql::open(address)))
+        }
         Some((scheme, _)) if OTHER_ENGINES.contains(&scheme.to_ascii_lowercase().as_str()) => {
             Err(Error::OtherEngine)
         }
