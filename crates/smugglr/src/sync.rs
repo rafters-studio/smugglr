@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use smugglr_core::change::{Change, Op};
 use smugglr_core::ignore::Ignore;
@@ -20,15 +21,34 @@ use smugglr_place::{Place, Table};
 
 use crate::shape;
 
-/// How a sync runs.
+/// How the places connect, as `--sync-type` names it.
+///
+/// Only direct is built; hub, multi and mesh are not yet, so they cannot be
+/// named here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SyncType {
+    /// The two places, source and target, synced with each other.
+    #[default]
+    Direct,
+}
+
+/// How a sync runs: the options the flags give, as `--dryrun`,
+/// `--sync-mode`, `--sync-type` and `--watch` do, and the settings the
+/// config gives.
 #[derive(Debug, Clone, Default)]
 pub struct Options {
     /// Where smugglr keeps its memory; `None` is smugglr's config directory.
     pub config_dir: Option<PathBuf>,
     /// What happens to a row changed in both places.
     pub sync_mode: SyncMode,
+    /// How the places connect.
+    pub sync_type: SyncType,
     /// Show what the sync would do, and write nothing.
     pub dryrun: bool,
+    /// Rerun every given interval, until stopped. One [`sync`] is one whole
+    /// run; repeating belongs to the front end that reads this, as the CLI
+    /// does for `--watch`.
+    pub watch: Option<Duration>,
     /// The tables the run is limited to; empty is every table.
     pub tables: Vec<String>,
     /// The tables the person lists to ignore, names or patterns with `*`
@@ -64,13 +84,18 @@ pub enum Error {
     NoSteering(Vec<String>),
 }
 
-/// Syncs `source` and `target` once, and says what it did.
+/// Syncs `source` and `target` once, and returns the record of what it did:
+/// the same record `smugglr sync` prints.
 ///
-/// When the places' shapes differ, the run stops before any row is read,
-/// writes nothing, and the record names the difference.
+/// A stop is a record, never an error: a table stopped on a row changed in
+/// both places, a shape mismatch, or a first sync too much for the wire each
+/// comes back as `Ok`, the record naming it.
 ///
 /// # Errors
-/// When a place cannot be reached, read or written, or memory cannot be kept.
+/// When a place cannot be reached, read or written, or memory cannot be
+/// kept; and before any row is read, when the run is named wrong (a table no
+/// place has, a table without a primary key, or `--sync-mode last` without a
+/// steering column).
 pub fn sync(
     source: &mut dyn Place,
     target: &mut dyn Place,

@@ -132,3 +132,21 @@ Feature: one sync between two places, with places and memory as they are
     Given two places with rows to move, whose orders table has no steering column named in the config
     When the agent runs smugglr sync on them with --sync-mode last
     Then neither place has changed
+
+  @criterion-01a14bed-5112-7002-b72f-4272b004411c @module-front-ends
+  Scenario: a stop is a record
+    Given two places with a row changed in both since the last sync
+    When a program syncs them through the Rust crates
+    Then the call returns a record whose table status for that row's table is stopped
+
+  @criterion-01a14bed-5112-7002-b72f-4283f84d3e2e @module-front-ends
+  Scenario: an unreachable place is an error
+    Given a local file and an HTTP-SQL address that does not answer
+    When a program syncs them through the Rust crates
+    Then the call returns an error
+
+  @criterion-01a14bed-5112-7002-b72f-429ae7829fae @module-front-ends
+  Scenario: dryrun in the options
+    Given two places where the source has rows the target lacks
+    When a program syncs them through the Rust crates with dryrun set
+    Then the call returns a record whose run status is preview

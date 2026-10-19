@@ -32,6 +32,8 @@ pub(crate) struct World {
     /// Each line a watching smugglr printed, with the seconds since it
     /// started.
     pub(crate) lines: Slot<Vec<(f64, String)>>,
+    /// What a program's call to `smugglr::sync` returned.
+    pub(crate) called: Slot<Result<smugglr_core::record::Record, smugglr::Error>>,
 }
 
 #[fixture]
