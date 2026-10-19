@@ -35,6 +35,8 @@ pub(crate) struct Pair {
     before: Slot<(Tables, Tables)>,
     /// Ids of rows a scenario added.
     added: Slot<Vec<String>>,
+    /// Tables whose database hands out their keys.
+    self_keyed: Slot<Vec<String>>,
 }
 
 #[fixture]
@@ -75,7 +77,12 @@ fn run_as(pair: &Pair, mode: SyncMode, dryrun: bool) -> Result<(), String> {
     let mut tables = BTreeMap::new();
     let empty = Rows::new();
     let names: Vec<String> = source.keys().cloned().collect();
+    let self_keyed = pair.self_keyed.get().unwrap_or_default();
     for name in names {
+        if self_keyed.contains(&name) {
+            tables.insert(name, record::self_keyed());
+            continue;
+        }
         let last = memory.get(&name).cloned().unwrap_or_default();
         let planned = plan(
             &name,
@@ -612,6 +619,64 @@ fn orders_overwritten_empty(pair: &Pair) -> Result<(), String> {
             Ok(())
         }
         _ => Err(format!("orders: {orders}")),
+    }
+}
+
+/// Two places synced before, each since given a sessions table keyed by the
+/// database, which handed out the same key to a different row in each.
+fn sessions_self_keyed(pair: &Pair) -> Result<(), String> {
+    synced(pair)?;
+    let session = |user: &str| vec!["1".to_owned(), format!("'{user}'")];
+    change(&pair.source, "sessions", |rows| {
+        rows.insert(vec!["1".to_owned()], session("ada"));
+    })?;
+    change(&pair.target, "sessions", |rows| {
+        rows.insert(vec!["1".to_owned()], session("grace"));
+    })?;
+    pair.self_keyed.set(vec!["sessions".to_owned()]);
+    Ok(())
+}
+
+#[given("two places whose sessions table is keyed INTEGER PRIMARY KEY")]
+fn sessions_keyed_by_database(pair: &Pair) -> Result<(), String> {
+    sessions_self_keyed(pair)
+}
+
+#[given(
+    "two places whose sessions table is keyed INTEGER PRIMARY KEY and whose orders table has rows to move"
+)]
+fn sessions_keyed_orders_move(pair: &Pair) -> Result<(), String> {
+    sessions_self_keyed(pair)?;
+    new_orders(pair, 3)
+}
+
+#[then("the record gives sessions the status stopped with an empty rows list")]
+fn sessions_stopped(pair: &Pair) -> Result<(), String> {
+    let sessions = entry(pair, "sessions")?;
+    let empty = sessions
+        .get("rows")
+        .and_then(Value::as_array)
+        .is_some_and(Vec::is_empty);
+    match sessions.get("status").and_then(Value::as_str) {
+        Some("stopped") if empty => Ok(()),
+        _ => Err(format!("sessions: {sessions}")),
+    }
+}
+
+#[then(
+    "the why for sessions says two places would hand out the same key and names a random, unique key such as UUIDv7"
+)]
+fn why_for_sessions(pair: &Pair) -> Result<(), String> {
+    let sessions = entry(pair, "sessions")?;
+    match sessions.get("why").and_then(Value::as_str) {
+        Some(why)
+            if why.contains("two places would hand out the same key")
+                && why.contains("random, unique key")
+                && why.contains("UUIDv7") =>
+        {
+            Ok(())
+        }
+        _ => Err(format!("sessions gives no such why: {sessions}")),
     }
 }
 

@@ -78,16 +78,26 @@ impl LocalFile {
         while let Some(row) = rows.next()? {
             let column: String = row.get(0)?;
             let position: i64 = row.get(1)?;
+            let declared: String = row.get(2)?;
             if position > 0 {
-                key.push((position, column.clone()));
+                key.push((position, column.clone(), declared));
             }
             columns.push(column);
         }
         key.sort();
+        // SQLite hands out the key of a rowid table whose key is one column
+        // declared exactly INTEGER: that column is the rowid.
+        let self_keyed = match key.as_slice() {
+            [(_, _, declared)] if declared.eq_ignore_ascii_case("INTEGER") => !self
+                .connection
+                .query_row(queries::KEY_INDEXED, [name], |row| row.get::<_, bool>(0))?,
+            _ => false,
+        };
         Ok(Table {
             name: name.to_owned(),
             columns,
-            key: key.into_iter().map(|(_, column)| column).collect(),
+            key: key.into_iter().map(|(_, column, _)| column).collect(),
+            self_keyed,
         })
     }
 }
@@ -326,6 +336,44 @@ mod tests {
         };
         assert_eq!(place.write(&table, &[stale])?, Vec::<Vec<String>>::new());
         assert_eq!(place.rows(&table, &[first.key])?, vec![first.values]);
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn only_a_rowid_key_is_handed_out_by_the_database() -> Result<(), Error> {
+        let path = file("self-keyed")?;
+        rusqlite::Connection::open(&path)
+            .and_then(|c| {
+                c.execute_batch(
+                    "CREATE TABLE a (id INTEGER PRIMARY KEY, n TEXT); \
+                     CREATE TABLE b (id integer primary key autoincrement, n TEXT); \
+                     CREATE TABLE c (id INT PRIMARY KEY, n TEXT); \
+                     CREATE TABLE d (id INTEGER PRIMARY KEY, n TEXT) WITHOUT ROWID; \
+                     CREATE TABLE e (id INTEGER, n TEXT, PRIMARY KEY (id, n)); \
+                     CREATE TABLE f (id INTEGER, n TEXT, PRIMARY KEY (id))",
+                )
+            })
+            .map_err(|source| Error::Sqlite {
+                address: path.display().to_string(),
+                source,
+            })?;
+        let self_keyed: Vec<(String, bool)> = LocalFile::open(&path)?
+            .tables()?
+            .into_iter()
+            .map(|table| (table.name, table.self_keyed))
+            .collect();
+        let want = [
+            ("a", true),
+            ("b", true),
+            ("c", false),
+            ("d", false),
+            ("e", false),
+            ("f", true),
+            ("t", false),
+        ]
+        .map(|(name, keyed)| (name.to_owned(), keyed));
+        assert_eq!(self_keyed, want);
         let _ = std::fs::remove_file(&path);
         Ok(())
     }
