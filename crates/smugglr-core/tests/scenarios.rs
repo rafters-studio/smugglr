@@ -3,6 +3,9 @@
 //! `scenarios!` discovers every `.feature` file under `tests/` and emits one
 //! test per scenario. Step definitions must compile into this binary.
 
+#[path = "steps/plan.rs"]
+mod plan_steps;
+
 use std::fmt::Write as _;
 use std::fs;
 use std::io::ErrorKind;
@@ -14,6 +17,8 @@ use rstest_bdd::Slot;
 use rstest_bdd_macros::{ScenarioState, given, scenarios, then, when};
 use smugglr_core::change::{Change, Decision, Op, decide};
 use smugglr_core::row_hash::row_hash;
+
+use plan_steps::{Pair, pair};
 
 /// Rows as SQLite's `quote()` text of each column, and the hashes taken.
 #[derive(Debug, Default, ScenarioState)]
@@ -270,4 +275,7 @@ fn unchanged(place: &Place) -> Result<(), String> {
     }
 }
 
-scenarios!("tests", fixtures = [rows: Rows, place: Place]);
+scenarios!(
+    "tests",
+    fixtures = [rows: Rows, place: Place, pair: Pair]
+);

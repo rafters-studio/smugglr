@@ -3,11 +3,19 @@
 //! `scenarios!` discovers every `.feature` file under `tests/` and emits one
 //! test per scenario. Step definitions must compile into this binary.
 
+#[path = "steps/cli.rs"]
+mod cli;
+#[path = "steps/world.rs"]
+mod setup;
+#[path = "steps/sync.rs"]
+mod sync;
+
 use std::process::{Command, Output};
 
 use rstest::fixture;
 use rstest_bdd::Slot;
 use rstest_bdd_macros::{ScenarioState, scenarios, then, when};
+use setup::{World, world};
 
 #[derive(Debug, Default, ScenarioState)]
 struct Run {
@@ -43,4 +51,4 @@ fn prints_name_and_version(run: &Run) -> Result<(), String> {
     }
 }
 
-scenarios!("tests", fixtures = [run: Run]);
+scenarios!("tests", fixtures = [run: Run, world: World]);
