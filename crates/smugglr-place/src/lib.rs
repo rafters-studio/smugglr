@@ -98,6 +98,39 @@ pub trait Place {
     /// When the place cannot be read.
     fn rows(&mut self, table: &Table, keys: &[Key]) -> Result<Vec<Vec<String>>, Error>;
 
+    /// Each row's key and its weight: the bytes of its columns' `quote()`
+    /// text, what the row is when it travels. A first sync weighs itself with
+    /// this before it moves anything (FR-SMUGGLR-065).
+    ///
+    /// The default reads every row through [`Place::rows`]; a place that can
+    /// weigh rows where the data lives should do so instead.
+    ///
+    /// # Errors
+    /// When the place cannot be read.
+    fn weights(&mut self, table: &Table) -> Result<Vec<(Key, u64)>, Error> {
+        let keys: Vec<Key> = self
+            .hashes(table)?
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        let positions: Vec<usize> = table
+            .key
+            .iter()
+            .filter_map(|column| table.columns.iter().position(|c| c == column))
+            .collect();
+        Ok(self
+            .rows(table, &keys)?
+            .into_iter()
+            .map(|row| {
+                let key = positions
+                    .iter()
+                    .filter_map(|&i| row.get(i).cloned())
+                    .collect();
+                (key, row.iter().map(|column| column.len() as u64).sum())
+            })
+            .collect())
+    }
+
     /// Writes the changes to the table, all in one transaction, each only
     /// where its row is still at the change's `from` (no row when `from` is
     /// `None`), and returns the keys of the rows it wrote. The engine's

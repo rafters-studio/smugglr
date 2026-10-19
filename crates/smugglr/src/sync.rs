@@ -1,5 +1,6 @@
 //! One direct sync between two places: read each place's hashes, let the
-//! engine plan each table, write, and keep the pair's memory.
+//! engine plan each table, weigh a first sync, write, and keep the pair's
+//! memory.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -9,6 +10,7 @@ use smugglr_core::ignore::Ignore;
 use smugglr_core::plan::{Hashes, Plan, Side, SyncMode, Write, not_read_back, plan, recover};
 use smugglr_core::record::{self, Record};
 use smugglr_core::row_hash::row_hash;
+use smugglr_core::weight::{DEFAULT_MAX_WIRE, Weight, too_much};
 use smugglr_memory::Memory;
 use smugglr_place::{Place, Table};
 
@@ -28,6 +30,9 @@ pub struct Options {
     /// The tables the person lists to ignore, names or patterns with `*`
     /// and `?`, beside those smugglr always ignores.
     pub ignore: Vec<String>,
+    /// The most bytes a first sync moves; `None` is
+    /// [`DEFAULT_MAX_WIRE`], 100 MB.
+    pub max_wire: Option<u64>,
 }
 
 /// Why a sync could not run.
@@ -69,11 +74,21 @@ pub fn sync(
     let named = |table: &Table| options.tables.is_empty() || options.tables.contains(&table.name);
     let tables: Vec<Table> = every.iter().filter(|t| named(t)).cloned().collect();
     let theirs: Vec<Table> = theirs_every.iter().filter(|t| named(t)).cloned().collect();
+    let config = match &options.config_dir {
+        Some(dir) => dir.clone(),
+        None => smugglr_memory::config_dir().ok_or(Error::NoConfigDir)?,
+    };
+    // Memory is only read here; a shape stop says whether the pair is new.
+    let mut memory = Memory::open(&config, source.address(), target.address())?;
     // The whole places' shapes, not only the tables named: any mismatch
     // stops the whole run (FR-SMUGGLR-070).
     if let Some(mismatch) = shape::check(source.address(), target.address(), &every, &theirs_every)?
     {
-        return Ok(Record::shape_mismatch(mismatch, ignored));
+        return Ok(Record::shape_mismatch(
+            mismatch,
+            ignored,
+            memory.first_sync(),
+        ));
     }
     if let Some(name) = options
         .tables
@@ -82,11 +97,6 @@ pub fn sync(
     {
         return Err(Error::Shape(format!("neither place has a table {name}")));
     }
-    let config = match &options.config_dir {
-        Some(dir) => dir.clone(),
-        None => smugglr_memory::config_dir().ok_or(Error::NoConfigDir)?,
-    };
-    let mut memory = Memory::open(&config, source.address(), target.address())?;
     // Every table both places hold, not only those named: the journal goes
     // once it is finished, so no table's lines may be left unfinished.
     let common: Vec<Table> = every
@@ -96,21 +106,29 @@ pub fn sync(
     finish_cut_off_run(&mut memory, &common, source, target, options.dryrun)?;
     let mut done = BTreeMap::new();
     let mut unmatched = false;
-    for table in tables {
-        // A table whose database hands out its own keys, in either place,
-        // stops before any row is read; the run's other tables go on.
-        if table.self_keyed
-            || theirs
-                .iter()
-                .any(|other| other.name == table.name && other.self_keyed)
-        {
-            done.insert(table.name.clone(), record::self_keyed());
-            continue;
-        }
-        let here: Hashes = source.hashes(&table)?.into_iter().collect();
-        let there: Hashes = target.hashes(&table)?.into_iter().collect();
-        let last = memory.table(&table.name);
-        let planned = plan(&table.name, &here, &there, &last, options.sync_mode);
+    let plans = plan_tables(
+        tables,
+        &theirs,
+        &mut *source,
+        &mut *target,
+        &memory,
+        options.sync_mode,
+        &mut done,
+    )?;
+    let weight = if memory.first_sync() {
+        Some(weigh(&plans, &mut *source, &mut *target)?)
+    } else {
+        None
+    };
+    if let Some(weight) = weight
+        && !options.dryrun
+        && weight.over(options.max_wire.unwrap_or(DEFAULT_MAX_WIRE))
+    {
+        // Nothing written, and no memory kept: the pair stays unsynced.
+        let why = too_much(&weight, source.address(), target.address());
+        return Ok(Record::too_much(weight, why, ignored));
+    }
+    for (table, last, planned) in plans {
         done.insert(table.name.clone(), record::table(&planned, options.dryrun));
         let Plan::Move {
             writes,
@@ -122,29 +140,15 @@ pub fn sync(
         if options.dryrun {
             continue;
         }
-        let (to_target, to_source): (Vec<Write>, Vec<Write>) = writes
-            .into_iter()
-            .partition(|write| write.side == Side::Target);
-        let (mut mismatched, mut written) = carry(
+        let (mismatched, written) = carry_both(
             &table,
             &mut *source,
             &mut *target,
-            &to_target,
+            writes,
             &memory,
             &last,
             &mut next,
         )?;
-        let (more, also) = carry(
-            &table,
-            &mut *target,
-            &mut *source,
-            &to_source,
-            &memory,
-            &last,
-            &mut next,
-        )?;
-        mismatched.extend(more);
-        written.extend(also);
         // The record counts only the rows written.
         let wrote = Plan::Move {
             writes: written,
@@ -159,7 +163,7 @@ pub fn sync(
         }
         memory.set_table(&table.name, next);
     }
-    let record = Record::new(done, ignored, options.dryrun);
+    let record = Record::new(done, ignored, options.dryrun, weight);
     if !options.dryrun {
         memory.save()?;
         // Kept after a run whose rows read back different (exit 4), so
@@ -170,6 +174,78 @@ pub fn sync(
         }
     }
     Ok(record)
+}
+
+/// Plans every table before any is written, so a first sync can weigh
+/// itself whole. A table whose database hands out its own keys, in either
+/// place, goes into `done` as stopped before any row is read; the run's other
+/// tables go on.
+fn plan_tables(
+    tables: Vec<Table>,
+    theirs: &[Table],
+    source: &mut dyn Place,
+    target: &mut dyn Place,
+    memory: &Memory,
+    sync_mode: SyncMode,
+    done: &mut BTreeMap<String, record::Table>,
+) -> Result<Vec<(Table, Hashes, Plan)>, Error> {
+    let mut plans = Vec::new();
+    for table in tables {
+        if table.self_keyed
+            || theirs
+                .iter()
+                .any(|other| other.name == table.name && other.self_keyed)
+        {
+            done.insert(table.name.clone(), record::self_keyed());
+            continue;
+        }
+        let here: Hashes = source.hashes(&table)?.into_iter().collect();
+        let there: Hashes = target.hashes(&table)?.into_iter().collect();
+        let last = memory.table(&table.name);
+        let planned = plan(&table.name, &here, &there, &last, sync_mode);
+        plans.push((table, last, planned));
+    }
+    Ok(plans)
+}
+
+/// What the planned writes move: each row written with values, weighed in
+/// the place it is copied from, and the tables they are in. A delete moves
+/// no row, and a stopped table moves nothing.
+fn weigh(
+    plans: &[(Table, Hashes, Plan)],
+    source: &mut dyn Place,
+    target: &mut dyn Place,
+) -> Result<Weight, Error> {
+    let mut weight = Weight::default();
+    for (table, _, planned) in plans {
+        let Plan::Move { writes, .. } = planned else {
+            continue;
+        };
+        let copies: Vec<&Write> = writes.iter().filter(|write| write.op != Op::Down).collect();
+        if copies.is_empty() {
+            continue;
+        }
+        let weights = |place: &mut dyn Place, side: Side| -> Result<BTreeMap<_, _>, Error> {
+            if copies.iter().any(|write| write.side == side) {
+                Ok(place.weights(table)?.into_iter().collect())
+            } else {
+                Ok(BTreeMap::new())
+            }
+        };
+        // Rows written in the target are copied from the source.
+        let from_source = weights(&mut *source, Side::Target)?;
+        let from_target = weights(&mut *target, Side::Source)?;
+        for write in copies {
+            let from = match write.side {
+                Side::Target => &from_source,
+                Side::Source => &from_target,
+            };
+            weight.rows += 1;
+            weight.bytes += from.get(&write.key).copied().unwrap_or_default();
+        }
+        weight.tables += 1;
+    }
+    Ok(weight)
 }
 
 /// Finishes a run that was cut off while writing: each journal line whose
@@ -244,6 +320,29 @@ fn read_hashes(
             Some((key_of(table, &row)?, row_hash(&columns)))
         })
         .collect())
+}
+
+/// Carries `writes` each way: those for the target from the source, then
+/// those for the source from the target. Returns the keys of rows that read
+/// back different, and the writes that were made.
+fn carry_both(
+    table: &Table,
+    source: &mut dyn Place,
+    target: &mut dyn Place,
+    writes: Vec<Write>,
+    journal: &Memory,
+    last: &Hashes,
+    memory: &mut Hashes,
+) -> Result<(Vec<Vec<String>>, Vec<Write>), Error> {
+    let (to_target, to_source): (Vec<Write>, Vec<Write>) = writes
+        .into_iter()
+        .partition(|write| write.side == Side::Target);
+    let (mut mismatched, mut written) =
+        carry(table, source, target, &to_target, journal, last, memory)?;
+    let (more, also) = carry(table, target, source, &to_source, journal, last, memory)?;
+    mismatched.extend(more);
+    written.extend(also);
+    Ok((mismatched, written))
 }
 
 /// Journals and writes `writes` in `to`, with `from`'s copy of each row,

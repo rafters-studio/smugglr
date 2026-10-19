@@ -30,13 +30,21 @@ fn extra_column(world: &World, notes_rows: &str) -> Result<(), String> {
     )
 }
 
-/// Every table, index and row of each place.
-fn snapshot(world: &World) -> Result<String, String> {
+/// Every table, index and row of each place, with its `user_version` and
+/// `application_id`; the rows of notes and orders where the place has them.
+pub(crate) fn snapshot(world: &World) -> Result<String, String> {
     let mut all = Vec::new();
     for place in [world.source.get(), world.target.get()] {
         let path = place.ok_or("no place named")?;
         all.push(rows_of(&path, "SELECT * FROM sqlite_schema ORDER BY name")?);
+        all.push(rows_of(&path, "PRAGMA user_version")?);
+        all.push(rows_of(&path, "PRAGMA application_id")?);
         for table in ["notes", "orders"] {
+            let held =
+                format!("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = '{table}'");
+            if rows_of(&path, &held)?.is_empty() {
+                continue;
+            }
             all.push(rows_of(
                 &path,
                 &format!("SELECT * FROM {table} ORDER BY id"),

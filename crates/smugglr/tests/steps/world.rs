@@ -121,6 +121,15 @@ impl World {
     }
 }
 
+/// A scenario's folder goes with it; one holds over 100 MB of rows.
+impl Drop for World {
+    fn drop(&mut self) {
+        if let Some(folder) = self.folder.get() {
+            let _ = std::fs::remove_dir_all(folder);
+        }
+    }
+}
+
 fn open(path: &str) -> Result<Connection, String> {
     Connection::open(path).map_err(|err| format!("{path}: {err}"))
 }

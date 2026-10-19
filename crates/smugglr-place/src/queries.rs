@@ -77,6 +77,22 @@ pub(crate) fn quoted_rows(table: &Table) -> String {
     )
 }
 
+/// Each row's key columns' `quote()` text, then the bytes of all its
+/// columns' `quote()` text.
+pub(crate) fn weights(table: &Table) -> String {
+    let bytes: Vec<String> = table
+        .columns
+        .iter()
+        .map(|column| format!("length(CAST(quote({}) AS BLOB))", ident(column)))
+        .collect();
+    format!(
+        "SELECT {}, {} FROM {}",
+        quoted(&table.key),
+        bytes.join(" + "),
+        ident(&table.name)
+    )
+}
+
 /// One row's columns' `quote()` text, by key.
 pub(crate) fn row(table: &Table) -> String {
     format!(
