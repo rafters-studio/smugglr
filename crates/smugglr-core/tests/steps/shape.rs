@@ -51,7 +51,7 @@ fn device_and_blob(device: &Device) {
         columns: columns(&[("id", "TEXT"), ("body", "TEXT"), ("created_at", "INTEGER")]),
     });
     // The blob was stashed from a place whose notes has no created_at.
-    device.blob.set(Stamp::Columns(column_hash(&columns(&[
+    device.blob.set(Stamp(column_hash(&columns(&[
         ("id", "TEXT"),
         ("body", "TEXT"),
     ]))));
@@ -61,7 +61,7 @@ fn device_and_blob(device: &Device) {
 fn retrieve(device: &Device) -> Result<(), String> {
     let notes = device.notes.get().ok_or("no device")?;
     let blob = device.blob.get().ok_or("no blob")?;
-    let mismatch = compare_stamp(&notes, None, &blob).ok_or("the stamps match")?;
+    let mismatch = compare_stamp(&notes, blob).ok_or("the stamps match")?;
     let json = Record::shape_mismatch(mismatch).json();
     device
         .record
@@ -73,7 +73,7 @@ fn retrieve(device: &Device) -> Result<(), String> {
 fn names_what_it_can(device: &Device) -> Result<(), String> {
     let record = device.record.get().ok_or("nothing was retrieved")?;
     let notes = device.notes.get().ok_or("no device")?;
-    let Some(Stamp::Columns(blob)) = device.blob.get() else {
+    let Some(Stamp(blob)) = device.blob.get() else {
         return Err("no blob".to_owned());
     };
     let shape = record.get("shape").ok_or("the record names no shape")?;

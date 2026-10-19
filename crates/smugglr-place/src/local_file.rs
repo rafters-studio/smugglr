@@ -3,16 +3,15 @@
 //! The engine's row hash runs as a SQL function registered on the
 //! connection, so each row is hashed where it lives. The file is opened for
 //! reading and writing but never created: an empty place gets its shape from
-//! migratr or the person, never from smugglr.
+//! the person, never from smugglr.
 
 use std::path::Path;
 
 use rusqlite::functions::FunctionFlags;
 use rusqlite::types::Value;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params_from_iter};
+use rusqlite::{Connection, OpenFlags, params_from_iter};
 use smugglr_core::change::{Change, Op};
 use smugglr_core::row_hash::row_hash;
-use smugglr_core::shape::{LEDGER, Ledger};
 
 use crate::queries::{self, ROW_HASH};
 use crate::value::unquote;
@@ -125,26 +124,6 @@ impl Place for LocalFile {
             .iter()
             .map(|name| self.columns(name).map_err(|source| self.sqlite(source)))
             .collect()
-    }
-
-    fn ledger(&mut self) -> Result<Option<Ledger>, Error> {
-        let connection = &self.connection;
-        let read = || -> rusqlite::Result<Option<Ledger>> {
-            let has: bool =
-                connection.query_row(queries::HAS_LEDGER, [LEDGER], |row| row.get(0))?;
-            if !has {
-                return Ok(None);
-            }
-            connection
-                .query_row(&queries::latest_migration(), [], |row| {
-                    Ok(Ledger {
-                        version: row.get(0)?,
-                        checksum: row.get(1)?,
-                    })
-                })
-                .optional()
-        };
-        read().map_err(|source| self.sqlite(source))
     }
 
     fn hashes(&mut self, table: &Table) -> Result<Vec<(Key, [u8; 16])>, Error> {

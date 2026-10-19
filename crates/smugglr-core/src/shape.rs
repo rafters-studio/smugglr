@@ -1,12 +1,9 @@
 //! Shape comparison and the shape stamp (FR-SMUGGLR-070): compare and stop
-//! only. smugglr never changes a shape; that is migratr's job.
+//! only. smugglr never changes a shape.
 //!
-//! Where both places carry migratr's ledger, the shape is the ledger's latest
-//! version and checksum, and nothing behind migratr's back is policed.
-//! Otherwise each table's shape is its column names, types and order. A
-//! table whose shape is known only by a stamp (in a blob or an envelope) is
-//! compared by stamp: the ledger's latest when this place has the ledger,
-//! otherwise the 16-byte column hash.
+//! Each table's shape is its column names, types and order. A table whose
+//! shape is known only by a stamp (in a blob or an envelope) is compared by
+//! stamp: the 16-byte column hash.
 
 use std::fmt::Write as _;
 
@@ -14,9 +11,6 @@ use serde::{Serialize, Serializer};
 
 use crate::plan::Side;
 use crate::row_hash::row_hash;
-
-/// The name of migratr's ledger table.
-pub const LEDGER: &str = "_migratr_migrations";
 
 /// One column of a table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -37,41 +31,20 @@ pub struct TableShape {
     pub columns: Vec<Column>,
 }
 
-/// The latest migration in a place's migratr ledger.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct Ledger {
-    /// The latest migration's version.
-    pub version: i64,
-    /// Its checksum.
-    pub checksum: String,
-}
-
-/// A place's shape: its ledger's latest migration, when it carries migratr's
-/// ledger, and its tables.
+/// A place's shape: its tables.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Shape {
-    /// The latest migration in the place's ledger; `None` without one.
-    pub ledger: Option<Ledger>,
     /// The place's tables.
     pub tables: Vec<TableShape>,
 }
 
-/// A table's shape stamp: migratr's latest version and checksum when the
-/// ledger is present, otherwise the column hash.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Stamp {
-    /// The latest migration in the place's ledger.
-    Ledger(Ledger),
-    /// The table's [`column_hash`].
-    Columns([u8; 16]),
-}
+/// A table's shape stamp: its [`column_hash`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stamp(pub [u8; 16]);
 
 impl Serialize for Stamp {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self {
-            Self::Ledger(ledger) => ledger.serialize(serializer),
-            Self::Columns(hash) => serializer.serialize_str(&hex(hash)),
-        }
+        serializer.serialize_str(&hex(&self.0))
     }
 }
 
@@ -83,14 +56,10 @@ fn hex(hash: &[u8]) -> String {
 }
 
 impl Stamp {
-    /// The stamp of a table with `columns` in a place whose ledger's latest
-    /// migration is `ledger`.
+    /// The stamp of a table with `columns`.
     #[must_use]
-    pub fn of(ledger: Option<&Ledger>, columns: &[Column]) -> Self {
-        ledger.map_or_else(
-            || Self::Columns(column_hash(columns)),
-            |ledger| Self::Ledger(ledger.clone()),
-        )
+    pub fn of(columns: &[Column]) -> Self {
+        Self(column_hash(columns))
     }
 }
 
@@ -131,14 +100,6 @@ pub struct ColumnDifference {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "difference")]
 pub enum Mismatch {
-    /// Both places carry migratr's ledger, at different latest migrations.
-    #[serde(rename = "migratr versions")]
-    Versions {
-        /// The source's latest migration.
-        source: Ledger,
-        /// The target's latest migration.
-        target: Ledger,
-    },
     /// The source has tables and the target none.
     #[serde(rename = "no tables")]
     NoTables,
@@ -173,9 +134,8 @@ pub enum Mismatch {
 }
 
 /// What every shape stop says about going on.
-const MIGRATR: &str = "smugglr stopped before reading any row and wrote nothing. smugglr \
-     never changes a shape: changing shapes is migratr's job. Give both places the same shape, \
-     then run again.";
+const GO_ON: &str = "smugglr stopped before reading any row and wrote nothing. smugglr \
+     never changes a shape. Give both places the same shape, then run again.";
 
 fn side(side: Side) -> &'static str {
     match side {
@@ -191,14 +151,8 @@ fn other(only_in: Side) -> Side {
     }
 }
 
-fn stamp_text(stamp: &Stamp) -> String {
-    match stamp {
-        Stamp::Ledger(ledger) => format!(
-            "migratr version {} (checksum {})",
-            ledger.version, ledger.checksum
-        ),
-        Stamp::Columns(hash) => format!("column hash {}", hex(hash)),
-    }
+fn stamp_text(stamp: Stamp) -> String {
+    format!("column hash {}", hex(&stamp.0))
 }
 
 impl Mismatch {
@@ -206,10 +160,6 @@ impl Mismatch {
     #[must_use]
     pub fn why(&self) -> String {
         let difference = match self {
-            Self::Versions { source, target } => format!(
-                "The source's migratr ledger is at version {} and the target's at version {}.",
-                source.version, target.version
-            ),
             Self::NoTables => "The target has no tables.".to_owned(),
             Self::Table { table, only_in } => format!(
                 "The table {table} is in the {} but not in the {}.",
@@ -236,12 +186,12 @@ impl Mismatch {
                 format!(
                     "The table {table} here ({}) has the shape stamp {}; it arrived with {}.",
                     columns.join(", "),
-                    stamp_text(stamp),
-                    stamp_text(arrived)
+                    stamp_text(*stamp),
+                    stamp_text(*arrived)
                 )
             }
         };
-        format!("{difference} {MIGRATR}")
+        format!("{difference} {GO_ON}")
     }
 }
 
@@ -249,16 +199,6 @@ impl Mismatch {
 /// `None` when they are the same.
 #[must_use]
 pub fn compare(source: &Shape, target: &Shape) -> Option<Mismatch> {
-    let ledgers_match = match (&source.ledger, &target.ledger) {
-        (Some(s), Some(t)) if s != t => {
-            return Some(Mismatch::Versions {
-                source: s.clone(),
-                target: t.clone(),
-            });
-        }
-        (Some(_), Some(_)) => true,
-        _ => false,
-    };
     if target.tables.is_empty() && !source.tables.is_empty() {
         return Some(Mismatch::NoTables);
     }
@@ -275,11 +215,6 @@ pub fn compare(source: &Shape, target: &Shape) -> Option<Mismatch> {
                 only_in,
             });
         }
-    }
-    if ledgers_match {
-        // The same migration in both: smugglr does not police changes made
-        // behind migratr's back.
-        return None;
     }
     source.tables.iter().find_map(|ours| {
         let theirs = target.tables.iter().find(|t| t.name == ours.name)?;
@@ -322,27 +257,22 @@ fn differences(source: &[Column], target: &[Column]) -> Vec<ColumnDifference> {
         .collect()
 }
 
-/// Compares `table`, in a place whose ledger's latest migration is `ledger`,
-/// with the stamp `arrived` it is known by elsewhere (a blob or an
-/// envelope); `None` when they match.
+/// Compares `table` with the stamp `arrived` it is known by elsewhere (a
+/// blob or an envelope); `None` when they match.
 #[must_use]
-pub fn compare_stamp(
-    table: &TableShape,
-    ledger: Option<&Ledger>,
-    arrived: &Stamp,
-) -> Option<Mismatch> {
-    let stamp = Stamp::of(ledger, &table.columns);
-    (stamp != *arrived).then(|| Mismatch::Stamps {
+pub fn compare_stamp(table: &TableShape, arrived: Stamp) -> Option<Mismatch> {
+    let stamp = Stamp::of(&table.columns);
+    (stamp != arrived).then(|| Mismatch::Stamps {
         table: table.name.clone(),
         columns: table.columns.clone(),
         stamp,
-        arrived: arrived.clone(),
+        arrived,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Column, Ledger, Mismatch, Shape, TableShape, column_hash, compare};
+    use super::{Column, Mismatch, Shape, TableShape, column_hash, compare};
 
     fn columns(names: &[&str]) -> Vec<Column> {
         names
@@ -354,12 +284,8 @@ mod tests {
             .collect()
     }
 
-    fn shape(ledger: Option<i64>, names: &[&str]) -> Shape {
+    fn shape(names: &[&str]) -> Shape {
         Shape {
-            ledger: ledger.map(|version| Ledger {
-                version,
-                checksum: format!("c{version}"),
-            }),
             tables: vec![TableShape {
                 name: "orders".to_owned(),
                 columns: columns(names),
@@ -376,17 +302,9 @@ mod tests {
     }
 
     #[test]
-    fn the_same_ledger_is_not_policed() {
-        assert_eq!(
-            compare(&shape(Some(3), &["id"]), &shape(Some(3), &["id", "extra"])),
-            None
-        );
-    }
-
-    #[test]
-    fn one_ledger_falls_back_to_columns() {
+    fn a_column_in_one_place_only_is_a_mismatch() {
         assert!(matches!(
-            compare(&shape(Some(3), &["id"]), &shape(None, &["id", "extra"])),
+            compare(&shape(&["id"]), &shape(&["id", "extra"])),
             Some(Mismatch::Columns { .. })
         ));
     }

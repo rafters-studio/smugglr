@@ -11,10 +11,6 @@ const ORDERS: &str = "CREATE TABLE orders (id TEXT PRIMARY KEY, item TEXT)";
 
 const ROWS: &str = "INSERT INTO notes VALUES ('n1', 'first', 1), ('n2', 'second', 2)";
 
-/// migratr's ledger table, as migratr makes it.
-const LEDGER: &str = "CREATE TABLE _migratr_migrations (version INTEGER PRIMARY KEY, \
-     name TEXT NOT NULL, checksum TEXT NOT NULL, applied_at TEXT NOT NULL)";
-
 /// The column the target's orders has and the source's lacks.
 const EXTRA: &str = "discount";
 
@@ -66,32 +62,7 @@ fn extra_column_and_rows(world: &World) -> Result<(), String> {
     Ok(())
 }
 
-#[given("two places holding migratr's ledger at different latest migration versions")]
-fn ledgers_differ(world: &World) -> Result<(), String> {
-    let migration = |version: u64| {
-        format!(
-            "INSERT INTO _migratr_migrations VALUES ({version}, 'm{version}', 'sum{version}', \
-             '2026-10-19T00:00:00.000Z');"
-        )
-    };
-    places(
-        world,
-        &format!(
-            "{LEDGER}; {} {} {ORDERS}",
-            migration(20_261_001_000_001),
-            migration(20_261_002_000_002)
-        ),
-        &format!("{LEDGER}; {} {ORDERS}", migration(20_261_001_000_001)),
-    )?;
-    world
-        .watched
-        .set("20261002000002 20261001000001".to_owned());
-    Ok(())
-}
-
-#[given(
-    "two places without migratr's ledger whose orders tables have the same columns in a different order"
-)]
+#[given("two places whose orders tables have the same columns in a different order")]
 fn columns_reordered(world: &World) -> Result<(), String> {
     places(
         world,
@@ -172,27 +143,6 @@ fn names_column(world: &World) -> Result<(), String> {
                 .any(|c| c.get("name").and_then(Value::as_str) == Some(column.as_str()))
         });
     if named && shape.get("table").and_then(Value::as_str) == Some("orders") {
-        Ok(())
-    } else {
-        Err(format!("the record's shape stop is {shape}"))
-    }
-}
-
-#[then("the record names both versions")]
-fn names_versions(world: &World) -> Result<(), String> {
-    let shape = shape(world)?;
-    let watched = world.watched.get().ok_or("no versions watched")?;
-    let version = |side: &str| {
-        shape
-            .get(side)
-            .and_then(|ledger| ledger.get("version"))
-            .and_then(Value::as_i64)
-            .map(|v| v.to_string())
-            .unwrap_or_default()
-    };
-    let named = format!("{} {}", version("source"), version("target"));
-    let why = shape.get("why").and_then(Value::as_str).unwrap_or_default();
-    if named == watched && watched.split(' ').all(|v| why.contains(v)) {
         Ok(())
     } else {
         Err(format!("the record's shape stop is {shape}"))
