@@ -3,9 +3,13 @@
 use std::process::ExitCode;
 
 use smugglr::{Options, sync};
+use smugglr_core::record::Table;
 
 /// Exit status for a usage error, or a place smugglr refuses.
 const USAGE: u8 = 2;
+
+/// Exit status for a run that wrote something and is not done.
+const NOT_DONE: u8 = 4;
 
 /// Runs the command line `args` (without the program name).
 pub(crate) fn run(args: &[String]) -> ExitCode {
@@ -33,7 +37,16 @@ fn sync_once(source: &str, target: &str) -> ExitCode {
         }
     };
     match sync(source.as_mut(), target.as_mut(), &Options::default()) {
-        Ok(_) => ExitCode::SUCCESS,
+        Ok(record) => {
+            let unmatched = record.tables.values().any(|table| {
+                matches!(table, Table::Stopped { not_read_back, .. } if !not_read_back.is_empty())
+            });
+            if unmatched {
+                ExitCode::from(NOT_DONE)
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
         Err(err) => {
             eprintln!("{err}");
             ExitCode::FAILURE

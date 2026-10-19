@@ -17,6 +17,11 @@ pub const CHANGED_IN_BOTH: &str = "These rows changed in both places since the l
      smugglr stops rather than choose. Rerun with --sync-mode source or target to keep one \
      place's copy, or name a steering column and use --sync-mode last.";
 
+/// Why a table stops when rows it wrote read back different.
+pub const NOT_READ_BACK: &str = "smugglr wrote these rows and read them back different from \
+     what it wrote, so the run is not done. Something in the place changes rows as they are \
+     written.";
+
 /// What a sync did, by table name.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Record {
@@ -44,11 +49,15 @@ pub enum Table {
     /// Rows moved.
     #[serde(rename = "moved")]
     Moved(Moves),
-    /// Nothing in the table was written.
+    /// The table did not move: nothing in it was written, or rows it wrote
+    /// read back different.
     #[serde(rename = "stopped")]
     Stopped {
         /// The rows that stopped it, by key.
         rows: Vec<Key>,
+        /// Rows written that read back different from what was written.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        not_read_back: Vec<Key>,
         /// Why, and how to go on.
         why: String,
     },
@@ -99,6 +108,7 @@ pub fn table(plan: &Plan) -> Table {
     match plan {
         Plan::Stop { rows } => Table::Stopped {
             rows: rows.iter().cloned().map(Key).collect(),
+            not_read_back: Vec::new(),
             why: CHANGED_IN_BOTH.to_owned(),
         },
         Plan::Move { writes, .. } if writes.is_empty() => Table::InStep,
@@ -129,5 +139,15 @@ pub fn table(plan: &Plan) -> Table {
             }
             Table::Moved(moves)
         }
+    }
+}
+
+/// The record of a table whose written rows `keys` read back different.
+#[must_use]
+pub fn not_read_back(keys: Vec<Vec<String>>) -> Table {
+    Table::Stopped {
+        rows: Vec::new(),
+        not_read_back: keys.into_iter().map(Key).collect(),
+        why: NOT_READ_BACK.to_owned(),
     }
 }
