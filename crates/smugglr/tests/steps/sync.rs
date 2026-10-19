@@ -105,6 +105,7 @@ fn quoted_notes(path: &str) -> Result<Vec<Vec<String>>, String> {
 fn options(world: &World) -> Result<Options, String> {
     Ok(Options {
         config_dir: Some(world.config()?),
+        ..Options::default()
     })
 }
 
