@@ -62,6 +62,9 @@ pub struct Table {
     /// Its primary key's column names, in key order; empty when it declares
     /// none.
     pub key: Vec<String>,
+    /// The database hands out the table's keys itself: in SQLite, its key is
+    /// one column declared `INTEGER PRIMARY KEY`, the rowid.
+    pub self_keyed: bool,
 }
 
 /// A database smugglr keeps in step.

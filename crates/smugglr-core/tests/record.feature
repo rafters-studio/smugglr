@@ -1,5 +1,5 @@
 # Generated from the legion requirement. Do not hand-edit this file.
-Feature: --dryrun, and the record of what moved (FR-SMUGGLR-063)
+Feature: --dryrun, and the record of what moved, and the self-keyed stop (FR-SMUGGLR-063, FR-SMUGGLR-069)
 
   @criterion-01a14bed-5c0f-7821-a114-9099223a3832 @module-smugglr-core
   Scenario: a dry run writes nothing
@@ -72,3 +72,21 @@ Feature: --dryrun, and the record of what moved (FR-SMUGGLR-063)
     Given two places whose only differences are rows changed in both places since the last sync
     When the agent runs smugglr sync on them with --json
     Then the record's run status is stopped
+
+  @criterion-01a14bed-75a7-7210-9d31-049332940dd9 @module-smugglr-core
+  Scenario: a self-keyed table stops
+    Given two places whose sessions table is keyed INTEGER PRIMARY KEY
+    When the agent runs smugglr sync on them with --json
+    Then the record gives sessions the status stopped with an empty rows list
+
+  @criterion-01a14bed-75a7-7210-9d31-04aaa4d813f4 @module-smugglr-core
+  Scenario: the self-keyed stop says why
+    Given two places whose sessions table is keyed INTEGER PRIMARY KEY
+    When the agent runs smugglr sync on them with --json
+    Then the why for sessions says two places would hand out the same key and names a random, unique key such as UUIDv7
+
+  @criterion-01a14bed-75a7-7210-9d31-04b1d70b0df4 @module-smugglr-core
+  Scenario: other tables still move
+    Given two places whose sessions table is keyed INTEGER PRIMARY KEY and whose orders table has rows to move
+    When the agent runs smugglr sync on them with --json
+    Then the record gives orders the status moved

@@ -78,6 +78,16 @@ pub fn sync(
     finish_cut_off_run(&mut memory, &common, source, target, options.dryrun)?;
     let mut done = BTreeMap::new();
     for table in tables {
+        // A table whose database hands out its own keys, in either place,
+        // stops before any row is read; the run's other tables go on.
+        if table.self_keyed
+            || theirs
+                .iter()
+                .any(|other| other.name == table.name && other.self_keyed)
+        {
+            done.insert(table.name.clone(), record::self_keyed());
+            continue;
+        }
         let here: Hashes = source.hashes(&table)?.into_iter().collect();
         let there: Hashes = target.hashes(&table)?.into_iter().collect();
         let last = memory.table(&table.name);
@@ -211,7 +221,7 @@ fn read_hashes(
 
 /// Stops the run, before any row is read, unless both places hold the same
 /// tables and each has a primary key. The full shape check and its words
-/// are #506's; a table without a primary key is #507's.
+/// are #506's.
 fn check_shape(ours: &[Table], theirs: &[Table], source: &str, target: &str) -> Result<(), Error> {
     for (tables, others, here, there) in [
         (ours, theirs, source, target),
@@ -342,6 +352,7 @@ mod tests {
                 name: "notes".to_owned(),
                 columns: vec!["id".to_owned()],
                 key: vec!["id".to_owned()],
+                self_keyed: false,
             }])
         }
         fn hashes(&mut self, _: &Table) -> Result<Vec<(Key, [u8; 16])>, PlaceError> {
