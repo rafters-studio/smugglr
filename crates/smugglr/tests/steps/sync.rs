@@ -453,3 +453,56 @@ fn record_not_kept(world: &World) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// Each place's rows and marks, to tell whether a run wrote anything.
+fn snapshot(world: &World) -> Result<String, String> {
+    let (source, target) = places(world)?;
+    let rows = |path: &str| rows_of(path, "SELECT * FROM notes ORDER BY id");
+    Ok(format!(
+        "{:?}",
+        [
+            rows(&source)?,
+            marks(&source)?,
+            rows(&target)?,
+            marks(&target)?
+        ]
+    ))
+}
+
+/// #512's dry run through the real sync: `smugglr sync --dryrun` writes
+/// nothing to either place and keeps no memory.
+#[test]
+fn a_real_dry_run_writes_nothing_and_keeps_no_memory() -> Result<(), String> {
+    let world = World::default();
+    world
+        .source
+        .set(world.place("source.db", &format!("{NOTES}; {THREE_NOTES}"))?);
+    world.target.set(world.place(
+        "target.db",
+        &format!("{NOTES}; INSERT INTO notes VALUES ('t1', 'only here', 4)"),
+    )?);
+    let before = snapshot(&world)?;
+    let output = world.sync(&["--dryrun", "--json"])?;
+    let said = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() || !said.contains("\"preview\"") || !said.contains("would move") {
+        return Err(format!("the dry run printed {said}{}", stderr(&world)));
+    }
+    let after = snapshot(&world)?;
+    if before != after {
+        return Err(format!("a place changed: before {before}, after {after}"));
+    }
+    let config = world.config()?;
+    let kept = if config.exists() {
+        files_under(&config)?
+    } else {
+        Vec::new()
+    };
+    if kept.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "the dry run kept {:?}",
+            kept.iter().map(|(p, _)| p).collect::<Vec<_>>()
+        ))
+    }
+}
