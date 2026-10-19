@@ -5,13 +5,18 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/rafters-studio/smugglr"
 authors = ["Rafters Studio"]
 
 [workspace.dependencies]
 smugglr-core = { path = "crates/smugglr-core", version = "0.1.0" }
+# Acceptance-scenario runner (dev-dependencies only). rstest is a required
+# peer: the `scenarios!` expansion names `rstest` directly.
+rstest = "0.28"
+rstest-bdd = "0.6"
+rstest-bdd-macros = "0.6"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

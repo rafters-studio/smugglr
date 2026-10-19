@@ -10,4 +10,5 @@ The previous implementation is preserved two ways:
 - a full working copy at `../smugglr-archive`
 - this repository's own git history, through commit `1ff0b75`
 
-Nothing here is built yet. Code arrives when the spec calls for it.
+Nothing here is built yet. Code arrives when the spec calls for it. Until
+then, `smugglr` prints its name and version (`smugglr 0.1.0`) and exits.

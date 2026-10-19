@@ -15,5 +15,10 @@ path = "src/main.rs"
 [dependencies]
 smugglr-core = { workspace = true, features = ["native"] }
 
+[dev-dependencies]
+rstest = { workspace = true }
+rstest-bdd = { workspace = true }
+rstest-bdd-macros = { workspace = true }
+
 [lints]
 workspace = true
