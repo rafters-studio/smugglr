@@ -12,6 +12,7 @@ use std::process::Command;
 use rstest::fixture;
 use rstest_bdd::Slot;
 use rstest_bdd_macros::{ScenarioState, given, scenarios, then, when};
+use smugglr_core::change::{Change, Decision, Op, decide};
 use smugglr_core::row_hash::row_hash;
 
 /// Rows as SQLite's `quote()` text of each column, and the hashes taken.
@@ -174,4 +175,99 @@ fn all_differ(rows: &Rows) -> Result<(), String> {
     }
 }
 
-scenarios!("tests", fixtures = [rows: Rows]);
+/// A place holding one row, and the change arriving at it.
+#[derive(Debug, Default, ScenarioState)]
+struct Place {
+    /// The row's columns as SQLite's `quote()` text.
+    row: Slot<Vec<String>>,
+    /// The row as it was before the change arrived.
+    before: Slot<Vec<String>>,
+    change: Slot<Change>,
+    /// How many times the place wrote the row.
+    writes: Slot<usize>,
+}
+
+#[fixture]
+fn place() -> Place {
+    Place::default()
+}
+
+fn quoted(columns: &[&str]) -> Vec<String> {
+    columns.iter().map(|&column| column.to_owned()).collect()
+}
+
+fn hash_of(row: &[String]) -> [u8; 16] {
+    let columns: Vec<&str> = row.iter().map(String::as_str).collect();
+    row_hash(&columns)
+}
+
+fn arriving(from: &[String], to: Vec<String>) -> Change {
+    Change {
+        op: Op::Upsert,
+        table: "notes".to_owned(),
+        key: quoted(&["1"]),
+        from: Some(hash_of(from)),
+        to: Some(hash_of(&to)),
+        values: to,
+    }
+}
+
+fn holding(place: &Place, row: Vec<String>, change: Change) {
+    place.before.set(row.clone());
+    place.row.set(row);
+    place.change.set(change);
+    place.writes.set(0);
+}
+
+#[given("a place holding a row whose hash is the from of an arriving change")]
+fn at_from(place: &Place) {
+    let row = quoted(&["1", "'draft'"]);
+    let change = arriving(&row, quoted(&["1", "'final'"]));
+    holding(place, row, change);
+}
+
+#[given("a place holding a row whose hash is already the to of an arriving change")]
+fn at_to(place: &Place) {
+    let row = quoted(&["1", "'final'"]);
+    let change = arriving(&quoted(&["1", "'draft'"]), row.clone());
+    holding(place, row, change);
+}
+
+#[when("the place receives the change")]
+fn receive(place: &Place) -> Result<(), String> {
+    let change = place.change.get().ok_or("no change arrived")?;
+    let row = place.row.get().ok_or("the place holds no row")?;
+    if decide(&change, Some(hash_of(&row))) == Decision::Apply {
+        place.row.set(change.values);
+        place
+            .writes
+            .with_mut(|writes| *writes += 1)
+            .ok_or("the place keeps no write count")?;
+    }
+    Ok(())
+}
+
+#[then("the row holds the change's values")]
+fn holds_values(place: &Place) -> Result<(), String> {
+    let change = place.change.get().ok_or("no change arrived")?;
+    let row = place.row.get().ok_or("the place holds no row")?;
+    if row == change.values {
+        Ok(())
+    } else {
+        Err(format!("the row holds {row:?}, not {:?}", change.values))
+    }
+}
+
+#[then("the row is unchanged")]
+fn unchanged(place: &Place) -> Result<(), String> {
+    let before = place.before.get().ok_or("the place held no row")?;
+    let row = place.row.get().ok_or("the place holds no row")?;
+    match place.writes.get() {
+        Some(0) if row == before => Ok(()),
+        writes => Err(format!(
+            "the row went from {before:?} to {row:?} after {writes:?} writes"
+        )),
+    }
+}
+
+scenarios!("tests", fixtures = [rows: Rows, place: Place]);
