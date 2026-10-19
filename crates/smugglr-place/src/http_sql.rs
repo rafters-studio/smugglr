@@ -11,6 +11,7 @@
 use serde_json::{Value as Json, json};
 use smugglr_core::change::{Change, Op};
 use smugglr_core::row_hash::row_hash;
+use smugglr_core::shape::{LEDGER, Ledger};
 
 use crate::queries;
 use crate::value::param;
@@ -189,6 +190,7 @@ impl Place for HttpSql {
                     .and_then(Json::as_str)
                     .ok_or_else(|| self.failed("a table without a name"))?;
                 let mut columns = Vec::new();
+                let mut types = Vec::new();
                 let mut key = Vec::new();
                 for info in self.query(queries::COLUMNS, &[json!(name)])? {
                     let (Some(column), Some(position)) = (
@@ -202,6 +204,7 @@ impl Place for HttpSql {
                         key.push((position, column.to_owned(), declared.to_owned()));
                     }
                     columns.push(column.to_owned());
+                    types.push(info.get(2).and_then(Json::as_str).unwrap_or("").to_owned());
                 }
                 key.sort();
                 let declared: Vec<&str> = key
@@ -218,11 +221,36 @@ impl Place for HttpSql {
                 Ok(Table {
                     name: name.to_owned(),
                     columns,
+                    types,
                     key: key.into_iter().map(|(_, column, _)| column).collect(),
                     self_keyed,
                 })
             })
             .collect()
+    }
+
+    fn ledger(&mut self) -> Result<Option<Ledger>, Error> {
+        let has = self.query(queries::HAS_LEDGER, &[json!(LEDGER)])?;
+        if !matches!(
+            has.first().and_then(|row| row.first()),
+            Some(Json::Number(n)) if n.as_i64() != Some(0)
+        ) {
+            return Ok(None);
+        }
+        let latest = self.query(&queries::latest_migration(), &[])?;
+        let Some(row) = latest.first() else {
+            return Ok(None);
+        };
+        match (
+            row.first().and_then(Json::as_i64),
+            row.get(1).and_then(Json::as_str),
+        ) {
+            (Some(version), Some(checksum)) => Ok(Some(Ledger {
+                version,
+                checksum: checksum.to_owned(),
+            })),
+            _ => Err(self.failed(format_args!("the latest migration in {LEDGER}"))),
+        }
     }
 
     fn hashes(&mut self, table: &Table) -> Result<Vec<(Key, [u8; 16])>, Error> {
@@ -285,6 +313,7 @@ mod tests {
         Table {
             name: "notes".to_owned(),
             columns: vec!["id".to_owned(), "n".to_owned()],
+            types: vec!["TEXT".to_owned(), "INTEGER".to_owned()],
             key: vec!["id".to_owned()],
             self_keyed: false,
         }

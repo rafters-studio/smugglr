@@ -134,6 +134,7 @@ fn program_syncs_adapter(world: &World) -> Result<(), String> {
     let notes = Table {
         name: "notes".to_owned(),
         columns: vec!["id".to_owned(), "body".to_owned(), "created_at".to_owned()],
+        types: vec!["TEXT".to_owned(), "TEXT".to_owned(), "INTEGER".to_owned()],
         key: vec!["id".to_owned()],
         self_keyed: false,
     };
