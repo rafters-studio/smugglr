@@ -8,7 +8,8 @@ Feature: the Change and the one decision path (FR-SMUGGLR-075)
     Then the row holds the change's values
 
   @criterion-01a14bed-8b9b-7142-a602-826a1c1b0307 @module-smugglr-core
-  Scenario: a repeat is skipped
+  Scenario: a repeat is skipped, not held
     Given a place holding a row whose hash is already the to of an arriving change
     When the place receives the change
     Then the row is unchanged
+    And the change counts as done, not as waiting
