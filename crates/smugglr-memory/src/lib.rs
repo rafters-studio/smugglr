@@ -64,7 +64,7 @@ pub fn config_dir() -> Option<PathBuf> {
 pub struct Memory {
     folder: PathBuf,
     tables: BTreeMap<String, Hashes>,
-    /// A done run of this pair saved memory, even of empty tables.
+    /// A run of this pair that wrote saved memory, even of empty tables.
     synced: bool,
 }
 
