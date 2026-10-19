@@ -7,4 +7,5 @@
 //! Code arrives as the spec defines it.
 
 pub mod change;
+pub mod plan;
 pub mod row_hash;

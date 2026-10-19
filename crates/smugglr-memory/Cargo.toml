@@ -1,0 +1,16 @@
+[package]
+name = "smugglr-memory"
+description = "smugglr's memory: each key's last hash per pair of places, in smugglr's own files."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+smugglr-core = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
