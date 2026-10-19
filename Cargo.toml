@@ -1,39 +1,31 @@
 [workspace]
-members = [
-    "crates/smugglr-core",
-    "crates/smugglr",
-    "crates/smugglr-forger",
-    "crates/smugglr-plugin-sdk",
-    "crates/smugglr-wasm",
-    "crates/smugglr-wire",
-    "plugins/smugglr-http-sql",
-]
-# smugglr-wasm is the only member held out: it is #![cfg(target_arch =
-# "wasm32")] and compiles to nothing on the host. smugglr-forger is a default
-# member because its fixture teardown is a Windows-specific claim, and CI's
-# three-OS `cargo test` job is default-members-scoped -- held out, its tests
-# would never run on the platform they exist to defend.
-default-members = [
-    "crates/smugglr-core",
-    "crates/smugglr",
-    "crates/smugglr-forger",
-    "crates/smugglr-plugin-sdk",
-    "crates/smugglr-wire",
-    "plugins/smugglr-http-sql",
-]
-resolver = "2"
+resolver = "3"
+members = ["crates/*"]
 
 [workspace.package]
-version = "0.5.0"
-edition = "2021"
-rust-version = "1.75"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
 license = "MIT"
 repository = "https://github.com/rafters-studio/smugglr"
-homepage = "https://smugglr.dev"
-documentation = "https://smugglr.dev/docs"
-authors = ["Sean Silvius"]
+authors = ["Rafters Studio"]
+
+[workspace.dependencies]
+smugglr-core = { path = "crates/smugglr-core", version = "0.1.0" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+rust_2024_compatibility = { level = "warn", priority = -1 }
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
 
 [profile.release]
-lto = true
-codegen-units = 1
+lto = "thin"
 strip = true

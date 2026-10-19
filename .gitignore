@@ -1,12 +1,11 @@
 # Build artifacts
 /target/
 
-# Config with credentials (use config.example.toml as template)
-config.toml
+# WASM package output
+/crates/*/pkg/
 
-# State files (not needed, tool is stateless)
-.d1-sync-state.json
-failed_rows.json
+# Config with credentials (use config.example.toml as a template)
+config.toml
 
 # IDE
 .idea/
@@ -18,9 +17,9 @@ failed_rows.json
 # OS
 .DS_Store
 Thumbs.db
-/crates/smugglr-wasm/pkg/
 
-# Example working files (created by running docs/examples/*)
-docs/examples/**/*.db
-docs/examples/**/config-*.toml
-docs/examples/cli-migrate/migrations/
+# Claude Code runtime and session data
+.claude/
+
+# Embedded legion working directory
+/legion/

@@ -1,106 +1,22 @@
 [package]
 name = "smugglr-core"
-description = "SQLite replication engine -- content-hash diffing, delta sync, any target"
+description = "The smugglr sync engine: content-hashed delta sync for SQLite."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
-documentation.workspace = true
 authors.workspace = true
-readme = "../../README.md"
-keywords = ["sqlite", "sync", "replication", "delta", "content-hash"]
-categories = ["database", "wasm"]
 
 [features]
-default = ["native"]
-native = [
-    "dep:rusqlite",
-    "dep:reqwest",
-    "dep:tokio",
-    "dep:object_store",
-    "dep:url",
-    "dep:tempfile",
-    "dep:chacha20poly1305",
-    "dep:rand",
-    "dep:libc",
-    "dep:socket2",
-]
+# Default is the portable, WASM-compatible surface: the engine and its traits,
+# with no filesystem, network, or SQLite bindings compiled in.
+default = []
+# Full native stack (local SQLite, HTTP transport, relay, broadcast). Added as
+# the spec defines each capability.
+native = []
 
 [dependencies]
-# Canonical wire types (TableInfo/ColumnInfo/RowMeta), shared with
-# smugglr-plugin-sdk. serde-only, no tokio -- safe on the wasm32 path. See #228.
-smugglr-wire = { path = "../smugglr-wire", version = "0.5.0" }
 
-# Serialization (always needed)
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-
-# Config (always needed)
-toml = "0.8"
-
-# Error handling (always needed)
-thiserror = "2"
-anyhow = "1"
-
-# Hashing for change detection (always needed, WASM-compatible)
-sha2 = "0.10"
-hex = "0.4"
-
-# Blob canonicalization for the content hash: a JSON backend renders BLOB
-# columns as base64, native renders lowercase hex; the hash pins hex, so the
-# base64 rendering is decoded here before folding. Always-on, WASM-compatible. (#292)
-base64 = "0.22"
-
-# Timestamps
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
-
-# Logging (always needed)
-tracing = "0.1"
-
-# -- Native-only dependencies --
-
-# SQLite
-rusqlite = { version = "0.34", features = ["bundled"], optional = true }
-
-# HTTP client
-reqwest = { version = "0.12", features = ["json"], optional = true }
-
-# Async runtime
-tokio = { version = "1", features = ["full"], optional = true }
-
-# Object storage (S3, R2, GCS, local filesystem)
-object_store = { version = "0.12", features = ["aws"], optional = true }
-url = { version = "2", optional = true }
-tempfile = { version = "3", optional = true }
-
-# Encryption (broadcast packets)
-chacha20poly1305 = { version = "0.5", optional = true }
-rand = { version = "0.9", optional = true }
-
-# Unix process checking (PID lock)
-libc = { version = "0.2", optional = true }
-
-# Multicast socket setup (SO_REUSEADDR/SO_REUSEPORT, group join)
-# "all" feature exposes set_reuse_port on unix.
-socket2 = { version = "0.5", features = ["all"], optional = true }
-
-[dev-dependencies]
-# The differential oracle, driven by tests/forger_drives_the_real_migrate.rs.
-#
-# **dev-dependencies only, and by path.** The dependency runs exactly one way --
-# smugglr's tests depend on forger, never the reverse -- and
-# `scripts/check-forger-boundary.py` fails CI on either half being broken. A
-# normal dependency here would put forger in the shipped artifact and, with the
-# forward rule ("forger depends on no smugglr crate"), form a cycle.
-#
-# No version key, and do not add one. forger is `publish = false` and carries
-# its own version line because it is an independent artifact that happens to
-# live in this workspace. Measured: `cargo package` ships a path-only
-# dev-dependency as an EMPTY `[dev-dependencies]` table, while a dev-dependency
-# carrying a version keeps the req and must resolve on crates.io -- so a version
-# here would turn a working `cargo publish` into one that fails looking for a
-# crate that will never be published. `scripts/check-crate-versions.py` knows
-# this and exempts exactly this shape.
-smugglr-forger = { path = "../smugglr-forger" }
+[lints]
+workspace = true

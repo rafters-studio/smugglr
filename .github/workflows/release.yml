@@ -3,225 +3,51 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    name: Build ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            artifact: smugglr-linux-x64
-            ext: tar.gz
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            artifact: smugglr-macos-x64
-            ext: tar.gz
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            artifact: smugglr-macos-arm64
-            ext: tar.gz
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            artifact: smugglr-windows-x64
-            ext: zip
-
+  create-release:
+    name: Create release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+      - id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          name: smugglr ${{ github.ref_name }}
+          generate_release_notes: true
 
+  build:
+    name: Build ${{ matrix.target }}
+    needs: create-release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu }
+          - { os: macos-latest, target: x86_64-apple-darwin }
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+    steps:
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-
-      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/upload-rust-binary-action@v1
         with:
-          key: ${{ matrix.target }}
-
-      # Two binaries ship together: the CLI and the smugglr-http-sql plugin
-      # every remote target (D1, Turso, rqlite, ...) is reached through. A
-      # release that carried only the CLI could sync SQLite to SQLite and
-      # nothing hosted (#430).
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }} -p smugglr -p smugglr-http-sql
-
-      - name: Package (Unix)
-        if: matrix.os != 'windows-latest'
-        run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../${{ matrix.artifact }}.${{ matrix.ext }} smugglr smugglr-http-sql
-
-      - name: Package (Windows)
-        if: matrix.os == 'windows-latest'
-        run: |
-          cd target/${{ matrix.target }}/release
-          7z a ../../../${{ matrix.artifact }}.${{ matrix.ext }} smugglr.exe smugglr-http-sql.exe
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}.${{ matrix.ext }}
-
-  release:
-    name: Create Release
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Generate checksums
-        run: |
-          cd artifacts
-          find . -type f \( -name "*.tar.gz" -o -name "*.zip" \) -print0 | \
-            xargs -0 sha256sum | sed 's|  \./[^/]*/|  |' > ../checksums.txt
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          files: |
-            artifacts/**/*
-            checksums.txt
-
-  publish-crates:
-    name: Publish to crates.io
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Authenticate to crates.io
-        uses: rust-lang/crates-io-auth-action@v1
-        id: auth
-
-      # Dependency order: wire has no internal deps, sdk and core need
-      # wire, http-sql needs core + sdk, the CLI needs core. Each step is
-      # idempotent (see scripts/publish-crate.sh), so a failure partway
-      # through can be re-run without the earlier crates killing the job.
-      - name: Publish smugglr-wire
-        run: ./scripts/publish-crate.sh smugglr-wire
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-
-      - name: Publish smugglr-plugin-sdk
-        run: ./scripts/publish-crate.sh smugglr-plugin-sdk
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-
-      - name: Publish smugglr-core
-        run: ./scripts/publish-crate.sh smugglr-core
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-
-      - name: Publish smugglr-http-sql
-        run: ./scripts/publish-crate.sh smugglr-http-sql
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-
-      - name: Publish smugglr (CLI)
-        run: ./scripts/publish-crate.sh smugglr
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-
-  publish-npm:
-    name: Publish to npm
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install wasm-pack
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
-
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: pnpm
-          cache-dependency-path: packages/smugglr/pnpm-lock.yaml
-          registry-url: https://registry.npmjs.org
-
-      - name: Install deps
-        run: pnpm install --frozen-lockfile
-        working-directory: packages/smugglr
-
-      - name: Build
-        run: pnpm build
-        working-directory: packages/smugglr
-
-      - name: Publish
-        run: npm publish --access=public --provenance
-        working-directory: packages/smugglr
-
-      # Framework plugins. They build against the local `smugglr` package
-      # (`smugglr` devDep is `link:../smugglr`, built above), so they need no
-      # published smugglr and have no propagation-timing dependency. Each is a
-      # pure-tsc build; published after smugglr so a smugglr publish failure
-      # short-circuits before any plugin ships.
-      - name: Install @smugglr/zustand deps
-        run: pnpm install --frozen-lockfile
-        working-directory: packages/zustand-plugin
-
-      - name: Build @smugglr/zustand
-        run: pnpm build
-        working-directory: packages/zustand-plugin
-
-      - name: Publish @smugglr/zustand
-        working-directory: packages/zustand-plugin
-        run: |
-          name=$(node -p "require('./package.json').name")
-          version=$(node -p "require('./package.json').version")
-          if npm view "$name@$version" version >/dev/null 2>&1; then
-            echo "$name@$version already on npm, skipping"
-          else
-            npm publish --access=public --provenance
-          fi
-
-      - name: Install @smugglr/nanostores deps
-        run: pnpm install --frozen-lockfile
-        working-directory: packages/nanostores-plugin
-
-      - name: Build @smugglr/nanostores
-        run: pnpm build
-        working-directory: packages/nanostores-plugin
-
-      - name: Publish @smugglr/nanostores
-        working-directory: packages/nanostores-plugin
-        run: |
-          name=$(node -p "require('./package.json').name")
-          version=$(node -p "require('./package.json').version")
-          if npm view "$name@$version" version >/dev/null 2>&1; then
-            echo "$name@$version already on npm, skipping"
-          else
-            npm publish --access=public --provenance
-          fi
+          bin: smugglr
+          target: ${{ matrix.target }}
+          archive: smugglr-${{ matrix.target }}
+          token: ${{ secrets.GITHUB_TOKEN }}
