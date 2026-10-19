@@ -688,6 +688,104 @@ fn a_table_limited_run_finishes_every_cut_off_table() -> Result<(), String> {
     }
 }
 
+/// Two real files synced once through `smugglr::sync`, then note n1 edited
+/// in both and, in the source, a new order; returns the record of the next
+/// run under `mode`.
+fn both_sides_edit(
+    world: &World,
+    mode: smugglr_core::plan::SyncMode,
+) -> Result<smugglr_core::record::Record, String> {
+    let source = world.place(
+        "source.db",
+        &format!("{NOTES}; {THREE_NOTES}; {ORDERS}; INSERT INTO orders VALUES ('o1', 'tent')"),
+    )?;
+    let target = world.place("target.db", &format!("{NOTES}; {ORDERS}"))?;
+    world.source.set(source.clone());
+    world.target.set(target.clone());
+    let open = |path: &str| LocalFile::open(path).map_err(|err| err.to_string());
+    let run = |mode| {
+        let options = Options {
+            sync_mode: mode,
+            ..options(world)?
+        };
+        sync(&mut open(&source)?, &mut open(&target)?, &options).map_err(|err| err.to_string())
+    };
+    run(smugglr_core::plan::SyncMode::Stop)?;
+    sql_on(
+        &source,
+        "UPDATE notes SET body = 'source copy' WHERE id = 'n1'; \
+                     INSERT INTO orders VALUES ('o2', 'stove')",
+    )?;
+    sql_on(
+        &target,
+        "UPDATE notes SET body = 'target copy' WHERE id = 'n1'",
+    )?;
+    run(mode)
+}
+
+fn body(path: &str) -> Result<Option<Vec<String>>, String> {
+    note(path, "n1")
+}
+
+/// #509 through the real sync: a stop stops only its table.
+#[test]
+fn sync_stops_only_the_table_with_a_both_sides_change() -> Result<(), String> {
+    use smugglr_core::record::Table as Entry;
+    let world = World::default();
+    let record = both_sides_edit(&world, smugglr_core::plan::SyncMode::Stop)?;
+    let (source, target) = places(&world)?;
+    let notes_stopped = matches!(record.tables.get("notes"), Some(Entry::Stopped { .. }));
+    let orders_moved = matches!(record.tables.get("orders"), Some(Entry::Moved(_)));
+    let o2 = rows_of(&target, "SELECT * FROM orders WHERE id = 'o2'")?;
+    if notes_stopped && orders_moved && !o2.is_empty() && body(&source)? != body(&target)? {
+        Ok(())
+    } else {
+        Err(format!("the record is {}", record.json()))
+    }
+}
+
+/// #509 through the real sync: --sync-mode source writes the source's copy
+/// into the target and names it.
+#[test]
+fn sync_mode_source_keeps_the_sources_copy() -> Result<(), String> {
+    use smugglr_core::record::Table as Entry;
+    let world = World::default();
+    let record = both_sides_edit(&world, smugglr_core::plan::SyncMode::Source)?;
+    let (source, target) = places(&world)?;
+    let named = matches!(record.tables.get("notes"),
+        Some(Entry::Moved(moves)) if moves.overwritten_in_target.len() == 1);
+    let held = body(&target)?;
+    if named && held == body(&source)? && format!("{held:?}").contains("source copy") {
+        Ok(())
+    } else {
+        Err(format!(
+            "the target holds {held:?}; the record is {}",
+            record.json()
+        ))
+    }
+}
+
+/// #509 through the real sync: --sync-mode target writes the target's copy
+/// into the source and names it.
+#[test]
+fn sync_mode_target_keeps_the_targets_copy() -> Result<(), String> {
+    use smugglr_core::record::Table as Entry;
+    let world = World::default();
+    let record = both_sides_edit(&world, smugglr_core::plan::SyncMode::Target)?;
+    let (source, target) = places(&world)?;
+    let named = matches!(record.tables.get("notes"),
+        Some(Entry::Moved(moves)) if moves.overwritten_in_source.len() == 1);
+    let held = body(&source)?;
+    if named && held == body(&target)? && format!("{held:?}").contains("target copy") {
+        Ok(())
+    } else {
+        Err(format!(
+            "the source holds {held:?}; the record is {}",
+            record.json()
+        ))
+    }
+}
+
 /// Each place's rows and marks, to tell whether a run wrote anything.
 fn snapshot(world: &World) -> Result<String, String> {
     let (source, target) = places(world)?;
