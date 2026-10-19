@@ -118,11 +118,7 @@ impl Memory {
     /// # Errors
     /// When the folder or its file cannot be written.
     pub fn save(&self) -> Result<(), Error> {
-        let io = |path: &Path| {
-            let path = path.to_owned();
-            move |source| Error::Io { path, source }
-        };
-        fs::create_dir_all(&self.folder).map_err(io(&self.folder))?;
+        fs::create_dir_all(&self.folder).map_err(io_at(&self.folder))?;
         let mut text = String::new();
         for (table, hashes) in &self.tables {
             for (key, hash) in hashes {
@@ -141,15 +137,13 @@ impl Memory {
         // The new file's data reaches the disk before the rename, and the
         // rename before save returns, so a power cut leaves the old memory
         // or the new, never an empty file.
-        let mut file = fs::File::create(&next).map_err(io(&next))?;
-        file.write_all(text.as_bytes()).map_err(io(&next))?;
-        file.sync_all().map_err(io(&next))?;
-        fs::rename(&next, &path).map_err(io(&path))?;
-        sync_folder(&self.folder).map_err(io(&self.folder))
+        let mut file = fs::File::create(&next).map_err(io_at(&next))?;
+        file.write_all(text.as_bytes()).map_err(io_at(&next))?;
+        file.sync_all().map_err(io_at(&next))?;
+        fs::rename(&next, &path).map_err(io_at(&path))?;
+        sync_folder(&self.folder).map_err(io_at(&self.folder))
     }
-}
 
-impl Memory {
     /// Adds a line per write to the journal and flushes it to disk; call it
     /// before the rows are written.
     ///
@@ -159,11 +153,7 @@ impl Memory {
         if writes.is_empty() {
             return Ok(());
         }
-        let io = |path: &Path| {
-            let path = path.to_owned();
-            move |source| Error::Io { path, source }
-        };
-        fs::create_dir_all(&self.folder).map_err(io(&self.folder))?;
+        fs::create_dir_all(&self.folder).map_err(io_at(&self.folder))?;
         let path = self.folder.join(JOURNAL);
         let mut text = String::new();
         for write in writes {
@@ -189,9 +179,9 @@ impl Memory {
             .create(true)
             .append(true)
             .open(&path)
-            .map_err(io(&path))?;
-        file.write_all(text.as_bytes()).map_err(io(&path))?;
-        file.sync_data().map_err(io(&path))
+            .map_err(io_at(&path))?;
+        file.write_all(text.as_bytes()).map_err(io_at(&path))?;
+        file.sync_data().map_err(io_at(&path))
     }
 
     /// The journal a cut-off run left, by table; empty when there is none.
@@ -273,6 +263,12 @@ impl Memory {
             _ => Ok(()),
         }
     }
+}
+
+/// Makes an I/O error at `path` into memory's error.
+fn io_at(path: &Path) -> impl FnOnce(io::Error) -> Error {
+    let path = path.to_owned();
+    move |source| Error::Io { path, source }
 }
 
 /// Flushes a folder's entries (a rename into it) to disk. Windows cannot
