@@ -6,6 +6,7 @@
 //! counts. No word for one copy being better than another appears in it.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use serde::{Serialize, Serializer};
 
@@ -22,14 +23,56 @@ pub const NOT_READ_BACK: &str = "smugglr wrote these rows and read them back dif
      what it wrote, so the run is not done. Something in the place changes rows as they are \
      written.";
 
-/// What a sync did, by table name.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+/// Why a table without a primary key stops (FR-SMUGGLR-069; #507 owns the
+/// words).
+pub const NO_KEY: &str = "This table has no primary key, so its database hands out each \
+     row's rowid. Two places would hand out the same rowid to different rows. A random, \
+     unique key such as UUIDv7 lets it sync.";
+
+/// What a run did as a whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum Status {
+    /// A dry run: what a sync would do; nothing was written.
+    #[serde(rename = "preview")]
+    Preview,
+    /// Every table that had rows to move moved.
+    #[serde(rename = "done")]
+    Done,
+    /// Some tables moved and some stopped.
+    #[serde(rename = "stopped in part")]
+    StoppedInPart,
+    /// Tables stopped and none moved.
+    #[serde(rename = "stopped")]
+    Stopped,
+}
+
+/// What a sync did: one status for the run, one entry per table by name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Record {
+    /// The run's status.
+    pub status: Status,
     /// Each table's part, by name.
     pub tables: BTreeMap<String, Table>,
 }
 
 impl Record {
+    /// The record of a run whose tables did `tables`; a dry run's when
+    /// `dryrun`.
+    #[must_use]
+    pub fn new(tables: BTreeMap<String, Table>, dryrun: bool) -> Self {
+        let any = |f: fn(&Table) -> bool| tables.values().any(f);
+        let status = if dryrun {
+            Status::Preview
+        } else if !any(|t| matches!(t, Table::Stopped { .. })) {
+            Status::Done
+        } else if any(|t| matches!(t, Table::Moved(_))) {
+            Status::StoppedInPart
+        } else {
+            Status::Stopped
+        };
+        Self { status, tables }
+    }
+
     /// The record as JSON.
     #[must_use]
     pub fn json(&self) -> String {
@@ -46,6 +89,9 @@ pub enum Table {
     /// Both places already held the same rows.
     #[serde(rename = "in step")]
     InStep,
+    /// A dry run found rows to move.
+    #[serde(rename = "would move")]
+    WouldMove(Moves),
     /// Rows moved.
     #[serde(rename = "moved")]
     Moved(Moves),
@@ -102,9 +148,10 @@ impl Serialize for Key {
     }
 }
 
-/// The record of one table's plan, once its writes have landed.
+/// The record of one table's plan: once its writes have landed, or, in a
+/// dry run, what they would be.
 #[must_use]
-pub fn table(plan: &Plan) -> Table {
+pub fn table(plan: &Plan, dryrun: bool) -> Table {
     match plan {
         Plan::Stop { rows } => Table::Stopped {
             rows: rows.iter().cloned().map(Key).collect(),
@@ -137,7 +184,11 @@ pub fn table(plan: &Plan) -> Table {
                     *count += 1;
                 }
             }
-            Table::Moved(moves)
+            if dryrun {
+                Table::WouldMove(moves)
+            } else {
+                Table::Moved(moves)
+            }
         }
     }
 }
@@ -149,5 +200,90 @@ pub fn not_read_back(keys: Vec<Vec<String>>) -> Table {
         rows: Vec::new(),
         not_read_back: keys.into_iter().map(Key).collect(),
         why: NOT_READ_BACK.to_owned(),
+    }
+}
+
+/// The record of a table without a primary key.
+#[must_use]
+pub fn no_key() -> Table {
+    Table::Stopped {
+        rows: Vec::new(),
+        not_read_back: Vec::new(),
+        why: NO_KEY.to_owned(),
+    }
+}
+
+fn keys(keys: &[Key]) -> String {
+    keys.iter()
+        .map(|key| {
+            key.0
+                .iter()
+                .map(|c| shown(c))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The record as text: the run's status, then each table with its status
+/// and counts, and the rows it names.
+impl fmt::Display for Record {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let status = match self.status {
+            Status::Preview => "preview",
+            Status::Done => "done",
+            Status::StoppedInPart => "stopped in part",
+            Status::Stopped => "stopped",
+        };
+        writeln!(f, "smugglr sync: {status}")?;
+        for (name, table) in &self.tables {
+            match table {
+                Table::InStep => writeln!(f, "  {name}: in step")?,
+                Table::WouldMove(moves) | Table::Moved(moves) => {
+                    let status = if matches!(table, Table::Moved(_)) {
+                        "moved"
+                    } else {
+                        "would move"
+                    };
+                    writeln!(
+                        f,
+                        "  {name}: {status}, {} to target, {} to source, {} deleted in target, \
+                         {} deleted in source, {} overwritten in target, {} overwritten in source",
+                        moves.to_target,
+                        moves.to_source,
+                        moves.deleted_in_target.len(),
+                        moves.deleted_in_source.len(),
+                        moves.overwritten_in_target.len(),
+                        moves.overwritten_in_source.len(),
+                    )?;
+                    for (label, list) in [
+                        ("deleted in target", &moves.deleted_in_target),
+                        ("deleted in source", &moves.deleted_in_source),
+                        ("overwritten in target", &moves.overwritten_in_target),
+                        ("overwritten in source", &moves.overwritten_in_source),
+                    ] {
+                        if !list.is_empty() {
+                            writeln!(f, "    {label}: {}", keys(list))?;
+                        }
+                    }
+                }
+                Table::Stopped {
+                    rows,
+                    not_read_back,
+                    why,
+                } => {
+                    writeln!(f, "  {name}: stopped")?;
+                    if !rows.is_empty() {
+                        writeln!(f, "    rows: {}", keys(rows))?;
+                    }
+                    if !not_read_back.is_empty() {
+                        writeln!(f, "    not read back: {}", keys(not_read_back))?;
+                    }
+                    writeln!(f, "    {why}")?;
+                }
+            }
+        }
+        Ok(())
     }
 }
