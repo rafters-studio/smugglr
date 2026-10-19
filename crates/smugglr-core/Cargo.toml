@@ -10,6 +10,8 @@ authors.workspace = true
 
 [dependencies]
 blake3 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 rstest = { workspace = true }

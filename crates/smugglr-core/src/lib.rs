@@ -8,4 +8,5 @@
 
 pub mod change;
 pub mod plan;
+pub mod record;
 pub mod row_hash;
