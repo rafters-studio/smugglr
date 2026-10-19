@@ -12,6 +12,9 @@ authors = ["Rafters Studio"]
 
 [workspace.dependencies]
 smugglr-core = { path = "crates/smugglr-core", version = "0.1.0" }
+# The row hash (smugglr-core); does no I/O and reads no clock.
+# `pure`: the portable Rust build, no C or assembly, so it builds for wasm32.
+blake3 = { version = "1.8.7", default-features = false, features = ["pure"] }
 # Acceptance-scenario runner (dev-dependencies only). rstest is a required
 # peer: the `scenarios!` expansion names `rstest` directly.
 rstest = "0.28"
