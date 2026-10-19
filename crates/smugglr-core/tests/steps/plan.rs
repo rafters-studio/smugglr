@@ -1,7 +1,9 @@
 //! Steps for the plan and the record: two places simulated in memory, synced
 //! by the same `plan` the CLI runs, each write applied with the other side's
 //! copy, and the record made from the plans by the same `record::table`.
-//! Tables are set aside by the same `Ignore` the CLI runs.
+//! Tables are set aside by the same `Ignore` the CLI runs, and under
+//! `--sync-mode last` steering values are read and tables lacking a steering
+//! column refused by the same `Steering` and `plan_steered`.
 
 use std::collections::BTreeMap;
 
@@ -11,9 +13,12 @@ use rstest_bdd_macros::{ScenarioState, given, then, when};
 use serde_json::Value;
 use smugglr_core::change::Op;
 use smugglr_core::ignore::Ignore;
-use smugglr_core::plan::{Hashes, Plan, Side, SyncMode, not_read_back, plan};
+use smugglr_core::plan::{
+    Hashes, Plan, Side, Steered, SyncMode, changed_in_both, not_read_back, plan_steered,
+};
 use smugglr_core::record::{self, Record};
 use smugglr_core::row_hash::row_hash;
+use smugglr_core::steering::{Steering, needs_steering};
 
 /// One table's rows by key, each row its columns' `quote()` text.
 pub(crate) type Rows = BTreeMap<Vec<String>, Vec<String>>;
@@ -41,7 +46,16 @@ pub(crate) struct Pair {
     added: Slot<Vec<String>>,
     /// Tables whose database hands out their keys.
     self_keyed: Slot<Vec<String>>,
+    /// Each table's column names; a table not here has [`COLUMNS`].
+    pub(crate) columns: Slot<BTreeMap<String, Vec<String>>>,
+    /// The steering columns the config names.
+    pub(crate) steering: Slot<Steering>,
+    /// What a run refused with instead of syncing.
+    pub(crate) refused: Slot<String>,
 }
+
+/// The columns of a table whose columns a scenario does not name.
+const COLUMNS: [&str; 2] = ["id", "body"];
 
 #[fixture]
 pub(crate) fn pair() -> Pair {
@@ -71,6 +85,60 @@ pub(crate) fn run(pair: &Pair, mode: SyncMode) -> Result<(), String> {
     run_as(pair, mode, false)
 }
 
+/// The columns of `table`, as the scenario names them.
+fn columns(pair: &Pair, table: &str) -> Vec<String> {
+    pair.columns
+        .get()
+        .and_then(|columns| columns.get(table).cloned())
+        .unwrap_or_else(|| COLUMNS.map(str::to_owned).to_vec())
+}
+
+/// Under `--sync-mode last`, the error for the tables `names` (less those
+/// self-keyed) that have no steering column, if any.
+fn refusal(pair: &Pair, mode: SyncMode, names: &[String], self_keyed: &[String]) -> Option<String> {
+    if mode != SyncMode::Last {
+        return None;
+    }
+    let all: Vec<(&String, Vec<String>)> = names
+        .iter()
+        .filter(|name| !self_keyed.contains(name))
+        .map(|name| (name, columns(pair, name)))
+        .collect();
+    let lacking = pair.steering.get().unwrap_or_default().lacking(
+        all.iter()
+            .map(|(name, cols)| (name.as_str(), cols.as_slice())),
+    );
+    (!lacking.is_empty()).then(|| needs_steering(&lacking))
+}
+
+/// Under `--sync-mode last`, the steering values in each place of the rows
+/// of `table` changed in both.
+fn steered(
+    pair: &Pair,
+    mode: SyncMode,
+    table: &str,
+    (here, there): (&Rows, &Rows),
+    last: &Hashes,
+) -> Steered {
+    let mut steered = Steered::new();
+    let column = pair
+        .steering
+        .get()
+        .unwrap_or_default()
+        .column(table)
+        .and_then(|column| columns(pair, table).iter().position(|c| c == column));
+    let (SyncMode::Last, Some(column)) = (mode, column) else {
+        return steered;
+    };
+    for key in changed_in_both(&hashes(here), &hashes(there), last) {
+        let value = |rows: &Rows| rows.get(&key).and_then(|row| row.get(column)).cloned();
+        if let (Some(ours), Some(theirs)) = (value(here), value(there)) {
+            steered.insert(key, (ours, theirs));
+        }
+    }
+    steered
+}
+
 /// One run, or with `dryrun` what it would do, writing nothing.
 fn run_as(pair: &Pair, mode: SyncMode, dryrun: bool) -> Result<(), String> {
     let mut source = pair.source.take().ok_or("no source")?;
@@ -85,19 +153,26 @@ fn run_as(pair: &Pair, mode: SyncMode, dryrun: bool) -> Result<(), String> {
     let (_, ignored_there) = ignore.split(target.keys().cloned().collect(), String::as_str);
     ignored.extend(ignored_there);
     let self_keyed = pair.self_keyed.get().unwrap_or_default();
+    if let Some(refusal) = refusal(pair, mode, &names, &self_keyed) {
+        pair.refused.set(refusal);
+        pair.source.set(source);
+        pair.target.set(target);
+        pair.memory.set(memory);
+        return Ok(());
+    }
     for name in names {
         if self_keyed.contains(&name) {
             tables.insert(name, record::self_keyed());
             continue;
         }
         let last = memory.get(&name).cloned().unwrap_or_default();
-        let planned = plan(
-            &name,
-            &hashes(source.get(&name).unwrap_or(&empty)),
-            &hashes(target.get(&name).unwrap_or(&empty)),
-            &last,
-            mode,
+        let (here, there) = (
+            source.get(&name).unwrap_or(&empty),
+            target.get(&name).unwrap_or(&empty),
         );
+        let (here_hashes, there_hashes) = (hashes(here), hashes(there));
+        let steered = steered(pair, mode, &name, (here, there), &last);
+        let planned = plan_steered(&name, &here_hashes, &there_hashes, &last, mode, &steered);
         if let (
             Plan::Move {
                 writes,
@@ -157,7 +232,7 @@ fn run_as(pair: &Pair, mode: SyncMode, dryrun: bool) -> Result<(), String> {
 }
 
 /// Two places holding the same notes and orders, synced once.
-fn synced(pair: &Pair) -> Result<(), String> {
+pub(crate) fn synced(pair: &Pair) -> Result<(), String> {
     let notes: Rows = [("n1", "first"), ("n2", "second")]
         .into_iter()
         .map(|(id, body)| (key(id), row(id, body)))
@@ -171,12 +246,16 @@ fn synced(pair: &Pair) -> Result<(), String> {
     run(pair, SyncMode::Stop)
 }
 
-fn change(slot: &Slot<Tables>, table: &str, f: impl FnOnce(&mut Rows)) -> Result<(), String> {
+pub(crate) fn change(
+    slot: &Slot<Tables>,
+    table: &str,
+    f: impl FnOnce(&mut Rows),
+) -> Result<(), String> {
     slot.with_mut(|tables| f(tables.entry(table.to_owned()).or_default()))
         .ok_or_else(|| "no place".to_owned())
 }
 
-fn watch(pair: &Pair, table: &str, id: &str) {
+pub(crate) fn watch(pair: &Pair, table: &str, id: &str) {
     pair.watched.set((table.to_owned(), key(id)));
 }
 
@@ -329,7 +408,7 @@ fn target_holds_source(pair: &Pair) -> Result<(), String> {
 }
 
 /// The record's entry for `table`.
-fn entry(pair: &Pair, table: &str) -> Result<Value, String> {
+pub(crate) fn entry(pair: &Pair, table: &str) -> Result<Value, String> {
     let record = pair.record.get().ok_or("no record")?;
     record
         .pointer(&format!("/tables/{table}"))
@@ -338,7 +417,7 @@ fn entry(pair: &Pair, table: &str) -> Result<Value, String> {
 }
 
 /// The watched row's key as the record writes it.
-fn watched_key(pair: &Pair) -> Result<Value, String> {
+pub(crate) fn watched_key(pair: &Pair) -> Result<Value, String> {
     let (_, key) = pair.watched.get().ok_or("no row watched")?;
     match key.as_slice() {
         [column] => Ok(Value::String(column.trim_matches('\'').to_owned())),
@@ -346,7 +425,7 @@ fn watched_key(pair: &Pair) -> Result<Value, String> {
     }
 }
 
-fn holds_key(entry: &Value, field: &str, key: &Value) -> Result<(), String> {
+pub(crate) fn holds_key(entry: &Value, field: &str, key: &Value) -> Result<(), String> {
     match entry.get(field).and_then(Value::as_array) {
         Some(keys) if keys.contains(key) => Ok(()),
         _ => Err(format!("{field} does not hold {key}: {entry}")),
@@ -436,7 +515,7 @@ fn names_table_and_key(pair: &Pair) -> Result<(), String> {
 }
 
 /// Adds `count` new orders to the source, remembering their ids.
-fn new_orders(pair: &Pair, count: usize) -> Result<(), String> {
+pub(crate) fn new_orders(pair: &Pair, count: usize) -> Result<(), String> {
     let ids: Vec<String> = (1..=count).map(|i| format!("new-order-{i:02}")).collect();
     change(&pair.source, "orders", |rows| {
         for id in &ids {

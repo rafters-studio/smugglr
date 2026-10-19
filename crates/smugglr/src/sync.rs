@@ -7,9 +7,13 @@ use std::path::PathBuf;
 
 use smugglr_core::change::{Change, Op};
 use smugglr_core::ignore::Ignore;
-use smugglr_core::plan::{Hashes, Plan, Side, SyncMode, Write, not_read_back, plan, recover};
+use smugglr_core::plan::{
+    Hashes, Plan, Side, Steered, SyncMode, Write, changed_in_both, not_read_back, plan_steered,
+    recover,
+};
 use smugglr_core::record::{self, Record};
 use smugglr_core::row_hash::row_hash;
+use smugglr_core::steering::{Steering, needs_steering};
 use smugglr_core::weight::{DEFAULT_MAX_WIRE, Weight, too_much};
 use smugglr_memory::Memory;
 use smugglr_place::{Place, Table};
@@ -33,6 +37,9 @@ pub struct Options {
     /// The most bytes a first sync moves; `None` is
     /// [`DEFAULT_MAX_WIRE`], 100 MB.
     pub max_wire: Option<u64>,
+    /// The steering columns the config names; only `--sync-mode last` reads
+    /// them.
+    pub steering: Steering,
 }
 
 /// Why a sync could not run.
@@ -51,6 +58,10 @@ pub enum Error {
     /// There is no config directory to keep memory in.
     #[error("smugglr has no config directory: set XDG_CONFIG_HOME or HOME")]
     NoConfigDir,
+    /// `--sync-mode last` with tables that have no steering column, each
+    /// named; the run stops before any row is read or written.
+    #[error("{}", needs_steering(.0))]
+    NoSteering(Vec<String>),
 }
 
 /// Syncs `source` and `target` once, and says what it did.
@@ -74,6 +85,8 @@ pub fn sync(
     let named = |table: &Table| options.tables.is_empty() || options.tables.contains(&table.name);
     let tables: Vec<Table> = every.iter().filter(|t| named(t)).cloned().collect();
     let theirs: Vec<Table> = theirs_every.iter().filter(|t| named(t)).cloned().collect();
+    // Before memory is touched or a row read.
+    steering_named(&tables, &theirs, options)?;
     let config = match &options.config_dir {
         Some(dir) => dir.clone(),
         None => smugglr_memory::config_dir().ok_or(Error::NoConfigDir)?,
@@ -112,7 +125,7 @@ pub fn sync(
         &mut *source,
         &mut *target,
         &memory,
-        options.sync_mode,
+        options,
         &mut done,
     )?;
     let weight = if memory.first_sync() {
@@ -176,6 +189,30 @@ pub fn sync(
     Ok(record)
 }
 
+/// Under `--sync-mode last`, fails naming every table the run would plan
+/// that has no steering column.
+fn steering_named(tables: &[Table], theirs: &[Table], options: &Options) -> Result<(), Error> {
+    if options.sync_mode != SyncMode::Last {
+        return Ok(());
+    }
+    // A table whose database hands out its keys stops unplanned.
+    let self_keyed = |table: &Table| {
+        theirs
+            .iter()
+            .any(|other| other.name == table.name && other.self_keyed)
+    };
+    let planned = tables
+        .iter()
+        .filter(|table| !table.self_keyed && !self_keyed(table))
+        .map(|table| (table.name.as_str(), table.columns.as_slice()));
+    let lacking = options.steering.lacking(planned);
+    if lacking.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::NoSteering(lacking))
+    }
+}
+
 /// Plans every table before any is written, so a first sync can weigh
 /// itself whole. A table whose database hands out its own keys, in either
 /// place, goes into `done` as stopped before any row is read; the run's other
@@ -186,7 +223,7 @@ fn plan_tables(
     source: &mut dyn Place,
     target: &mut dyn Place,
     memory: &Memory,
-    sync_mode: SyncMode,
+    options: &Options,
     done: &mut BTreeMap<String, record::Table>,
 ) -> Result<Vec<(Table, Hashes, Plan)>, Error> {
     let mut plans = Vec::new();
@@ -202,10 +239,66 @@ fn plan_tables(
         let here: Hashes = source.hashes(&table)?.into_iter().collect();
         let there: Hashes = target.hashes(&table)?.into_iter().collect();
         let last = memory.table(&table.name);
-        let planned = plan(&table.name, &here, &there, &last, sync_mode);
+        let steered = if options.sync_mode == SyncMode::Last {
+            steered(
+                &table,
+                &options.steering,
+                &here,
+                &there,
+                &last,
+                source,
+                target,
+            )?
+        } else {
+            Steered::new()
+        };
+        let planned = plan_steered(
+            &table.name,
+            &here,
+            &there,
+            &last,
+            options.sync_mode,
+            &steered,
+        );
         plans.push((table, last, planned));
     }
     Ok(plans)
+}
+
+/// The steering values, in each place, of the rows changed in both: read
+/// only for those rows, and only under `--sync-mode last`.
+fn steered(
+    table: &Table,
+    steering: &Steering,
+    here: &Hashes,
+    there: &Hashes,
+    last: &Hashes,
+    source: &mut dyn Place,
+    target: &mut dyn Place,
+) -> Result<Steered, Error> {
+    let keys = changed_in_both(here, there, last);
+    let column = steering
+        .column(&table.name)
+        .and_then(|name| table.columns.iter().position(|c| c == name));
+    let (Some(column), false) = (column, keys.is_empty()) else {
+        return Ok(Steered::new());
+    };
+    let values = |place: &mut dyn Place| -> Result<BTreeMap<Vec<String>, String>, Error> {
+        Ok(place
+            .rows(table, &keys)?
+            .into_iter()
+            .filter_map(|row| Some((key_of(table, &row)?, row.get(column)?.clone())))
+            .collect())
+    };
+    let ours = values(source)?;
+    let mut theirs = values(target)?;
+    Ok(ours
+        .into_iter()
+        .filter_map(|(key, value)| {
+            let other = theirs.remove(&key)?;
+            Some((key, (value, other)))
+        })
+        .collect())
 }
 
 /// What the planned writes move: each row written with values, weighed in

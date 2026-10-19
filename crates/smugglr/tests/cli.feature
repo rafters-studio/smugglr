@@ -66,3 +66,15 @@ Feature: smugglr sync on the command line
     Given two places never synced with each other, holding more than the max_wire setting allows
     When the agent runs smugglr sync on them
     Then smugglr exits 5
+
+  @criterion-01a14bed-72a8-7b31-abbd-3ce1b2645982 @module-front-ends
+  Scenario: last without a steering column is a usage error
+    Given two places whose orders and line_items tables have no steering column named in the config
+    When the agent runs smugglr sync on them with --sync-mode last
+    Then smugglr exits 2
+
+  @criterion-01a14bed-72a8-7b31-abbd-3cf53995f701 @module-front-ends
+  Scenario: the error lists every table without one
+    Given two places whose orders and line_items tables have no steering column named in the config
+    When the agent runs smugglr sync on them with --sync-mode last
+    Then one error names both orders and line_items

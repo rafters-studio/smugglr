@@ -9,6 +9,8 @@ mod ignore_steps;
 mod plan_steps;
 #[path = "steps/shape.rs"]
 mod shape_steps;
+#[path = "steps/steering.rs"]
+mod steering_steps;
 
 use std::fmt::Write as _;
 use std::fs;

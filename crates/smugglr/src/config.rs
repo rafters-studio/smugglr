@@ -5,16 +5,20 @@
 //! but not its file, and one place for everything smugglr keeps is the
 //! simplest to find; revisable.
 //!
-//! Only what smugglr reads is taken from it: the tables to ignore, and
+//! Only what smugglr reads is taken from it: the tables to ignore;
 //! `max_wire`, the most a first sync moves (FR-SMUGGLR-065), as bytes or text
-//! with a decimal unit such as `"250 MB"`. Other settings it will read later
-//! (the steering column, per-table settings) are left alone.
+//! with a decimal unit such as `"250 MB"`; and the steering column
+//! `--sync-mode last` reads (FR-SMUGGLR-068), once for all tables
+//! (`steering = "updated_at"`) or per table (`[tables.orders] steering =
+//! "modified"`). Other settings are left alone.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+use smugglr_core::steering::Steering;
 
 /// The config file's name in smugglr's config directory.
 pub const FILE: &str = "config.toml";
@@ -27,6 +31,8 @@ pub struct Config {
     pub ignore: Vec<String>,
     /// The most bytes a first sync moves; `None` when not set.
     pub max_wire: Option<u64>,
+    /// The steering columns named, for all tables and per table.
+    pub steering: Steering,
 }
 
 /// The config as the file holds it, before its settings are checked.
@@ -35,6 +41,15 @@ struct File {
     #[serde(default)]
     ignore: Vec<String>,
     max_wire: Option<toml::Value>,
+    steering: Option<String>,
+    #[serde(default)]
+    tables: BTreeMap<String, TableFile>,
+}
+
+/// One table's settings as the file holds them.
+#[derive(Debug, Default, Deserialize)]
+struct TableFile {
+    steering: Option<String>,
 }
 
 /// Why the config could not be read.
@@ -112,9 +127,18 @@ fn parse(text: &str) -> Result<Config, Problem> {
             )));
         }
     };
+    let tables = file
+        .tables
+        .into_iter()
+        .filter_map(|(table, settings)| Some((table, settings.steering?)))
+        .collect();
     Ok(Config {
         ignore: file.ignore,
         max_wire,
+        steering: Steering {
+            all: file.steering,
+            tables,
+        },
     })
 }
 
@@ -160,15 +184,20 @@ mod tests {
     }
 
     #[test]
-    fn the_ignore_list_is_read_and_other_settings_left_alone() -> Result<(), Error> {
+    fn the_ignore_list_and_steering_are_read_and_other_settings_left_alone() -> Result<(), Error> {
         let dir = dir("ignore");
-        let text = "steering = \"updated_at\"\nignore = [\"cache_*\", \"sessions_tmp\"]\n\n\
-                    [tables.orders]\nsteering = \"modified\"\n";
+        let text = "steering = \"updated_at\"\nignore = [\"cache_*\", \"sessions_tmp\"]\n\
+                    colour = \"blue\"\n\n[tables.orders]\nsteering = \"modified\"\n\n\
+                    [tables.notes]\nkept = true\n";
         std::fs::write(dir.join(FILE), text).map_err(|source| Error::Io {
             path: dir.clone(),
             source,
         })?;
-        assert_eq!(Config::load(&dir)?.ignore, vec!["cache_*", "sessions_tmp"]);
+        let config = Config::load(&dir)?;
+        assert_eq!(config.ignore, vec!["cache_*", "sessions_tmp"]);
+        assert_eq!(config.steering.all.as_deref(), Some("updated_at"));
+        assert_eq!(config.steering.column("orders"), Some("modified"));
+        assert_eq!(config.steering.column("notes"), Some("updated_at"));
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }

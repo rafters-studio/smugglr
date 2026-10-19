@@ -4,18 +4,25 @@
 //! decides what changed: a key memory does not know is new and is copied; a
 //! known key missing on one side was deleted there and the delete is carried;
 //! a row whose hash matches memory did not change on that side; a row changed
-//! on both sides follows `--sync-mode` (FR-SMUGGLR-067). No clock, key order
-//! or steering column is read.
+//! on both sides follows `--sync-mode` (FR-SMUGGLR-067). No clock or key
+//! order is read, and a steering column only under `--sync-mode last`
+//! (FR-SMUGGLR-068), and only for rows changed on both sides.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
 use crate::change::{Change, Decision, Op, decide, op};
+use crate::steering::further_on;
 
 /// Each row's hash by key, the key as SQLite's `quote()` text of each key
 /// column.
 pub type Hashes = BTreeMap<Vec<String>, [u8; 16]>;
+
+/// Each row's steering value in the source and in the target, by key, as
+/// SQLite's `quote()` text; for `--sync-mode last`.
+pub type Steered = BTreeMap<Vec<String>, (String, String)>;
 
 /// What a sync does with a row changed in both places (`--sync-mode`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -27,6 +34,9 @@ pub enum SyncMode {
     Source,
     /// Keep the target's copy.
     Target,
+    /// Keep the copy whose steering column is further on; stop the row's
+    /// table and name the row when the two values are equal.
+    Last,
 }
 
 /// One of the two places of a direct sync.
@@ -80,6 +90,9 @@ pub enum Plan {
 /// through the one decision path: each place's difference from memory is a
 /// [`Change`] (from memory's hash to that place's), decided by [`decide`]
 /// against the other place's row and the other place's own change.
+///
+/// Under [`SyncMode::Last`] no steering value is known here, so every row
+/// changed in both places stops; [`plan_steered`] takes them.
 #[must_use]
 pub fn plan(
     table: &str,
@@ -88,15 +101,23 @@ pub fn plan(
     memory: &Hashes,
     mode: SyncMode,
 ) -> Plan {
+    plan_steered(table, source, target, memory, mode, &Steered::new())
+}
+
+/// Each key of the table and what the one decision path makes of it, with
+/// the side a write of it would land in.
+fn decisions<'a>(
+    table: &str,
+    source: &'a Hashes,
+    target: &'a Hashes,
+    memory: &'a Hashes,
+) -> impl Iterator<Item = (&'a Vec<String>, Decision, Side)> {
     let keys: BTreeSet<&Vec<String>> = source
         .keys()
         .chain(target.keys())
         .chain(memory.keys())
         .collect();
-    let mut writes = Vec::new();
-    let mut next = Hashes::new();
-    let mut stopped = Vec::new();
-    for key in keys {
+    keys.into_iter().map(move |key| {
         let (s, t, m) = (
             source.get(key).copied(),
             target.get(key).copied(),
@@ -124,17 +145,62 @@ pub fn plan(
         } else {
             Side::Source
         };
-        let (side, overwrite) = match (decided, mode) {
-            (Decision::Skip, _) => {
+        (key, decided, side)
+    })
+}
+
+/// The keys of the rows changed in both places since memory's last hashes:
+/// those whose steering values `--sync-mode last` needs.
+#[must_use]
+pub fn changed_in_both(source: &Hashes, target: &Hashes, memory: &Hashes) -> Vec<Vec<String>> {
+    decisions("", source, target, memory)
+        .filter(|(_, decided, _)| *decided == Decision::Conflict)
+        .map(|(key, _, _)| key.clone())
+        .collect()
+}
+
+/// [`plan`], with each row's steering values for [`SyncMode::Last`]: of a
+/// row changed in both places it keeps the copy whose steering value is
+/// further on, and stops on a row whose two values are equal or that has
+/// none in `steered` (a row deleted on one side has none there).
+#[must_use]
+pub fn plan_steered(
+    table: &str,
+    source: &Hashes,
+    target: &Hashes,
+    memory: &Hashes,
+    mode: SyncMode,
+    steered: &Steered,
+) -> Plan {
+    let mut writes = Vec::new();
+    let mut next = Hashes::new();
+    let mut stopped = Vec::new();
+    for (key, decided, side) in decisions(table, source, target, memory) {
+        let (s, t) = (source.get(key).copied(), target.get(key).copied());
+        let last = || {
+            let (here, there) = steered.get(key)?;
+            match further_on(here, there) {
+                Ordering::Greater => Some(Side::Target),
+                Ordering::Less => Some(Side::Source),
+                Ordering::Equal => None,
+            }
+        };
+        // Under last, the side a row changed in both places is written in.
+        let kept = (decided == Decision::Conflict && mode == SyncMode::Last)
+            .then(last)
+            .flatten();
+        let (side, overwrite) = match (decided, mode, kept) {
+            (Decision::Skip, ..) => {
                 if let Some(hash) = s {
                     next.insert(key.clone(), hash);
                 }
                 continue;
             }
-            (Decision::Apply, _) => (side, false),
-            (Decision::Conflict, SyncMode::Source) => (Side::Target, true),
-            (Decision::Conflict, SyncMode::Target) => (Side::Source, true),
-            (Decision::Conflict | Decision::Hold, _) => {
+            (Decision::Apply, ..) => (side, false),
+            (Decision::Conflict, SyncMode::Source, _) => (Side::Target, true),
+            (Decision::Conflict, SyncMode::Target, _) => (Side::Source, true),
+            (Decision::Conflict, SyncMode::Last, Some(written)) => (written, true),
+            (Decision::Conflict | Decision::Hold, ..) => {
                 stopped.push(key.clone());
                 continue;
             }
@@ -198,7 +264,9 @@ pub fn not_read_back(writes: &[Write], read_back: &Hashes) -> Vec<Vec<String>> {
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{Hashes, Plan, Side, SyncMode, Write, plan, recover};
+    use super::{
+        Hashes, Plan, Side, Steered, SyncMode, Write, changed_in_both, plan, plan_steered, recover,
+    };
     use crate::change::{Op, op};
 
     /// FR-SMUGGLR-072's per-key rules, as a direct sync planned before it
@@ -227,7 +295,8 @@ mod tests {
                 (false, true, _) => (Side::Source, s, t, false),
                 (_, _, SyncMode::Source) => (Side::Target, t, s, true),
                 (_, _, SyncMode::Target) => (Side::Source, s, t, true),
-                (_, _, SyncMode::Stop) => {
+                // Without steering values, last stops as stop does.
+                (_, _, SyncMode::Stop | SyncMode::Last) => {
                     stopped.push(key.clone());
                     continue;
                 }
@@ -257,7 +326,8 @@ mod tests {
     /// FR-SMUGGLR-075: deciding through the one decision path gives the
     /// same writes, stops and memory as the per-key rules, for every state
     /// of a two-key table (each key absent or at one of three hashes in the
-    /// source, the target and memory) under every sync mode.
+    /// source, the target and memory) under every sync mode, last with no
+    /// steering values.
     #[test]
     fn the_one_decision_path_plans_as_the_per_key_rules() {
         let hashes = [None, Some([1; 16]), Some([2; 16]), Some([3; 16])];
@@ -281,7 +351,12 @@ mod tests {
                     }
                 }
                 let [source, target, memory] = &places;
-                for mode in [SyncMode::Stop, SyncMode::Source, SyncMode::Target] {
+                for mode in [
+                    SyncMode::Stop,
+                    SyncMode::Source,
+                    SyncMode::Target,
+                    SyncMode::Last,
+                ] {
                     assert_eq!(
                         plan("t", source, target, memory, mode),
                         per_key(source, target, memory, mode),
@@ -291,7 +366,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(compared, 64 * 64 * 3);
+        assert_eq!(compared, 64 * 64 * 4);
     }
 
     #[test]
@@ -310,6 +385,51 @@ mod tests {
         assert_eq!(memory.get(&key), Some(&[2; 16]));
         recover(&mut memory, &write, Some([3; 16]));
         assert_eq!(memory.get(&key), Some(&[1; 16]));
+    }
+
+    /// Memory, and a row changed differently in each place since.
+    fn both_changed() -> (Hashes, Hashes, Hashes) {
+        let key = vec!["'o1'".to_owned()];
+        (
+            Hashes::from([(key.clone(), [2; 16])]),
+            Hashes::from([(key.clone(), [3; 16])]),
+            Hashes::from([(key, [1; 16])]),
+        )
+    }
+
+    #[test]
+    fn last_keeps_the_copy_further_on() {
+        let (source, target, memory) = both_changed();
+        let key = vec!["'o1'".to_owned()];
+        assert_eq!(
+            changed_in_both(&source, &target, &memory),
+            std::slice::from_ref(&key)
+        );
+        let steered = Steered::from([(key.clone(), ("9".to_owned(), "10".to_owned()))]);
+        let planned = plan_steered("t", &source, &target, &memory, SyncMode::Last, &steered);
+        let kept = match &planned {
+            Plan::Move { writes, .. } => writes
+                .iter()
+                .map(|write| (write.side, write.overwrite))
+                .collect(),
+            Plan::Stop { .. } => Vec::new(),
+        };
+        assert_eq!(kept, [(Side::Source, true)], "{planned:?}");
+    }
+
+    #[test]
+    fn last_stops_on_equal_or_missing_steering_values() {
+        let (source, target, memory) = both_changed();
+        let key = vec!["'o1'".to_owned()];
+        let equal = Steered::from([(key.clone(), ("'a'".to_owned(), "'a'".to_owned()))]);
+        for steered in [equal, Steered::new()] {
+            assert_eq!(
+                plan_steered("t", &source, &target, &memory, SyncMode::Last, &steered),
+                Plan::Stop {
+                    rows: vec![key.clone()]
+                }
+            );
+        }
     }
 
     #[test]
