@@ -19,15 +19,9 @@ Feature: any shape mismatch stops the run before a row is read (FR-SMUGGLR-070)
     When the agent runs smugglr sync on them with --json
     Then the record names that column
 
-  @criterion-01a14bed-7869-73b3-8435-7b2a3e659629 @module-smugglr-core
-  Scenario: migratr versions differ
-    Given two places holding migratr's ledger at different latest migration versions
-    When the agent runs smugglr sync on them with --json
-    Then the record names both versions
-
   @criterion-01a14bed-7869-73b3-8435-7b37c5bef6f4 @module-smugglr-core
   Scenario: column order is part of the shape
-    Given two places without migratr's ledger whose orders tables have the same columns in a different order
+    Given two places whose orders tables have the same columns in a different order
     When the agent runs smugglr sync on them with --json
     Then the record's run status is stopped
 

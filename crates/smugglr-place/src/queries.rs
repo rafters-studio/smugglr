@@ -1,8 +1,6 @@
 //! The SQL the places run. Names pass through [`ident`]; values are always
 //! parameters.
 
-use smugglr_core::shape::LEDGER;
-
 use crate::Table;
 
 /// The name of the row-hash function registered on each connection.
@@ -34,18 +32,6 @@ pub(crate) fn self_keyed<E>(
         [declared] if declared.eq_ignore_ascii_case("INTEGER") => Ok(!key_indexed()?),
         _ => Ok(false),
     }
-}
-
-/// Whether the place holds migratr's ledger table, `?1`.
-pub(crate) const HAS_LEDGER: &str =
-    "SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)";
-
-/// The latest migration in migratr's ledger: its version and checksum.
-pub(crate) fn latest_migration() -> String {
-    format!(
-        "SELECT version, checksum FROM {} ORDER BY version DESC LIMIT 1",
-        ident(LEDGER)
-    )
 }
 
 /// A name as a quoted SQL identifier.

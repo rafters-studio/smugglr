@@ -11,7 +11,6 @@
 use serde_json::{Value as Json, json};
 use smugglr_core::change::{Change, Op};
 use smugglr_core::row_hash::row_hash;
-use smugglr_core::shape::{LEDGER, Ledger};
 
 use crate::queries;
 use crate::value::param;
@@ -227,30 +226,6 @@ impl Place for HttpSql {
                 })
             })
             .collect()
-    }
-
-    fn ledger(&mut self) -> Result<Option<Ledger>, Error> {
-        let has = self.query(queries::HAS_LEDGER, &[json!(LEDGER)])?;
-        if !matches!(
-            has.first().and_then(|row| row.first()),
-            Some(Json::Number(n)) if n.as_i64() != Some(0)
-        ) {
-            return Ok(None);
-        }
-        let latest = self.query(&queries::latest_migration(), &[])?;
-        let Some(row) = latest.first() else {
-            return Ok(None);
-        };
-        match (
-            row.first().and_then(Json::as_i64),
-            row.get(1).and_then(Json::as_str),
-        ) {
-            (Some(version), Some(checksum)) => Ok(Some(Ledger {
-                version,
-                checksum: checksum.to_owned(),
-            })),
-            _ => Err(self.failed(format_args!("the latest migration in {LEDGER}"))),
-        }
     }
 
     fn hashes(&mut self, table: &Table) -> Result<Vec<(Key, [u8; 16])>, Error> {
