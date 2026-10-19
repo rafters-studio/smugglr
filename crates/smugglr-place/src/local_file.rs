@@ -8,6 +8,7 @@
 use std::path::Path;
 
 use rusqlite::functions::FunctionFlags;
+use rusqlite::types::Value;
 use rusqlite::{Connection, OpenFlags, params_from_iter};
 use smugglr_core::change::{Change, Op};
 use smugglr_core::row_hash::row_hash;
@@ -158,42 +159,55 @@ impl Place for LocalFile {
         Ok(found)
     }
 
-    fn write(&mut self, table: &Table, changes: &[Change]) -> Result<(), Error> {
+    fn write(&mut self, table: &Table, changes: &[Change]) -> Result<Vec<Key>, Error> {
         let address = self.address.clone();
         let sqlite = |source| Error::Sqlite {
             address: address.clone(),
             source,
         };
+        let unquoted = |texts: &[String]| {
+            texts
+                .iter()
+                .map(|text| unquote(text))
+                .collect::<Result<Vec<Value>, Error>>()
+        };
         let transaction = self.connection.transaction().map_err(sqlite)?;
+        let mut written = Vec::new();
         {
-            let mut upsert = transaction
-                .prepare(&queries::upsert(table))
+            let mut insert = transaction
+                .prepare(&queries::insert(table))
+                .map_err(sqlite)?;
+            let mut update = transaction
+                .prepare(&queries::update(table))
                 .map_err(sqlite)?;
             let mut delete = transaction
                 .prepare(&queries::delete(table))
                 .map_err(sqlite)?;
             for change in changes {
-                match change.op {
-                    Op::Up | Op::Upsert => {
-                        let values = change
-                            .values
-                            .iter()
-                            .map(|value| unquote(value))
-                            .collect::<Result<Vec<_>, Error>>()?;
-                        upsert.execute(params_from_iter(values)).map_err(sqlite)?;
+                let from = change.from.map(|hash| Value::Blob(hash.to_vec()));
+                let count = match (change.op, from) {
+                    (Op::Up, _) | (Op::Upsert, None) => insert
+                        .execute(params_from_iter(unquoted(&change.values)?))
+                        .map_err(sqlite)?,
+                    (Op::Upsert, Some(from)) => {
+                        let mut params = unquoted(&change.values)?;
+                        params.push(from);
+                        update.execute(params_from_iter(params)).map_err(sqlite)?
                     }
-                    Op::Down => {
-                        let key = change
-                            .key
-                            .iter()
-                            .map(|column| unquote(column))
-                            .collect::<Result<Vec<_>, Error>>()?;
-                        delete.execute(params_from_iter(key)).map_err(sqlite)?;
+                    (Op::Down, Some(from)) => {
+                        let mut params = unquoted(&change.key)?;
+                        params.push(from);
+                        delete.execute(params_from_iter(params)).map_err(sqlite)?
                     }
+                    (Op::Down, None) => 0,
+                };
+                if count > 0 {
+                    written.push(change.key.clone());
                 }
             }
         }
-        transaction.commit().map_err(sqlite)
+        transaction.commit().map_err(sqlite)?;
+        Ok(written)
     }
 }
 
@@ -242,6 +256,42 @@ mod tests {
         place.write(&table, std::slice::from_ref(&change))?;
         assert_eq!(place.hashes(&table)?, vec![(change.key.clone(), hash)]);
         assert_eq!(place.rows(&table, &[change.key])?, vec![values]);
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn a_row_no_longer_at_from_is_not_written() -> Result<(), Error> {
+        let path = file("moved-on")?;
+        let mut place = LocalFile::open(&path)?;
+        let table = place
+            .tables()?
+            .into_iter()
+            .next()
+            .ok_or(Error::Adapter("no table".to_owned()))?;
+        let row = ["'a'", "1"];
+        let first = Change {
+            op: Op::Up,
+            table: "t".to_owned(),
+            key: vec!["'a'".to_owned()],
+            from: None,
+            to: Some(row_hash(&row)),
+            values: row.iter().map(|&c| c.to_owned()).collect(),
+        };
+        assert_eq!(
+            place.write(&table, std::slice::from_ref(&first))?,
+            vec![first.key.clone()]
+        );
+        // An edit whose from is not the row's hash here: the row moved on.
+        let stale = Change {
+            op: Op::Upsert,
+            from: Some([9; 16]),
+            to: Some(row_hash(&["'a'", "2"])),
+            values: vec!["'a'".to_owned(), "2".to_owned()],
+            ..first.clone()
+        };
+        assert_eq!(place.write(&table, &[stale])?, Vec::<Vec<String>>::new());
+        assert_eq!(place.rows(&table, &[first.key])?, vec![first.values]);
         let _ = std::fs::remove_file(&path);
         Ok(())
     }

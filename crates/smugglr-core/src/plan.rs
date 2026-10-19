@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::change::Op;
+use crate::change::{Change, Decision, Op, decide, op};
 
 /// Each row's hash by key, the key as SQLite's `quote()` text of each key
 /// column.
@@ -73,9 +73,18 @@ pub enum Plan {
     },
 }
 
-/// Plans one table from each place's hashes and memory's last hashes.
+/// Plans one table from each place's hashes and memory's last hashes,
+/// through the one decision path: each place's difference from memory is a
+/// [`Change`] (from memory's hash to that place's), decided by [`decide`]
+/// against the other place's row and the other place's own change.
 #[must_use]
-pub fn plan(source: &Hashes, target: &Hashes, memory: &Hashes, mode: SyncMode) -> Plan {
+pub fn plan(
+    table: &str,
+    source: &Hashes,
+    target: &Hashes,
+    memory: &Hashes,
+    mode: SyncMode,
+) -> Plan {
     let keys: BTreeSet<&Vec<String>> = source
         .keys()
         .chain(target.keys())
@@ -85,37 +94,61 @@ pub fn plan(source: &Hashes, target: &Hashes, memory: &Hashes, mode: SyncMode) -
     let mut next = Hashes::new();
     let mut stopped = Vec::new();
     for key in keys {
-        let (s, t, m) = (source.get(key), target.get(key), memory.get(key));
-        if s == t {
-            if let Some(&hash) = s {
-                next.insert(key.clone(), hash);
+        let (s, t, m) = (
+            source.get(key).copied(),
+            target.get(key).copied(),
+            memory.get(key).copied(),
+        );
+        let change = |to: Option<[u8; 16]>| {
+            (to != m).then(|| Change {
+                op: op(m, to),
+                table: table.to_owned(),
+                key: key.clone(),
+                from: m,
+                to,
+                values: Vec::new(),
+            })
+        };
+        let (ours, theirs) = (change(s), change(t));
+        // Each place's change, decided where it would land.
+        let decided = match (&ours, &theirs) {
+            (None, None) => Decision::Skip,
+            (Some(ours), _) => decide(ours, t, theirs.as_ref()),
+            (None, Some(theirs)) => decide(theirs, s, None),
+        };
+        let side = if ours.is_some() {
+            Side::Target
+        } else {
+            Side::Source
+        };
+        let (side, overwrite) = match (decided, mode) {
+            (Decision::Skip, _) => {
+                if let Some(hash) = s {
+                    next.insert(key.clone(), hash);
+                }
+                continue;
             }
-            continue;
-        }
-        let (side, from, to, overwrite) = match (s != m, t != m, mode) {
-            (true, false, _) => (Side::Target, t, s, false),
-            (false, true, _) => (Side::Source, s, t, false),
-            (_, _, SyncMode::Source) => (Side::Target, t, s, true),
-            (_, _, SyncMode::Target) => (Side::Source, s, t, true),
-            (_, _, SyncMode::Stop) => {
+            (Decision::Apply, _) => (side, false),
+            (Decision::Conflict, SyncMode::Source) => (Side::Target, true),
+            (Decision::Conflict, SyncMode::Target) => (Side::Source, true),
+            (Decision::Conflict | Decision::Hold, _) => {
                 stopped.push(key.clone());
                 continue;
             }
         };
-        let op = match (from, to) {
-            (_, None) => Op::Down,
-            (None, Some(_)) => Op::Up,
-            (Some(_), Some(_)) => Op::Upsert,
+        let (from, to) = match side {
+            Side::Target => (t, s),
+            Side::Source => (s, t),
         };
-        if let Some(&hash) = to {
+        if let Some(hash) = to {
             next.insert(key.clone(), hash);
         }
         writes.push(Write {
             side,
-            op,
+            op: op(from, to),
             key: key.clone(),
-            from: from.copied(),
-            to: to.copied(),
+            from,
+            to,
             overwrite,
         });
     }
@@ -185,7 +218,7 @@ mod tests {
     fn a_first_sync_of_equal_rows_is_in_step() {
         let hashes = Hashes::from([(vec!["1".to_owned()], [1; 16])]);
         assert_eq!(
-            plan(&hashes, &hashes, &Hashes::new(), SyncMode::Stop),
+            plan("t", &hashes, &hashes, &Hashes::new(), SyncMode::Stop),
             Plan::Move {
                 writes: Vec::new(),
                 memory: hashes.clone()

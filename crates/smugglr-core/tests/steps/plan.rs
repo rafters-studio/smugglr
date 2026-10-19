@@ -78,6 +78,7 @@ fn run_as(pair: &Pair, mode: SyncMode, dryrun: bool) -> Result<(), String> {
     for name in names {
         let last = memory.get(&name).cloned().unwrap_or_default();
         let planned = plan(
+            &name,
             &hashes(source.get(&name).unwrap_or(&empty)),
             &hashes(target.get(&name).unwrap_or(&empty)),
             &last,
