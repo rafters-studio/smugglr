@@ -242,7 +242,7 @@ fn at_to(place: &Place) {
 fn receive(place: &Place) -> Result<(), String> {
     let change = place.change.get().ok_or("no change arrived")?;
     let row = place.row.get().ok_or("the place holds no row")?;
-    if decide(&change, Some(hash_of(&row))) == Decision::Apply {
+    if decide(&change, Some(hash_of(&row)), None) == Decision::Apply {
         place.row.set(change.values);
         place
             .writes

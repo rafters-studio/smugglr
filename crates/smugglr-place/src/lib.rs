@@ -90,11 +90,14 @@ pub trait Place {
     /// When the place cannot be read.
     fn rows(&mut self, table: &Table, keys: &[Key]) -> Result<Vec<Vec<String>>, Error>;
 
-    /// Writes the changes to the table, all in one transaction.
+    /// Writes the changes to the table, all in one transaction, each only
+    /// where its row is still at the change's `from` (no row when `from` is
+    /// `None`), and returns the keys of the rows it wrote. The engine's
+    /// statement carries that condition; the place decides nothing.
     ///
     /// # Errors
     /// When the place cannot be written; nothing is then written.
-    fn write(&mut self, table: &Table, changes: &[Change]) -> Result<(), Error>;
+    fn write(&mut self, table: &Table, changes: &[Change]) -> Result<Vec<Key>, Error>;
 }
 
 /// Database addresses that name another engine.

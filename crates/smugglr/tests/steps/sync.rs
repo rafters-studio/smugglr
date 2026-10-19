@@ -68,12 +68,21 @@ impl Place for Shelf {
             .collect())
     }
 
-    fn write(&mut self, table: &Table, changes: &[Change]) -> Result<(), Error> {
+    fn write(&mut self, table: &Table, changes: &[Change]) -> Result<Vec<Key>, Error> {
         let (_, rows) = self
             .tables
             .get_mut(&table.name)
             .ok_or_else(|| Error::Adapter(format!("no table {}", table.name)))?;
+        let mut written = Vec::new();
         for change in changes {
+            // Only where the row is still at the change's from.
+            let here = rows.get(&change.key).map(|row| {
+                let columns: Vec<&str> = row.iter().map(String::as_str).collect();
+                row_hash(&columns)
+            });
+            if here != change.from {
+                continue;
+            }
             match change.op {
                 Op::Down => {
                     rows.remove(&change.key);
@@ -82,8 +91,9 @@ impl Place for Shelf {
                     rows.insert(change.key.clone(), change.values.clone());
                 }
             }
+            written.push(change.key.clone());
         }
-        Ok(())
+        Ok(written)
     }
 }
 
@@ -181,7 +191,7 @@ impl Place for Busy {
         self.file.rows(table, keys)
     }
 
-    fn write(&mut self, table: &Table, changes: &[Change]) -> Result<(), Error> {
+    fn write(&mut self, table: &Table, changes: &[Change]) -> Result<Vec<Key>, Error> {
         self.file.write(table, changes)
     }
 }
@@ -477,7 +487,7 @@ impl Place for Cut {
         self.file.rows(table, keys)
     }
 
-    fn write(&mut self, table: &Table, changes: &[Change]) -> Result<(), Error> {
+    fn write(&mut self, table: &Table, changes: &[Change]) -> Result<Vec<Key>, Error> {
         if table.name != self.table {
             return self.file.write(table, changes);
         }
