@@ -1157,6 +1157,7 @@ dependencies = [
  "rstest-bdd",
  "rstest-bdd-macros",
  "rusqlite",
+ "serde_json",
  "smugglr-core",
  "smugglr-memory",
  "smugglr-place",
