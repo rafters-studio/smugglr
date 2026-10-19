@@ -31,8 +31,8 @@ pub enum Error {
     /// smugglr's memory could not be read or written.
     #[error(transparent)]
     Memory(#[from] smugglr_memory::Error),
-    /// The two places do not hold the same tables; the run stops before any
-    /// row is read.
+    /// The two places do not hold the same tables, or a table has no
+    /// primary key; the run stops before any row is read.
     #[error("{0}")]
     Shape(String),
     /// There is no config directory to keep memory in.
@@ -63,10 +63,6 @@ pub fn sync(
     )?;
     let mut done = BTreeMap::new();
     for table in tables {
-        if table.key.is_empty() {
-            done.insert(table.name.clone(), record::no_key());
-            continue;
-        }
         let here: Hashes = source.hashes(&table)?.into_iter().collect();
         let there: Hashes = target.hashes(&table)?.into_iter().collect();
         let last = memory.table(&table.name);
@@ -115,7 +111,8 @@ pub fn sync(
 }
 
 /// Stops the run, before any row is read, unless both places hold the same
-/// tables. The full shape check and its words are #506's.
+/// tables and each has a primary key. The full shape check and its words
+/// are #506's; a table without a primary key is #507's.
 fn check_shape(ours: &[Table], theirs: &[Table], source: &str, target: &str) -> Result<(), Error> {
     for (tables, others, here, there) in [
         (ours, theirs, source, target),
@@ -125,6 +122,12 @@ fn check_shape(ours: &[Table], theirs: &[Table], source: &str, target: &str) -> 
             if !others.iter().any(|other| other.name == table.name) {
                 return Err(Error::Shape(format!(
                     "the table {} is in {here} but not in {there}",
+                    table.name
+                )));
+            }
+            if table.key.is_empty() {
+                return Err(Error::Shape(format!(
+                    "the table {} in {here} has no primary key",
                     table.name
                 )));
             }

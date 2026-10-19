@@ -23,12 +23,6 @@ pub const NOT_READ_BACK: &str = "smugglr wrote these rows and read them back dif
      what it wrote, so the run is not done. Something in the place changes rows as they are \
      written.";
 
-/// Why a table without a primary key stops (FR-SMUGGLR-069; #507 owns the
-/// words).
-pub const NO_KEY: &str = "This table has no primary key, so its database hands out each \
-     row's rowid. Two places would hand out the same rowid to different rows. A random, \
-     unique key such as UUIDv7 lets it sync.";
-
 /// What a run did as a whole.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Status {
@@ -200,16 +194,6 @@ pub fn not_read_back(keys: Vec<Vec<String>>) -> Table {
         rows: Vec::new(),
         not_read_back: keys.into_iter().map(Key).collect(),
         why: NOT_READ_BACK.to_owned(),
-    }
-}
-
-/// The record of a table without a primary key.
-#[must_use]
-pub fn no_key() -> Table {
-    Table::Stopped {
-        rows: Vec::new(),
-        not_read_back: Vec::new(),
-        why: NO_KEY.to_owned(),
     }
 }
 
