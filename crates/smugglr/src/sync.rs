@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use smugglr_core::change::{Change, Op};
-use smugglr_core::plan::{Hashes, Plan, Side, Write, plan};
+use smugglr_core::plan::{Hashes, Plan, Side, SyncMode, Write, plan};
+use smugglr_core::record::{self, Record};
 use smugglr_memory::Memory;
 use smugglr_place::{Place, Table};
 
@@ -14,6 +15,8 @@ use smugglr_place::{Place, Table};
 pub struct Options {
     /// Where smugglr keeps its memory; `None` is smugglr's config directory.
     pub config_dir: Option<PathBuf>,
+    /// What happens to a row changed in both places.
+    pub sync_mode: SyncMode,
 }
 
 /// Why a sync could not run.
@@ -34,7 +37,7 @@ pub enum Error {
     NoConfigDir,
 }
 
-/// Syncs `source` and `target` once.
+/// Syncs `source` and `target` once, and says what it did.
 ///
 /// # Errors
 /// When a place cannot be reached, read or written, or memory cannot be kept.
@@ -42,7 +45,7 @@ pub fn sync(
     source: &mut dyn Place,
     target: &mut dyn Place,
     options: &Options,
-) -> Result<(), Error> {
+) -> Result<Record, Error> {
     let config = match &options.config_dir {
         Some(dir) => dir.clone(),
         None => smugglr_memory::config_dir().ok_or(Error::NoConfigDir)?,
@@ -55,14 +58,18 @@ pub fn sync(
         source.address(),
         target.address(),
     )?;
+    let mut done = Record::default();
     for table in tables {
         let here: Hashes = source.hashes(&table)?.into_iter().collect();
         let there: Hashes = target.hashes(&table)?.into_iter().collect();
         let last = memory.table(&table.name);
+        let planned = plan(&here, &there, &last, options.sync_mode);
+        done.tables
+            .insert(table.name.clone(), record::table(&planned));
         let Plan::Move {
             writes,
             memory: mut next,
-        } = plan(&here, &there, &last)
+        } = planned
         else {
             continue;
         };
@@ -88,7 +95,7 @@ pub fn sync(
         memory.set_table(&table.name, next);
     }
     memory.save()?;
-    Ok(())
+    Ok(done)
 }
 
 /// Stops the run, before any row is read, unless both places hold the same
@@ -233,6 +240,7 @@ mod tests {
         let mut target = Vanishing("b", vec![(key, [1; 16])]);
         let options = Options {
             config_dir: Some(config.clone()),
+            ..Options::default()
         };
         sync(&mut source, &mut target, &options)?;
         assert_eq!(Memory::open(&config, "a", "b")?.table("notes"), last);

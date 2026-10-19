@@ -22,6 +22,10 @@ thiserror = "2"
 # The row hash (smugglr-core); does no I/O and reads no clock.
 # `pure`: the portable Rust build, no C or assembly, so it builds for wasm32.
 blake3 = { version = "1.8.7", default-features = false, features = ["pure"] }
+# The record (smugglr-core): its shape and its JSON. Neither does I/O or
+# reads a clock, and both build for wasm32.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 # Acceptance-scenario runner (dev-dependencies only). rstest is a required
 # peer: the `scenarios!` expansion names `rstest` directly.
 rstest = "0.28"

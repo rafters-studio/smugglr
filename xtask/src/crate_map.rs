@@ -44,7 +44,10 @@ const CRATE_MAP: &[(&str, &[&str])] = &[
 /// Current choice 2026-10-19: blake3 (its portable `pure` build) for the row
 /// hash (#499, FR-SMUGGLR-058), because it does no I/O, reads no clock and
 /// builds for wasm32; revisable.
-const CORE_MAY_USE: &[&str] = &["blake3"];
+/// Current choice 2026-10-19: serde and `serde_json` for the record and its
+/// JSON (#509, FR-SMUGGLR-063), because neither does I/O or reads a clock and
+/// both build for wasm32; revisable.
+const CORE_MAY_USE: &[&str] = &["blake3", "serde", "serde_json"];
 
 /// One way the workspace leaves the crate map.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]

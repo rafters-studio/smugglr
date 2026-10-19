@@ -33,7 +33,7 @@ fn sync_once(source: &str, target: &str) -> ExitCode {
         }
     };
     match sync(source.as_mut(), target.as_mut(), &Options::default()) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(_) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("{err}");
             ExitCode::FAILURE

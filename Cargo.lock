@@ -1171,6 +1171,8 @@ dependencies = [
  "rstest",
  "rstest-bdd",
  "rstest-bdd-macros",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
