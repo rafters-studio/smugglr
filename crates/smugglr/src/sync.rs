@@ -18,6 +18,8 @@ pub struct Options {
     pub config_dir: Option<PathBuf>,
     /// What happens to a row changed in both places.
     pub sync_mode: SyncMode,
+    /// Show what the sync would do, and write nothing.
+    pub dryrun: bool,
 }
 
 /// Why a sync could not run.
@@ -29,8 +31,8 @@ pub enum Error {
     /// smugglr's memory could not be read or written.
     #[error(transparent)]
     Memory(#[from] smugglr_memory::Error),
-    /// The two places do not hold the same tables, or a table has no
-    /// primary key; the run stops before any row is read.
+    /// The two places do not hold the same tables; the run stops before any
+    /// row is read.
     #[error("{0}")]
     Shape(String),
     /// There is no config directory to keep memory in.
@@ -59,14 +61,17 @@ pub fn sync(
         source.address(),
         target.address(),
     )?;
-    let mut done = Record::default();
+    let mut done = BTreeMap::new();
     for table in tables {
+        if table.key.is_empty() {
+            done.insert(table.name.clone(), record::no_key());
+            continue;
+        }
         let here: Hashes = source.hashes(&table)?.into_iter().collect();
         let there: Hashes = target.hashes(&table)?.into_iter().collect();
         let last = memory.table(&table.name);
         let planned = plan(&here, &there, &last, options.sync_mode);
-        done.tables
-            .insert(table.name.clone(), record::table(&planned));
+        done.insert(table.name.clone(), record::table(&planned, options.dryrun));
         let Plan::Move {
             writes,
             memory: mut next,
@@ -74,6 +79,9 @@ pub fn sync(
         else {
             continue;
         };
+        if options.dryrun {
+            continue;
+        }
         let (to_target, to_source): (Vec<Write>, Vec<Write>) = writes
             .into_iter()
             .partition(|write| write.side == Side::Target);
@@ -95,19 +103,19 @@ pub fn sync(
         )?);
         if !mismatched.is_empty() {
             // Not done: the table keeps its old memory.
-            done.tables
-                .insert(table.name.clone(), record::not_read_back(mismatched));
+            done.insert(table.name.clone(), record::not_read_back(mismatched));
             continue;
         }
         memory.set_table(&table.name, next);
     }
-    memory.save()?;
-    Ok(done)
+    if !options.dryrun {
+        memory.save()?;
+    }
+    Ok(Record::new(done, options.dryrun))
 }
 
 /// Stops the run, before any row is read, unless both places hold the same
-/// tables and each has a primary key. The full shape check and its words
-/// are #506's; a table without a primary key is #507's.
+/// tables. The full shape check and its words are #506's.
 fn check_shape(ours: &[Table], theirs: &[Table], source: &str, target: &str) -> Result<(), Error> {
     for (tables, others, here, there) in [
         (ours, theirs, source, target),
@@ -117,12 +125,6 @@ fn check_shape(ours: &[Table], theirs: &[Table], source: &str, target: &str) -> 
             if !others.iter().any(|other| other.name == table.name) {
                 return Err(Error::Shape(format!(
                     "the table {} is in {here} but not in {there}",
-                    table.name
-                )));
-            }
-            if table.key.is_empty() {
-                return Err(Error::Shape(format!(
-                    "the table {} in {here} has no primary key",
                     table.name
                 )));
             }

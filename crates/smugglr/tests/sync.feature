@@ -36,3 +36,9 @@ Feature: one sync between two places, with places and memory as they are
     Given a target that keeps a written row differently from how it was written
     When the agent runs smugglr sync on the source and that target
     Then smugglr exits 4
+
+  @criterion-01a14bed-5c0f-7821-a114-9144e7a109e5 @module-memory
+  Scenario: nothing of the record is kept
+    Given two places where the source has rows the target lacks
+    When the agent runs smugglr sync on them and the run is done
+    Then smugglr's own files hold no copy of the run's record
