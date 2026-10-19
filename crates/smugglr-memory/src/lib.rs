@@ -5,18 +5,26 @@
 //! done run, per table. The CLI and mesh nodes keep it in smugglr's config
 //! directory, one folder per pair of places; the folder is named by a hash of
 //! the two places' addresses, the same whichever is named first.
+//!
+//! While a run writes, the pair's folder also holds the run's journal,
+//! `smugglr.sync` (FR-SMUGGLR-073): one line per row, holding its table,
+//! side, key and from and to hashes, written and flushed before the row is.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::fs;
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
-use smugglr_core::plan::Hashes;
+use smugglr_core::change::Op;
+use smugglr_core::plan::{Hashes, Side, Write};
 use smugglr_core::row_hash::row_hash;
 
 /// The file in a pair's folder that holds each key's last hash.
 const LAST: &str = "last";
+
+/// The journal of a run that is writing.
+const JOURNAL: &str = "smugglr.sync";
 
 /// What memory says when its files cannot be read or written.
 #[derive(Debug, thiserror::Error)]
@@ -132,6 +140,132 @@ impl Memory {
         let next = self.folder.join("last.next");
         fs::write(&next, text).map_err(io(&next))?;
         fs::rename(&next, &path).map_err(io(&path))
+    }
+}
+
+impl Memory {
+    /// Adds a line per write to the journal and flushes it to disk; call it
+    /// before the rows are written.
+    ///
+    /// # Errors
+    /// When the journal cannot be written.
+    pub fn journal(&self, table: &str, writes: &[Write]) -> Result<(), Error> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+        let io = |path: &Path| {
+            let path = path.to_owned();
+            move |source| Error::Io { path, source }
+        };
+        fs::create_dir_all(&self.folder).map_err(io(&self.folder))?;
+        let path = self.folder.join(JOURNAL);
+        let mut text = String::new();
+        for write in writes {
+            let hash = |hash: Option<[u8; 16]>| hash.map_or_else(|| "-".to_owned(), |h| hex(&h));
+            let side = match write.side {
+                Side::Source => "s",
+                Side::Target => "t",
+            };
+            let _ = write!(
+                text,
+                "{} {side} {} {}",
+                hex(table.as_bytes()),
+                hash(write.from),
+                hash(write.to)
+            );
+            for column in &write.key {
+                text.push(' ');
+                text.push_str(&hex(column.as_bytes()));
+            }
+            text.push('\n');
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(io(&path))?;
+        file.write_all(text.as_bytes()).map_err(io(&path))?;
+        file.sync_data().map_err(io(&path))
+    }
+
+    /// The journal a cut-off run left, by table; empty when there is none.
+    ///
+    /// # Errors
+    /// When the journal cannot be read.
+    pub fn journaled(&self) -> Result<Vec<(String, Write)>, Error> {
+        let path = self.folder.join(JOURNAL);
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => return Err(Error::Io { path, source }),
+        };
+        let mut lines = Vec::new();
+        // A line cut off by a crash ends without its newline; its row was
+        // never written, since a row is written only after its line is on
+        // disk.
+        let whole = text
+            .split_inclusive('\n')
+            .filter_map(|line| line.strip_suffix('\n'));
+        for (i, line) in whole.enumerate() {
+            let unreadable = || Error::Unreadable {
+                path: path.clone(),
+                line: i + 1,
+            };
+            let mut fields = line.split(' ');
+            let mut next = || fields.next().ok_or_else(unreadable);
+            let table = unhex(next()?)
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .ok_or_else(unreadable)?;
+            let side = match next()? {
+                "s" => Side::Source,
+                "t" => Side::Target,
+                _ => return Err(unreadable()),
+            };
+            let hash = |field: &str| -> Result<Option<[u8; 16]>, Error> {
+                if field == "-" {
+                    return Ok(None);
+                }
+                let bytes = unhex(field).ok_or_else(unreadable)?;
+                Ok(Some(bytes.try_into().map_err(|_| unreadable())?))
+            };
+            let from = hash(next()?)?;
+            let to = hash(next()?)?;
+            let key = fields
+                .map(|field| unhex(field).and_then(|bytes| String::from_utf8(bytes).ok()))
+                .collect::<Option<Vec<String>>>()
+                .ok_or_else(unreadable)?;
+            let op = match (from, to) {
+                (_, None) => Op::Down,
+                (None, Some(_)) => Op::Up,
+                (Some(_), Some(_)) => Op::Upsert,
+            };
+            lines.push((
+                table,
+                Write {
+                    side,
+                    op,
+                    key,
+                    from,
+                    to,
+                    overwrite: false,
+                },
+            ));
+        }
+        Ok(lines)
+    }
+
+    /// Deletes the journal; call it once the run is done.
+    ///
+    /// # Errors
+    /// When the journal is there and cannot be deleted.
+    pub fn clear_journal(&self) -> Result<(), Error> {
+        let path = self.folder.join(JOURNAL);
+        match fs::remove_file(&path) {
+            Err(err) if err.kind() != io::ErrorKind::NotFound => {
+                Err(Error::Io { path, source: err })
+            }
+            _ => Ok(()),
+        }
     }
 }
 

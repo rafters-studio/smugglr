@@ -42,3 +42,27 @@ Feature: one sync between two places, with places and memory as they are
     Given two places where the source has rows the target lacks
     When the agent runs smugglr sync on them and the run is done
     Then smugglr's own files hold no copy of the run's record
+
+  @criterion-01a14bed-8499-7e32-9e9a-8361d15d3e83 @module-memory
+  Scenario: a delete after a cut stays deleted
+    Given a run that copied a new row from the source to the target and was cut off before it ended
+    When the row is deleted in the source and the agent runs smugglr sync on them again
+    Then the row is gone from both places
+
+  @criterion-01a14bed-8499-7e32-9e9a-83759a7c5dd5 @module-memory
+  Scenario: the next run finishes the cut-off run
+    Given a run between two places cut off part-way through writing
+    When the agent runs smugglr sync on them again
+    Then both places hold the same rows
+
+  @criterion-01a14bed-8499-7e32-9e9a-838d0ee4a387 @module-memory
+  Scenario: a row changed since the cut stops
+    Given a run cut off before writing a row of notes to the target, and that row since edited in the target
+    When the agent runs smugglr sync on them again with --json
+    Then the record names that row's key as stopped
+
+  @criterion-01a14bed-8499-7e32-9e9a-839f719641bc @module-memory
+  Scenario: the journal goes when the run is done
+    Given two places with rows to move
+    When the agent runs smugglr sync on them and the run is done
+    Then smugglr's files hold no smugglr.sync journal

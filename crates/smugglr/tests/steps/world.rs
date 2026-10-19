@@ -31,6 +31,9 @@ pub(crate) fn world() -> World {
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
+/// The orders table some scenarios' places hold.
+pub(crate) const ORDERS: &str = "CREATE TABLE orders (id TEXT PRIMARY KEY, item TEXT)";
+
 /// The notes table every scenario's places hold.
 pub(crate) const NOTES: &str =
     "CREATE TABLE notes (id TEXT PRIMARY KEY, body TEXT, created_at INTEGER)";

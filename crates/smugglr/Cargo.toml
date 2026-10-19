@@ -23,6 +23,7 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 rusqlite = { workspace = true }
+serde_json = { workspace = true }
 rstest = { workspace = true }
 rstest-bdd = { workspace = true }
 rstest-bdd-macros = { workspace = true }
