@@ -12,3 +12,9 @@ Feature: one engine, one row hash, native and in WASM (FR-SMUGGLR-058)
     Given three rows alike except one column, holding NULL in the first, empty text in the second and an empty blob in the third
     When the engine hashes the three rows
     Then the three hashes all differ
+
+  @criterion-01a15311-1191-7862-953b-cee711d85553 @module-smugglr-core
+  Scenario: a known row hashes to its known value
+    Given the row whose columns' quote() text is 1 and 'smugglr'
+    When the engine hashes the row
+    Then the hash is the 16-byte value recorded for that row

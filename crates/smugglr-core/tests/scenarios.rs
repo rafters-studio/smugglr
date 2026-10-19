@@ -143,6 +143,35 @@ fn null_text_blob(rows: &Rows) {
     rows.rows.set(vec![row("NULL"), row("''"), row("X''")]);
 }
 
+#[given("the row whose columns' quote() text is 1 and 'smugglr'")]
+fn the_known_row(rows: &Rows) {
+    rows.rows
+        .set(vec![vec!["1".to_owned(), "'smugglr'".to_owned()]]);
+}
+
+/// The row hash of the row `1, 'smugglr'`, computed once from `row_hash` and
+/// written here, so a change to the hash's algorithm, its length prefix or
+/// its 16-byte length fails.
+const KNOWN_HASH: &str = "6198887a4dfed5172bf2a92c7661e7e4";
+
+#[when("the engine hashes the row")]
+fn hash_one(rows: &Rows) -> Result<(), String> {
+    let all = rows.rows.take().ok_or("no row was given")?;
+    let row = all.first().ok_or("no row was given")?;
+    rows.hashes.set(vec![native_hash(row)]);
+    Ok(())
+}
+
+#[then("the hash is the 16-byte value recorded for that row")]
+fn known_value(rows: &Rows) -> Result<(), String> {
+    let hashes = rows.hashes.take().ok_or("the row was not hashed")?;
+    match hashes.as_slice() {
+        [hash] if hash == KNOWN_HASH => Ok(()),
+        [hash] => Err(format!("the row hashed to {hash}, not {KNOWN_HASH}")),
+        _ => Err(format!("expected one hash, got {hashes:?}")),
+    }
+}
+
 #[when("the native engine and the WASM engine each hash the row")]
 fn native_and_wasm(rows: &Rows) -> Result<(), String> {
     let all = rows.rows.take().ok_or("no row was given")?;
@@ -190,6 +219,8 @@ struct Place {
     change: Slot<Change>,
     /// How many times the place wrote the row.
     writes: Slot<usize>,
+    /// What the place decided about the change.
+    decision: Slot<Decision>,
 }
 
 #[fixture]
@@ -242,7 +273,9 @@ fn at_to(place: &Place) {
 fn receive(place: &Place) -> Result<(), String> {
     let change = place.change.get().ok_or("no change arrived")?;
     let row = place.row.get().ok_or("the place holds no row")?;
-    if decide(&change, Some(hash_of(&row)), None) == Decision::Apply {
+    let decision = decide(&change, Some(hash_of(&row)), None);
+    place.decision.set(decision);
+    if decision == Decision::Apply {
         place.row.set(change.values);
         place
             .writes
@@ -250,6 +283,15 @@ fn receive(place: &Place) -> Result<(), String> {
             .ok_or("the place keeps no write count")?;
     }
     Ok(())
+}
+
+#[then("the change counts as done, not as waiting")]
+fn done_not_waiting(place: &Place) -> Result<(), String> {
+    match place.decision.get() {
+        Some(Decision::Skip) => Ok(()),
+        Some(Decision::Hold) => Err("the change was held: it waits, not done".to_owned()),
+        other => Err(format!("expected the change skipped, got {other:?}")),
+    }
 }
 
 #[then("the row holds the change's values")]
