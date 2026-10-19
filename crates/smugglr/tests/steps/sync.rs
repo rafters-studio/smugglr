@@ -10,7 +10,7 @@ use smugglr_place::{Error, Key, LocalFile, Place, Table};
 
 use rstest_bdd_macros::{given, then, when};
 
-use crate::setup::{NOTES, World, note, rows_of, sql_on};
+use crate::setup::{NOTES, ORDERS, World, note, rows_of, sql_on};
 
 const THREE_NOTES: &str = "INSERT INTO notes VALUES ('n1', 'first', 1), ('n2', 'second', 2), \
      ('n3', 'third', 3)";
@@ -452,6 +452,195 @@ fn record_not_kept(world: &World) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The target of a run cut off while writing `table`: after writing it when
+/// `after`, else before.
+#[derive(Debug)]
+struct Cut {
+    file: LocalFile,
+    table: &'static str,
+    after: bool,
+}
+
+impl Place for Cut {
+    fn address(&self) -> &str {
+        self.file.address()
+    }
+
+    fn tables(&mut self) -> Result<Vec<Table>, Error> {
+        self.file.tables()
+    }
+
+    fn hashes(&mut self, table: &Table) -> Result<Vec<(Key, [u8; 16])>, Error> {
+        self.file.hashes(table)
+    }
+
+    fn rows(&mut self, table: &Table, keys: &[Key]) -> Result<Vec<Vec<String>>, Error> {
+        self.file.rows(table, keys)
+    }
+
+    fn write(&mut self, table: &Table, changes: &[Change]) -> Result<(), Error> {
+        if table.name != self.table {
+            return self.file.write(table, changes);
+        }
+        if self.after {
+            self.file.write(table, changes)?;
+        }
+        Err(Error::Adapter("the run was cut off".to_owned()))
+    }
+}
+
+/// Runs a sync through the Rust crates whose target is cut off while
+/// writing `table`, and fails unless the run ends early.
+fn cut_run(world: &World, table: &'static str, after: bool) -> Result<(), String> {
+    let (source, target) = places(world)?;
+    let mut source = LocalFile::open(&source).map_err(|err| err.to_string())?;
+    let mut target = Cut {
+        file: LocalFile::open(&target).map_err(|err| err.to_string())?,
+        table,
+        after,
+    };
+    match sync(&mut source, &mut target, &options(world)?) {
+        Err(_) => Ok(()),
+        Ok(record) => Err(format!("the run was not cut off: {}", record.json())),
+    }
+}
+
+#[given(
+    "a run that copied a new row from the source to the target and was cut off before it ended"
+)]
+fn copied_then_cut(world: &World) -> Result<(), String> {
+    world
+        .source
+        .set(world.place("source.db", &format!("{NOTES}; {THREE_NOTES}"))?);
+    world.target.set(world.place("target.db", NOTES)?);
+    world.sync_ok()?;
+    let (source, target) = places(world)?;
+    sql_on(&source, "INSERT INTO notes VALUES ('n9', 'new', 9)")?;
+    cut_run(world, "notes", true)?;
+    world.watched.set("n9".to_owned());
+    match note(&target, "n9")? {
+        Some(_) => Ok(()),
+        None => Err("the cut-off run did not copy the row".to_owned()),
+    }
+}
+
+#[when("the row is deleted in the source and the agent runs smugglr sync on them again")]
+fn delete_and_sync(world: &World) -> Result<(), String> {
+    let (source, _) = places(world)?;
+    let id = world.watched.get().ok_or("no row watched")?;
+    sql_on(&source, &format!("DELETE FROM notes WHERE id = '{id}'"))?;
+    world.sync_ok()
+}
+
+#[then("the row is gone from both places")]
+fn gone_from_both(world: &World) -> Result<(), String> {
+    let (source, target) = places(world)?;
+    let id = world.watched.get().ok_or("no row watched")?;
+    match (note(&source, &id)?, note(&target, &id)?) {
+        (None, None) => Ok(()),
+        (here, there) => Err(format!("the source holds {here:?}, the target {there:?}")),
+    }
+}
+
+#[given("a run between two places cut off part-way through writing")]
+fn cut_part_way(world: &World) -> Result<(), String> {
+    world.source.set(world.place(
+        "source.db",
+        &format!(
+            "{NOTES}; {THREE_NOTES}; {ORDERS}; \
+             INSERT INTO orders VALUES ('o1', 'tent'), ('o2', 'stove')"
+        ),
+    )?);
+    world.target.set(world.place(
+        "target.db",
+        &format!("{NOTES}; {ORDERS}; INSERT INTO orders VALUES ('o3', 'lamp')"),
+    )?);
+    // notes is written, then the run is cut before orders.
+    cut_run(world, "orders", false)
+}
+
+#[when("the agent runs smugglr sync on them again")]
+fn sync_again_once(world: &World) -> Result<(), String> {
+    world.sync(&[]).map(|_| ())
+}
+
+#[then("both places hold the same rows")]
+fn same_rows(world: &World) -> Result<(), String> {
+    let (source, target) = places(world)?;
+    for table in ["notes", "orders"] {
+        let query = format!("SELECT * FROM {table} ORDER BY id");
+        let (here, there) = (rows_of(&source, &query)?, rows_of(&target, &query)?);
+        if here != there || here.is_empty() {
+            return Err(format!(
+                "{table}: the source holds {here:?}, the target {there:?}{}",
+                stderr(world)
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[given(
+    "a run cut off before writing a row of notes to the target, and that row since edited in the target"
+)]
+fn cut_before_row(world: &World) -> Result<(), String> {
+    world
+        .source
+        .set(world.place("source.db", &format!("{NOTES}; {THREE_NOTES}"))?);
+    world.target.set(world.place("target.db", NOTES)?);
+    world.sync_ok()?;
+    let (source, target) = places(world)?;
+    sql_on(
+        &source,
+        "UPDATE notes SET body = 'edited in the source' WHERE id = 'n1'",
+    )?;
+    cut_run(world, "notes", false)?;
+    sql_on(
+        &target,
+        "UPDATE notes SET body = 'edited after the cut' WHERE id = 'n1'",
+    )?;
+    world.watched.set("n1".to_owned());
+    Ok(())
+}
+
+#[when("the agent runs smugglr sync on them again with --json")]
+fn sync_again_json(world: &World) -> Result<(), String> {
+    world.sync(&["--json"]).map(|_| ())
+}
+
+#[then("the record names that row's key as stopped")]
+fn named_as_stopped(world: &World) -> Result<(), String> {
+    let output = world.output.get().ok_or("smugglr was not run")?;
+    let record: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|err| format!("not a record: {err}{}", stderr(world)))?;
+    let id = world.watched.get().ok_or("no row watched")?;
+    let notes = record.pointer("/tables/notes").cloned().unwrap_or_default();
+    let named = notes
+        .get("rows")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|rows| rows.contains(&serde_json::Value::String(id)));
+    if notes.get("status").and_then(serde_json::Value::as_str) == Some("stopped") && named {
+        Ok(())
+    } else {
+        Err(format!("the record gives notes {notes}"))
+    }
+}
+
+#[then("smugglr's files hold no smugglr.sync journal")]
+fn no_journal(world: &World) -> Result<(), String> {
+    let files = files_under(&world.config()?)?;
+    if files.is_empty() {
+        return Err("smugglr kept no files at all".to_owned());
+    }
+    match files
+        .iter()
+        .find(|(path, _)| path.ends_with("smugglr.sync"))
+    {
+        None => Ok(()),
+        Some((path, _)) => Err(format!("{path} remains")),
+    }
 }
 
 /// Each place's rows and marks, to tell whether a run wrote anything.

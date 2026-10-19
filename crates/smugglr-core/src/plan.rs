@@ -129,6 +129,23 @@ pub fn plan(source: &Hashes, target: &Hashes, memory: &Hashes, mode: SyncMode) -
     }
 }
 
+/// Takes one journal line of a run cut off while writing (FR-SMUGGLR-073)
+/// into `memory`: when the row is now at the write's `to` (`here` is its
+/// hash in the place written), the write counts as done and memory takes
+/// `to`; otherwise memory keeps the write's `from`, so the next plan carries
+/// the write again, or stops on a row changed since the cut.
+pub fn recover(memory: &mut Hashes, write: &Write, here: Option<[u8; 16]>) {
+    let agreed = if here == write.to {
+        write.to
+    } else {
+        write.from
+    };
+    match agreed {
+        Some(hash) => memory.insert(write.key.clone(), hash),
+        None => memory.remove(&write.key),
+    };
+}
+
 /// The keys of `writes` whose rows, read back after writing, do not hash to
 /// what was written (FR-SMUGGLR-064): `read_back` is each written row's hash
 /// as its place now holds it, a deleted row absent.
@@ -143,7 +160,26 @@ pub fn not_read_back(writes: &[Write], read_back: &Hashes) -> Vec<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Hashes, Plan, SyncMode, plan};
+    use super::{Hashes, Plan, Side, SyncMode, Write, plan, recover};
+    use crate::change::Op;
+
+    #[test]
+    fn a_journaled_write_counts_only_when_its_row_is_at_to() {
+        let key = vec!["1".to_owned()];
+        let write = Write {
+            side: Side::Target,
+            op: Op::Upsert,
+            key: key.clone(),
+            from: Some([1; 16]),
+            to: Some([2; 16]),
+            overwrite: false,
+        };
+        let mut memory = Hashes::new();
+        recover(&mut memory, &write, Some([2; 16]));
+        assert_eq!(memory.get(&key), Some(&[2; 16]));
+        recover(&mut memory, &write, Some([3; 16]));
+        assert_eq!(memory.get(&key), Some(&[1; 16]));
+    }
 
     #[test]
     fn a_first_sync_of_equal_rows_is_in_step() {
