@@ -54,3 +54,9 @@ Feature: smugglr sync on the command line
     Given two copies of the same pair of places, with the same rows changed in each copy
     When the agent syncs one copy with smugglr sync --json and a program syncs the other through the Rust crates
     Then the two records hold the same statuses, counts and keys
+
+  @criterion-01a14bed-6a79-7543-91fd-005d8c496793 @module-front-ends
+  Scenario: no ignore flag
+    Given the smugglr CLI
+    When the agent runs smugglr sync --help
+    Then the help lists no flag for ignoring tables

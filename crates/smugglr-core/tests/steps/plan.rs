@@ -1,6 +1,7 @@
 //! Steps for the plan and the record: two places simulated in memory, synced
 //! by the same `plan` the CLI runs, each write applied with the other side's
 //! copy, and the record made from the plans by the same `record::table`.
+//! Tables are set aside by the same `Ignore` the CLI runs.
 
 use std::collections::BTreeMap;
 
@@ -9,30 +10,33 @@ use rstest_bdd::Slot;
 use rstest_bdd_macros::{ScenarioState, given, then, when};
 use serde_json::Value;
 use smugglr_core::change::Op;
+use smugglr_core::ignore::Ignore;
 use smugglr_core::plan::{Hashes, Plan, Side, SyncMode, not_read_back, plan};
 use smugglr_core::record::{self, Record};
 use smugglr_core::row_hash::row_hash;
 
 /// One table's rows by key, each row its columns' `quote()` text.
-type Rows = BTreeMap<Vec<String>, Vec<String>>;
+pub(crate) type Rows = BTreeMap<Vec<String>, Vec<String>>;
 
 /// A place: its tables' rows by table name.
-type Tables = BTreeMap<String, Rows>;
+pub(crate) type Tables = BTreeMap<String, Rows>;
 
 /// Two places, the pair's memory, the last record, and the row a scenario
 /// watches (its table and key).
 #[derive(Debug, Default, ScenarioState)]
 pub(crate) struct Pair {
-    source: Slot<Tables>,
-    target: Slot<Tables>,
+    pub(crate) source: Slot<Tables>,
+    pub(crate) target: Slot<Tables>,
     memory: Slot<BTreeMap<String, Hashes>>,
-    record: Slot<Value>,
+    pub(crate) record: Slot<Value>,
     json: Slot<String>,
     watched: Slot<(String, Vec<String>)>,
     /// The target keeps each written row with its text upper-cased.
     alters: Slot<bool>,
     /// Both places as they were before the last run.
-    before: Slot<(Tables, Tables)>,
+    pub(crate) before: Slot<(Tables, Tables)>,
+    /// The config's ignore list.
+    pub(crate) ignore: Slot<Vec<String>>,
     /// Ids of rows a scenario added.
     added: Slot<Vec<String>>,
     /// Tables whose database hands out their keys.
@@ -44,11 +48,11 @@ pub(crate) fn pair() -> Pair {
     Pair::default()
 }
 
-fn key(id: &str) -> Vec<String> {
+pub(crate) fn key(id: &str) -> Vec<String> {
     vec![format!("'{id}'")]
 }
 
-fn row(id: &str, body: &str) -> Vec<String> {
+pub(crate) fn row(id: &str, body: &str) -> Vec<String> {
     vec![format!("'{id}'"), format!("'{body}'")]
 }
 
@@ -63,7 +67,7 @@ fn hashes(rows: &Rows) -> Hashes {
 
 /// One run: plan each table from both sides' hashes and memory, write, and
 /// make the record.
-fn run(pair: &Pair, mode: SyncMode) -> Result<(), String> {
+pub(crate) fn run(pair: &Pair, mode: SyncMode) -> Result<(), String> {
     run_as(pair, mode, false)
 }
 
@@ -76,7 +80,10 @@ fn run_as(pair: &Pair, mode: SyncMode, dryrun: bool) -> Result<(), String> {
     pair.before.set((source.clone(), target.clone()));
     let mut tables = BTreeMap::new();
     let empty = Rows::new();
-    let names: Vec<String> = source.keys().cloned().collect();
+    let ignore = Ignore::new(pair.ignore.get().unwrap_or_default());
+    let (names, mut ignored) = ignore.split(source.keys().cloned().collect(), String::as_str);
+    let (_, ignored_there) = ignore.split(target.keys().cloned().collect(), String::as_str);
+    ignored.extend(ignored_there);
     let self_keyed = pair.self_keyed.get().unwrap_or_default();
     for name in names {
         if self_keyed.contains(&name) {
@@ -137,7 +144,7 @@ fn run_as(pair: &Pair, mode: SyncMode, dryrun: bool) -> Result<(), String> {
         }
         tables.insert(name, record::table(&planned, dryrun));
     }
-    let json = Record::new(tables, dryrun).json();
+    let json = Record::new(tables, ignored, dryrun).json();
     pair.record
         .set(serde_json::from_str(&json).map_err(|err| format!("the record is not JSON: {err}"))?);
     pair.json.set(json);

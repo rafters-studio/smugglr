@@ -62,7 +62,7 @@ fn retrieve(device: &Device) -> Result<(), String> {
     let notes = device.notes.get().ok_or("no device")?;
     let blob = device.blob.get().ok_or("no blob")?;
     let mismatch = compare_stamp(&notes, blob).ok_or("the stamps match")?;
-    let json = Record::shape_mismatch(mismatch).json();
+    let json = Record::shape_mismatch(mismatch, std::collections::BTreeSet::new()).json();
     device
         .record
         .set(serde_json::from_str(&json).map_err(|err| format!("{err}: {json}"))?);

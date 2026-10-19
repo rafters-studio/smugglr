@@ -5,7 +5,7 @@
 //! `--sync-mode`, or stopped; rows copied or carried over appear only in the
 //! counts. No word for one copy being better than another appears in it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde::{Serialize, Serializer};
@@ -54,6 +54,8 @@ pub struct Record {
     pub status: Status,
     /// Each table's part, by name.
     pub tables: BTreeMap<String, Table>,
+    /// The tables the run ignored, in either place, each named once.
+    pub ignored: BTreeSet<String>,
     /// The shapes of the places differ: the run stopped before any row was
     /// read (FR-SMUGGLR-070).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -71,10 +73,10 @@ pub struct ShapeStop {
 }
 
 impl Record {
-    /// The record of a run whose tables did `tables`; a dry run's when
-    /// `dryrun`.
+    /// The record of a run whose tables did `tables` and which ignored the
+    /// tables `ignored`; a dry run's when `dryrun`.
     #[must_use]
-    pub fn new(tables: BTreeMap<String, Table>, dryrun: bool) -> Self {
+    pub fn new(tables: BTreeMap<String, Table>, ignored: BTreeSet<String>, dryrun: bool) -> Self {
         let any = |f: fn(&Table) -> bool| tables.values().any(f);
         let status = if dryrun {
             Status::Preview
@@ -88,17 +90,20 @@ impl Record {
         Self {
             status,
             tables,
+            ignored,
             shape: None,
         }
     }
 
     /// The record of a run stopped, before any row was read, because the
-    /// places' shapes differ as `mismatch` says.
+    /// places' shapes differ as `mismatch` says; it ignored the tables
+    /// `ignored`.
     #[must_use]
-    pub fn shape_mismatch(mismatch: Mismatch) -> Self {
+    pub fn shape_mismatch(mismatch: Mismatch, ignored: BTreeSet<String>) -> Self {
         Self {
             status: Status::Stopped,
             tables: BTreeMap::new(),
+            ignored,
             shape: Some(ShapeStop {
                 why: mismatch.why(),
                 mismatch,
@@ -271,6 +276,10 @@ impl fmt::Display for Record {
             Status::Stopped => "stopped",
         };
         writeln!(f, "smugglr sync: {status}")?;
+        if !self.ignored.is_empty() {
+            let ignored: Vec<&str> = self.ignored.iter().map(String::as_str).collect();
+            writeln!(f, "  ignored: {}", ignored.join(", "))?;
+        }
         if let Some(shape) = &self.shape {
             writeln!(f, "  shape: {}", shape.why)?;
         }
