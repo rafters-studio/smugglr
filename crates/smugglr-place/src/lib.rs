@@ -18,6 +18,7 @@ mod queries;
 mod value;
 
 use smugglr_core::change::Change;
+use smugglr_core::shape::Ledger;
 
 pub use http_sql::HttpSql;
 pub use local_file::LocalFile;
@@ -59,6 +60,9 @@ pub struct Table {
     pub name: String,
     /// Its column names, in column order.
     pub columns: Vec<String>,
+    /// Each column's declared type, in column order; empty text for a
+    /// column declared without one.
+    pub types: Vec<String>,
     /// Its primary key's column names, in key order; empty when it declares
     /// none.
     pub key: Vec<String>,
@@ -81,6 +85,16 @@ pub trait Place {
     /// # Errors
     /// When the place cannot be read.
     fn tables(&mut self) -> Result<Vec<Table>, Error>;
+
+    /// The latest migration in the place's migratr ledger, read from its
+    /// `_migratr_migrations` table; `None` when the place has no ledger. A
+    /// place that cannot hold one keeps this default.
+    ///
+    /// # Errors
+    /// When the place cannot be read.
+    fn ledger(&mut self) -> Result<Option<Ledger>, Error> {
+        Ok(None)
+    }
 
     /// Each row's key and hash, computed where the data lives.
     ///

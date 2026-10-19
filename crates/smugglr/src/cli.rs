@@ -159,8 +159,12 @@ fn sync_once(command: &Sync) -> ExitCode {
 }
 
 /// What the run did, as an exit status: 4 when rows it wrote read back
-/// different (#511). The rest of FR-SMUGGLR-060's table is #514's.
+/// different (#511), and 1, as before the record carried it, when the
+/// places' shapes differ. The rest of FR-SMUGGLR-060's table is #514's.
 fn exit(record: &Record) -> ExitCode {
+    if record.shape.is_some() {
+        return ExitCode::FAILURE;
+    }
     let unmatched = record.tables.values().any(
         |table| matches!(table, Table::Stopped { not_read_back, .. } if !not_read_back.is_empty()),
     );

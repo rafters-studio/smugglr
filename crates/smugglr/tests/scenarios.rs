@@ -9,6 +9,8 @@ mod cli;
 mod http_sql;
 #[path = "steps/world.rs"]
 mod setup;
+#[path = "steps/shape.rs"]
+mod shape;
 #[path = "steps/sync.rs"]
 mod sync;
 

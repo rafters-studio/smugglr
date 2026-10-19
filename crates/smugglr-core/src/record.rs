@@ -12,6 +12,7 @@ use serde::{Serialize, Serializer};
 
 use crate::change::Op;
 use crate::plan::{Plan, Side};
+use crate::shape::Mismatch;
 
 /// Why a table stops when rows changed in both places.
 pub const CHANGED_IN_BOTH: &str = "These rows changed in both places since the last sync. \
@@ -53,6 +54,20 @@ pub struct Record {
     pub status: Status,
     /// Each table's part, by name.
     pub tables: BTreeMap<String, Table>,
+    /// The shapes of the places differ: the run stopped before any row was
+    /// read (FR-SMUGGLR-070).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shape: Option<ShapeStop>,
+}
+
+/// A run stopped because the places' shapes differ.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ShapeStop {
+    /// How the shapes differ.
+    #[serde(flatten)]
+    pub mismatch: Mismatch,
+    /// The difference in words, and how to go on.
+    pub why: String,
 }
 
 impl Record {
@@ -70,7 +85,25 @@ impl Record {
         } else {
             Status::Stopped
         };
-        Self { status, tables }
+        Self {
+            status,
+            tables,
+            shape: None,
+        }
+    }
+
+    /// The record of a run stopped, before any row was read, because the
+    /// places' shapes differ as `mismatch` says.
+    #[must_use]
+    pub fn shape_mismatch(mismatch: Mismatch) -> Self {
+        Self {
+            status: Status::Stopped,
+            tables: BTreeMap::new(),
+            shape: Some(ShapeStop {
+                why: mismatch.why(),
+                mismatch,
+            }),
+        }
     }
 
     /// The record as JSON.
@@ -238,6 +271,9 @@ impl fmt::Display for Record {
             Status::Stopped => "stopped",
         };
         writeln!(f, "smugglr sync: {status}")?;
+        if let Some(shape) = &self.shape {
+            writeln!(f, "  shape: {}", shape.why)?;
+        }
         for (name, table) in &self.tables {
             match table {
                 Table::InStep => writeln!(f, "  {name}: in step")?,
