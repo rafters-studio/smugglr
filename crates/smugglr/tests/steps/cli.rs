@@ -2,7 +2,7 @@
 
 use rstest_bdd_macros::{given, then, when};
 
-use crate::setup::{NOTES, World};
+use crate::setup::{NOTES, ORDERS, World};
 
 #[given("a local file and a postgres:// address")]
 fn file_and_postgres(world: &World) -> Result<(), String> {
@@ -28,9 +28,6 @@ fn refuses_other_engine(world: &World) -> Result<(), String> {
         Err(format!("smugglr exited {} saying {said:?}", output.status))
     }
 }
-
-/// The orders table of the record-as-text scenario.
-const ORDERS: &str = "CREATE TABLE orders (id TEXT PRIMARY KEY, item TEXT)";
 
 #[given("two places where the source's orders table has rows the target lacks")]
 fn source_orders_has_rows(world: &World) -> Result<(), String> {
