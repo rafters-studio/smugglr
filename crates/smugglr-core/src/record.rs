@@ -1,5 +1,5 @@
 //! The record: what a sync did, table by table, in smugglr's own words
-//! (FR-SMUGGLR-063, FR-SMUGGLR-067, FR-SMUGGLR-069).
+//! (FR-SMUGGLR-063, FR-SMUGGLR-065, FR-SMUGGLR-067, FR-SMUGGLR-069).
 //!
 //! Key lists name rows only where they were deleted, overwritten by
 //! `--sync-mode`, or stopped; rows copied or carried over appear only in the
@@ -13,6 +13,7 @@ use serde::{Serialize, Serializer};
 use crate::change::Op;
 use crate::plan::{Plan, Side};
 use crate::shape::Mismatch;
+use crate::weight::Weight;
 
 /// Why a table stops when rows changed in both places.
 pub const CHANGED_IN_BOTH: &str = "These rows changed in both places since the last sync. \
@@ -45,6 +46,14 @@ pub enum Status {
     /// Tables stopped and none moved.
     #[serde(rename = "stopped")]
     Stopped,
+    /// A first sync over `max_wire`: nothing was written.
+    ///
+    /// Current choice (2026-10-19): its own run status, not `stopped`,
+    /// because each exit code then follows from one status (3 for stopped,
+    /// 5 for too much, FR-SMUGGLR-060) and "too much" is the spec's word for
+    /// it; revisable.
+    #[serde(rename = "too much")]
+    TooMuch,
 }
 
 /// What a sync did: one status for the run, one entry per table by name.
@@ -52,6 +61,17 @@ pub enum Status {
 pub struct Record {
     /// The run's status.
     pub status: Status,
+    /// The pair had no memory yet: a row on one side only was copied as new.
+    pub first_sync: bool,
+    /// Whether the run could tell a delete from a row never copied; never on
+    /// a first sync.
+    pub deletes_seen: bool,
+    /// What a first sync moves, or would move; none on a later sync.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weight: Option<Weight>,
+    /// Why nothing moved, and how to go on; only when the run is too much.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
     /// Each table's part, by name.
     pub tables: BTreeMap<String, Table>,
     /// The tables the run ignored, in either place, each named once.
@@ -74,9 +94,15 @@ pub struct ShapeStop {
 
 impl Record {
     /// The record of a run whose tables did `tables` and which ignored the
-    /// tables `ignored`; a dry run's when `dryrun`.
+    /// tables `ignored`; a dry run's when `dryrun`. `first_sync` is a first
+    /// sync's weight, `None` when the pair synced before.
     #[must_use]
-    pub fn new(tables: BTreeMap<String, Table>, ignored: BTreeSet<String>, dryrun: bool) -> Self {
+    pub fn new(
+        tables: BTreeMap<String, Table>,
+        ignored: BTreeSet<String>,
+        dryrun: bool,
+        first_sync: Option<Weight>,
+    ) -> Self {
         let any = |f: fn(&Table) -> bool| tables.values().any(f);
         let status = if dryrun {
             Status::Preview
@@ -89,6 +115,10 @@ impl Record {
         };
         Self {
             status,
+            first_sync: first_sync.is_some(),
+            deletes_seen: first_sync.is_none(),
+            weight: first_sync,
+            why: None,
             tables,
             ignored,
             shape: None,
@@ -97,17 +127,39 @@ impl Record {
 
     /// The record of a run stopped, before any row was read, because the
     /// places' shapes differ as `mismatch` says; it ignored the tables
-    /// `ignored`.
+    /// `ignored`. `first_sync` when the pair had no memory yet; no run that
+    /// reads no row sees a delete.
     #[must_use]
-    pub fn shape_mismatch(mismatch: Mismatch, ignored: BTreeSet<String>) -> Self {
+    pub fn shape_mismatch(mismatch: Mismatch, ignored: BTreeSet<String>, first_sync: bool) -> Self {
         Self {
             status: Status::Stopped,
+            first_sync,
+            deletes_seen: false,
+            weight: None,
+            why: None,
             tables: BTreeMap::new(),
             ignored,
             shape: Some(ShapeStop {
                 why: mismatch.why(),
                 mismatch,
             }),
+        }
+    }
+
+    /// The record of a first sync that weighs `weight`, over `max_wire`: it
+    /// wrote nothing, and `why` says how to move the data instead. It ignored
+    /// the tables `ignored`.
+    #[must_use]
+    pub fn too_much(weight: Weight, why: String, ignored: BTreeSet<String>) -> Self {
+        Self {
+            status: Status::TooMuch,
+            first_sync: true,
+            deletes_seen: false,
+            weight: Some(weight),
+            why: Some(why),
+            tables: BTreeMap::new(),
+            ignored,
+            shape: None,
         }
     }
 
@@ -274,8 +326,23 @@ impl fmt::Display for Record {
             Status::Done => "done",
             Status::StoppedInPart => "stopped in part",
             Status::Stopped => "stopped",
+            Status::TooMuch => "too much",
         };
         writeln!(f, "smugglr sync: {status}")?;
+        if self.first_sync {
+            writeln!(
+                f,
+                "  first sync: a row on one side only is copied as new; deletes are not seen"
+            )?;
+        }
+        // A why already gives the weight.
+        if let Some(why) = &self.why {
+            for line in why.lines() {
+                writeln!(f, "  {line}")?;
+            }
+        } else if let Some(weight) = &self.weight {
+            writeln!(f, "  weight: {weight}")?;
+        }
         if !self.ignored.is_empty() {
             let ignored: Vec<&str> = self.ignored.iter().map(String::as_str).collect();
             writeln!(f, "  ignored: {}", ignored.join(", "))?;

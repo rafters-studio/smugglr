@@ -12,3 +12,4 @@ pub mod plan;
 pub mod record;
 pub mod row_hash;
 pub mod shape;
+pub mod weight;

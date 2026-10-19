@@ -84,3 +84,45 @@ Feature: one sync between two places, with places and memory as they are
     Given a service that speaks HTTP-SQL holding a row with the integer 9223372036854775807, and a local file without it
     When the agent runs smugglr sync on the service and the file
     Then the file's row holds 9223372036854775807
+
+  @criterion-01a14bed-657d-7353-b2bb-44d67ce1d3ff @module-smugglr-core
+  Scenario: a first sync says so
+    Given two places never synced with each other
+    When the agent runs smugglr sync on them with --json
+    Then the record says first_sync true
+
+  @criterion-01a14bed-657d-7353-b2bb-44ec8f7addcc @module-smugglr-core
+  Scenario: a first sync cannot see deletes
+    Given two places never synced with each other
+    When the agent runs smugglr sync on them with --json
+    Then the record says deletes_seen false
+
+  @criterion-01a14bed-657d-7353-b2bb-44f3b5dfb317 @module-smugglr-core
+  Scenario: a first sync copies one-sided rows
+    Given two places never synced with each other, and a row only in the target
+    When the agent runs smugglr sync on them
+    Then the source holds that row
+
+  @criterion-01a14bed-657d-7353-b2bb-4513d83aa4d5 @module-smugglr-core
+  Scenario: too much for one sync moves nothing
+    Given two places never synced with each other, holding more than the max_wire setting allows
+    When the agent runs smugglr sync on them
+    Then neither place has changed
+
+  @criterion-01a14bed-657d-7353-b2bb-4529a881ff60 @module-smugglr-core
+  Scenario: too much for one sync says what to do
+    Given two places never synced with each other, holding more than the max_wire setting allows
+    When the agent runs smugglr sync on them
+    Then the output tells the agent to move it with smugglr stash and then smugglr retrieve
+
+  @criterion-01a14bed-657d-7353-b2bb-45335407d68c @module-smugglr-core
+  Scenario: a dry run shows the weight
+    Given two places never synced with each other
+    When the agent runs smugglr sync on them with --dryrun
+    Then the output gives the rows, bytes and tables the first sync would move
+
+  @criterion-01a14c16-5feb-74e2-b96d-6f2f229c4554 @module-smugglr-core
+  Scenario: the default limit is 100 MB
+    Given no max_wire setting, and two places never synced with each other whose rows weigh more than 100 MB
+    When the agent runs smugglr sync on them
+    Then smugglr exits 5
