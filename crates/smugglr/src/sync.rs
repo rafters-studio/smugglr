@@ -57,8 +57,10 @@ pub fn sync(
     };
     let mut memory = Memory::open(&config, source.address(), target.address())?;
     let named = |table: &Table| options.tables.is_empty() || options.tables.contains(&table.name);
-    let tables: Vec<Table> = source.tables()?.into_iter().filter(named).collect();
-    let theirs: Vec<Table> = target.tables()?.into_iter().filter(named).collect();
+    let every = source.tables()?;
+    let theirs_every = target.tables()?;
+    let tables: Vec<Table> = every.iter().filter(|t| named(t)).cloned().collect();
+    let theirs: Vec<Table> = theirs_every.iter().filter(|t| named(t)).cloned().collect();
     check_shape(&tables, &theirs, source.address(), target.address())?;
     if let Some(name) = options
         .tables
@@ -67,7 +69,13 @@ pub fn sync(
     {
         return Err(Error::Shape(format!("neither place has a table {name}")));
     }
-    finish_cut_off_run(&mut memory, &tables, source, target, options.dryrun)?;
+    // Every table both places hold, not only those named: the journal goes
+    // once it is finished, so no table's lines may be left unfinished.
+    let common: Vec<Table> = every
+        .into_iter()
+        .filter(|table| theirs_every.iter().any(|other| other.name == table.name))
+        .collect();
+    finish_cut_off_run(&mut memory, &common, source, target, options.dryrun)?;
     let mut done = BTreeMap::new();
     for table in tables {
         let here: Hashes = source.hashes(&table)?.into_iter().collect();
@@ -88,7 +96,7 @@ pub fn sync(
         let (to_target, to_source): (Vec<Write>, Vec<Write>) = writes
             .into_iter()
             .partition(|write| write.side == Side::Target);
-        let mut mismatched = carry(
+        let (mut mismatched, mut written) = carry(
             &table,
             &mut *source,
             &mut *target,
@@ -97,7 +105,7 @@ pub fn sync(
             &last,
             &mut next,
         )?;
-        mismatched.extend(carry(
+        let (more, also) = carry(
             &table,
             &mut *target,
             &mut *source,
@@ -105,7 +113,15 @@ pub fn sync(
             &memory,
             &last,
             &mut next,
-        )?);
+        )?;
+        mismatched.extend(more);
+        written.extend(also);
+        // The record counts only the rows written.
+        let wrote = Plan::Move {
+            writes: written,
+            memory: next.clone(),
+        };
+        done.insert(table.name.clone(), record::table(&wrote, false));
         if !mismatched.is_empty() {
             // Not done: the table keeps its old memory.
             done.insert(table.name.clone(), record::not_read_back(mismatched));
@@ -221,7 +237,7 @@ fn check_shape(ours: &[Table], theirs: &[Table], source: &str, target: &str) -> 
 
 /// Journals and writes `writes` in `to`, with `from`'s copy of each row,
 /// reads back the rows written and returns the keys of those that do not
-/// match what was written.
+/// match what was written, and the writes that were made.
 fn carry(
     table: &Table,
     from: &mut dyn Place,
@@ -230,7 +246,7 @@ fn carry(
     journal: &Memory,
     last: &Hashes,
     memory: &mut Hashes,
-) -> Result<Vec<Vec<String>>, Error> {
+) -> Result<(Vec<Vec<String>>, Vec<Write>), Error> {
     let changes = changes(table, from, writes)?;
     let journaled: Vec<Write> = writes
         .iter()
@@ -256,7 +272,7 @@ fn carry(
         .filter(|write| wrote.contains(&write.key))
         .collect();
     let read_back = read_hashes(table, to, &wrote)?;
-    Ok(not_read_back(&written, &read_back))
+    Ok((not_read_back(&written, &read_back), written))
 }
 
 /// A row's key, from its columns in column order.
