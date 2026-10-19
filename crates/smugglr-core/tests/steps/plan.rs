@@ -129,7 +129,9 @@ fn run_as(pair: &Pair, mode: SyncMode, dryrun: bool) -> Result<(), String> {
         }
         tables.insert(name, record::table(&planned, dryrun));
     }
-    let json = Record::new(tables, dryrun).json();
+    // These steps simulate the plan and the record, not a first sync's
+    // weigh; that runs end to end in the smugglr crate.
+    let json = Record::new(tables, dryrun, None).json();
     pair.record
         .set(serde_json::from_str(&json).map_err(|err| format!("the record is not JSON: {err}"))?);
     pair.json.set(json);

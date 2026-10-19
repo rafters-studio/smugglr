@@ -20,12 +20,14 @@ smugglr-core = { workspace = true }
 smugglr-memory = { workspace = true }
 smugglr-place = { workspace = true }
 thiserror = { workspace = true }
+toml = { workspace = true }
 
 [dev-dependencies]
 rusqlite = { workspace = true }
 rstest = { workspace = true }
 rstest-bdd = { workspace = true }
 rstest-bdd-macros = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

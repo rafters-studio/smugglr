@@ -1,5 +1,6 @@
 //! One direct sync between two places: read each place's hashes, let the
-//! engine plan each table, write, and keep the pair's memory.
+//! engine plan each table, weigh a first sync, write, and keep the pair's
+//! memory.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -8,6 +9,7 @@ use smugglr_core::change::{Change, Op};
 use smugglr_core::plan::{Hashes, Plan, Side, SyncMode, Write, not_read_back, plan};
 use smugglr_core::record::{self, Record};
 use smugglr_core::row_hash::row_hash;
+use smugglr_core::weight::{DEFAULT_MAX_WIRE, Weight, too_much};
 use smugglr_memory::Memory;
 use smugglr_place::{Place, Table};
 
@@ -20,6 +22,9 @@ pub struct Options {
     pub sync_mode: SyncMode,
     /// Show what the sync would do, and write nothing.
     pub dryrun: bool,
+    /// The most bytes a first sync moves; `None` is
+    /// [`DEFAULT_MAX_WIRE`], 100 MB.
+    pub max_wire: Option<u64>,
 }
 
 /// Why a sync could not run.
@@ -61,12 +66,31 @@ pub fn sync(
         source.address(),
         target.address(),
     )?;
-    let mut done = BTreeMap::new();
+    // Every table is planned before any is written, so a first sync can
+    // weigh itself whole.
+    let mut plans = Vec::new();
     for table in tables {
         let here: Hashes = source.hashes(&table)?.into_iter().collect();
         let there: Hashes = target.hashes(&table)?.into_iter().collect();
         let last = memory.table(&table.name);
         let planned = plan(&here, &there, &last, options.sync_mode);
+        plans.push((table, last, planned));
+    }
+    let weight = if memory.first_sync() {
+        Some(weigh(&plans, &mut *source, &mut *target)?)
+    } else {
+        None
+    };
+    if let Some(weight) = weight
+        && !options.dryrun
+        && weight.over(options.max_wire.unwrap_or(DEFAULT_MAX_WIRE))
+    {
+        // Nothing written, and no memory kept: the pair stays unsynced.
+        let why = too_much(&weight, source.address(), target.address());
+        return Ok(Record::too_much(weight, why));
+    }
+    let mut done = BTreeMap::new();
+    for (table, last, planned) in plans {
         done.insert(table.name.clone(), record::table(&planned, options.dryrun));
         let Plan::Move {
             writes,
@@ -107,7 +131,47 @@ pub fn sync(
     if !options.dryrun {
         memory.save()?;
     }
-    Ok(Record::new(done, options.dryrun))
+    Ok(Record::new(done, options.dryrun, weight))
+}
+
+/// What the planned writes move: each row written with values, weighed in
+/// the place it is copied from, and the tables they are in. A delete moves
+/// no row, and a stopped table moves nothing.
+fn weigh(
+    plans: &[(Table, Hashes, Plan)],
+    source: &mut dyn Place,
+    target: &mut dyn Place,
+) -> Result<Weight, Error> {
+    let mut weight = Weight::default();
+    for (table, _, planned) in plans {
+        let Plan::Move { writes, .. } = planned else {
+            continue;
+        };
+        let copies: Vec<&Write> = writes.iter().filter(|write| write.op != Op::Down).collect();
+        if copies.is_empty() {
+            continue;
+        }
+        let weights = |place: &mut dyn Place, side: Side| -> Result<BTreeMap<_, _>, Error> {
+            if copies.iter().any(|write| write.side == side) {
+                Ok(place.weights(table)?.into_iter().collect())
+            } else {
+                Ok(BTreeMap::new())
+            }
+        };
+        // Rows written in the target are copied from the source.
+        let from_source = weights(&mut *source, Side::Target)?;
+        let from_target = weights(&mut *target, Side::Source)?;
+        for write in copies {
+            let from = match write.side {
+                Side::Target => &from_source,
+                Side::Source => &from_target,
+            };
+            weight.rows += 1;
+            weight.bytes += from.get(&write.key).copied().unwrap_or_default();
+        }
+        weight.tables += 1;
+    }
+    Ok(weight)
 }
 
 /// Stops the run, before any row is read, unless both places hold the same

@@ -129,6 +129,25 @@ impl Place for LocalFile {
             .map_err(|source| self.sqlite(source))
     }
 
+    fn weights(&mut self, table: &Table) -> Result<Vec<(Key, u64)>, Error> {
+        let width = table.key.len();
+        self.connection
+            .prepare(&queries::weights(table))
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| {
+                        let key = (0..width)
+                            .map(|i| row.get::<_, String>(i))
+                            .collect::<rusqlite::Result<Vec<String>>>()?;
+                        // A length is never negative.
+                        let bytes = u64::try_from(row.get::<_, i64>(width)?).unwrap_or_default();
+                        Ok((key, bytes))
+                    })?
+                    .collect()
+            })
+            .map_err(|source| self.sqlite(source))
+    }
+
     fn rows(&mut self, table: &Table, keys: &[Key]) -> Result<Vec<Vec<String>>, Error> {
         let width = table.columns.len();
         let address = self.address.clone();
@@ -241,6 +260,8 @@ mod tests {
         };
         place.write(&table, std::slice::from_ref(&change))?;
         assert_eq!(place.hashes(&table)?, vec![(change.key.clone(), hash)]);
+        // Weighed where the row lives, as the bytes of its quote() text.
+        assert_eq!(place.weights(&table)?, vec![(change.key.clone(), 3 + 16)]);
         assert_eq!(place.rows(&table, &[change.key])?, vec![values]);
         let _ = std::fs::remove_file(&path);
         Ok(())

@@ -3,13 +3,18 @@
 use std::process::ExitCode;
 
 use smugglr::{Options, sync};
-use smugglr_core::record::{Record, Table};
+use smugglr_core::record::{Record, Status, Table};
+
+use crate::config;
 
 /// Exit status for a usage error, or a place smugglr refuses.
 const USAGE: u8 = 2;
 
 /// Exit status for a run that wrote something and is not done.
 const NOT_DONE: u8 = 4;
+
+/// Exit status for a run too much for the wire.
+const TOO_MUCH: u8 = 5;
 
 const HELP: &str = "usage: smugglr sync <source> <target> [--dryrun] [--json]";
 
@@ -62,13 +67,20 @@ fn sync_once(command: &Sync) -> ExitCode {
     let [source, target] = command.places.as_slice() else {
         return usage("smugglr sync takes two places");
     };
+    let mut options = command.options.clone();
+    if let Some(dir) = smugglr_memory::config_dir() {
+        match config::read(&dir) {
+            Ok(config) => options.max_wire = config.max_wire,
+            Err(err) => return usage(&err),
+        }
+    }
     let places =
         smugglr_place::open(source).and_then(|source| Ok((source, smugglr_place::open(target)?)));
     let (mut source, mut target) = match places {
         Ok(places) => places,
         Err(err) => return usage(&err.to_string()),
     };
-    match sync(source.as_mut(), target.as_mut(), &command.options) {
+    match sync(source.as_mut(), target.as_mut(), &options) {
         Ok(record) => {
             if command.json {
                 println!("{}", record.json());
@@ -85,8 +97,12 @@ fn sync_once(command: &Sync) -> ExitCode {
 }
 
 /// What the run did, as an exit status: 4 when rows it wrote read back
-/// different (#511). The rest of FR-SMUGGLR-060's table is #514's.
+/// different (#511), 5 when a first sync is too much for the wire (#508).
+/// The rest of FR-SMUGGLR-060's table is #514's.
 fn exit(record: &Record) -> ExitCode {
+    if record.status == Status::TooMuch {
+        return ExitCode::from(TOO_MUCH);
+    }
     let unmatched = record.tables.values().any(
         |table| matches!(table, Table::Stopped { not_read_back, .. } if !not_read_back.is_empty()),
     );

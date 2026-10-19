@@ -1,6 +1,7 @@
 //! The smugglr command-line interface.
 
 mod cli;
+mod config;
 
 use std::process::ExitCode;
 

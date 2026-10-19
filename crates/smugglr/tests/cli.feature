@@ -12,3 +12,9 @@ Feature: smugglr sync on the command line
     Given two places where the source's orders table has rows the target lacks
     When the agent runs smugglr sync on them without --json
     Then the output names orders with its status and counts in text
+
+  @criterion-01a14bed-657d-7353-b2bb-4507f28693ab @module-front-ends
+  Scenario: too much for one sync exits 5
+    Given two places never synced with each other, holding more than the max_wire setting allows
+    When the agent runs smugglr sync on them
+    Then smugglr exits 5
