@@ -3,6 +3,7 @@
 //! Inside a program, [`sync`] runs one sync between two places, the same
 //! sync `smugglr sync` runs.
 
+mod shape;
 mod sync;
 
 pub use sync::{Error, Options, sync};

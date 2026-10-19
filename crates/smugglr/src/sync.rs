@@ -11,6 +11,8 @@ use smugglr_core::row_hash::row_hash;
 use smugglr_memory::Memory;
 use smugglr_place::{Place, Table};
 
+use crate::shape;
+
 /// How a sync runs.
 #[derive(Debug, Clone, Default)]
 pub struct Options {
@@ -31,8 +33,7 @@ pub enum Error {
     /// smugglr's memory could not be read or written.
     #[error(transparent)]
     Memory(#[from] smugglr_memory::Error),
-    /// The two places do not hold the same tables, or a table has no
-    /// primary key; the run stops before any row is read.
+    /// A table has no primary key; the run stops before any row is read.
     #[error("{0}")]
     Shape(String),
     /// There is no config directory to keep memory in.
@@ -42,6 +43,9 @@ pub enum Error {
 
 /// Syncs `source` and `target` once, and says what it did.
 ///
+/// When the places' shapes differ, the run stops before any row is read,
+/// writes nothing, and the record names the difference.
+///
 /// # Errors
 /// When a place cannot be reached, read or written, or memory cannot be kept.
 pub fn sync(
@@ -49,18 +53,16 @@ pub fn sync(
     target: &mut dyn Place,
     options: &Options,
 ) -> Result<Record, Error> {
+    let tables = source.tables()?;
+    let theirs = target.tables()?;
+    if let Some(mismatch) = shape::check(&mut *source, &mut *target, &tables, &theirs)? {
+        return Ok(Record::shape_mismatch(mismatch));
+    }
     let config = match &options.config_dir {
         Some(dir) => dir.clone(),
         None => smugglr_memory::config_dir().ok_or(Error::NoConfigDir)?,
     };
     let mut memory = Memory::open(&config, source.address(), target.address())?;
-    let tables = source.tables()?;
-    check_shape(
-        &tables,
-        &target.tables()?,
-        source.address(),
-        target.address(),
-    )?;
     let mut done = BTreeMap::new();
     for table in tables {
         let here: Hashes = source.hashes(&table)?.into_iter().collect();
@@ -108,32 +110,6 @@ pub fn sync(
         memory.save()?;
     }
     Ok(Record::new(done, options.dryrun))
-}
-
-/// Stops the run, before any row is read, unless both places hold the same
-/// tables and each has a primary key. The full shape check and its words
-/// are #506's; a table without a primary key is #507's.
-fn check_shape(ours: &[Table], theirs: &[Table], source: &str, target: &str) -> Result<(), Error> {
-    for (tables, others, here, there) in [
-        (ours, theirs, source, target),
-        (theirs, ours, target, source),
-    ] {
-        for table in tables {
-            if !others.iter().any(|other| other.name == table.name) {
-                return Err(Error::Shape(format!(
-                    "the table {} is in {here} but not in {there}",
-                    table.name
-                )));
-            }
-            if table.key.is_empty() {
-                return Err(Error::Shape(format!(
-                    "the table {} in {here} has no primary key",
-                    table.name
-                )));
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Writes `writes` in `to`, with `from`'s copy of each row, reads the rows
@@ -242,6 +218,7 @@ mod tests {
             Ok(vec![Table {
                 name: "notes".to_owned(),
                 columns: vec!["id".to_owned()],
+                types: vec!["TEXT".to_owned()],
                 key: vec!["id".to_owned()],
             }])
         }

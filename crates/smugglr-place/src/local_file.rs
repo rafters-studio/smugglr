@@ -8,9 +8,10 @@
 use std::path::Path;
 
 use rusqlite::functions::FunctionFlags;
-use rusqlite::{Connection, OpenFlags, params_from_iter};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params_from_iter};
 use smugglr_core::change::{Change, Op};
 use smugglr_core::row_hash::row_hash;
+use smugglr_core::shape::{LEDGER, Ledger};
 
 use crate::queries::{self, ROW_HASH};
 use crate::value::unquote;
@@ -72,6 +73,7 @@ impl LocalFile {
     fn columns(&self, name: &str) -> rusqlite::Result<Table> {
         let mut statement = self.connection.prepare(queries::COLUMNS)?;
         let mut columns = Vec::new();
+        let mut types = Vec::new();
         let mut key = Vec::new();
         let mut rows = statement.query([name])?;
         while let Some(row) = rows.next()? {
@@ -81,11 +83,13 @@ impl LocalFile {
                 key.push((position, column.clone()));
             }
             columns.push(column);
+            types.push(row.get(2)?);
         }
         key.sort();
         Ok(Table {
             name: name.to_owned(),
             columns,
+            types,
             key: key.into_iter().map(|(_, column)| column).collect(),
         })
     }
@@ -110,6 +114,26 @@ impl Place for LocalFile {
             .iter()
             .map(|name| self.columns(name).map_err(|source| self.sqlite(source)))
             .collect()
+    }
+
+    fn ledger(&mut self) -> Result<Option<Ledger>, Error> {
+        let connection = &self.connection;
+        let read = || -> rusqlite::Result<Option<Ledger>> {
+            let has: bool =
+                connection.query_row(queries::HAS_LEDGER, [LEDGER], |row| row.get(0))?;
+            if !has {
+                return Ok(None);
+            }
+            connection
+                .query_row(&queries::latest_migration(), [], |row| {
+                    Ok(Ledger {
+                        version: row.get(0)?,
+                        checksum: row.get(1)?,
+                    })
+                })
+                .optional()
+        };
+        read().map_err(|source| self.sqlite(source))
     }
 
     fn hashes(&mut self, table: &Table) -> Result<Vec<(Key, [u8; 16])>, Error> {

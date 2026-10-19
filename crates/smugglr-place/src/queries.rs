@@ -1,6 +1,8 @@
 //! The SQL the local file runs. Names pass through [`ident`]; values are
 //! always parameters.
 
+use smugglr_core::shape::LEDGER;
+
 use crate::Table;
 
 /// The name of the row-hash function registered on each connection.
@@ -10,8 +12,21 @@ pub(crate) const ROW_HASH: &str = "smugglr_row_hash";
 pub(crate) const TABLES: &str = "SELECT name FROM sqlite_schema \
      WHERE type = 'table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY name";
 
-/// A table's columns and where each sits in the primary key (0 when not).
-pub(crate) const COLUMNS: &str = "SELECT name, pk FROM pragma_table_info(?1) ORDER BY cid";
+/// A table's columns, where each sits in the primary key (0 when not), and
+/// its declared type.
+pub(crate) const COLUMNS: &str = "SELECT name, pk, type FROM pragma_table_info(?1) ORDER BY cid";
+
+/// Whether the place holds migratr's ledger table, `?1`.
+pub(crate) const HAS_LEDGER: &str =
+    "SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)";
+
+/// The latest migration in migratr's ledger: its version and checksum.
+pub(crate) fn latest_migration() -> String {
+    format!(
+        "SELECT version, checksum FROM {} ORDER BY version DESC LIMIT 1",
+        ident(LEDGER)
+    )
+}
 
 /// A name as a quoted SQL identifier.
 pub(crate) fn ident(name: &str) -> String {
@@ -104,6 +119,7 @@ mod tests {
         let table = Table {
             name: "notes".to_owned(),
             columns: vec!["id".to_owned(), "body".to_owned()],
+            types: vec!["TEXT".to_owned(), "TEXT".to_owned()],
             key: vec!["id".to_owned()],
         };
         assert_eq!(
