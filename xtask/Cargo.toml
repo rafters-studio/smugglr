@@ -1,0 +1,21 @@
+[package]
+name = "xtask"
+description = "The smugglr repository's own tooling; first job: the crate-map check (NFR-SMUGGLR-009)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+cargo_metadata = { workspace = true }
+
+[dev-dependencies]
+rstest = { workspace = true }
+rstest-bdd = { workspace = true }
+rstest-bdd-macros = { workspace = true }
+
+[lints]
+workspace = true
