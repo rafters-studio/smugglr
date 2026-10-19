@@ -3,13 +3,10 @@
 use std::process::ExitCode;
 
 use smugglr::{Options, sync};
-use smugglr_core::record::{Record, Status, Table};
+use smugglr_core::record::{Record, Table};
 
 /// Exit status for a usage error, or a place smugglr refuses.
 const USAGE: u8 = 2;
-
-/// Exit status for a run that stopped before writing anything.
-const STOPPED: u8 = 3;
 
 /// Exit status for a run that wrote something and is not done.
 const NOT_DONE: u8 = 4;
@@ -87,15 +84,15 @@ fn sync_once(command: &Sync) -> ExitCode {
     }
 }
 
-/// What the run did, as an exit status (FR-SMUGGLR-060 is #514's).
+/// What the run did, as an exit status: 4 when rows it wrote read back
+/// different (#511). The rest of FR-SMUGGLR-060's table is #514's.
 fn exit(record: &Record) -> ExitCode {
     let unmatched = record.tables.values().any(
         |table| matches!(table, Table::Stopped { not_read_back, .. } if !not_read_back.is_empty()),
     );
-    match record.status {
-        _ if unmatched => ExitCode::from(NOT_DONE),
-        Status::Preview | Status::Done => ExitCode::SUCCESS,
-        Status::StoppedInPart => ExitCode::from(NOT_DONE),
-        Status::Stopped => ExitCode::from(STOPPED),
+    if unmatched {
+        ExitCode::from(NOT_DONE)
+    } else {
+        ExitCode::SUCCESS
     }
 }
