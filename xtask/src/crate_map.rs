@@ -41,7 +41,10 @@ const CRATE_MAP: &[(&str, &[&str])] = &[
 
 /// External crates smugglr-core may depend on. Each one does no I/O and reads
 /// no clock; a crate joins this list only after that is checked.
-const CORE_MAY_USE: &[&str] = &[];
+/// Current choice 2026-10-19: blake3 (its portable `pure` build) for the row
+/// hash (#499, FR-SMUGGLR-058), because it does no I/O, reads no clock and
+/// builds for wasm32; revisable.
+const CORE_MAY_USE: &[&str] = &["blake3"];
 
 /// One way the workspace leaves the crate map.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
