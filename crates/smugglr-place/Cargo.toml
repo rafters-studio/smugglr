@@ -1,6 +1,6 @@
 [package]
 name = "smugglr-place"
-description = "smugglr's places: the place interface and the local SQLite file."
+description = "smugglr's places: the place interface, the local SQLite file and HTTP-SQL."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,6 +12,8 @@ authors.workspace = true
 smugglr-core = { workspace = true }
 rusqlite = { workspace = true }
 thiserror = { workspace = true }
+serde_json = { workspace = true }
+ureq = { workspace = true }
 
 [lints]
 workspace = true
