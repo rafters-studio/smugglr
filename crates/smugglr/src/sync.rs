@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use smugglr_core::change::{Change, Op};
-use smugglr_core::plan::{Hashes, Plan, Side, SyncMode, Write, not_read_back, plan};
+use smugglr_core::plan::{Hashes, Plan, Side, SyncMode, Write, not_read_back, plan, recover};
 use smugglr_core::record::{self, Record};
 use smugglr_core::row_hash::row_hash;
 use smugglr_memory::Memory;
@@ -61,7 +61,9 @@ pub fn sync(
         source.address(),
         target.address(),
     )?;
+    finish_cut_off_run(&mut memory, &tables, source, target, options.dryrun)?;
     let mut done = BTreeMap::new();
+    let mut unmatched = false;
     for table in tables {
         let here: Hashes = source.hashes(&table)?.into_iter().collect();
         let there: Hashes = target.hashes(&table)?.into_iter().collect();
@@ -86,6 +88,7 @@ pub fn sync(
             &mut *source,
             &mut *target,
             &to_target,
+            &memory,
             &last,
             &mut next,
         )?;
@@ -94,20 +97,103 @@ pub fn sync(
             &mut *target,
             &mut *source,
             &to_source,
+            &memory,
             &last,
             &mut next,
         )?);
         if !mismatched.is_empty() {
             // Not done: the table keeps its old memory.
+            unmatched = true;
             done.insert(table.name.clone(), record::not_read_back(mismatched));
             continue;
         }
         memory.set_table(&table.name, next);
     }
+    let record = Record::new(done, options.dryrun);
     if !options.dryrun {
         memory.save()?;
+        // Kept after a run whose rows read back different (exit 4), so
+        // the next run finishes it; any other run's memory already holds
+        // what it wrote.
+        if !unmatched {
+            memory.clear_journal()?;
+        }
     }
-    Ok(Record::new(done, options.dryrun))
+    Ok(record)
+}
+
+/// Finishes a run that was cut off while writing: each journal line whose
+/// row is now at its `to` counts as written, and otherwise memory keeps its
+/// `from`, so this run carries the write again or stops on a row changed
+/// since the cut. The memory so finished is saved before the journal goes.
+fn finish_cut_off_run(
+    memory: &mut Memory,
+    tables: &[Table],
+    source: &mut dyn Place,
+    target: &mut dyn Place,
+    dryrun: bool,
+) -> Result<(), Error> {
+    let journaled = memory.journaled()?;
+    if journaled.is_empty() {
+        // A journal holding only a line torn by a crash names no row
+        // written; it goes, so the next lines are not appended to it.
+        if !dryrun {
+            memory.clear_journal()?;
+        }
+        return Ok(());
+    }
+    for table in tables {
+        let lines: Vec<&Write> = journaled
+            .iter()
+            .filter(|(name, _)| *name == table.name)
+            .map(|(_, write)| write)
+            .collect();
+        if lines.is_empty() {
+            continue;
+        }
+        let mut last = memory.table(&table.name);
+        recover_side(table, &lines, Side::Source, source, &mut last)?;
+        recover_side(table, &lines, Side::Target, target, &mut last)?;
+        memory.set_table(&table.name, last);
+    }
+    if !dryrun {
+        memory.save()?;
+        memory.clear_journal()?;
+    }
+    Ok(())
+}
+
+/// Takes the journal lines for `side`, whose place is `place`, into `last`.
+fn recover_side(
+    table: &Table,
+    lines: &[&Write],
+    side: Side,
+    place: &mut dyn Place,
+    last: &mut Hashes,
+) -> Result<(), Error> {
+    let lines: Vec<&Write> = lines.iter().copied().filter(|w| w.side == side).collect();
+    let keys: Vec<Vec<String>> = lines.iter().map(|w| w.key.clone()).collect();
+    let here = read_hashes(table, place, &keys)?;
+    for line in lines {
+        recover(last, line, here.get(&line.key).copied());
+    }
+    Ok(())
+}
+
+/// The hash of each row `keys` names, as `place` holds it now.
+fn read_hashes(
+    table: &Table,
+    place: &mut dyn Place,
+    keys: &[Vec<String>],
+) -> Result<Hashes, Error> {
+    Ok(place
+        .rows(table, keys)?
+        .into_iter()
+        .filter_map(|row| {
+            let columns: Vec<&str> = row.iter().map(String::as_str).collect();
+            Some((key_of(table, &row)?, row_hash(&columns)))
+        })
+        .collect())
 }
 
 /// Stops the run, before any row is read, unless both places hold the same
@@ -136,7 +222,7 @@ fn check_shape(ours: &[Table], theirs: &[Table], source: &str, target: &str) -> 
     Ok(())
 }
 
-/// Writes `writes` in `to`, with `from`'s copy of each row, reads the rows
+/// Journals and writes `writes` in `to`, with `from`'s copy of each row, reads the rows
 /// back and returns the keys of those that do not match what was written. A
 /// row gone from `from` since its hash was read is not written, and its key
 /// keeps its `last` hash in memory, so the next run finds it missing on that
@@ -146,6 +232,7 @@ fn carry(
     from: &mut dyn Place,
     to: &mut dyn Place,
     writes: &[Write],
+    journal: &Memory,
     last: &Hashes,
     memory: &mut Hashes,
 ) -> Result<Vec<Vec<String>>, Error> {
@@ -158,21 +245,16 @@ fn carry(
             };
         }
     }
-    to.write(table, &changes)?;
     let written: Vec<Write> = writes
         .iter()
         .filter(|write| changes.iter().any(|change| change.key == write.key))
         .cloned()
         .collect();
+    // The journal line goes to disk before the row does.
+    journal.journal(&table.name, &written)?;
+    to.write(table, &changes)?;
     let keys: Vec<Vec<String>> = written.iter().map(|write| write.key.clone()).collect();
-    let read_back: Hashes = to
-        .rows(table, &keys)?
-        .into_iter()
-        .filter_map(|row| {
-            let columns: Vec<&str> = row.iter().map(String::as_str).collect();
-            Some((key_of(table, &row)?, row_hash(&columns)))
-        })
-        .collect();
+    let read_back = read_hashes(table, to, &keys)?;
     Ok(not_read_back(&written, &read_back))
 }
 
