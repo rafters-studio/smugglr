@@ -20,7 +20,8 @@ pub(crate) struct World {
     pub(crate) target: Slot<String>,
     /// What the last smugglr run printed.
     pub(crate) output: Slot<Output>,
-    /// The key (`id`) of the row the scenario watches.
+    /// What the scenario watches: the key (`id`) of one row, or a snapshot
+    /// of rows to compare after the run.
     pub(crate) watched: Slot<String>,
     /// Two copies of a pair of places, each as (source, target).
     pub(crate) copies: Slot<Vec<(String, String)>>,
