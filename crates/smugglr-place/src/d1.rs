@@ -160,10 +160,13 @@ impl D1 {
         let mut envelope: Json = serde_json::from_str(&text)
             .map_err(|err| format!("D1 answered {status} with no JSON ({err}): {text}"))?;
         if status.is_success() && envelope["success"] == json!(true) {
-            return Ok(Ok(envelope
-                .get_mut("result")
-                .map(Json::take)
-                .unwrap_or_default()));
+            return match envelope.get_mut("result").map(Json::take) {
+                Some(result) => Ok(Ok(result)),
+                None => Ok(Err((
+                    "server_error".to_owned(),
+                    format!("D1 answered {status} with no result: {text}"),
+                ))),
+            };
         }
         let error = envelope["errors"]
             .as_array()
@@ -255,11 +258,14 @@ impl D1 {
             Ok(other) => return Err(format!("D1 answered a batch with {other}")),
             Err(refusal) => return Ok(Err(refusal)),
         };
-        Ok(Ok(results
+        // An answer of the wrong shape is HTTP-SQL's server error, never an
+        // empty result.
+        Ok(results
             .into_iter()
             .zip(written)
             .map(|(result, is_write)| answer(result, is_write))
-            .collect()))
+            .collect::<Result<Vec<Json>, String>>()
+            .map_err(|message| ("server_error".to_owned(), message)))
     }
 }
 
@@ -267,9 +273,11 @@ impl D1 {
 /// statement turning each back into its kind.
 fn translate(statement: &Json) -> Result<(String, Vec<Json>), String> {
     let sql = statement["sql"].as_str().ok_or("a statement without sql")?;
-    let params = statement["params"]
-        .as_array()
-        .map_or(&[][..], Vec::as_slice);
+    let params = match statement.get("params") {
+        None | Some(Json::Null) => &[][..],
+        Some(Json::Array(params)) => params.as_slice(),
+        Some(other) => return Err(format!("params {other} is not a list")),
+    };
     if params.len() > MAX_PARAMS {
         return Err(format!(
             "D1 binds at most {MAX_PARAMS} parameters to a statement, and this one has {}",
@@ -325,51 +333,64 @@ fn hex(bytes: &[u8]) -> String {
 
 /// One D1 result as an HTTP-SQL result. A write returned a row for each row
 /// it wrote; it answers with no rows, and counts them.
-fn answer(mut result: Json, wrote: bool) -> Json {
-    // Taken, not indexed mutably, so an answer of the wrong shape reads as
-    // empty rather than panics.
+///
+/// An answer of any other shape is an error, never an empty result: rows
+/// read as missing would look deleted on this side, and the plan would
+/// carry those deletes to the other place.
+fn answer(mut result: Json, wrote: bool) -> Result<Json, String> {
+    let wrong = |what: &str| format!("D1 answered a statement {what}");
+    if result.get("success").and_then(Json::as_bool) == Some(false) {
+        return Err(wrong(&format!("as failed: {result}")));
+    }
     let mut take = |field: &str| match result
         .get_mut("results")
         .and_then(|results| results.get_mut(field))
         .map(Json::take)
     {
-        Some(Json::Array(values)) => values,
-        _ => Vec::new(),
+        Some(Json::Array(values)) => Ok(values),
+        Some(other) => Err(wrong(&format!("with {field} {other}"))),
+        None => Err(wrong(&format!("without {field}"))),
     };
-    let rows = take("rows");
+    let rows = take("rows")?;
     if wrote {
-        return json!({"columns": [], "rows": [], "rowsAffected": rows.len(), "lastInsertId": null});
+        return Ok(
+            json!({"columns": [], "rows": [], "rowsAffected": rows.len(), "lastInsertId": null}),
+        );
     }
     // D1 answers a blob as a list of its bytes; HTTP-SQL tags it.
-    let rows: Vec<Json> = rows
+    let rows = rows
         .into_iter()
         .map(|row| match row {
-            Json::Array(values) => Json::Array(values.into_iter().map(blob).collect()),
-            other => other,
+            Json::Array(values) => values
+                .into_iter()
+                .map(blob)
+                .collect::<Result<Vec<Json>, String>>()
+                .map(Json::Array),
+            other => Err(wrong(&format!("with the row {other}"))),
         })
-        .collect();
-    let columns = take("columns");
-    json!({
+        .collect::<Result<Vec<Json>, String>>()?;
+    // Columns are D1's to give, and HTTP-SQL's place does not read them.
+    let columns = take("columns").unwrap_or_default();
+    Ok(json!({
         "columns": columns,
         "rows": rows,
         "rowsAffected": 0,
         "lastInsertId": null,
-    })
+    }))
 }
 
 /// A D1 value as HTTP-SQL's: a blob, which D1 answers as a list of bytes, as
-/// a tagged value.
-fn blob(value: Json) -> Json {
-    let bytes = value.as_array().and_then(|bytes| {
-        bytes
-            .iter()
-            .map(|byte| byte.as_u64().and_then(|byte| u8::try_from(byte).ok()))
-            .collect::<Option<Vec<u8>>>()
-    });
-    match bytes {
-        Some(bytes) => json!({"$type": "blob", "$value": base64(&bytes)}),
-        None => value,
-    }
+/// a tagged value. A list that is not bytes is an error.
+fn blob(value: Json) -> Result<Json, String> {
+    let Json::Array(bytes) = &value else {
+        return Ok(value);
+    };
+    let bytes = bytes
+        .iter()
+        .map(|byte| byte.as_u64().and_then(|byte| u8::try_from(byte).ok()))
+        .collect::<Option<Vec<u8>>>()
+        .ok_or_else(|| format!("D1 answered {value} where a value was due"))?;
+    Ok(json!({"$type": "blob", "$value": base64(&bytes)}))
 }
 
 impl Transport for D1 {
@@ -379,7 +400,13 @@ impl Transport for D1 {
             None => (std::slice::from_ref(request), true),
         };
         Ok(match self.run(statements)? {
-            Ok(mut results) if single => (true, results.pop().unwrap_or_default()),
+            Ok(mut results) if single => match results.pop() {
+                Some(result) => (true, result),
+                None => (
+                    false,
+                    json!({"error": {"code": "server_error", "message": "D1 answered no result"}}),
+                ),
+            },
             Ok(results) => (true, json!({ "results": results })),
             Err((code, message)) => (false, json!({"error": {"code": code, "message": message}})),
         })
@@ -501,7 +528,7 @@ mod tests {
                 serde_json::Value::Array(results) => results
                     .into_iter()
                     .map(|result| answer(result, true))
-                    .collect(),
+                    .collect::<Result<_, String>>()?,
                 _ => return Err("not a list".to_owned()),
             };
             back += started.elapsed();
@@ -543,10 +570,23 @@ mod tests {
         Ok(())
     }
 
+    /// Rows read as missing would look deleted on the D1 side, so an answer
+    /// of the wrong shape is an error, never an empty result.
     #[test]
-    fn an_answer_of_the_wrong_shape_reads_as_empty() {
-        for result in [json!("not an object"), json!([1]), json!({"results": 3})] {
-            assert_eq!(answer(result, false)["rows"], json!([]));
+    fn an_answer_of_the_wrong_shape_is_an_error() {
+        for (result, wrote) in [
+            (json!("not an object"), false),
+            (json!([1]), false),
+            (json!({"results": 3}), false),
+            (json!({"results": {"columns": ["a"]}}), false),
+            (json!({"results": {"columns": []}}), true),
+            (json!({"results": {"rows": [7]}}), false),
+            (json!({"results": {"rows": [[[1, "x"]]]}}), false),
+            (json!({"results": {"rows": "none"}}), true),
+            (json!({"success": false, "results": {"rows": []}}), false),
+        ] {
+            let answered = answer(result.clone(), wrote);
+            assert!(answered.is_err(), "{result} read as {answered:?}");
         }
     }
 
@@ -557,13 +597,14 @@ mod tests {
     }
 
     #[test]
-    fn a_write_counts_the_rows_it_returned() {
+    fn a_write_counts_the_rows_it_returned() -> Result<(), String> {
         let result = json!({"results": {"columns": ["1"], "rows": [[1], [1]]}, "success": true});
-        assert_eq!(answer(result, true)["rowsAffected"], json!(2));
+        assert_eq!(answer(result, true)?["rowsAffected"], json!(2));
         let read = json!({"results": {"columns": ["b"], "rows": [[[0, 255]]]}});
         assert_eq!(
-            answer(read, false)["rows"],
+            answer(read, false)?["rows"],
             json!([[{"$type": "blob", "$value": "AP8="}]])
         );
+        Ok(())
     }
 }
