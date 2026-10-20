@@ -10,8 +10,29 @@ pub(crate) const ROW_HASH: &str = "smugglr_row_hash";
 pub(crate) const TABLES: &str = "SELECT name FROM sqlite_schema \
      WHERE type = 'table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY name";
 
-/// A table's columns and where each sits in the primary key (0 when not).
-pub(crate) const COLUMNS: &str = "SELECT name, pk FROM pragma_table_info(?1) ORDER BY cid";
+/// A table's columns, where each sits in the primary key (0 when not), and
+/// each one's declared type.
+pub(crate) const COLUMNS: &str = "SELECT name, pk, type FROM pragma_table_info(?1) ORDER BY cid";
+
+/// Whether a table's primary key has an index of its own: true for a
+/// `WITHOUT ROWID` table and for any key that is not the rowid.
+pub(crate) const KEY_INDEXED: &str =
+    "SELECT EXISTS (SELECT 1 FROM pragma_index_list(?1) WHERE origin = 'pk')";
+
+/// Whether the database hands out a table's keys, from [`COLUMNS`]' declared
+/// type of each key column (in key order) and [`KEY_INDEXED`]: SQLite hands
+/// out the key of a rowid table whose key is one column declared exactly
+/// INTEGER, since that column is the rowid. `key_indexed` runs
+/// [`KEY_INDEXED`], and only for such a key.
+pub(crate) fn self_keyed<E>(
+    declared: &[&str],
+    key_indexed: impl FnOnce() -> Result<bool, E>,
+) -> Result<bool, E> {
+    match declared {
+        [declared] if declared.eq_ignore_ascii_case("INTEGER") => Ok(!key_indexed()?),
+        _ => Ok(false),
+    }
+}
 
 /// A name as a quoted SQL identifier.
 pub(crate) fn ident(name: &str) -> String {
@@ -173,6 +194,7 @@ mod tests {
             name: "notes".to_owned(),
             columns: vec!["id".to_owned(), "body".to_owned()],
             key: vec!["id".to_owned()],
+            self_keyed: false,
         }
     }
 

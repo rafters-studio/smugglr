@@ -1,5 +1,5 @@
 //! The record: what a sync did, table by table, in smugglr's own words
-//! (FR-SMUGGLR-063, FR-SMUGGLR-067).
+//! (FR-SMUGGLR-063, FR-SMUGGLR-067, FR-SMUGGLR-069).
 //!
 //! Key lists name rows only where they were deleted, overwritten by
 //! `--sync-mode`, or stopped; rows copied or carried over appear only in the
@@ -22,6 +22,12 @@ pub const CHANGED_IN_BOTH: &str = "These rows changed in both places since the l
 pub const NOT_READ_BACK: &str = "smugglr wrote these rows and read them back different from \
      what it wrote, so the run is not done. Something in the place changes rows as they are \
      written.";
+
+/// Why a table stops when its database hands out its own keys
+/// (FR-SMUGGLR-069).
+pub const SELF_KEYED: &str = "This table's database hands out its own keys (INTEGER PRIMARY \
+     KEY), so two places would hand out the same key to different rows and one would erase the \
+     other. smugglr does no re-sequencing. Any random, unique key, such as UUIDv7, lets it sync.";
 
 /// What a run did as a whole.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -194,6 +200,17 @@ pub fn not_read_back(keys: Vec<Vec<String>>) -> Table {
         rows: Vec::new(),
         not_read_back: keys.into_iter().map(Key).collect(),
         why: NOT_READ_BACK.to_owned(),
+    }
+}
+
+/// The record of a table whose database hands out its own keys: stopped,
+/// with no rows read.
+#[must_use]
+pub fn self_keyed() -> Table {
+    Table::Stopped {
+        rows: Vec::new(),
+        not_read_back: Vec::new(),
+        why: SELF_KEYED.to_owned(),
     }
 }
 

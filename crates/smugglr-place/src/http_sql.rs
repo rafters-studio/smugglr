@@ -190,23 +190,36 @@ impl Place for HttpSql {
                     .ok_or_else(|| self.failed("a table without a name"))?;
                 let mut columns = Vec::new();
                 let mut key = Vec::new();
-                for column in self.query(queries::COLUMNS, &[json!(name)])? {
+                for info in self.query(queries::COLUMNS, &[json!(name)])? {
                     let (Some(column), Some(position)) = (
-                        column.first().and_then(Json::as_str),
-                        column.get(1).and_then(Json::as_i64),
+                        info.first().and_then(Json::as_str),
+                        info.get(1).and_then(Json::as_i64),
                     ) else {
                         return Err(self.failed(format_args!("the columns of {name}")));
                     };
                     if position > 0 {
-                        key.push((position, column.to_owned()));
+                        let declared = info.get(2).and_then(Json::as_str).unwrap_or("");
+                        key.push((position, column.to_owned(), declared.to_owned()));
                     }
                     columns.push(column.to_owned());
                 }
                 key.sort();
+                let declared: Vec<&str> = key
+                    .iter()
+                    .map(|(_, _, declared)| declared.as_str())
+                    .collect();
+                let self_keyed = queries::self_keyed(&declared, || {
+                    let indexed = self.query(queries::KEY_INDEXED, &[json!(name)])?;
+                    Ok(matches!(
+                        indexed.first().and_then(|row| row.first()),
+                        Some(Json::Number(n)) if n.as_i64() != Some(0)
+                    ))
+                })?;
                 Ok(Table {
                     name: name.to_owned(),
                     columns,
-                    key: key.into_iter().map(|(_, column)| column).collect(),
+                    key: key.into_iter().map(|(_, column, _)| column).collect(),
+                    self_keyed,
                 })
             })
             .collect()
@@ -273,6 +286,7 @@ mod tests {
             name: "notes".to_owned(),
             columns: vec!["id".to_owned(), "n".to_owned()],
             key: vec!["id".to_owned()],
+            self_keyed: false,
         }
     }
 

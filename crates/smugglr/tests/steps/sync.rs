@@ -135,6 +135,7 @@ fn program_syncs_adapter(world: &World) -> Result<(), String> {
         name: "notes".to_owned(),
         columns: vec!["id".to_owned(), "body".to_owned(), "created_at".to_owned()],
         key: vec!["id".to_owned()],
+        self_keyed: false,
     };
     let mut shelf = Shelf::default();
     shelf
@@ -836,5 +837,45 @@ fn a_real_dry_run_writes_nothing_and_keeps_no_memory() -> Result<(), String> {
             "the dry run kept {:?}",
             kept.iter().map(|(p, _)| p).collect::<Vec<_>>()
         ))
+    }
+}
+
+/// #507 through the real sync: in two SQLite files, a sessions table keyed
+/// INTEGER PRIMARY KEY stops with an empty rows list and its why, and is not
+/// written, while notes, keyed by text, moves.
+#[test]
+fn a_real_self_keyed_table_stops_and_the_others_move() -> Result<(), String> {
+    const SESSIONS: &str = "CREATE TABLE sessions (id INTEGER PRIMARY KEY, user TEXT)";
+    let world = World::default();
+    world.source.set(world.place(
+        "source.db",
+        &format!("{NOTES}; {THREE_NOTES}; {SESSIONS}; INSERT INTO sessions VALUES (1, 'ada')"),
+    )?);
+    world.target.set(world.place(
+        "target.db",
+        &format!("{NOTES}; {SESSIONS}; INSERT INTO sessions VALUES (1, 'grace')"),
+    )?);
+    let output = world.sync(&["--json"])?;
+    let said = String::from_utf8_lossy(&output.stdout);
+    let record: serde_json::Value = serde_json::from_str(&said)
+        .map_err(|err| format!("the record is not JSON ({err}): {said}{}", stderr(&world)))?;
+    let sessions = &record["tables"]["sessions"];
+    let why = sessions["why"].as_str().unwrap_or_default();
+    if sessions["status"] != "stopped"
+        || sessions["rows"] != serde_json::json!([])
+        || !why.contains("two places would hand out the same key")
+        || !why.contains("UUIDv7")
+    {
+        return Err(format!("sessions: {sessions}"));
+    }
+    if record["tables"]["notes"]["status"] != "moved" {
+        return Err(format!("notes did not move: {record}"));
+    }
+    let (_, target) = places(&world)?;
+    let held = rows_of(&target, "SELECT user FROM sessions")?;
+    if held == vec![vec!["Text(\"grace\")".to_owned()]] {
+        Ok(())
+    } else {
+        Err(format!("the target's sessions became {held:?}"))
     }
 }
