@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 
 use smugglr::{Options, sync};
 use smugglr_core::change::{Change, Op};
+use smugglr_core::plan::SyncMode;
+use smugglr_core::record::{Record, Table as Entry};
 use smugglr_core::row_hash::row_hash;
 use smugglr_place::{Error, Key, LocalFile, Place, Table};
 
@@ -691,10 +693,7 @@ fn a_table_limited_run_finishes_every_cut_off_table() -> Result<(), String> {
 /// Two real files synced once through `smugglr::sync`, then note n1 edited
 /// in both and, in the source, a new order; returns the record of the next
 /// run under `mode`.
-fn both_sides_edit(
-    world: &World,
-    mode: smugglr_core::plan::SyncMode,
-) -> Result<smugglr_core::record::Record, String> {
+fn both_sides_edit(world: &World, mode: SyncMode) -> Result<Record, String> {
     let source = world.place(
         "source.db",
         &format!("{NOTES}; {THREE_NOTES}; {ORDERS}; INSERT INTO orders VALUES ('o1', 'tent')"),
@@ -710,7 +709,7 @@ fn both_sides_edit(
         };
         sync(&mut open(&source)?, &mut open(&target)?, &options).map_err(|err| err.to_string())
     };
-    run(smugglr_core::plan::SyncMode::Stop)?;
+    run(SyncMode::Stop)?;
     sql_on(
         &source,
         "UPDATE notes SET body = 'source copy' WHERE id = 'n1'; \
@@ -723,21 +722,20 @@ fn both_sides_edit(
     run(mode)
 }
 
-fn body(path: &str) -> Result<Option<Vec<String>>, String> {
-    note(path, "n1")
-}
-
 /// #509 through the real sync: a stop stops only its table.
 #[test]
 fn sync_stops_only_the_table_with_a_both_sides_change() -> Result<(), String> {
-    use smugglr_core::record::Table as Entry;
     let world = World::default();
-    let record = both_sides_edit(&world, smugglr_core::plan::SyncMode::Stop)?;
+    let record = both_sides_edit(&world, SyncMode::Stop)?;
     let (source, target) = places(&world)?;
     let notes_stopped = matches!(record.tables.get("notes"), Some(Entry::Stopped { .. }));
     let orders_moved = matches!(record.tables.get("orders"), Some(Entry::Moved(_)));
     let o2 = rows_of(&target, "SELECT * FROM orders WHERE id = 'o2'")?;
-    if notes_stopped && orders_moved && !o2.is_empty() && body(&source)? != body(&target)? {
+    if notes_stopped
+        && orders_moved
+        && !o2.is_empty()
+        && note(&source, "n1")? != note(&target, "n1")?
+    {
         Ok(())
     } else {
         Err(format!("the record is {}", record.json()))
@@ -748,14 +746,13 @@ fn sync_stops_only_the_table_with_a_both_sides_change() -> Result<(), String> {
 /// into the target and names it.
 #[test]
 fn sync_mode_source_keeps_the_sources_copy() -> Result<(), String> {
-    use smugglr_core::record::Table as Entry;
     let world = World::default();
-    let record = both_sides_edit(&world, smugglr_core::plan::SyncMode::Source)?;
+    let record = both_sides_edit(&world, SyncMode::Source)?;
     let (source, target) = places(&world)?;
     let named = matches!(record.tables.get("notes"),
         Some(Entry::Moved(moves)) if moves.overwritten_in_target.len() == 1);
-    let held = body(&target)?;
-    if named && held == body(&source)? && format!("{held:?}").contains("source copy") {
+    let held = note(&target, "n1")?;
+    if named && held == note(&source, "n1")? && format!("{held:?}").contains("source copy") {
         Ok(())
     } else {
         Err(format!(
@@ -769,14 +766,13 @@ fn sync_mode_source_keeps_the_sources_copy() -> Result<(), String> {
 /// into the source and names it.
 #[test]
 fn sync_mode_target_keeps_the_targets_copy() -> Result<(), String> {
-    use smugglr_core::record::Table as Entry;
     let world = World::default();
-    let record = both_sides_edit(&world, smugglr_core::plan::SyncMode::Target)?;
+    let record = both_sides_edit(&world, SyncMode::Target)?;
     let (source, target) = places(&world)?;
     let named = matches!(record.tables.get("notes"),
         Some(Entry::Moved(moves)) if moves.overwritten_in_source.len() == 1);
-    let held = body(&source)?;
-    if named && held == body(&target)? && format!("{held:?}").contains("target copy") {
+    let held = note(&source, "n1")?;
+    if named && held == note(&target, "n1")? && format!("{held:?}").contains("target copy") {
         Ok(())
     } else {
         Err(format!(
