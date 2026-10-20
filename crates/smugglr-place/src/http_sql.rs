@@ -204,18 +204,17 @@ impl Place for HttpSql {
                     columns.push(column.to_owned());
                 }
                 key.sort();
-                // SQLite hands out the key of a rowid table whose key is one
-                // column declared exactly INTEGER: that column is the rowid.
-                let self_keyed = match key.as_slice() {
-                    [(_, _, declared)] if declared.eq_ignore_ascii_case("INTEGER") => {
-                        let indexed = self.query(queries::KEY_INDEXED, &[json!(name)])?;
-                        !matches!(
-                            indexed.first().and_then(|row| row.first()),
-                            Some(Json::Number(n)) if n.as_i64() != Some(0)
-                        )
-                    }
-                    _ => false,
-                };
+                let declared: Vec<&str> = key
+                    .iter()
+                    .map(|(_, _, declared)| declared.as_str())
+                    .collect();
+                let self_keyed = queries::self_keyed(&declared, || {
+                    let indexed = self.query(queries::KEY_INDEXED, &[json!(name)])?;
+                    Ok(matches!(
+                        indexed.first().and_then(|row| row.first()),
+                        Some(Json::Number(n)) if n.as_i64() != Some(0)
+                    ))
+                })?;
                 Ok(Table {
                     name: name.to_owned(),
                     columns,

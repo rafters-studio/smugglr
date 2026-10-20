@@ -85,14 +85,14 @@ impl LocalFile {
             columns.push(column);
         }
         key.sort();
-        // SQLite hands out the key of a rowid table whose key is one column
-        // declared exactly INTEGER: that column is the rowid.
-        let self_keyed = match key.as_slice() {
-            [(_, _, declared)] if declared.eq_ignore_ascii_case("INTEGER") => !self
-                .connection
-                .query_row(queries::KEY_INDEXED, [name], |row| row.get::<_, bool>(0))?,
-            _ => false,
-        };
+        let declared: Vec<&str> = key
+            .iter()
+            .map(|(_, _, declared)| declared.as_str())
+            .collect();
+        let self_keyed = queries::self_keyed(&declared, || {
+            self.connection
+                .query_row(queries::KEY_INDEXED, [name], |row| row.get::<_, bool>(0))
+        })?;
         Ok(Table {
             name: name.to_owned(),
             columns,

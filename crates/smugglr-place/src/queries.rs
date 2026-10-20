@@ -19,6 +19,21 @@ pub(crate) const COLUMNS: &str = "SELECT name, pk, type FROM pragma_table_info(?
 pub(crate) const KEY_INDEXED: &str =
     "SELECT EXISTS (SELECT 1 FROM pragma_index_list(?1) WHERE origin = 'pk')";
 
+/// Whether the database hands out a table's keys, from [`COLUMNS`]' declared
+/// type of each key column (in key order) and [`KEY_INDEXED`]: SQLite hands
+/// out the key of a rowid table whose key is one column declared exactly
+/// INTEGER, since that column is the rowid. `key_indexed` runs
+/// [`KEY_INDEXED`], and only for such a key.
+pub(crate) fn self_keyed<E>(
+    declared: &[&str],
+    key_indexed: impl FnOnce() -> Result<bool, E>,
+) -> Result<bool, E> {
+    match declared {
+        [declared] if declared.eq_ignore_ascii_case("INTEGER") => Ok(!key_indexed()?),
+        _ => Ok(false),
+    }
+}
+
 /// A name as a quoted SQL identifier.
 pub(crate) fn ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
