@@ -185,7 +185,7 @@ fn statement(connection: &Connection, sql: &str, params: &Json) -> Result<Json, 
 
 /// Makes the SQLite file `name` running `sql`, serves it over HTTP-SQL and
 /// returns its address; the file's path is kept as the world's service.
-fn service(world: &World, name: &str, sql: &str) -> Result<String, String> {
+pub(crate) fn service(world: &World, name: &str, sql: &str) -> Result<String, String> {
     let path = world.place(name, sql)?;
     world.service.set(path.clone());
     serve(&path)

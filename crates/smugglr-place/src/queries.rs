@@ -200,6 +200,95 @@ fn delete_where(table: &Table, at: fn(&Table, usize) -> String) -> String {
     )
 }
 
+/// What Cloudflare D1's adapter does to an HTTP-SQL statement before D1
+/// runs it, as D1's quirks need (NFR-SMUGGLR-008).
+pub(crate) mod d1 {
+    /// The most parameters D1 binds to one statement.
+    pub(crate) const MAX_PARAMS: usize = 100;
+
+    /// What a parameter is, for D1, which binds every parameter as text:
+    /// the kind the statement turns the text back into.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Kind {
+        Null,
+        Integer,
+        Real,
+        Text,
+        Blob,
+    }
+
+    /// Parameter `?n` turned back from text into its kind.
+    fn typed(kind: Kind, n: &str) -> String {
+        match kind {
+            // Always NULL, with the parameter still in the statement.
+            Kind::Null => format!("NULLIF(?{n}, ?{n})"),
+            Kind::Integer => format!("CAST(?{n} AS INTEGER)"),
+            Kind::Real => format!("CAST(?{n} AS REAL)"),
+            Kind::Text => format!("?{n}"),
+            Kind::Blob => format!("unhex(?{n})"),
+        }
+    }
+
+    /// `sql` with each numbered parameter `?n` turned back into its kind,
+    /// `kinds[n - 1]`. Text inside a `'...'` string literal or a `"..."`
+    /// identifier is left as it is, a doubled quote inside one included.
+    /// Those are the only quoting the place's own SQL uses ([`super::ident`]);
+    /// backtick and bracket identifiers and comments are not read as such.
+    pub(crate) fn typed_params(sql: &str, kinds: &[Kind]) -> String {
+        let mut out = String::with_capacity(sql.len());
+        let mut chars = sql.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\'' | '"' => {
+                    // A literal or identifier runs to its closing quote; a
+                    // doubled quote inside it is one quote, read in turn.
+                    out.push(c);
+                    for inner in chars.by_ref() {
+                        out.push(inner);
+                        if inner == c {
+                            break;
+                        }
+                    }
+                }
+                '?' => {
+                    let mut n = String::new();
+                    while let Some(&digit) = chars.peek().filter(|d| d.is_ascii_digit()) {
+                        n.push(digit);
+                        chars.next();
+                    }
+                    let kind = n
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|i| kinds.get(i.checked_sub(1)?));
+                    if let Some(&kind) = kind {
+                        out.push_str(&typed(kind, &n));
+                    } else {
+                        out.push('?');
+                        out.push_str(&n);
+                    }
+                }
+                _ => out.push(c),
+            }
+        }
+        out
+    }
+
+    /// Whether `sql` writes: D1 counts changes by connection, not by
+    /// statement, so the adapter has a write return a row for each row it
+    /// writes.
+    pub(crate) fn writes(sql: &str) -> bool {
+        let first = sql.split_whitespace().next().unwrap_or("");
+        ["INSERT", "UPDATE", "DELETE", "REPLACE"]
+            .iter()
+            .any(|verb| first.eq_ignore_ascii_case(verb))
+    }
+
+    /// A write that returns a row for each row it writes.
+    pub(crate) fn returning(sql: &str) -> String {
+        format!("{} RETURNING 1", sql.trim_end().trim_end_matches(';'))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{delete_at_quoted, ident, quoted_rows, update, update_at_quoted};
@@ -232,6 +321,61 @@ mod tests {
             "DELETE FROM \"notes\" WHERE \"id\" IS ?1 \
              AND quote(\"id\") IS ?2 AND quote(\"body\") IS ?3"
         );
+    }
+
+    #[test]
+    fn d1_turns_each_text_parameter_back_into_its_kind() {
+        use super::d1::{Kind, returning, typed_params, writes};
+        let table = Table {
+            name: "no?1tes".to_owned(),
+            columns: vec!["id".to_owned(), "n".to_owned(), "data".to_owned()],
+            types: vec![String::new(); 3],
+            key: vec!["id".to_owned()],
+            self_keyed: false,
+        };
+        let kinds = [
+            Kind::Integer,
+            Kind::Null,
+            Kind::Blob,
+            Kind::Text,
+            Kind::Text,
+            Kind::Text,
+        ];
+        let update = typed_params(&update_at_quoted(&table), &kinds);
+        assert_eq!(
+            update,
+            "UPDATE \"no?1tes\" SET \"n\" = NULLIF(?2, ?2), \"data\" = unhex(?3) \
+             WHERE \"id\" IS CAST(?1 AS INTEGER) \
+             AND quote(\"id\") IS ?4 AND quote(\"n\") IS ?5 AND quote(\"data\") IS ?6"
+        );
+        assert!(writes(&update));
+        assert_eq!(
+            returning(&super::insert(&table)),
+            "INSERT INTO \"no?1tes\" (\"id\", \"n\", \"data\") VALUES (?1, ?2, ?3) \
+             ON CONFLICT (\"id\") DO NOTHING RETURNING 1"
+        );
+        assert_eq!(
+            typed_params("SELECT '?1', ?1, ?12", &[Kind::Real]),
+            "SELECT '?1', CAST(?1 AS REAL), ?12"
+        );
+        // A doubled quote stays inside its literal or identifier.
+        assert_eq!(
+            typed_params(
+                "SELECT 'it''s ?1', \"a\"\"?2\" FROM \"t\" WHERE ?2 IS ?1",
+                &[Kind::Blob, Kind::Integer]
+            ),
+            "SELECT 'it''s ?1', \"a\"\"?2\" FROM \"t\" WHERE CAST(?2 AS INTEGER) IS unhex(?1)"
+        );
+        // An identifier made by ident() from a name holding quotes and a
+        // placeholder stays whole.
+        assert_eq!(
+            typed_params(
+                &format!("SELECT {} = ?1", super::ident("x\"?1'")),
+                &[Kind::Null]
+            ),
+            "SELECT \"x\"\"?1'\" = NULLIF(?1, ?1)"
+        );
+        assert!(!writes(super::TABLES));
     }
 
     #[test]
