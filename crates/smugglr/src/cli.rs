@@ -115,6 +115,11 @@ fn parse(args: &[String]) -> Result<Sync, String> {
                 if seconds.is_some() {
                     args.next();
                 }
+                // A zero interval would rerun with no pause, a busy loop
+                // against both places.
+                if seconds == Some(0) {
+                    return Err("--watch 0: give a number of seconds above 0".to_owned());
+                }
                 command.options.watch = Some(Duration::from_secs(seconds.unwrap_or(WATCH_SECONDS)));
             }
             flag if flag.starts_with("--") => return Err(format!("unknown flag {flag}")),

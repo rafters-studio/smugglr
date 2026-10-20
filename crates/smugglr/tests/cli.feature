@@ -1,4 +1,5 @@
 # Generated from the legion requirement. Do not hand-edit this file.
+# FR-SMUGGLR-059 rev 9 holds the --watch scenarios.
 Feature: smugglr sync on the command line
 
   @criterion-01a14bed-7cc2-7a31-be37-60b3a9434e90 @module-front-ends
@@ -48,6 +49,12 @@ Feature: smugglr sync on the command line
     Given two places
     When the agent runs smugglr sync on them with --watch and no number, and stops it after three minutes
     Then smugglr made a run about every 60 seconds
+
+  @criterion-01a15b12-a0e0-7dd3-8347-571eaf2eeb32 @module-front-ends
+  Scenario: --watch 0 is refused
+    Given two places
+    When the agent runs smugglr sync on them with --watch 0
+    Then smugglr exits with code 2 and makes no run
 
   @criterion-01a14be5-057d-7163-9138-90702b17b1dd @module-front-ends
   Scenario: the Rust crates and the CLI give the same record
