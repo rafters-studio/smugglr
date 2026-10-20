@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use smugglr::{Config, Options, sync};
 use smugglr_core::plan::SyncMode;
-use smugglr_core::record::{Record, Table};
+use smugglr_core::record::{Record, Status, Table};
 
 /// Exit status for a usage error, a config smugglr cannot read, or a place
 /// smugglr refuses.
@@ -15,6 +15,9 @@ const USAGE: u8 = 2;
 
 /// Exit status for a run that wrote something and is not done.
 const NOT_DONE: u8 = 4;
+
+/// Exit status for a run too much for the wire.
+const TOO_MUCH: u8 = 5;
 
 /// Seconds between runs under `--watch` when no number is given.
 const WATCH_SECONDS: u64 = 60;
@@ -134,7 +137,8 @@ fn sync_command(command: &Sync) -> ExitCode {
 }
 
 fn sync_once(command: &Sync) -> ExitCode {
-    // The tables to ignore come from the config, never from a flag.
+    // The tables to ignore and max_wire come from the config, never from a
+    // flag.
     let mut options = command.options.clone();
     let dir = options
         .config_dir
@@ -142,7 +146,10 @@ fn sync_once(command: &Sync) -> ExitCode {
         .or_else(smugglr_memory::config_dir);
     if let Some(dir) = dir {
         match Config::load(&dir) {
-            Ok(config) => options.ignore = config.ignore,
+            Ok(config) => {
+                options.ignore = config.ignore;
+                options.max_wire = config.max_wire;
+            }
             Err(err) => {
                 eprintln!("{err}");
                 return ExitCode::from(USAGE);
@@ -175,9 +182,13 @@ fn sync_once(command: &Sync) -> ExitCode {
 }
 
 /// What the run did, as an exit status: 4 when rows it wrote read back
-/// different (#511), and 1, as before the record carried it, when the
-/// places' shapes differ. The rest of FR-SMUGGLR-060's table is #514's.
+/// different (#511), 5 when a first sync is too much for the wire (#508),
+/// and 1, as before the record carried it, when the places' shapes differ.
+/// The rest of FR-SMUGGLR-060's table is #514's.
 fn exit(record: &Record) -> ExitCode {
+    if record.status == Status::TooMuch {
+        return ExitCode::from(TOO_MUCH);
+    }
     if record.shape.is_some() {
         return ExitCode::FAILURE;
     }

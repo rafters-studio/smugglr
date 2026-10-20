@@ -880,3 +880,155 @@ fn a_real_self_keyed_table_stops_and_the_others_move() -> Result<(), String> {
         Err(format!("the target's sessions became {held:?}"))
     }
 }
+
+/// Two places never synced with each other: three notes only in the source,
+/// one only in the target.
+fn never_synced(world: &World) -> Result<(), String> {
+    world
+        .source
+        .set(world.place("source.db", &format!("{NOTES}; {THREE_NOTES}"))?);
+    world.target.set(world.place(
+        "target.db",
+        &format!("{NOTES}; INSERT INTO notes VALUES ('t1', 'only here', 4)"),
+    )?);
+    Ok(())
+}
+
+#[given("two places never synced with each other")]
+fn two_never_synced(world: &World) -> Result<(), String> {
+    never_synced(world)
+}
+
+#[given("two places never synced with each other, and a row only in the target")]
+fn only_in_target(world: &World) -> Result<(), String> {
+    never_synced(world)?;
+    world.watched.set("t1".to_owned());
+    Ok(())
+}
+
+#[when("the agent runs smugglr sync on them with --dryrun")]
+fn sync_dryrun(world: &World) -> Result<(), String> {
+    world.sync(&["--dryrun"]).map(|_| ())
+}
+
+/// The record smugglr printed with `--json`.
+fn record(world: &World) -> Result<serde_json::Value, String> {
+    let output = world.output.get().ok_or("smugglr was not run")?;
+    let said = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(&said)
+        .map_err(|err| format!("the record is not JSON ({err}): {said}{}", stderr(world)))
+}
+
+#[then("the record says first_sync true")]
+fn says_first_sync(world: &World) -> Result<(), String> {
+    let record = record(world)?;
+    match record.get("first_sync") {
+        Some(serde_json::Value::Bool(true)) => Ok(()),
+        _ => Err(format!("the record says {record}")),
+    }
+}
+
+#[then("the record says deletes_seen false")]
+fn says_no_deletes_seen(world: &World) -> Result<(), String> {
+    let record = record(world)?;
+    match record.get("deletes_seen") {
+        Some(serde_json::Value::Bool(false)) => Ok(()),
+        _ => Err(format!("the record says {record}")),
+    }
+}
+
+/// The `max_wire` setting of the scenarios that are too much: fewer bytes
+/// than the rows of [`never_synced`] weigh.
+const SMALL_MAX_WIRE: u64 = 20;
+
+#[given("two places never synced with each other, holding more than the max_wire setting allows")]
+fn over_max_wire(world: &World) -> Result<(), String> {
+    never_synced(world)?;
+    let config = world.config()?;
+    std::fs::create_dir_all(&config).map_err(|err| format!("{}: {err}", config.display()))?;
+    let file = config.join("config.toml");
+    std::fs::write(&file, format!("max_wire = {SMALL_MAX_WIRE}\n"))
+        .map_err(|err| format!("{}: {err}", file.display()))?;
+    let (rows, bytes, _) = expected_weight(world)?;
+    if bytes <= SMALL_MAX_WIRE {
+        return Err(format!("the places hold only {rows} rows of {bytes} bytes"));
+    }
+    // The shape steps' "neither place has changed" compares this snapshot.
+    world.watched.set(crate::shape::snapshot(world)?);
+    Ok(())
+}
+
+#[then("the output tells the agent to move it with smugglr stash and then smugglr retrieve")]
+fn says_stash_then_retrieve(world: &World) -> Result<(), String> {
+    let output = world.output.get().ok_or("smugglr was not run")?;
+    let said = String::from_utf8_lossy(&output.stdout);
+    match (said.find("smugglr stash"), said.find("smugglr retrieve")) {
+        (Some(stash), Some(retrieve)) if stash < retrieve => Ok(()),
+        _ => Err(format!("smugglr printed {said:?}{}", stderr(world))),
+    }
+}
+
+/// The rows, bytes and tables a first sync of [`never_synced`]'s places
+/// moves, found here from the files: every notes row is on one side only,
+/// so each is copied, and a row's bytes are its columns' `quote()` text.
+fn expected_weight(world: &World) -> Result<(u64, u64, u64), String> {
+    let (source, target) = places(world)?;
+    let mut rows = 0;
+    let mut bytes = 0;
+    for path in [source, target] {
+        for row in quoted_notes(&path)? {
+            rows += 1;
+            bytes += row.iter().map(|column| column.len() as u64).sum::<u64>();
+        }
+    }
+    Ok((rows, bytes, 1))
+}
+
+#[then("the output gives the rows, bytes and tables the first sync would move")]
+fn gives_weight(world: &World) -> Result<(), String> {
+    let output = world.output.get().ok_or("smugglr was not run")?;
+    let said = String::from_utf8_lossy(&output.stdout);
+    let (rows, bytes, tables) = expected_weight(world)?;
+    let want = format!("weight: {rows} rows, {bytes} B in {tables} table");
+    let found = said.lines().any(|line| line.trim() == want);
+    if output.status.success() && found {
+        Ok(())
+    } else {
+        Err(format!(
+            "wanted {want:?}; smugglr printed {said:?}{}",
+            stderr(world)
+        ))
+    }
+}
+
+#[given(
+    "no max_wire setting, and two places never synced with each other whose rows weigh more than 100 MB"
+)]
+fn over_default(world: &World) -> Result<(), String> {
+    // 110 rows of one million characters of text each: 110 MB stored, and
+    // more than 100 MB however a megabyte is counted.
+    let source = world.place(
+        "source.db",
+        &format!(
+            "{NOTES}; WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 110) \
+             INSERT INTO notes SELECT 'big-' || i, hex(zeroblob(500000)), i FROM n"
+        ),
+    )?;
+    let target = world.place("target.db", NOTES)?;
+    let config = world.config()?.join("config.toml");
+    if config.exists() {
+        return Err(format!("{} sets max_wire", config.display()));
+    }
+    world.source.set(source);
+    world.target.set(target);
+    Ok(())
+}
+
+#[then("smugglr exits 5")]
+fn exits_5(world: &World) -> Result<(), String> {
+    let output = world.output.get().ok_or("smugglr was not run")?;
+    match output.status.code() {
+        Some(5) => Ok(()),
+        code => Err(format!("smugglr exited {code:?}{}", stderr(world))),
+    }
+}

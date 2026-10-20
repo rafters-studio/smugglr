@@ -144,11 +144,14 @@ fn sync_two_tables(world: &World) -> Result<(), String> {
 fn lists_two_tables(world: &World) -> Result<(), String> {
     let output = world.output.get().ok_or("smugglr was not run")?;
     let said = String::from_utf8_lossy(&output.stdout);
-    // The record as text names each table at the start of its line.
+    // The record as text names each table at the start of its line, after
+    // the run's own lines.
+    let run = ["first sync", "weight", "ignored", "shape"];
     let tables: Vec<&str> = said
         .lines()
         .filter(|line| line.starts_with("  ") && !line.starts_with("   "))
         .filter_map(|line| line.trim_start().split(':').next())
+        .filter(|name| !run.contains(name))
         .collect();
     if tables == ["notes", "orders"] {
         Ok(())

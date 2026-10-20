@@ -64,6 +64,8 @@ pub fn config_dir() -> Option<PathBuf> {
 pub struct Memory {
     folder: PathBuf,
     tables: BTreeMap<String, Hashes>,
+    /// A run of this pair that wrote saved memory, even of empty tables.
+    synced: bool,
 }
 
 impl Memory {
@@ -76,9 +78,9 @@ impl Memory {
         let (first, second) = if a <= b { (a, b) } else { (b, a) };
         let folder = config.join(hex(&row_hash(&[first, second])));
         let path = folder.join(LAST);
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
+        let (text, synced) = match fs::read_to_string(&path) {
+            Ok(text) => (text, true),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => (String::new(), false),
             Err(source) => return Err(Error::Io { path, source }),
         };
         let mut tables: BTreeMap<String, Hashes> = BTreeMap::new();
@@ -99,7 +101,18 @@ impl Memory {
                 .ok_or_else(unreadable)?;
             tables.entry(table).or_default().insert(key, hash);
         }
-        Ok(Self { folder, tables })
+        Ok(Self {
+            folder,
+            tables,
+            synced,
+        })
+    }
+
+    /// Whether the pair has no memory yet: no run of it was ever saved. A
+    /// dry run saves none, so the run after it is still a first sync.
+    #[must_use]
+    pub fn first_sync(&self) -> bool {
+        !self.synced
     }
 
     /// Each key's last hash in `table`; empty when memory holds none.

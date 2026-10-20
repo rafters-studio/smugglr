@@ -30,13 +30,21 @@ fn extra_column(world: &World, notes_rows: &str) -> Result<(), String> {
     )
 }
 
-/// Every table, index and row of each place.
-fn snapshot(world: &World) -> Result<String, String> {
+/// Every table, index and row of each place, with its `user_version` and
+/// `application_id`; the rows of notes and orders where the place has them.
+pub(crate) fn snapshot(world: &World) -> Result<String, String> {
     let mut all = Vec::new();
     for place in [world.source.get(), world.target.get()] {
         let path = place.ok_or("no place named")?;
         all.push(rows_of(&path, "SELECT * FROM sqlite_schema ORDER BY name")?);
+        all.push(rows_of(&path, "PRAGMA user_version")?);
+        all.push(rows_of(&path, "PRAGMA application_id")?);
         for table in ["notes", "orders"] {
+            let held =
+                format!("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = '{table}'");
+            if rows_of(&path, &held)?.is_empty() {
+                continue;
+            }
             all.push(rows_of(
                 &path,
                 &format!("SELECT * FROM {table} ORDER BY id"),
@@ -120,7 +128,15 @@ fn run_stopped(world: &World) -> Result<(), String> {
 
 #[then("neither place has changed")]
 fn nothing_changed(world: &World) -> Result<(), String> {
-    world.output.get().ok_or("smugglr was not run")?;
+    // The run reached the places and said what it did, so nothing changing
+    // is its doing, not a failure to start.
+    let output = world.output.get().ok_or("smugglr was not run")?;
+    if !String::from_utf8_lossy(&output.stdout).starts_with("smugglr sync:") {
+        return Err(format!(
+            "smugglr printed no record, saying {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
     let before = world.watched.get().ok_or("no snapshot taken")?;
     let after = snapshot(world)?;
     if before == after {
