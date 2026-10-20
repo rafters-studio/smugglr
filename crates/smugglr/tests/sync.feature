@@ -150,3 +150,9 @@ Feature: one sync between two places, with places and memory as they are
     Given two places where the source has rows the target lacks
     When a program syncs them through the Rust crates with dryrun set
     Then the call returns a record whose run status is preview
+
+  @criterion-01a14bed-4d5a-7dc2-b311-edda0371ac87 @module-smugglr-core
+  Scenario: an exit-4 record names what was written
+    Given a target that drops its connection after the run has written some rows
+    When the agent runs smugglr sync --json on the source and that target
+    Then the record names the tables and keys of the rows written before the connection dropped

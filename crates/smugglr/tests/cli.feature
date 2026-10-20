@@ -78,3 +78,27 @@ Feature: smugglr sync on the command line
     Given two places whose orders and line_items tables have no steering column named in the config
     When the agent runs smugglr sync on them with --sync-mode last
     Then one error names both orders and line_items
+
+  @criterion-01a14bed-4d5a-7dc2-b311-ed9c254c9fdc @module-front-ends
+  Scenario: done exits 0
+    Given two places where the source has rows the target lacks
+    When the agent runs smugglr sync on them
+    Then smugglr exits 0
+
+  @criterion-01a14bed-4d5a-7dc2-b311-edbc7bdb0839 @module-front-ends
+  Scenario: stopped before writing exits 3
+    Given two places whose only differences are rows changed in both places since the last sync
+    When the agent runs smugglr sync on them
+    Then smugglr exits 3
+
+  @criterion-01a14bed-4d5a-7dc2-b311-edcac086a5bd @module-front-ends
+  Scenario: wrote then stopped exits 4
+    Given a target that drops its connection after the run has written some rows
+    When the agent runs smugglr sync on the source and that target
+    Then smugglr exits 4
+
+  @criterion-01a14c16-4bdd-7001-b4c6-73e037b2bdfe @module-front-ends
+  Scenario: stopped in part exits 4
+    Given two places where orders has rows to move and notes has a row changed in both places since the last sync
+    When the agent runs smugglr sync on them
+    Then smugglr exits 4
