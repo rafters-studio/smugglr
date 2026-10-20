@@ -56,15 +56,18 @@ pub(crate) fn row(table: &Table) -> String {
 }
 
 /// Inserts one row only where its key holds none (a change whose `from` is
-/// no row); every column a parameter in column order.
+/// no row); every column a parameter in column order. Only a conflict on
+/// the key is passed over; any other constraint fails the write.
 pub(crate) fn insert(table: &Table) -> String {
     let columns: Vec<String> = table.columns.iter().map(|c| ident(c)).collect();
     let params: Vec<String> = (1..=columns.len()).map(|i| format!("?{i}")).collect();
+    let key: Vec<String> = table.key.iter().map(|c| ident(c)).collect();
     format!(
-        "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT DO NOTHING",
+        "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT ({}) DO NOTHING",
         ident(&table.name),
         columns.join(", "),
-        params.join(", ")
+        params.join(", "),
+        key.join(", ")
     )
 }
 

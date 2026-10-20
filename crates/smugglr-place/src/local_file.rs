@@ -261,6 +261,40 @@ mod tests {
     }
 
     #[test]
+    fn a_new_row_breaking_another_unique_column_fails_the_write() -> Result<(), Error> {
+        let path = file("unique")?;
+        rusqlite::Connection::open(&path)
+            .and_then(|c| {
+                c.execute_batch("CREATE UNIQUE INDEX t_n ON t (n); INSERT INTO t VALUES ('a', 1)")
+            })
+            .map_err(|source| Error::Sqlite {
+                address: path.display().to_string(),
+                source,
+            })?;
+        let mut place = LocalFile::open(&path)?;
+        let table = place
+            .tables()?
+            .into_iter()
+            .next()
+            .ok_or(Error::Adapter("no table".to_owned()))?;
+        let row = ["'b'", "1"];
+        let new = Change {
+            op: Op::Up,
+            table: "t".to_owned(),
+            key: vec!["'b'".to_owned()],
+            from: None,
+            to: Some(row_hash(&row)),
+            values: row.iter().map(|&c| c.to_owned()).collect(),
+        };
+        // Only a row already at the key is a change that waits; any other
+        // conflict is an error, never a row silently left out.
+        let failed = place.write(&table, &[new]).is_err();
+        let _ = std::fs::remove_file(&path);
+        assert!(failed, "the write of a row breaking t_n did not fail");
+        Ok(())
+    }
+
+    #[test]
     fn a_row_no_longer_at_from_is_not_written() -> Result<(), Error> {
         let path = file("moved-on")?;
         let mut place = LocalFile::open(&path)?;
