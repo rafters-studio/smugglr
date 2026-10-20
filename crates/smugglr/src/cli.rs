@@ -7,14 +7,17 @@ use std::time::{Duration, Instant};
 
 use smugglr::{Config, Options, SyncType, sync};
 use smugglr_core::plan::SyncMode;
-use smugglr_core::record::{Record, Status, Table};
+use smugglr_core::record::{Record, Status};
 
 /// Exit status for a usage error, a config smugglr cannot read, or a place
 /// smugglr refuses.
 const USAGE: u8 = 2;
 
+/// Exit status for a run that stopped before writing anything.
+const STOPPED: u8 = 3;
+
 /// Exit status for a run that wrote something and is not done.
-const NOT_DONE: u8 = 4;
+pub(crate) const NOT_DONE: u8 = 4;
 
 /// Exit status for a run too much for the wire.
 const TOO_MUCH: u8 = 5;
@@ -169,11 +172,7 @@ fn sync_once(command: &Sync) -> ExitCode {
     };
     match sync(source.as_mut(), target.as_mut(), &options) {
         Ok(record) => {
-            if command.json {
-                println!("{}", record.json());
-            } else {
-                print!("{record}");
-            }
+            print_record(&record, command.json);
             exit(&record)
         }
         // A usage error: the one message, without the usage after it.
@@ -181,30 +180,36 @@ fn sync_once(command: &Sync) -> ExitCode {
             eprintln!("{err}");
             ExitCode::from(USAGE)
         }
+        Err(smugglr::Error::CutOff { record, cause }) => {
+            print_record(&record, command.json);
+            eprintln!("{cause}");
+            ExitCode::from(NOT_DONE)
+        }
+        // Every other error comes before a row is journaled or written.
         Err(err) => {
             eprintln!("{err}");
-            ExitCode::FAILURE
+            ExitCode::from(STOPPED)
         }
     }
 }
 
-/// What the run did, as an exit status: 4 when rows it wrote read back
-/// different (#511), 5 when a first sync is too much for the wire (#508),
-/// and 1, as before the record carried it, when the places' shapes differ.
-/// The rest of FR-SMUGGLR-060's table is #514's.
-fn exit(record: &Record) -> ExitCode {
-    if record.status == Status::TooMuch {
-        return ExitCode::from(TOO_MUCH);
-    }
-    if record.shape.is_some() {
-        return ExitCode::FAILURE;
-    }
-    let unmatched = record.tables.values().any(
-        |table| matches!(table, Table::Stopped { not_read_back, .. } if !not_read_back.is_empty()),
-    );
-    if unmatched {
-        ExitCode::from(NOT_DONE)
+fn print_record(record: &Record, json: bool) {
+    if json {
+        println!("{}", record.json());
     } else {
-        ExitCode::SUCCESS
+        print!("{record}");
+    }
+}
+
+/// What the run did, as an exit status (FR-SMUGGLR-060): 0 done (or a
+/// preview), 3 stopped before writing anything, 4 wrote something and is not
+/// done, 5 too much for the wire. A shape mismatch stops before any row is
+/// read, so it is 3.
+fn exit(record: &Record) -> ExitCode {
+    match record.status {
+        Status::Done | Status::Preview => ExitCode::SUCCESS,
+        Status::TooMuch => ExitCode::from(TOO_MUCH),
+        Status::Stopped | Status::StoppedInPart if record.wrote() => ExitCode::from(NOT_DONE),
+        Status::Stopped | Status::StoppedInPart => ExitCode::from(STOPPED),
     }
 }

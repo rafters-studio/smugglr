@@ -519,8 +519,12 @@ fn cut_run(world: &World, table: &'static str, after: bool) -> Result<(), String
         table,
         after,
     };
+    // Cut once a journal line is written, the Cut place's error comes back
+    // inside the record-carrying error.
+    let cut = |err: &smugglr::Error| matches!(err, smugglr::Error::Place(Error::Adapter(message)) if message == CUT_OFF);
     match sync(&mut source, &mut target, &options(world)?) {
-        Err(smugglr::Error::Place(Error::Adapter(message))) if message == CUT_OFF => Ok(()),
+        Err(smugglr::Error::CutOff { cause, .. }) if cut(&cause) => Ok(()),
+        Err(err) if cut(&err) => Ok(()),
         Err(err) => Err(format!("the run ended before the cut: {err}")),
         Ok(record) => Err(format!("the run was not cut off: {}", record.json())),
     }
@@ -716,6 +720,12 @@ fn open(path: &str) -> Result<LocalFile, String> {
 /// Two real files synced once through `smugglr::sync`, then note n1 edited
 /// in both and, in the source, a new order.
 fn edited_in_both(world: &World) -> Result<(), String> {
+    edited_in_both_with(world, "INSERT INTO orders VALUES ('o2', 'stove')")
+}
+
+/// Two real files synced once through `smugglr::sync`, then note n1 edited
+/// in both, and `source_sql` run on the source.
+fn edited_in_both_with(world: &World, source_sql: &str) -> Result<(), String> {
     let source = world.place(
         "source.db",
         &format!("{NOTES}; {THREE_NOTES}; {ORDERS}; INSERT INTO orders VALUES ('o1', 'tent')"),
@@ -727,8 +737,7 @@ fn edited_in_both(world: &World) -> Result<(), String> {
         .map_err(|err| err.to_string())?;
     sql_on(
         &source,
-        "UPDATE notes SET body = 'source copy' WHERE id = 'n1'; \
-                     INSERT INTO orders VALUES ('o2', 'stove')",
+        &format!("UPDATE notes SET body = 'source copy' WHERE id = 'n1'; {source_sql}"),
     )?;
     sql_on(
         &target,
@@ -1181,6 +1190,18 @@ fn rows_to_move_without_steering(world: &World) -> Result<(), String> {
     // The shape steps' "neither place has changed" compares this snapshot.
     world.watched.set(crate::shape::snapshot(world)?);
     Ok(())
+}
+
+#[given(
+    "two places where orders has rows to move and notes has a row changed in both places since the last sync"
+)]
+fn orders_move_notes_stop(world: &World) -> Result<(), String> {
+    edited_in_both(world)
+}
+
+#[given("two places whose only differences are rows changed in both places since the last sync")]
+fn only_changed_in_both(world: &World) -> Result<(), String> {
+    edited_in_both_with(world, "")
 }
 
 #[given("two places with a row changed in both since the last sync")]

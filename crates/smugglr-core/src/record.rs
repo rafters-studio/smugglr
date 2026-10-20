@@ -163,6 +163,17 @@ impl Record {
         }
     }
 
+    /// Whether the run wrote any row: a table moved, or rows read back
+    /// different.
+    #[must_use]
+    pub fn wrote(&self) -> bool {
+        self.tables.values().any(|table| match table {
+            Table::Moved(_) => true,
+            Table::Stopped { not_read_back, .. } => !not_read_back.is_empty(),
+            Table::InStep | Table::WouldMove(_) => false,
+        })
+    }
+
     /// The record as JSON.
     #[must_use]
     pub fn json(&self) -> String {
@@ -290,6 +301,22 @@ pub fn not_read_back(keys: Vec<Vec<String>>) -> Table {
         rows: Vec::new(),
         not_read_back: keys.into_iter().map(Key).collect(),
         why: NOT_READ_BACK.to_owned(),
+    }
+}
+
+/// The record of the table a run was writing when a place stopped
+/// answering, on `cause`: stopped, naming the rows it wrote by key. Rows are
+/// idempotent, so running again finishes it.
+#[must_use]
+pub fn lost(rows: Vec<Vec<String>>, cause: &str) -> Table {
+    Table::Stopped {
+        rows: rows.into_iter().map(Key).collect(),
+        not_read_back: Vec::new(),
+        why: format!(
+            "smugglr wrote these rows and then stopped: {cause}. The run is not done. Rows \
+             are idempotent: run smugglr sync again once both places answer, and it \
+             finishes what this run began."
+        ),
     }
 }
 

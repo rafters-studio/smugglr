@@ -82,6 +82,18 @@ pub enum Error {
     /// named; the run stops before any row is read or written.
     #[error("{}", needs_steering(.0))]
     NoSteering(Vec<String>),
+    /// The run began writing and then could not go on: `cause` says why.
+    /// `record` is the run's record: the tables it finished, and the table
+    /// it was writing stopped, naming the rows it wrote. It is not done;
+    /// memory and the journal are left as they are, and rows are
+    /// idempotent, so the next run finishes it.
+    #[error("{cause}")]
+    CutOff {
+        /// What the run did before it stopped.
+        record: Box<Record>,
+        /// Why it could not go on.
+        cause: Box<Error>,
+    },
 }
 
 /// Syncs `source` and `target` once, and returns the record of what it did:
@@ -95,7 +107,9 @@ pub enum Error {
 /// When a place cannot be reached, read or written, or memory cannot be
 /// kept; and before any row is read, when the run is named wrong (a table no
 /// place has, a table without a primary key, or `--sync-mode last` without a
-/// steering column).
+/// steering column). Once a journal line is written, a failure is
+/// [`Error::CutOff`], carrying the run's record: the table being written
+/// stopped, naming the rows it wrote.
 pub fn sync(
     source: &mut dyn Place,
     target: &mut dyn Place,
@@ -143,7 +157,6 @@ pub fn sync(
         .collect();
     finish_cut_off_run(&mut memory, &common, source, target, options.dryrun)?;
     let mut done = BTreeMap::new();
-    let mut unmatched = false;
     let plans = plan_tables(
         tables,
         &theirs,
@@ -166,8 +179,89 @@ pub fn sync(
         let why = too_much(&weight, source.address(), target.address());
         return Ok(Record::too_much(weight, why, ignored));
     }
+    let mut wrote = Wrote::default();
+    let unmatched = match write_all(
+        plans,
+        &mut *source,
+        &mut *target,
+        &mut memory,
+        options.dryrun,
+        &mut done,
+        &mut wrote,
+    ) {
+        Ok(unmatched) => unmatched,
+        // Once a journal line is written a row may have been: the table
+        // being written stops, naming the rows it wrote.
+        Err(cause) if wrote.journaled => {
+            if let Some(name) = wrote.writing.take() {
+                done.insert(name, record::lost(wrote.keys, &cause.to_string()));
+            }
+            let record = Record::new(done, ignored, false, weight);
+            return Err(cut_off(record, cause));
+        }
+        Err(cause) => return Err(cause),
+    };
+    let record = Record::new(done, ignored, options.dryrun, weight);
+    if !options.dryrun {
+        let kept = memory.save().and_then(|()| {
+            // Kept after a run whose rows read back different (exit 4), so
+            // the next run finishes it; any other run's memory already holds
+            // what it wrote.
+            if unmatched {
+                Ok(())
+            } else {
+                memory.clear_journal()
+            }
+        });
+        if let Err(err) = kept {
+            return Err(if record.wrote() {
+                cut_off(record, err.into())
+            } else {
+                err.into()
+            });
+        }
+    }
+    Ok(record)
+}
+
+/// The error for a run that wrote rows and then stopped on `cause`,
+/// carrying its `record`.
+fn cut_off(record: Record, cause: Error) -> Error {
+    Error::CutOff {
+        record: Box::new(record),
+        cause: Box::new(cause),
+    }
+}
+
+/// What a run has written so far, kept as it goes so a run that cannot go
+/// on can say what it wrote.
+#[derive(Debug, Default)]
+struct Wrote {
+    /// A journal line was written: from here on a row may have been
+    /// written, even when no write has answered yet.
+    journaled: bool,
+    /// The table being written.
+    writing: Option<String>,
+    /// The keys of the rows the places answered as written in that table.
+    keys: Vec<Vec<String>>,
+}
+
+/// Writes each table's planned moves, table by table, recording each in
+/// `done` and noting in `wrote` what is written as it goes. Memory is set
+/// for each table that read back whole, not saved. Returns whether any
+/// table's rows read back different.
+fn write_all(
+    plans: Vec<(Table, Hashes, Plan)>,
+    source: &mut dyn Place,
+    target: &mut dyn Place,
+    memory: &mut Memory,
+    dryrun: bool,
+    done: &mut BTreeMap<String, record::Table>,
+    wrote: &mut Wrote,
+) -> Result<bool, Error> {
+    let mut unmatched = false;
     for (table, last, planned) in plans {
-        done.insert(table.name.clone(), record::table(&planned, options.dryrun));
+        done.insert(table.name.clone(), record::table(&planned, dryrun));
         let Plan::Move {
             writes,
             memory: mut next,
@@ -175,24 +269,28 @@ pub fn sync(
         else {
             continue;
         };
-        if options.dryrun {
+        if dryrun {
             continue;
         }
+        wrote.writing = Some(table.name.clone());
+        wrote.keys.clear();
         let (mismatched, written) = carry_both(
             &table,
             &mut *source,
             &mut *target,
             writes,
-            &memory,
+            memory,
             &last,
             &mut next,
+            wrote,
         )?;
+        wrote.writing = None;
         // The record counts only the rows written.
-        let wrote = Plan::Move {
+        let moved = Plan::Move {
             writes: written,
             memory: next.clone(),
         };
-        done.insert(table.name.clone(), record::table(&wrote, false));
+        done.insert(table.name.clone(), record::table(&moved, false));
         if !mismatched.is_empty() {
             // Not done: the table keeps its old memory.
             unmatched = true;
@@ -201,17 +299,7 @@ pub fn sync(
         }
         memory.set_table(&table.name, next);
     }
-    let record = Record::new(done, ignored, options.dryrun, weight);
-    if !options.dryrun {
-        memory.save()?;
-        // Kept after a run whose rows read back different (exit 4), so
-        // the next run finishes it; any other run's memory already holds
-        // what it wrote.
-        if !unmatched {
-            memory.clear_journal()?;
-        }
-    }
-    Ok(record)
+    Ok(unmatched)
 }
 
 /// Under `--sync-mode last`, fails naming every table the run would plan
@@ -443,6 +531,7 @@ fn read_hashes(
 /// Carries `writes` each way: those for the target from the source, then
 /// those for the source from the target. Returns the keys of rows that read
 /// back different, and the writes that were made.
+#[allow(clippy::too_many_arguments)]
 fn carry_both(
     table: &Table,
     source: &mut dyn Place,
@@ -451,13 +540,17 @@ fn carry_both(
     journal: &Memory,
     last: &Hashes,
     memory: &mut Hashes,
+    wrote: &mut Wrote,
 ) -> Result<(Vec<Vec<String>>, Vec<Write>), Error> {
     let (to_target, to_source): (Vec<Write>, Vec<Write>) = writes
         .into_iter()
         .partition(|write| write.side == Side::Target);
-    let (mut mismatched, mut written) =
-        carry(table, source, target, &to_target, journal, last, memory)?;
-    let (more, also) = carry(table, target, source, &to_source, journal, last, memory)?;
+    let (mut mismatched, mut written) = carry(
+        table, source, target, &to_target, journal, last, memory, wrote,
+    )?;
+    let (more, also) = carry(
+        table, target, source, &to_source, journal, last, memory, wrote,
+    )?;
     mismatched.extend(more);
     written.extend(also);
     Ok((mismatched, written))
@@ -465,7 +558,9 @@ fn carry_both(
 
 /// Journals and writes `writes` in `to`, with `from`'s copy of each row,
 /// reads back the rows written and returns the keys of those that do not
-/// match what was written, and the writes that were made.
+/// match what was written, and the writes that were made. Each write the
+/// place answers as made is noted in `wrote` before the rows are read back.
+#[allow(clippy::too_many_arguments)]
 fn carry(
     table: &Table,
     from: &mut dyn Place,
@@ -474,6 +569,7 @@ fn carry(
     journal: &Memory,
     last: &Hashes,
     memory: &mut Hashes,
+    wrote: &mut Wrote,
 ) -> Result<(Vec<Vec<String>>, Vec<Write>), Error> {
     let changes = changes(table, from, writes)?;
     let journaled: Vec<Write> = writes
@@ -483,12 +579,15 @@ fn carry(
         .collect();
     // The journal line goes to disk before the row does.
     journal.journal(&table.name, &journaled)?;
-    let wrote = to.write(table, &changes)?;
+    if !journaled.is_empty() {
+        wrote.journaled = true;
+    }
+    let made = to.write(table, &changes)?;
     // A row not written (gone from `from`, or no longer at the change's
     // `from` in `to`) keeps its last hash, so the next run decides it from
     // fresh reads.
     for write in writes {
-        if !wrote.contains(&write.key) {
+        if !made.contains(&write.key) {
             match last.get(&write.key) {
                 Some(&hash) => memory.insert(write.key.clone(), hash),
                 None => memory.remove(&write.key),
@@ -497,9 +596,12 @@ fn carry(
     }
     let written: Vec<Write> = journaled
         .into_iter()
-        .filter(|write| wrote.contains(&write.key))
+        .filter(|write| made.contains(&write.key))
         .collect();
-    let read_back = read_hashes(table, to, &wrote)?;
+    wrote
+        .keys
+        .extend(written.iter().map(|write| write.key.clone()));
+    let read_back = read_hashes(table, to, &made)?;
     Ok((not_read_back(&written, &read_back), written))
 }
 

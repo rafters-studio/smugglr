@@ -450,3 +450,28 @@ fn one_error_names_both(world: &World) -> Result<(), String> {
         )),
     }
 }
+
+/// Fails unless the last smugglr run exited `want`, naming what it printed.
+fn exits(world: &World, want: i32) -> Result<(), String> {
+    let output = world.output.get().ok_or("smugglr was not run")?;
+    if output.status.code() == Some(want) {
+        Ok(())
+    } else {
+        Err(format!(
+            "smugglr exited {:?}, printing {:?} and saying {:?}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+}
+
+#[then("smugglr exits 0")]
+fn exits_0(world: &World) -> Result<(), String> {
+    exits(world, 0)
+}
+
+#[then("smugglr exits 3")]
+fn exits_3(world: &World) -> Result<(), String> {
+    exits(world, 3)
+}
