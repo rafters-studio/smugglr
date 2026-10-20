@@ -34,6 +34,9 @@ pub(crate) struct World {
     pub(crate) lines: Slot<Vec<(f64, String)>>,
     /// What a program's call to `smugglr::sync` returned.
     pub(crate) called: Slot<Result<smugglr_core::record::Record, smugglr::Error>>,
+    /// The variables smugglr runs with, beside `XDG_CONFIG_HOME`: a hosted
+    /// place's credentials and where its API stands in.
+    pub(crate) env: Slot<Vec<(String, String)>>,
 }
 
 #[fixture]
@@ -93,6 +96,7 @@ impl World {
         let output = Command::new(env!("CARGO_BIN_EXE_smugglr"))
             .args(args)
             .env("XDG_CONFIG_HOME", self.xdg()?)
+            .envs(self.env.get().unwrap_or_default())
             .output()
             .map_err(|err| format!("failed to start smugglr: {err}"))?;
         self.output.set(output.clone());

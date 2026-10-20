@@ -180,3 +180,15 @@ Feature: one sync between two places, with places and memory as they are
     Given two local files with no steering column, keyed in order, whose writers' clocks agree
     When the agent runs smugglr sync on them 200 times, with inserts, edits and deletes on both sides between runs, and rows committed into the source while each run reads
     Then against the reference, 0 rows are lost, 0 deletes undone and 0 edits lost
+
+  @criterion-01a14c16-75a2-7872-bdde-c1c59e3b8d67 @module-places @hosted
+  Scenario: an adapter matches HTTP-SQL
+    Given the same table held in a hosted SQLite service reached through its adapter and in an HTTP-SQL service, each beside an identical local file
+    When the agent syncs each pair with smugglr sync --json
+    Then the two records hold the same statuses, counts and keys, and the two services' rows hash the same
+
+  @criterion-01a15879-7109-72e0-ad34-19e0cdd7b4bf @module-places
+  Scenario: D1's own tables are ignored
+    Given a local file and a D1 database that holds a _cf_KV table, with no ignore list in the config
+    When the agent runs smugglr sync on them with --json
+    Then the record lists _cf_KV once among the ignored tables and the run does not stop on it

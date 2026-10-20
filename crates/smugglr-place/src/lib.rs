@@ -12,6 +12,7 @@
 //! Rows travel as SQLite's `quote()` text of each column, so every value,
 //! integers beyond 2^53 included, is read without loss.
 
+pub mod d1;
 pub mod http_sql;
 pub mod local_file;
 mod queries;
@@ -19,7 +20,8 @@ mod value;
 
 use smugglr_core::change::Change;
 
-pub use http_sql::HttpSql;
+pub use d1::D1;
+pub use http_sql::{HttpSql, Transport};
 pub use local_file::LocalFile;
 
 /// What a place says when it cannot do what was asked.
@@ -31,6 +33,14 @@ pub enum Error {
     /// The address names a kind of place smugglr cannot reach.
     #[error("smugglr cannot reach {0}:// places")]
     Unreachable(String),
+    /// A hosted place needs a variable that is not set.
+    #[error("{address} needs {var}, and it is not set")]
+    Missing {
+        /// The place's address.
+        address: String,
+        /// The variable.
+        var: &'static str,
+    },
     /// A value is not SQLite `quote()` text.
     #[error("{0:?} is not SQLite quote() text")]
     Value(String),
@@ -79,7 +89,16 @@ pub trait Place {
     /// The place's address, the same every run.
     fn address(&self) -> &str;
 
-    /// Every table the place holds, except SQLite's own.
+    /// The host's own tables, as names or patterns with `*` and `?`: a sync
+    /// with this place ignores them on both sides, and the place never reads
+    /// them (FR-SMUGGLR-066). None by default.
+    fn own_tables(&self) -> &[&str] {
+        &[]
+    }
+
+    /// Every table the place holds, except SQLite's own. A table of the
+    /// host's own ([`Place::own_tables`]) is named and never read, so it has
+    /// no columns.
     ///
     /// # Errors
     /// When the place cannot be read.
@@ -158,16 +177,20 @@ const OTHER_ENGINES: &[&str] = &[
 ];
 
 /// Opens the place an address names: a path or `file://` URL is a local
-/// file, and an `http://` or `https://` URL a service that speaks HTTP-SQL.
+/// file, an `http://` or `https://` URL a service that speaks HTTP-SQL, and
+/// `d1://<database-name>` a Cloudflare D1 database, the HTTP-SQL place
+/// through D1's adapter.
 ///
 /// # Errors
 /// [`Error::OtherEngine`] for a database that is not SQLite,
-/// [`Error::Unreachable`] for a kind of place smugglr cannot reach, and the
-/// place's own error when it cannot be opened.
+/// [`Error::Unreachable`] for a kind of place smugglr cannot reach,
+/// [`Error::Missing`] for a D1 database without its account id or token,
+/// and the place's own error when it cannot be opened.
 pub fn open(address: &str) -> Result<Box<dyn Place>, Error> {
     match address.split_once("://") {
         None => Ok(Box::new(LocalFile::open(address)?)),
         Some(("file", path)) => Ok(Box::new(LocalFile::open(path)?)),
+        Some((scheme, name)) if scheme.eq_ignore_ascii_case("d1") => Ok(Box::new(D1::open(name)?)),
         Some((scheme, _))
             if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") =>
         {

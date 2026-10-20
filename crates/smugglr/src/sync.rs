@@ -117,7 +117,7 @@ pub fn sync(
 ) -> Result<Record, Error> {
     // An ignored table is set aside before anything else, so it is never
     // compared, hashed, read or written.
-    let ignore = Ignore::new(options.ignore.iter().cloned());
+    let ignore = ignore(source, target, options);
     let (every, mut ignored) = ignore.split(source.tables()?, |table| &table.name);
     let (theirs_every, ignored_there) = ignore.split(target.tables()?, |table| &table.name);
     ignored.extend(ignored_there);
@@ -300,6 +300,21 @@ fn write_all(
         memory.set_table(&table.name, next);
     }
     Ok(unmatched)
+}
+
+/// The tables a run ignores: those smugglr always ignores, those the person
+/// lists, and a host's own tables as either place declares them, on both
+/// sides (FR-SMUGGLR-066).
+fn ignore(source: &dyn Place, target: &dyn Place, options: &Options) -> Ignore {
+    Ignore::new(
+        options
+            .ignore
+            .iter()
+            .map(String::as_str)
+            .chain(source.own_tables().iter().copied())
+            .chain(target.own_tables().iter().copied())
+            .map(str::to_owned),
+    )
 }
 
 /// Under `--sync-mode last`, fails naming every table the run would plan
