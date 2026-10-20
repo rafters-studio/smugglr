@@ -5,11 +5,12 @@ use std::process::ExitCode;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use smugglr::{Options, sync};
+use smugglr::{Config, Options, sync};
 use smugglr_core::plan::SyncMode;
 use smugglr_core::record::{Record, Table};
 
-/// Exit status for a usage error, or a place smugglr refuses.
+/// Exit status for a usage error, a config smugglr cannot read, or a place
+/// smugglr refuses.
 const USAGE: u8 = 2;
 
 /// Exit status for a run that wrote something and is not done.
@@ -133,6 +134,21 @@ fn sync_command(command: &Sync) -> ExitCode {
 }
 
 fn sync_once(command: &Sync) -> ExitCode {
+    // The tables to ignore come from the config, never from a flag.
+    let mut options = command.options.clone();
+    let dir = options
+        .config_dir
+        .clone()
+        .or_else(smugglr_memory::config_dir);
+    if let Some(dir) = dir {
+        match Config::load(&dir) {
+            Ok(config) => options.ignore = config.ignore,
+            Err(err) => {
+                eprintln!("{err}");
+                return ExitCode::from(USAGE);
+            }
+        }
+    }
     let [source, target] = command.places.as_slice() else {
         return usage("smugglr sync takes two places");
     };
@@ -142,7 +158,7 @@ fn sync_once(command: &Sync) -> ExitCode {
         Ok(places) => places,
         Err(err) => return usage(&err.to_string()),
     };
-    match sync(source.as_mut(), target.as_mut(), &command.options) {
+    match sync(source.as_mut(), target.as_mut(), &options) {
         Ok(record) => {
             if command.json {
                 println!("{}", record.json());

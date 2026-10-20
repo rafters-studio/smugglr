@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use smugglr_core::change::{Change, Op};
+use smugglr_core::ignore::Ignore;
 use smugglr_core::plan::{Hashes, Plan, Side, SyncMode, Write, not_read_back, plan, recover};
 use smugglr_core::record::{self, Record};
 use smugglr_core::row_hash::row_hash;
@@ -24,6 +25,9 @@ pub struct Options {
     pub dryrun: bool,
     /// The tables the run is limited to; empty is every table.
     pub tables: Vec<String>,
+    /// The tables the person lists to ignore, names or patterns with `*`
+    /// and `?`, beside those smugglr always ignores.
+    pub ignore: Vec<String>,
 }
 
 /// Why a sync could not run.
@@ -56,16 +60,20 @@ pub fn sync(
     target: &mut dyn Place,
     options: &Options,
 ) -> Result<Record, Error> {
+    // An ignored table is set aside before anything else, so it is never
+    // compared, hashed, read or written.
+    let ignore = Ignore::new(options.ignore.iter().cloned());
+    let (every, mut ignored) = ignore.split(source.tables()?, |table| &table.name);
+    let (theirs_every, ignored_there) = ignore.split(target.tables()?, |table| &table.name);
+    ignored.extend(ignored_there);
     let named = |table: &Table| options.tables.is_empty() || options.tables.contains(&table.name);
-    let every = source.tables()?;
-    let theirs_every = target.tables()?;
     let tables: Vec<Table> = every.iter().filter(|t| named(t)).cloned().collect();
     let theirs: Vec<Table> = theirs_every.iter().filter(|t| named(t)).cloned().collect();
     // The whole places' shapes, not only the tables named: any mismatch
     // stops the whole run (FR-SMUGGLR-070).
     if let Some(mismatch) = shape::check(source.address(), target.address(), &every, &theirs_every)?
     {
-        return Ok(Record::shape_mismatch(mismatch));
+        return Ok(Record::shape_mismatch(mismatch, ignored));
     }
     if let Some(name) = options
         .tables
@@ -151,7 +159,7 @@ pub fn sync(
         }
         memory.set_table(&table.name, next);
     }
-    let record = Record::new(done, options.dryrun);
+    let record = Record::new(done, ignored, options.dryrun);
     if !options.dryrun {
         memory.save()?;
         // Kept after a run whose rows read back different (exit 4), so
@@ -327,7 +335,7 @@ mod tests {
     use smugglr_core::change::Change;
     use smugglr_core::plan::Hashes;
     use smugglr_memory::Memory;
-    use smugglr_place::{Error as PlaceError, Key, Place, Table};
+    use smugglr_place::{Error as PlaceError, Key, LocalFile, Place, Table};
 
     use super::{Error, Options, sync};
 
@@ -378,6 +386,92 @@ mod tests {
         sync(&mut source, &mut target, &options)?;
         assert_eq!(Memory::open(&config, "a", "b")?.table("notes"), last);
         let _ = std::fs::remove_dir_all(&config);
+        Ok(())
+    }
+
+    fn sqlite(path: &std::path::Path, sql: &str) -> rusqlite::Result<rusqlite::Connection> {
+        let connection = rusqlite::Connection::open(path)?;
+        connection.execute_batch(sql)?;
+        Ok(connection)
+    }
+
+    /// Each row of `table`, every column as debug text.
+    fn dump(connection: &rusqlite::Connection, table: &str) -> rusqlite::Result<Vec<String>> {
+        let mut statement = connection.prepare(&format!("SELECT * FROM {table} ORDER BY 1"))?;
+        let width = statement.column_count();
+        statement
+            .query_map([], |row| {
+                (0..width)
+                    .map(|i| row.get::<_, rusqlite::types::Value>(i))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map(|values| format!("{values:?}"))
+            })?
+            .collect()
+    }
+
+    /// Real files: ignored tables, one only in the source and without a
+    /// primary key, neither stop the run nor change, and the record names
+    /// each once.
+    #[test]
+    fn ignored_tables_are_left_alone_and_named_once() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join(format!("smugglr-ignore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        // tags is in step, but each place's sqlite_sequence counts it
+        // differently; SQLite itself moves the counter of a table written.
+        // notes is keyed by text: a rowid key would stop it (#507).
+        let shape = "CREATE TABLE notes (id TEXT PRIMARY KEY, body TEXT); \
+                     CREATE TABLE tags (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT); \
+                     CREATE TABLE sessions_tmp (id TEXT PRIMARY KEY, who TEXT);";
+        let source = sqlite(
+            &dir.join("source.db"),
+            &format!(
+                "{shape} CREATE TABLE cache_pages (url TEXT, body BLOB); \
+                 INSERT INTO notes VALUES ('n1', 'a'), ('n2', 'b'); \
+                 INSERT INTO tags (name) VALUES ('t'); \
+                 INSERT INTO sessions_tmp VALUES ('s1', 'source'); \
+                 INSERT INTO cache_pages VALUES ('/', x'00');"
+            ),
+        )?;
+        let target = sqlite(
+            &dir.join("target.db"),
+            &format!(
+                "{shape} INSERT INTO tags (name) VALUES ('t'), ('gone'); \
+                 DELETE FROM tags WHERE name = 'gone';"
+            ),
+        )?;
+        let watched = ["sqlite_sequence", "sessions_tmp"];
+        let before = watched
+            .iter()
+            .map(|table| dump(&target, table))
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let options = Options {
+            config_dir: Some(dir.join("config")),
+            ignore: vec!["cache_*".to_owned(), "sessions_tmp".to_owned()],
+            ..Options::default()
+        };
+        let record = sync(
+            &mut LocalFile::open(dir.join("source.db"))?,
+            &mut LocalFile::open(dir.join("target.db"))?,
+            &options,
+        )?;
+        let after = watched
+            .iter()
+            .map(|table| dump(&target, table))
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert_eq!(before, after);
+        assert_eq!(dump(&target, "notes")?.len(), 2);
+        assert_eq!(
+            record
+                .ignored
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["cache_pages", "sessions_tmp"]
+        );
+        assert_eq!(record.tables.keys().collect::<Vec<_>>(), ["notes", "tags"]);
+        drop((source, target));
+        let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
 }
