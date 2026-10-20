@@ -649,6 +649,35 @@ fn no_journal(world: &World) -> Result<(), String> {
     }
 }
 
+/// A run limited by --table still finishes every table a cut-off run left
+/// in the journal, so a later delete is not undone.
+#[test]
+fn a_table_limited_run_finishes_every_cut_off_table() -> Result<(), String> {
+    let world = World::default();
+    world.source.set(world.place(
+        "source.db",
+        &format!("{NOTES}; {THREE_NOTES}; {ORDERS}; INSERT INTO orders VALUES ('o1', 'tent')"),
+    )?);
+    world
+        .target
+        .set(world.place("target.db", &format!("{NOTES}; {ORDERS}"))?);
+    world.sync_ok()?;
+    let (source, target) = places(&world)?;
+    sql_on(&source, "INSERT INTO orders VALUES ('o9', 'new')")?;
+    cut_run(&world, "orders", true)?;
+    let output = world.sync(&["--table", "notes"])?;
+    if !output.status.success() {
+        return Err(format!("the --table run exited {}", output.status));
+    }
+    sql_on(&source, "DELETE FROM orders WHERE id = 'o9'")?;
+    world.sync_ok()?;
+    let query = "SELECT * FROM orders WHERE id = 'o9'";
+    match (rows_of(&source, query)?, rows_of(&target, query)?) {
+        (here, there) if here.is_empty() && there.is_empty() => Ok(()),
+        (here, there) => Err(format!("the source holds {here:?}, the target {there:?}")),
+    }
+}
+
 /// Each place's rows and marks, to tell whether a run wrote anything.
 fn snapshot(world: &World) -> Result<String, String> {
     let (source, target) = places(world)?;

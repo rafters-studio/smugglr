@@ -57,8 +57,10 @@ pub fn sync(
     };
     let mut memory = Memory::open(&config, source.address(), target.address())?;
     let named = |table: &Table| options.tables.is_empty() || options.tables.contains(&table.name);
-    let tables: Vec<Table> = source.tables()?.into_iter().filter(named).collect();
-    let theirs: Vec<Table> = target.tables()?.into_iter().filter(named).collect();
+    let every = source.tables()?;
+    let theirs_every = target.tables()?;
+    let tables: Vec<Table> = every.iter().filter(|t| named(t)).cloned().collect();
+    let theirs: Vec<Table> = theirs_every.iter().filter(|t| named(t)).cloned().collect();
     check_shape(&tables, &theirs, source.address(), target.address())?;
     if let Some(name) = options
         .tables
@@ -67,7 +69,13 @@ pub fn sync(
     {
         return Err(Error::Shape(format!("neither place has a table {name}")));
     }
-    finish_cut_off_run(&mut memory, &tables, source, target, options.dryrun)?;
+    // Every table both places hold, not only those named: the journal goes
+    // once it is finished, so no table's lines may be left unfinished.
+    let common: Vec<Table> = every
+        .into_iter()
+        .filter(|table| theirs_every.iter().any(|other| other.name == table.name))
+        .collect();
+    finish_cut_off_run(&mut memory, &common, source, target, options.dryrun)?;
     let mut done = BTreeMap::new();
     let mut unmatched = false;
     for table in tables {
