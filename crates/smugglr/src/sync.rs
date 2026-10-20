@@ -82,7 +82,7 @@ pub fn sync(
         let here: Hashes = source.hashes(&table)?.into_iter().collect();
         let there: Hashes = target.hashes(&table)?.into_iter().collect();
         let last = memory.table(&table.name);
-        let planned = plan(&here, &there, &last, options.sync_mode);
+        let planned = plan(&table.name, &here, &there, &last, options.sync_mode);
         done.insert(table.name.clone(), record::table(&planned, options.dryrun));
         let Plan::Move {
             writes,
@@ -97,7 +97,7 @@ pub fn sync(
         let (to_target, to_source): (Vec<Write>, Vec<Write>) = writes
             .into_iter()
             .partition(|write| write.side == Side::Target);
-        let mut mismatched = carry(
+        let (mut mismatched, mut written) = carry(
             &table,
             &mut *source,
             &mut *target,
@@ -106,7 +106,7 @@ pub fn sync(
             &last,
             &mut next,
         )?;
-        mismatched.extend(carry(
+        let (more, also) = carry(
             &table,
             &mut *target,
             &mut *source,
@@ -114,7 +114,15 @@ pub fn sync(
             &memory,
             &last,
             &mut next,
-        )?);
+        )?;
+        mismatched.extend(more);
+        written.extend(also);
+        // The record counts only the rows written.
+        let wrote = Plan::Move {
+            writes: written,
+            memory: next.clone(),
+        };
+        done.insert(table.name.clone(), record::table(&wrote, false));
         if !mismatched.is_empty() {
             // Not done: the table keeps its old memory.
             unmatched = true;
@@ -236,11 +244,9 @@ fn check_shape(ours: &[Table], theirs: &[Table], source: &str, target: &str) -> 
     Ok(())
 }
 
-/// Journals and writes `writes` in `to`, with `from`'s copy of each row, reads the rows
-/// back and returns the keys of those that do not match what was written. A
-/// row gone from `from` since its hash was read is not written, and its key
-/// keeps its `last` hash in memory, so the next run finds it missing on that
-/// side.
+/// Journals and writes `writes` in `to`, with `from`'s copy of each row,
+/// reads back the rows written and returns the keys of those that do not
+/// match what was written, and the writes that were made.
 fn carry(
     table: &Table,
     from: &mut dyn Place,
@@ -249,27 +255,33 @@ fn carry(
     journal: &Memory,
     last: &Hashes,
     memory: &mut Hashes,
-) -> Result<Vec<Vec<String>>, Error> {
+) -> Result<(Vec<Vec<String>>, Vec<Write>), Error> {
     let changes = changes(table, from, writes)?;
+    let journaled: Vec<Write> = writes
+        .iter()
+        .filter(|write| changes.iter().any(|change| change.key == write.key))
+        .cloned()
+        .collect();
+    // The journal line goes to disk before the row does.
+    journal.journal(&table.name, &journaled)?;
+    let wrote = to.write(table, &changes)?;
+    // A row not written (gone from `from`, or no longer at the change's
+    // `from` in `to`) keeps its last hash, so the next run decides it from
+    // fresh reads.
     for write in writes {
-        if !changes.iter().any(|change| change.key == write.key) {
+        if !wrote.contains(&write.key) {
             match last.get(&write.key) {
                 Some(&hash) => memory.insert(write.key.clone(), hash),
                 None => memory.remove(&write.key),
             };
         }
     }
-    let written: Vec<Write> = writes
-        .iter()
-        .filter(|write| changes.iter().any(|change| change.key == write.key))
-        .cloned()
+    let written: Vec<Write> = journaled
+        .into_iter()
+        .filter(|write| wrote.contains(&write.key))
         .collect();
-    // The journal line goes to disk before the row does.
-    journal.journal(&table.name, &written)?;
-    to.write(table, &changes)?;
-    let keys: Vec<Vec<String>> = written.iter().map(|write| write.key.clone()).collect();
-    let read_back = read_hashes(table, to, &keys)?;
-    Ok(not_read_back(&written, &read_back))
+    let read_back = read_hashes(table, to, &wrote)?;
+    Ok((not_read_back(&written, &read_back), written))
 }
 
 /// A row's key, from its columns in column order.
@@ -347,8 +359,8 @@ mod tests {
         fn rows(&mut self, _: &Table, _: &[Key]) -> Result<Vec<Vec<String>>, PlaceError> {
             Ok(Vec::new())
         }
-        fn write(&mut self, _: &Table, _: &[Change]) -> Result<(), PlaceError> {
-            Ok(())
+        fn write(&mut self, _: &Table, _: &[Change]) -> Result<Vec<Key>, PlaceError> {
+            Ok(Vec::new())
         }
     }
 

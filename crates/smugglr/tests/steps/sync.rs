@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 
 use smugglr::{Options, sync};
 use smugglr_core::change::{Change, Op};
+use smugglr_core::plan::SyncMode;
+use smugglr_core::record::{Record, Table as Entry};
 use smugglr_core::row_hash::row_hash;
 use smugglr_place::{Error, Key, LocalFile, Place, Table};
 
@@ -68,12 +70,21 @@ impl Place for Shelf {
             .collect())
     }
 
-    fn write(&mut self, table: &Table, changes: &[Change]) -> Result<(), Error> {
+    fn write(&mut self, table: &Table, changes: &[Change]) -> Result<Vec<Key>, Error> {
         let (_, rows) = self
             .tables
             .get_mut(&table.name)
             .ok_or_else(|| Error::Adapter(format!("no table {}", table.name)))?;
+        let mut written = Vec::new();
         for change in changes {
+            // Only where the row is still at the change's from.
+            let here = rows.get(&change.key).map(|row| {
+                let columns: Vec<&str> = row.iter().map(String::as_str).collect();
+                row_hash(&columns)
+            });
+            if here != change.from {
+                continue;
+            }
             match change.op {
                 Op::Down => {
                     rows.remove(&change.key);
@@ -82,8 +93,9 @@ impl Place for Shelf {
                     rows.insert(change.key.clone(), change.values.clone());
                 }
             }
+            written.push(change.key.clone());
         }
-        Ok(())
+        Ok(written)
     }
 }
 
@@ -181,7 +193,7 @@ impl Place for Busy {
         self.file.rows(table, keys)
     }
 
-    fn write(&mut self, table: &Table, changes: &[Change]) -> Result<(), Error> {
+    fn write(&mut self, table: &Table, changes: &[Change]) -> Result<Vec<Key>, Error> {
         self.file.write(table, changes)
     }
 }
@@ -477,7 +489,7 @@ impl Place for Cut {
         self.file.rows(table, keys)
     }
 
-    fn write(&mut self, table: &Table, changes: &[Change]) -> Result<(), Error> {
+    fn write(&mut self, table: &Table, changes: &[Change]) -> Result<Vec<Key>, Error> {
         if table.name != self.table {
             return self.file.write(table, changes);
         }
@@ -675,6 +687,98 @@ fn a_table_limited_run_finishes_every_cut_off_table() -> Result<(), String> {
     match (rows_of(&source, query)?, rows_of(&target, query)?) {
         (here, there) if here.is_empty() && there.is_empty() => Ok(()),
         (here, there) => Err(format!("the source holds {here:?}, the target {there:?}")),
+    }
+}
+
+/// Two real files synced once through `smugglr::sync`, then note n1 edited
+/// in both and, in the source, a new order; returns the record of the next
+/// run under `mode`.
+fn both_sides_edit(world: &World, mode: SyncMode) -> Result<Record, String> {
+    let source = world.place(
+        "source.db",
+        &format!("{NOTES}; {THREE_NOTES}; {ORDERS}; INSERT INTO orders VALUES ('o1', 'tent')"),
+    )?;
+    let target = world.place("target.db", &format!("{NOTES}; {ORDERS}"))?;
+    world.source.set(source.clone());
+    world.target.set(target.clone());
+    let open = |path: &str| LocalFile::open(path).map_err(|err| err.to_string());
+    let run = |mode| {
+        let options = Options {
+            sync_mode: mode,
+            ..options(world)?
+        };
+        sync(&mut open(&source)?, &mut open(&target)?, &options).map_err(|err| err.to_string())
+    };
+    run(SyncMode::Stop)?;
+    sql_on(
+        &source,
+        "UPDATE notes SET body = 'source copy' WHERE id = 'n1'; \
+                     INSERT INTO orders VALUES ('o2', 'stove')",
+    )?;
+    sql_on(
+        &target,
+        "UPDATE notes SET body = 'target copy' WHERE id = 'n1'",
+    )?;
+    run(mode)
+}
+
+/// #509 through the real sync: a stop stops only its table.
+#[test]
+fn sync_stops_only_the_table_with_a_both_sides_change() -> Result<(), String> {
+    let world = World::default();
+    let record = both_sides_edit(&world, SyncMode::Stop)?;
+    let (source, target) = places(&world)?;
+    let notes_stopped = matches!(record.tables.get("notes"), Some(Entry::Stopped { .. }));
+    let orders_moved = matches!(record.tables.get("orders"), Some(Entry::Moved(_)));
+    let o2 = rows_of(&target, "SELECT * FROM orders WHERE id = 'o2'")?;
+    if notes_stopped
+        && orders_moved
+        && !o2.is_empty()
+        && note(&source, "n1")? != note(&target, "n1")?
+    {
+        Ok(())
+    } else {
+        Err(format!("the record is {}", record.json()))
+    }
+}
+
+/// #509 through the real sync: --sync-mode source writes the source's copy
+/// into the target and names it.
+#[test]
+fn sync_mode_source_keeps_the_sources_copy() -> Result<(), String> {
+    let world = World::default();
+    let record = both_sides_edit(&world, SyncMode::Source)?;
+    let (source, target) = places(&world)?;
+    let named = matches!(record.tables.get("notes"),
+        Some(Entry::Moved(moves)) if moves.overwritten_in_target.len() == 1);
+    let held = note(&target, "n1")?;
+    if named && held == note(&source, "n1")? && format!("{held:?}").contains("source copy") {
+        Ok(())
+    } else {
+        Err(format!(
+            "the target holds {held:?}; the record is {}",
+            record.json()
+        ))
+    }
+}
+
+/// #509 through the real sync: --sync-mode target writes the target's copy
+/// into the source and names it.
+#[test]
+fn sync_mode_target_keeps_the_targets_copy() -> Result<(), String> {
+    let world = World::default();
+    let record = both_sides_edit(&world, SyncMode::Target)?;
+    let (source, target) = places(&world)?;
+    let named = matches!(record.tables.get("notes"),
+        Some(Entry::Moved(moves)) if moves.overwritten_in_source.len() == 1);
+    let held = note(&source, "n1")?;
+    if named && held == note(&target, "n1")? && format!("{held:?}").contains("target copy") {
+        Ok(())
+    } else {
+        Err(format!(
+            "the source holds {held:?}; the record is {}",
+            record.json()
+        ))
     }
 }
 
