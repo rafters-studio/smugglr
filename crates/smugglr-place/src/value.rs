@@ -1,5 +1,6 @@
 //! SQLite `quote()` text back to the value it quotes, so a write binds the
-//! value as a parameter and loses nothing.
+//! value as a parameter and loses nothing, to a local file or as an
+//! HTTP-SQL parameter.
 
 use rusqlite::types::Value;
 
@@ -30,11 +31,94 @@ pub(crate) fn unquote(text: &str) -> Result<Value, Error> {
     text.parse::<f64>().map(Value::Real).map_err(|_| invalid())
 }
 
+/// The largest integer a JSON number carries exactly (2^53 - 1).
+const JSON_SAFE: i64 = (1 << 53) - 1;
+
+/// The HTTP-SQL parameter for the value whose `quote()` text this is: an
+/// integer beyond the JSON-safe range or a blob as a tagged value, so
+/// nothing is lost on the way.
+pub(crate) fn param(text: &str) -> Result<serde_json::Value, Error> {
+    use serde_json::{Value as Json, json};
+    Ok(match unquote(text)? {
+        Value::Null => Json::Null,
+        Value::Integer(integer) if (-JSON_SAFE..=JSON_SAFE).contains(&integer) => json!(integer),
+        Value::Integer(integer) => json!({"$type": "bigint", "$value": integer.to_string()}),
+        Value::Real(real) => serde_json::Number::from_f64(real)
+            .map(Json::Number)
+            .ok_or_else(|| Error::Value(text.to_owned()))?,
+        Value::Text(text) => Json::String(text),
+        Value::Blob(bytes) => json!({"$type": "blob", "$value": base64(&bytes)}),
+    })
+}
+
+/// RFC 4648 base64, with padding.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(char::from(ALPHABET[(n >> (18 - 6 * i) & 63) as usize]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use rusqlite::types::Value;
+    use serde_json::json;
 
-    use super::unquote;
+    use super::{base64, param, unquote};
+
+    #[test]
+    fn base64_known_answers() {
+        // RFC 4648 section 10.
+        for (bytes, text) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64(bytes.as_bytes()), text);
+        }
+    }
+
+    #[test]
+    fn integers_beyond_two_to_the_53_are_tagged() -> Result<(), crate::Error> {
+        assert_eq!(param("9007199254740991")?, json!(9_007_199_254_740_991_i64));
+        assert_eq!(
+            param("9007199254740993")?,
+            json!({"$type": "bigint", "$value": "9007199254740993"})
+        );
+        assert_eq!(
+            param("9223372036854775807")?,
+            json!({"$type": "bigint", "$value": "9223372036854775807"})
+        );
+        assert_eq!(
+            param("X'00ff'")?,
+            json!({"$type": "blob", "$value": "AP8="})
+        );
+        assert_eq!(param("'it''s'")?, json!("it's"));
+        assert_eq!(param("NULL")?, json!(null));
+        assert_eq!(
+            param("-9223372036854775808")?,
+            json!({"$type": "bigint", "$value": "-9223372036854775808"})
+        );
+        Ok(())
+    }
 
     #[test]
     fn each_kind_comes_back() -> Result<(), crate::Error> {

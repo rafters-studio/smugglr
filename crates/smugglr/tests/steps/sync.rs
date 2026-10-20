@@ -149,7 +149,11 @@ fn program_syncs_adapter(world: &World) -> Result<(), String> {
 #[then("the service holds the same rows as the file")]
 fn service_holds_file(world: &World) -> Result<(), String> {
     let path = world.source.get().ok_or("no file")?;
-    let held = world.watched.get().ok_or("the service was not synced")?;
+    let held = match (world.watched.get(), world.service.get()) {
+        (Some(held), _) => held,
+        (None, Some(service)) => format!("{:?}", quoted_notes(&service)?),
+        (None, None) => return Err("the service was not synced".to_owned()),
+    };
     let want = format!("{:?}", quoted_notes(&path)?);
     if held == want {
         Ok(())

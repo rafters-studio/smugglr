@@ -5,6 +5,8 @@
 
 #[path = "steps/cli.rs"]
 mod cli;
+#[path = "steps/http_sql.rs"]
+mod http_sql;
 #[path = "steps/world.rs"]
 mod setup;
 #[path = "steps/sync.rs"]

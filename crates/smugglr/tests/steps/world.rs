@@ -20,6 +20,8 @@ pub(crate) struct World {
     pub(crate) target: Slot<String>,
     /// What the last smugglr run printed.
     pub(crate) output: Slot<Output>,
+    /// The SQLite file a local HTTP-SQL service serves.
+    pub(crate) service: Slot<String>,
     /// What the scenario watches: the key (`id`) of one row, or a snapshot
     /// of rows to compare after the run.
     pub(crate) watched: Slot<String>,
