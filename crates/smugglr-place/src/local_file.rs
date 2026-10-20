@@ -3,7 +3,7 @@
 //! The engine's row hash runs as a SQL function registered on the
 //! connection, so each row is hashed where it lives. The file is opened for
 //! reading and writing but never created: an empty place gets its shape from
-//! migratr or the person, never from smugglr.
+//! the person, never from smugglr.
 
 use std::path::Path;
 
@@ -73,6 +73,7 @@ impl LocalFile {
     fn columns(&self, name: &str) -> rusqlite::Result<Table> {
         let mut statement = self.connection.prepare(queries::COLUMNS)?;
         let mut columns = Vec::new();
+        let mut types = Vec::new();
         let mut key = Vec::new();
         let mut rows = statement.query([name])?;
         while let Some(row) = rows.next()? {
@@ -83,6 +84,7 @@ impl LocalFile {
                 key.push((position, column.clone(), declared));
             }
             columns.push(column);
+            types.push(row.get(2)?);
         }
         key.sort();
         let declared: Vec<&str> = key
@@ -96,6 +98,7 @@ impl LocalFile {
         Ok(Table {
             name: name.to_owned(),
             columns,
+            types,
             key: key.into_iter().map(|(_, column, _)| column).collect(),
             self_keyed,
         })

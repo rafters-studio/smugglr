@@ -193,6 +193,7 @@ mod tests {
         Table {
             name: "notes".to_owned(),
             columns: vec!["id".to_owned(), "body".to_owned()],
+            types: vec!["TEXT".to_owned(), "TEXT".to_owned()],
             key: vec!["id".to_owned()],
             self_keyed: false,
         }

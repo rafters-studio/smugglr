@@ -189,6 +189,7 @@ impl Place for HttpSql {
                     .and_then(Json::as_str)
                     .ok_or_else(|| self.failed("a table without a name"))?;
                 let mut columns = Vec::new();
+                let mut types = Vec::new();
                 let mut key = Vec::new();
                 for info in self.query(queries::COLUMNS, &[json!(name)])? {
                     let (Some(column), Some(position)) = (
@@ -202,6 +203,7 @@ impl Place for HttpSql {
                         key.push((position, column.to_owned(), declared.to_owned()));
                     }
                     columns.push(column.to_owned());
+                    types.push(info.get(2).and_then(Json::as_str).unwrap_or("").to_owned());
                 }
                 key.sort();
                 let declared: Vec<&str> = key
@@ -218,6 +220,7 @@ impl Place for HttpSql {
                 Ok(Table {
                     name: name.to_owned(),
                     columns,
+                    types,
                     key: key.into_iter().map(|(_, column, _)| column).collect(),
                     self_keyed,
                 })
@@ -285,6 +288,7 @@ mod tests {
         Table {
             name: "notes".to_owned(),
             columns: vec!["id".to_owned(), "n".to_owned()],
+            types: vec!["TEXT".to_owned(), "INTEGER".to_owned()],
             key: vec!["id".to_owned()],
             self_keyed: false,
         }

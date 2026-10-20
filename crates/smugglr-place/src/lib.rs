@@ -59,6 +59,9 @@ pub struct Table {
     pub name: String,
     /// Its column names, in column order.
     pub columns: Vec<String>,
+    /// Each column's declared type, in column order; empty text for a
+    /// column declared without one.
+    pub types: Vec<String>,
     /// Its primary key's column names, in key order; empty when it declares
     /// none.
     pub key: Vec<String>,

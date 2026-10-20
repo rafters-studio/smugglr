@@ -11,6 +11,8 @@ use smugglr_core::row_hash::row_hash;
 use smugglr_memory::Memory;
 use smugglr_place::{Place, Table};
 
+use crate::shape;
+
 /// How a sync runs.
 #[derive(Debug, Clone, Default)]
 pub struct Options {
@@ -33,8 +35,8 @@ pub enum Error {
     /// smugglr's memory could not be read or written.
     #[error(transparent)]
     Memory(#[from] smugglr_memory::Error),
-    /// The two places do not hold the same tables, or a table has no
-    /// primary key; the run stops before any row is read.
+    /// A table has no primary key, or no place has a table the run is
+    /// limited to; the run stops before any row is read.
     #[error("{0}")]
     Shape(String),
     /// There is no config directory to keep memory in.
@@ -44,6 +46,9 @@ pub enum Error {
 
 /// Syncs `source` and `target` once, and says what it did.
 ///
+/// When the places' shapes differ, the run stops before any row is read,
+/// writes nothing, and the record names the difference.
+///
 /// # Errors
 /// When a place cannot be reached, read or written, or memory cannot be kept.
 pub fn sync(
@@ -51,17 +56,17 @@ pub fn sync(
     target: &mut dyn Place,
     options: &Options,
 ) -> Result<Record, Error> {
-    let config = match &options.config_dir {
-        Some(dir) => dir.clone(),
-        None => smugglr_memory::config_dir().ok_or(Error::NoConfigDir)?,
-    };
-    let mut memory = Memory::open(&config, source.address(), target.address())?;
     let named = |table: &Table| options.tables.is_empty() || options.tables.contains(&table.name);
     let every = source.tables()?;
     let theirs_every = target.tables()?;
     let tables: Vec<Table> = every.iter().filter(|t| named(t)).cloned().collect();
     let theirs: Vec<Table> = theirs_every.iter().filter(|t| named(t)).cloned().collect();
-    check_shape(&tables, &theirs, source.address(), target.address())?;
+    // The whole places' shapes, not only the tables named: any mismatch
+    // stops the whole run (FR-SMUGGLR-070).
+    if let Some(mismatch) = shape::check(source.address(), target.address(), &every, &theirs_every)?
+    {
+        return Ok(Record::shape_mismatch(mismatch));
+    }
     if let Some(name) = options
         .tables
         .iter()
@@ -69,6 +74,11 @@ pub fn sync(
     {
         return Err(Error::Shape(format!("neither place has a table {name}")));
     }
+    let config = match &options.config_dir {
+        Some(dir) => dir.clone(),
+        None => smugglr_memory::config_dir().ok_or(Error::NoConfigDir)?,
+    };
+    let mut memory = Memory::open(&config, source.address(), target.address())?;
     // Every table both places hold, not only those named: the journal goes
     // once it is finished, so no table's lines may be left unfinished.
     let common: Vec<Table> = every
@@ -228,32 +238,6 @@ fn read_hashes(
         .collect())
 }
 
-/// Stops the run, before any row is read, unless both places hold the same
-/// tables and each has a primary key. The full shape check and its words
-/// are #506's.
-fn check_shape(ours: &[Table], theirs: &[Table], source: &str, target: &str) -> Result<(), Error> {
-    for (tables, others, here, there) in [
-        (ours, theirs, source, target),
-        (theirs, ours, target, source),
-    ] {
-        for table in tables {
-            if !others.iter().any(|other| other.name == table.name) {
-                return Err(Error::Shape(format!(
-                    "the table {} is in {here} but not in {there}",
-                    table.name
-                )));
-            }
-            if table.key.is_empty() {
-                return Err(Error::Shape(format!(
-                    "the table {} in {here} has no primary key",
-                    table.name
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Journals and writes `writes` in `to`, with `from`'s copy of each row,
 /// reads back the rows written and returns the keys of those that do not
 /// match what was written, and the writes that were made.
@@ -360,6 +344,7 @@ mod tests {
             Ok(vec![Table {
                 name: "notes".to_owned(),
                 columns: vec!["id".to_owned()],
+                types: vec!["TEXT".to_owned()],
                 key: vec!["id".to_owned()],
                 self_keyed: false,
             }])

@@ -9,6 +9,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::Serialize;
+
 use crate::change::{Change, Decision, Op, decide, op};
 
 /// Each row's hash by key, the key as SQLite's `quote()` text of each key
@@ -28,7 +30,8 @@ pub enum SyncMode {
 }
 
 /// One of the two places of a direct sync.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Side {
     /// The first place named.
     Source,

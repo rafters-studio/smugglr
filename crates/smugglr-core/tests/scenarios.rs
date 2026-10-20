@@ -5,6 +5,8 @@
 
 #[path = "steps/plan.rs"]
 mod plan_steps;
+#[path = "steps/shape.rs"]
+mod shape_steps;
 
 use std::fmt::Write as _;
 use std::fs;
@@ -19,6 +21,7 @@ use smugglr_core::change::{Change, Decision, Op, decide};
 use smugglr_core::row_hash::row_hash;
 
 use plan_steps::{Pair, pair};
+use shape_steps::{Device, device};
 
 /// Rows as SQLite's `quote()` text of each column, and the hashes taken.
 #[derive(Debug, Default, ScenarioState)]
@@ -319,5 +322,5 @@ fn unchanged(place: &Place) -> Result<(), String> {
 
 scenarios!(
     "tests",
-    fixtures = [rows: Rows, place: Place, pair: Pair]
+    fixtures = [rows: Rows, place: Place, pair: Pair, device: Device]
 );
