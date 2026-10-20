@@ -160,7 +160,10 @@ impl D1 {
         let mut envelope: Json = serde_json::from_str(&text)
             .map_err(|err| format!("D1 answered {status} with no JSON ({err}): {text}"))?;
         if status.is_success() && envelope["success"] == json!(true) {
-            return Ok(Ok(envelope["result"].take()));
+            return Ok(Ok(envelope
+                .get_mut("result")
+                .map(Json::take)
+                .unwrap_or_default()));
         }
         let error = envelope["errors"]
             .as_array()
@@ -323,10 +326,17 @@ fn hex(bytes: &[u8]) -> String {
 /// One D1 result as an HTTP-SQL result. A write returned a row for each row
 /// it wrote; it answers with no rows, and counts them.
 fn answer(mut result: Json, wrote: bool) -> Json {
-    let rows = match result["results"]["rows"].take() {
-        Json::Array(rows) => rows,
+    // Taken, not indexed mutably, so an answer of the wrong shape reads as
+    // empty rather than panics.
+    let mut take = |field: &str| match result
+        .get_mut("results")
+        .and_then(|results| results.get_mut(field))
+        .map(Json::take)
+    {
+        Some(Json::Array(values)) => values,
         _ => Vec::new(),
     };
+    let rows = take("rows");
     if wrote {
         return json!({"columns": [], "rows": [], "rowsAffected": rows.len(), "lastInsertId": null});
     }
@@ -338,10 +348,7 @@ fn answer(mut result: Json, wrote: bool) -> Json {
             other => other,
         })
         .collect();
-    let columns = match result["results"]["columns"].take() {
-        Json::Array(columns) => columns,
-        _ => Vec::new(),
-    };
+    let columns = take("columns");
     json!({
         "columns": columns,
         "rows": rows,
@@ -534,6 +541,13 @@ mod tests {
             per(seam)
         );
         Ok(())
+    }
+
+    #[test]
+    fn an_answer_of_the_wrong_shape_reads_as_empty() {
+        for result in [json!("not an object"), json!([1]), json!({"results": 3})] {
+            assert_eq!(answer(result, false)["rows"], json!([]));
+        }
     }
 
     #[test]
