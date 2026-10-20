@@ -12,3 +12,45 @@ Feature: smugglr sync on the command line
     Given two places where the source's orders table has rows the target lacks
     When the agent runs smugglr sync on them without --json
     Then the output names orders with its status and counts in text
+
+  @criterion-01a14bed-4909-7023-8f5a-6aa060849495 @module-front-ends
+  Scenario: --table limits a run to the named table
+    Given two places whose notes and orders tables both have rows to move
+    When the agent runs smugglr sync on them with --table notes
+    Then no row of orders is written in either place
+
+  @criterion-01a14bed-4909-7023-8f5a-6ab8f82913b4 @module-front-ends
+  Scenario: --table repeats
+    Given two places whose notes, orders and line_items tables all have rows to move
+    When the agent runs smugglr sync on them with --table notes --table orders
+    Then the record lists notes and orders and no other table
+
+  @criterion-01a14bed-4909-7023-8f5a-6acac6b87d0e @module-front-ends
+  Scenario: direct is the default for two places
+    Given two copies of the same pair of places, with the same rows changed in each copy
+    When the agent syncs one copy with no --sync-type and the other with --sync-type direct
+    Then the two records hold the same statuses, counts and keys
+
+  @criterion-01a14bed-4909-7023-8f5a-6ad815d86866 @module-front-ends
+  Scenario: --watch prints one record per run
+    Given two places
+    When the agent runs smugglr sync on them with --watch --json and stops it after several intervals
+    Then smugglr printed one record for each run it made
+
+  @criterion-01a14bed-4909-7023-8f5a-6aed63e21762 @module-front-ends
+  Scenario: a sync is one run
+    Given two places
+    When the agent runs smugglr sync on them without --watch
+    Then smugglr exits after printing one record
+
+  @criterion-01a14c16-47db-7b91-9033-a85b36d79732 @module-front-ends
+  Scenario: --watch defaults to 60 seconds
+    Given two places
+    When the agent runs smugglr sync on them with --watch and no number, and stops it after three minutes
+    Then smugglr made a run about every 60 seconds
+
+  @criterion-01a14be5-057d-7163-9138-90702b17b1dd @module-front-ends
+  Scenario: the Rust crates and the CLI give the same record
+    Given two copies of the same pair of places, with the same rows changed in each copy
+    When the agent syncs one copy with smugglr sync --json and a program syncs the other through the Rust crates
+    Then the two records hold the same statuses, counts and keys

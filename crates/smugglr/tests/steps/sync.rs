@@ -10,10 +10,7 @@ use smugglr_place::{Error, Key, LocalFile, Place, Table};
 
 use rstest_bdd_macros::{given, then, when};
 
-use crate::setup::{NOTES, ORDERS, World, note, rows_of, sql_on};
-
-const THREE_NOTES: &str = "INSERT INTO notes VALUES ('n1', 'first', 1), ('n2', 'second', 2), \
-     ('n3', 'third', 3)";
+use crate::setup::{NOTES, ORDERS, THREE_NOTES, World, note, rows_of, sql_on};
 
 /// A service smugglr does not know: tables of rows held in this program,
 /// reached through an adapter written outside smugglr. It cannot run the
@@ -649,6 +646,35 @@ fn no_journal(world: &World) -> Result<(), String> {
     {
         None => Ok(()),
         Some((path, _)) => Err(format!("{path} remains")),
+    }
+}
+
+/// A run limited by --table still finishes every table a cut-off run left
+/// in the journal, so a later delete is not undone.
+#[test]
+fn a_table_limited_run_finishes_every_cut_off_table() -> Result<(), String> {
+    let world = World::default();
+    world.source.set(world.place(
+        "source.db",
+        &format!("{NOTES}; {THREE_NOTES}; {ORDERS}; INSERT INTO orders VALUES ('o1', 'tent')"),
+    )?);
+    world
+        .target
+        .set(world.place("target.db", &format!("{NOTES}; {ORDERS}"))?);
+    world.sync_ok()?;
+    let (source, target) = places(&world)?;
+    sql_on(&source, "INSERT INTO orders VALUES ('o9', 'new')")?;
+    cut_run(&world, "orders", true)?;
+    let output = world.sync(&["--table", "notes"])?;
+    if !output.status.success() {
+        return Err(format!("the --table run exited {}", output.status));
+    }
+    sql_on(&source, "DELETE FROM orders WHERE id = 'o9'")?;
+    world.sync_ok()?;
+    let query = "SELECT * FROM orders WHERE id = 'o9'";
+    match (rows_of(&source, query)?, rows_of(&target, query)?) {
+        (here, there) if here.is_empty() && there.is_empty() => Ok(()),
+        (here, there) => Err(format!("the source holds {here:?}, the target {there:?}")),
     }
 }
 
