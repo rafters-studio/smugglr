@@ -10,8 +10,10 @@
 //! Before a release the @hosted scenario runs against the real service with
 //! credentials.
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::Mutex;
 
 use rstest_bdd_macros::{given, then, when};
 use rusqlite::types::Value;
@@ -43,16 +45,27 @@ struct Request {
 fn serve_d1(name: &str, path: &str) -> Result<String, String> {
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|err| err.to_string())?;
     let address = listener.local_addr().map_err(|err| err.to_string())?;
-    let (name, path) = (name.to_owned(), path.to_owned());
+    let api = format!("http://{address}/client/v4");
+    let (name, path, at) = (name.to_owned(), path.to_owned(), api.clone());
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            let _ = answer(stream, &name, &path);
+            let _ = answer(stream, &name, &path, &at);
         }
     });
-    Ok(format!("http://{address}/client/v4"))
+    Ok(api)
 }
 
-fn answer(mut stream: TcpStream, name: &str, path: &str) -> std::io::Result<()> {
+/// How many times each stand-in, by its API address, was asked for a
+/// database by name.
+static LOOKUPS: Mutex<BTreeMap<String, usize>> = Mutex::new(BTreeMap::new());
+
+fn lookups(api: &str) -> usize {
+    LOOKUPS
+        .lock()
+        .map_or(0, |lookups| lookups.get(api).copied().unwrap_or(0))
+}
+
+fn answer(mut stream: TcpStream, name: &str, path: &str, api: &str) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
     reader.read_line(&mut line)?;
@@ -78,7 +91,7 @@ fn answer(mut stream: TcpStream, name: &str, path: &str) -> std::io::Result<()> 
         authorization,
         body,
     };
-    let (status, envelope) = match handle(&request, name, path) {
+    let (status, envelope) = match handle(&request, name, path, api) {
         Ok(result) => (
             "200 OK",
             json!({"success": true, "errors": [], "messages": [], "result": result}),
@@ -104,7 +117,7 @@ fn answer(mut stream: TcpStream, name: &str, path: &str) -> std::io::Result<()> 
 
 type Refusal = (&'static str, u32, String);
 
-fn handle(request: &Request, name: &str, path: &str) -> Result<Json, Refusal> {
+fn handle(request: &Request, name: &str, path: &str, api: &str) -> Result<Json, Refusal> {
     if request.authorization.as_deref() != Some(&format!("Bearer {TOKEN}")) {
         return Err(("401 Unauthorized", 10000, "Authentication error".to_owned()));
     }
@@ -117,6 +130,9 @@ fn handle(request: &Request, name: &str, path: &str) -> Result<Json, Refusal> {
     if method == "GET"
         && let Some(query) = target.strip_prefix(&format!("{databases}?"))
     {
+        if let Ok(mut lookups) = LOOKUPS.lock() {
+            *lookups.entry(api.to_owned()).or_default() += 1;
+        }
         // D1's name filter is a search: it finds other names too.
         let asked = query.strip_prefix("name=").unwrap_or("");
         return Ok(json!([
@@ -468,5 +484,108 @@ fn a_missing_credential_is_refused_by_name() -> Result<(), String> {
             ));
         }
     }
+    Ok(())
+}
+
+/// A D1 database's id is looked up once per process: two runs, each with a
+/// place of its own, ask the API for it once.
+#[test]
+fn the_database_is_looked_up_once_per_process() -> Result<(), String> {
+    let world = World::default();
+    let file = world.place("field.db", &format!("{NOTES}; {THREE_NOTES}"))?;
+    let (_, api) = d1(&world, "shop", "d1.db", NOTES)?;
+    let options = smugglr::Options {
+        config_dir: Some(world.config()?),
+        ..smugglr::Options::default()
+    };
+    for _ in 0..2 {
+        let mut local = smugglr_place::LocalFile::open(&file).map_err(|err| err.to_string())?;
+        let mut d1 = D1::new("shop", ACCOUNT, TOKEN, &api).place();
+        smugglr::sync(&mut local, &mut d1, &options).map_err(|err| err.to_string())?;
+    }
+    match lookups(&api) {
+        1 => Ok(()),
+        n => Err(format!("the database was looked up {n} times")),
+    }
+}
+
+/// The time a batch of 1,000 writes takes, through the D1 place against the
+/// stand-in of D1's API, beside the same batch through the HTTP-SQL place
+/// against the local HTTP-SQL service: network and the services' own work,
+/// next to which the adapter's translation (smugglr-place's
+/// `translation_time_per_statement`) is measured.
+#[test]
+#[ignore = "a measurement: run with --ignored --nocapture"]
+fn d1_batch_send_time() -> Result<(), String> {
+    use std::time::{Duration, Instant};
+
+    use smugglr_core::change::{Change, Op};
+    use smugglr_core::row_hash::row_hash;
+
+    const ROWS: u32 = 1000;
+    const ROUNDS: u32 = 10;
+    // No blob: the local HTTP-SQL service takes no blob parameters.
+    let shape = "CREATE TABLE things (id TEXT PRIMARY KEY, n INTEGER, t TEXT, r REAL)";
+    let changes = |round: u32| -> Vec<Change> {
+        (0..ROWS)
+            .map(|i| {
+                let values = vec![
+                    format!("'r{round}k{i}'"),
+                    format!("{}", 9_007_199_254_740_993_i64 + i64::from(i)),
+                    format!("'row {i}, it''s'"),
+                    "1.5".to_owned(),
+                ];
+                let columns: Vec<&str> = values.iter().map(String::as_str).collect();
+                Change {
+                    op: Op::Up,
+                    table: "things".to_owned(),
+                    key: vec![values[0].clone()],
+                    from: None,
+                    to: Some(row_hash(&columns)),
+                    values,
+                }
+            })
+            .collect()
+    };
+    let time = |place: &mut dyn Place| -> Result<Duration, String> {
+        let table = place
+            .tables()
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .find(|table| table.name == "things")
+            .ok_or("no things table")?;
+        let mut total = Duration::ZERO;
+        for round in 0..ROUNDS {
+            let changes = changes(round);
+            let started = Instant::now();
+            let written = place
+                .write(&table, &changes)
+                .map_err(|err| err.to_string())?;
+            total += started.elapsed();
+            if written.len() != changes.len() {
+                return Err(format!(
+                    "{} of {} rows written",
+                    written.len(),
+                    changes.len()
+                ));
+            }
+        }
+        Ok(total / ROUNDS)
+    };
+    let world = World::default();
+    let (_, api) = d1(&world, "shop", "d1.db", shape)?;
+    let mut d1 = D1::new("shop", ACCOUNT, TOKEN, &api).place();
+    let through_d1 = time(&mut d1)?;
+    let mut http_sql = HttpSql::open(&service(&world, "service.db", shape)?);
+    let native = time(&mut http_sql)?;
+    let per = |batch: Duration| batch.as_secs_f64() * 1e6 / f64::from(ROWS);
+    println!(
+        "a {ROWS}-row write batch: through D1's stand-in {:.2} ms ({:.2} us/row), \
+         native HTTP-SQL service {:.2} ms ({:.2} us/row); one request each",
+        through_d1.as_secs_f64() * 1e3,
+        per(through_d1),
+        native.as_secs_f64() * 1e3,
+        per(native)
+    );
     Ok(())
 }

@@ -30,12 +30,14 @@ pub struct HttpSql {
 /// adapter speaks D1's REST API.
 pub trait Transport: std::fmt::Debug {
     /// Sends one HTTP-SQL request body, and returns whether it succeeded and
-    /// the HTTP-SQL response body.
+    /// the HTTP-SQL response body. Bodies cross as parsed JSON, so an
+    /// adapter in the process reads and answers them without encoding them
+    /// again; [`Post`] encodes and parses each once, at the wire.
     ///
     /// # Errors
-    /// When the request does not reach the service, in the transport's own
-    /// words.
-    fn send(&self, request: &str) -> Result<(bool, String), String>;
+    /// When the request does not reach the service, or its answer is not
+    /// JSON, in the transport's own words.
+    fn send(&self, request: &Json) -> Result<(bool, Json), String>;
 
     /// The host's own tables, as names or patterns ([`Place::own_tables`]).
     fn own_tables(&self) -> &[&str] {
@@ -51,13 +53,13 @@ struct Post {
 }
 
 impl Transport for Post {
-    fn send(&self, request: &str) -> Result<(bool, String), String> {
+    fn send(&self, request: &Json) -> Result<(bool, Json), String> {
         let mut response = self
             .agent
             .post(&self.url)
             .header("Content-Type", "application/json")
             .header("Http-Sql-Accept-Version", "0.0.1")
-            .send(request)
+            .send(request.to_string())
             .map_err(|err| err.to_string())?;
         let status = response.status();
         let text = response
@@ -66,7 +68,9 @@ impl Transport for Post {
             .limit(u64::MAX)
             .read_to_string()
             .map_err(|err| err.to_string())?;
-        Ok((status.is_success(), text))
+        let envelope = serde_json::from_str(&text)
+            .map_err(|err| format!("{status} with no JSON ({err}): {text}"))?;
+        Ok((status.is_success(), envelope))
     }
 }
 
@@ -106,11 +110,7 @@ impl HttpSql {
 
     /// Sends `body` and returns the success envelope.
     fn post(&self, body: &Json) -> Result<Json, Error> {
-        let (succeeded, text) = self
-            .transport
-            .send(&body.to_string())
-            .map_err(|err| self.failed(err))?;
-        let envelope: Json = serde_json::from_str(&text).map_err(|err| self.failed(err))?;
+        let (succeeded, envelope) = self.transport.send(body).map_err(|err| self.failed(err))?;
         if succeeded {
             Ok(envelope)
         } else {
@@ -118,7 +118,9 @@ impl HttpSql {
             Err(self.failed(format_args!(
                 "{} {}",
                 error["code"].as_str().unwrap_or("error"),
-                error["message"].as_str().unwrap_or(&text)
+                error["message"]
+                    .as_str()
+                    .map_or_else(|| envelope.to_string(), str::to_owned)
             )))
         }
     }

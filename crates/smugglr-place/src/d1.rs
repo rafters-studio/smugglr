@@ -24,11 +24,19 @@
 //!   journal and read-back are what cover it: the run stops not done, and
 //!   the next run finishes it (FR-SMUGGLR-073).
 //!
+//! Each HTTP-SQL request is one D1 request, so a run makes the round trips
+//! a native HTTP-SQL service would. The one request more is looking up the
+//! database's id by name: once per process, the first time a D1 place of
+//! that name is used, one GET to the API. Requests and answers cross the
+//! [`Transport`] seam as parsed JSON, so the adapter encodes and parses
+//! each D1 body once, at the wire.
+//!
 //! D1 answers integers as JSON numbers, so one beyond 2^53 a statement
 //! selects as itself arrives rounded; the HTTP-SQL place selects every value
 //! as its `quote()` text, so none of its reads meet this.
 
-use std::cell::OnceCell;
+use std::collections::BTreeMap;
+use std::sync::{Mutex, OnceLock};
 
 use serde_json::{Value as Json, json};
 
@@ -66,8 +74,18 @@ pub struct D1 {
     token: String,
     api: String,
     agent: ureq::Agent,
-    /// The database's id, looked up by name on first use.
-    id: OnceCell<String>,
+}
+
+/// D1 databases' ids, by API, account and name.
+type Ids = BTreeMap<(String, String, String), String>;
+
+/// Each D1 database's id, by API, account and name, looked up once per
+/// process: the one request the adapter makes that HTTP-SQL itself would
+/// not, so a `--watch` or a second place of the same database makes it no
+/// more.
+fn ids() -> &'static Mutex<Ids> {
+    static IDS: OnceLock<Mutex<Ids>> = OnceLock::new();
+    IDS.get_or_init(Mutex::default)
 }
 
 /// What D1 refused, as an HTTP-SQL error's code and message.
@@ -113,7 +131,6 @@ impl D1 {
             token: token.to_owned(),
             api: api.trim_end_matches('/').to_owned(),
             agent,
-            id: OnceCell::new(),
         }
     }
 
@@ -140,10 +157,10 @@ impl D1 {
             .limit(u64::MAX)
             .read_to_string()
             .map_err(|err| err.to_string())?;
-        let envelope: Json = serde_json::from_str(&text)
+        let mut envelope: Json = serde_json::from_str(&text)
             .map_err(|err| format!("D1 answered {status} with no JSON ({err}): {text}"))?;
         if status.is_success() && envelope["success"] == json!(true) {
-            return Ok(Ok(envelope["result"].clone()));
+            return Ok(Ok(envelope["result"].take()));
         }
         let error = envelope["errors"]
             .as_array()
@@ -158,10 +175,12 @@ impl D1 {
         )))
     }
 
-    /// The database's id: the one database in the account with its name.
-    fn id(&self) -> Result<Result<&str, Refusal>, String> {
-        if let Some(id) = self.id.get() {
-            return Ok(Ok(id));
+    /// The database's id: the one database in the account with its name,
+    /// looked up once per process.
+    fn id(&self) -> Result<Result<String, Refusal>, String> {
+        let at = (self.api.clone(), self.account.clone(), self.name.clone());
+        if let Some(id) = ids().lock().map_err(|err| err.to_string())?.get(&at) {
+            return Ok(Ok(id.clone()));
         }
         let response = self
             .agent
@@ -181,7 +200,13 @@ impl D1 {
             .find(|database| database["name"].as_str() == Some(self.name.as_str()))
             .and_then(|database| database["uuid"].as_str());
         Ok(match found {
-            Some(id) => Ok(self.id.get_or_init(|| id.to_owned())),
+            Some(id) => {
+                ids()
+                    .lock()
+                    .map_err(|err| err.to_string())?
+                    .insert(at, id.to_owned());
+                Ok(id.to_owned())
+            }
             None => Err((
                 "not_found".to_owned(),
                 format!("no D1 database named {} in the account", self.name),
@@ -228,7 +253,7 @@ impl D1 {
             Err(refusal) => return Ok(Err(refusal)),
         };
         Ok(Ok(results
-            .iter()
+            .into_iter()
             .zip(written)
             .map(|(result, is_write)| answer(result, is_write))
             .collect()))
@@ -239,7 +264,9 @@ impl D1 {
 /// statement turning each back into its kind.
 fn translate(statement: &Json) -> Result<(String, Vec<Json>), String> {
     let sql = statement["sql"].as_str().ok_or("a statement without sql")?;
-    let params = statement["params"].as_array().cloned().unwrap_or_default();
+    let params = statement["params"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice);
     if params.len() > MAX_PARAMS {
         return Err(format!(
             "D1 binds at most {MAX_PARAMS} parameters to a statement, and this one has {}",
@@ -295,11 +322,11 @@ fn hex(bytes: &[u8]) -> String {
 
 /// One D1 result as an HTTP-SQL result. A write returned a row for each row
 /// it wrote; it answers with no rows, and counts them.
-fn answer(result: &Json, wrote: bool) -> Json {
-    let rows: Vec<Json> = result["results"]["rows"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+fn answer(mut result: Json, wrote: bool) -> Json {
+    let rows = match result["results"]["rows"].take() {
+        Json::Array(rows) => rows,
+        _ => Vec::new(),
+    };
     if wrote {
         return json!({"columns": [], "rows": [], "rowsAffected": rows.len(), "lastInsertId": null});
     }
@@ -311,8 +338,12 @@ fn answer(result: &Json, wrote: bool) -> Json {
             other => other,
         })
         .collect();
+    let columns = match result["results"]["columns"].take() {
+        Json::Array(columns) => columns,
+        _ => Vec::new(),
+    };
     json!({
-        "columns": result["results"]["columns"].as_array().cloned().unwrap_or_default(),
+        "columns": columns,
         "rows": rows,
         "rowsAffected": 0,
         "lastInsertId": null,
@@ -335,24 +366,16 @@ fn blob(value: Json) -> Json {
 }
 
 impl Transport for D1 {
-    fn send(&self, request: &str) -> Result<(bool, String), String> {
-        let request: Json =
-            serde_json::from_str(request).map_err(|err| format!("not HTTP-SQL: {err}"))?;
+    fn send(&self, request: &Json) -> Result<(bool, Json), String> {
         let (statements, single) = match request["batch"].as_array() {
-            Some(batch) => (batch.clone(), false),
-            None => (vec![request], true),
+            Some(batch) => (batch.as_slice(), false),
+            None => (std::slice::from_ref(request), true),
         };
-        let response = match self.run(&statements)? {
-            Ok(mut results) if single => results.pop().unwrap_or_default(),
-            Ok(results) => json!({ "results": results }),
-            Err((code, message)) => {
-                return Ok((
-                    false,
-                    json!({"error": {"code": code, "message": message}}).to_string(),
-                ));
-            }
-        };
-        Ok((true, response.to_string()))
+        Ok(match self.run(statements)? {
+            Ok(mut results) if single => (true, results.pop().unwrap_or_default()),
+            Ok(results) => (true, json!({ "results": results })),
+            Err((code, message)) => (false, json!({"error": {"code": code, "message": message}})),
+        })
     }
 
     fn own_tables(&self) -> &[&str] {
@@ -399,6 +422,120 @@ mod tests {
         Ok(())
     }
 
+    /// The adapter's own work for one batch of 1,000 writes, as the
+    /// HTTP-SQL place sends them: each statement translated for D1 and the
+    /// D1 body encoded (out), and D1's answer parsed and each result turned
+    /// into HTTP-SQL's (back). Network time is measured beside it, against
+    /// the stand-in, in the smugglr crate's `d1_batch_send_time`.
+    #[test]
+    #[ignore = "a measurement: run with --ignored --nocapture"]
+    fn translation_time_per_statement() -> Result<(), String> {
+        use std::time::Instant;
+
+        use super::{returning, writes};
+        use crate::Table;
+        use crate::value::param;
+
+        const ROWS: u32 = 1000;
+        const ROUNDS: u32 = 50;
+        let table = Table {
+            name: "things".to_owned(),
+            columns: vec![
+                "id".to_owned(),
+                "n".to_owned(),
+                "t".to_owned(),
+                "b".to_owned(),
+            ],
+            types: vec![String::new(); 4],
+            key: vec!["id".to_owned()],
+            self_keyed: false,
+        };
+        let sql = crate::queries::insert(&table);
+        let batch: Vec<serde_json::Value> = (0..ROWS)
+            .map(|i| {
+                let values = [
+                    format!("'k{i}'"),
+                    format!("{}", 9_007_199_254_740_993_i64 + i64::from(i)),
+                    format!("'row {i}, it''s'"),
+                    "X'00FF'".to_owned(),
+                ];
+                let params = values
+                    .iter()
+                    .map(|value| param(value).map_err(|err| err.to_string()))
+                    .collect::<Result<Vec<_>, String>>()?;
+                Ok(json!({"sql": sql, "params": params}))
+            })
+            .collect::<Result<_, String>>()?;
+        // D1's answer to the batch: each insert returned its one row.
+        let answer_text = serde_json::to_string(
+            &(0..ROWS)
+                .map(|_| json!({"results": {"columns": ["1"], "rows": [[1]]}, "success": true}))
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|err| err.to_string())?;
+
+        let (mut out, mut back) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+        for _ in 0..ROUNDS {
+            let started = Instant::now();
+            let mut d1_batch = Vec::with_capacity(batch.len());
+            for statement in &batch {
+                let (sql, params) = translate(statement)?;
+                let sql = if writes(&sql) { returning(&sql) } else { sql };
+                d1_batch.push(json!({"sql": sql, "params": params}));
+            }
+            let body = json!({ "batch": d1_batch }).to_string();
+            out += started.elapsed();
+            assert_ne!(body, "");
+
+            let started = Instant::now();
+            let results: serde_json::Value =
+                serde_json::from_str(&answer_text).map_err(|err| err.to_string())?;
+            let answered: Vec<serde_json::Value> = match results {
+                serde_json::Value::Array(results) => results
+                    .into_iter()
+                    .map(|result| answer(result, true))
+                    .collect(),
+                _ => return Err("not a list".to_owned()),
+            };
+            back += started.elapsed();
+            assert_eq!(answered.len(), batch.len());
+        }
+        // What the string seam cost on top: the HTTP-SQL request encoded and
+        // parsed again, and the HTTP-SQL answer encoded and parsed again.
+        let request = json!({"batch": batch, "atomic": true});
+        let reply = json!({"results": (0..ROWS)
+            .map(|_| json!({"columns": [], "rows": [], "rowsAffected": 1, "lastInsertId": null}))
+            .collect::<Vec<_>>()});
+        let started = Instant::now();
+        for _ in 0..ROUNDS {
+            let again: serde_json::Value =
+                serde_json::from_str(&request.to_string()).map_err(|err| err.to_string())?;
+            let answered: serde_json::Value =
+                serde_json::from_str(&reply.to_string()).map_err(|err| err.to_string())?;
+            assert_eq!(
+                again["batch"].as_array().map(Vec::len),
+                answered["results"].as_array().map(Vec::len)
+            );
+        }
+        let seam = started.elapsed();
+        let per = |total: std::time::Duration| {
+            total.as_secs_f64() * 1e6 / f64::from(ROUNDS) / f64::from(ROWS)
+        };
+        println!(
+            "D1 adapter, {ROWS}-statement batch: out {:.2} us/statement, back {:.2} us/statement, \
+             total {:.2} us/statement ({:.2} ms per batch)",
+            per(out),
+            per(back),
+            per(out + back),
+            (out + back).as_secs_f64() * 1e3 / f64::from(ROUNDS)
+        );
+        println!(
+            "a string seam would add {:.2} us/statement more (encode and parse each way again)",
+            per(seam)
+        );
+        Ok(())
+    }
+
     #[test]
     fn more_than_a_hundred_parameters_are_refused() {
         let params = vec![json!(1); 101];
@@ -408,10 +545,10 @@ mod tests {
     #[test]
     fn a_write_counts_the_rows_it_returned() {
         let result = json!({"results": {"columns": ["1"], "rows": [[1], [1]]}, "success": true});
-        assert_eq!(answer(&result, true)["rowsAffected"], json!(2));
+        assert_eq!(answer(result, true)["rowsAffected"], json!(2));
         let read = json!({"results": {"columns": ["b"], "rows": [[[0, 255]]]}});
         assert_eq!(
-            answer(&read, false)["rows"],
+            answer(read, false)["rows"],
             json!([[{"$type": "blob", "$value": "AP8="}]])
         );
     }
