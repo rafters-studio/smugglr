@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use smugglr::{Config, Options, sync};
+use smugglr::{Config, Options, SyncType, sync};
 use smugglr_core::plan::SyncMode;
 use smugglr_core::record::{Record, Status, Table};
 
@@ -45,7 +45,6 @@ The first place named is the source, the second the target.
 struct Sync {
     places: Vec<String>,
     json: bool,
-    watch: Option<u64>,
     options: Options,
 }
 
@@ -89,7 +88,7 @@ fn parse(args: &[String]) -> Result<Sync, String> {
             "--dryrun" => command.options.dryrun = true,
             "--table" => command.options.tables.push(value("--table")?),
             "--sync-type" => match value("--sync-type")?.as_str() {
-                "direct" => {}
+                "direct" => command.options.sync_type = SyncType::Direct,
                 kind @ ("hub" | "multi" | "mesh") => {
                     return Err(format!("--sync-type {kind} is not built yet"));
                 }
@@ -113,7 +112,7 @@ fn parse(args: &[String]) -> Result<Sync, String> {
                 if seconds.is_some() {
                     args.next();
                 }
-                command.watch = Some(seconds.unwrap_or(WATCH_SECONDS));
+                command.options.watch = Some(Duration::from_secs(seconds.unwrap_or(WATCH_SECONDS)));
             }
             flag if flag.starts_with("--") => return Err(format!("unknown flag {flag}")),
             place => command.places.push(place.to_owned()),
@@ -128,10 +127,9 @@ fn parse(args: &[String]) -> Result<Sync, String> {
 
 /// One run, or under `--watch` a run every interval until stopped.
 fn sync_command(command: &Sync) -> ExitCode {
-    let Some(seconds) = command.watch else {
+    let Some(interval) = command.options.watch else {
         return sync_once(command);
     };
-    let interval = Duration::from_secs(seconds);
     loop {
         let started = Instant::now();
         let _ = sync_once(command);

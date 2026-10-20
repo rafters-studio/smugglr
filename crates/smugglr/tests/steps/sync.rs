@@ -700,6 +700,22 @@ fn a_table_limited_run_finishes_every_cut_off_table() -> Result<(), String> {
 /// in both and, in the source, a new order; returns the record of the next
 /// run under `mode`.
 fn both_sides_edit(world: &World, mode: SyncMode) -> Result<Record, String> {
+    edited_in_both(world)?;
+    let (source, target) = places(world)?;
+    let options = Options {
+        sync_mode: mode,
+        ..options(world)?
+    };
+    sync(&mut open(&source)?, &mut open(&target)?, &options).map_err(|err| err.to_string())
+}
+
+fn open(path: &str) -> Result<LocalFile, String> {
+    LocalFile::open(path).map_err(|err| err.to_string())
+}
+
+/// Two real files synced once through `smugglr::sync`, then note n1 edited
+/// in both and, in the source, a new order.
+fn edited_in_both(world: &World) -> Result<(), String> {
     let source = world.place(
         "source.db",
         &format!("{NOTES}; {THREE_NOTES}; {ORDERS}; INSERT INTO orders VALUES ('o1', 'tent')"),
@@ -707,15 +723,8 @@ fn both_sides_edit(world: &World, mode: SyncMode) -> Result<Record, String> {
     let target = world.place("target.db", &format!("{NOTES}; {ORDERS}"))?;
     world.source.set(source.clone());
     world.target.set(target.clone());
-    let open = |path: &str| LocalFile::open(path).map_err(|err| err.to_string());
-    let run = |mode| {
-        let options = Options {
-            sync_mode: mode,
-            ..options(world)?
-        };
-        sync(&mut open(&source)?, &mut open(&target)?, &options).map_err(|err| err.to_string())
-    };
-    run(SyncMode::Stop)?;
+    sync(&mut open(&source)?, &mut open(&target)?, &options(world)?)
+        .map_err(|err| err.to_string())?;
     sql_on(
         &source,
         "UPDATE notes SET body = 'source copy' WHERE id = 'n1'; \
@@ -724,8 +733,7 @@ fn both_sides_edit(world: &World, mode: SyncMode) -> Result<Record, String> {
     sql_on(
         &target,
         "UPDATE notes SET body = 'target copy' WHERE id = 'n1'",
-    )?;
-    run(mode)
+    )
 }
 
 /// #509 through the real sync: a stop stops only its table.
@@ -1173,4 +1181,87 @@ fn rows_to_move_without_steering(world: &World) -> Result<(), String> {
     // The shape steps' "neither place has changed" compares this snapshot.
     world.watched.set(crate::shape::snapshot(world)?);
     Ok(())
+}
+
+#[given("two places with a row changed in both since the last sync")]
+fn changed_in_both_since(world: &World) -> Result<(), String> {
+    edited_in_both(world)
+}
+
+#[given("a local file and an HTTP-SQL address that does not answer")]
+fn file_and_silent_address(world: &World) -> Result<(), String> {
+    world
+        .source
+        .set(world.place("field.db", &format!("{NOTES}; {THREE_NOTES}"))?);
+    // A port just let go: nothing listens there, so a connection is refused
+    // at once rather than left to time out.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .map_err(|err| err.to_string())?
+        .port();
+    world.target.set(format!("http://127.0.0.1:{port}/sql"));
+    Ok(())
+}
+
+/// A program's call: each place opened by its address, as the CLI opens
+/// it, then `smugglr::sync` with `options`.
+fn program_sync(world: &World, options: &Options) -> Result<(), String> {
+    let (source, target) = places(world)?;
+    let open = |address: &str| smugglr_place::open(address).map_err(|err| err.to_string());
+    let (mut source, mut target) = (open(&source)?, open(&target)?);
+    world
+        .called
+        .set(sync(source.as_mut(), target.as_mut(), options));
+    Ok(())
+}
+
+#[when("a program syncs them through the Rust crates")]
+fn program_syncs(world: &World) -> Result<(), String> {
+    program_sync(world, &options(world)?)
+}
+
+#[when("a program syncs them through the Rust crates with dryrun set")]
+fn program_syncs_dryrun(world: &World) -> Result<(), String> {
+    let options = Options {
+        dryrun: true,
+        ..options(world)?
+    };
+    program_sync(world, &options)
+}
+
+#[then("the call returns a record whose table status for that row's table is stopped")]
+fn call_names_stopped(world: &World) -> Result<(), String> {
+    use smugglr_core::record::Table as Entry;
+    match world.called.take().ok_or("no program called smugglr")? {
+        Ok(record) if matches!(record.tables.get("notes"), Some(Entry::Stopped { .. })) => Ok(()),
+        Ok(record) => Err(format!("the record is {}", record.json())),
+        Err(err) => Err(format!("the call failed: {err}")),
+    }
+}
+
+#[then("the call returns an error")]
+fn call_fails(world: &World) -> Result<(), String> {
+    match world.called.take().ok_or("no program called smugglr")? {
+        // The place, not memory or the config directory.
+        Err(smugglr::Error::Place(_)) => Ok(()),
+        Err(err) => Err(format!("the call failed, but not on the place: {err}")),
+        Ok(record) => Err(format!("the call returned a record: {}", record.json())),
+    }
+}
+
+#[then("the call returns a record whose run status is preview")]
+fn call_previews(world: &World) -> Result<(), String> {
+    use smugglr_core::record::Status;
+    let (_, target) = places(world)?;
+    match world.called.take().ok_or("no program called smugglr")? {
+        Ok(record) if record.status == Status::Preview => {
+            // A preview writes nothing.
+            match rows_of(&target, "SELECT * FROM notes")?.len() {
+                0 => Ok(()),
+                n => Err(format!("the dry run wrote {n} rows into the target")),
+            }
+        }
+        Ok(record) => Err(format!("the record is {}", record.json())),
+        Err(err) => Err(format!("the call failed: {err}")),
+    }
 }
