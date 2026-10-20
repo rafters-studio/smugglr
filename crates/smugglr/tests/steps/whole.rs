@@ -6,7 +6,7 @@
 //! No key is changed on both sides between the same two runs: such a row
 //! follows --sync-mode, which is not what this measures. smugglr reads no
 //! clock, so a clock behind lives where a writer leaves it: in the rows it
-//! stamps and in its file's modified time.
+//! stamps as it inserts them, and in its file's modified time.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -33,7 +33,9 @@ const ITEMS: &str = "CREATE TABLE items (id INT PRIMARY KEY, body TEXT, n INTEGE
                      b BLOB, stamp INTEGER)";
 
 const INSERT: &str = "INSERT INTO items VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
-const EDIT: &str = "UPDATE items SET body = ?2, n = ?3, x = ?4, b = ?5, stamp = ?6 WHERE id = ?1";
+/// An edit leaves `stamp` as the insert set it: no column moves forward on
+/// every change.
+const EDIT: &str = "UPDATE items SET body = ?2, n = ?3, x = ?4, b = ?5 WHERE id = ?1";
 const DELETE: &str = "DELETE FROM items WHERE id = ?1";
 
 /// How the keys of new rows are chosen.
@@ -197,7 +199,7 @@ impl Write {
     fn run(&self, connection: &Connection) -> rusqlite::Result<usize> {
         match self {
             Self::Insert(row) => connection.execute(INSERT, params_from_iter(row.iter())),
-            Self::Edit(row) => connection.execute(EDIT, params_from_iter(row.iter())),
+            Self::Edit(row) => connection.execute(EDIT, params_from_iter(row.iter().take(5))),
             Self::Delete(key) => connection.execute(DELETE, [key]),
         }
     }
@@ -213,8 +215,13 @@ struct Reference {
 impl Reference {
     fn apply(&mut self, write: &Write) {
         match write {
-            Write::Insert(row) | Write::Edit(row) => {
+            Write::Insert(row) => {
                 self.rows.insert(write.key(), row.clone());
+            }
+            Write::Edit(row) => {
+                if let Some(held) = self.rows.get_mut(&write.key()) {
+                    held.splice(..5, row.iter().take(5).cloned());
+                }
             }
             Write::Delete(key) => {
                 self.rows.remove(key);
