@@ -16,7 +16,13 @@
 //!   refused before it is sent.
 //! - D1's own `_cf_*` tables are the host's own: never read, always
 //!   ignored (FR-SMUGGLR-066).
-//! - A batch goes to D1 as one batch, taken as one transaction.
+//! - A batch goes to D1 as one `/raw` request. HTTP-SQL's `atomic: true`
+//!   is not proven there: D1 documents its Workers `batch()` as one
+//!   transaction, but its REST docs do not say a `/raw` batch is one. The
+//!   adapter does not claim it. A write batch that fails part-way may leave
+//!   its earlier rows written, which is the host's shortfall, and smugglr's
+//!   journal and read-back are what cover it: the run stops not done, and
+//!   the next run finishes it (FR-SMUGGLR-073).
 //!
 //! D1 answers integers as JSON numbers, so one beyond 2^53 a statement
 //! selects as itself arrives rounded; the HTTP-SQL place selects every value
@@ -186,11 +192,11 @@ impl D1 {
     /// Runs `statements` (each HTTP-SQL's `{sql, params}`) as one D1 batch,
     /// and returns each one's HTTP-SQL result, or what D1 refused.
     ///
-    /// Current choice (2026-10-20, #555): a `/raw` batch is taken as one
-    /// transaction, `atomic` or not, because D1 documents its Workers
-    /// `batch()` as one and its REST API offers no `BEGIN`; the REST docs do
-    /// not say so, and the release run against the real service must
-    /// confirm it; revisable.
+    /// `atomic` is not honored as a promise: the batch goes as one `/raw`
+    /// request whatever it says, and D1's REST API offers no `BEGIN` to make
+    /// it one transaction. Whether `/raw` is one is D1's to say and its REST
+    /// docs do not; the release run against the real service is where it
+    /// can be seen.
     fn run(&self, statements: &[Json]) -> Result<Result<Vec<Json>, Refusal>, String> {
         let mut batch = Vec::with_capacity(statements.len());
         let mut written = Vec::with_capacity(statements.len());

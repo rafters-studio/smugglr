@@ -230,8 +230,10 @@ pub(crate) mod d1 {
     }
 
     /// `sql` with each numbered parameter `?n` turned back into its kind,
-    /// `kinds[n - 1]`. Text inside a string literal or a quoted identifier
-    /// is left as it is.
+    /// `kinds[n - 1]`. Text inside a `'...'` string literal or a `"..."`
+    /// identifier is left as it is, a doubled quote inside one included.
+    /// Those are the only quoting the place's own SQL uses ([`super::ident`]);
+    /// backtick and bracket identifiers and comments are not read as such.
     pub(crate) fn typed_params(sql: &str, kinds: &[Kind]) -> String {
         let mut out = String::with_capacity(sql.len());
         let mut chars = sql.chars().peekable();
@@ -355,6 +357,23 @@ mod tests {
         assert_eq!(
             typed_params("SELECT '?1', ?1, ?12", &[Kind::Real]),
             "SELECT '?1', CAST(?1 AS REAL), ?12"
+        );
+        // A doubled quote stays inside its literal or identifier.
+        assert_eq!(
+            typed_params(
+                "SELECT 'it''s ?1', \"a\"\"?2\" FROM \"t\" WHERE ?2 IS ?1",
+                &[Kind::Blob, Kind::Integer]
+            ),
+            "SELECT 'it''s ?1', \"a\"\"?2\" FROM \"t\" WHERE CAST(?2 AS INTEGER) IS unhex(?1)"
+        );
+        // An identifier made by ident() from a name holding quotes and a
+        // placeholder stays whole.
+        assert_eq!(
+            typed_params(
+                &format!("SELECT {} = ?1", super::ident("x\"?1'")),
+                &[Kind::Null]
+            ),
+            "SELECT \"x\"\"?1'\" = NULLIF(?1, ?1)"
         );
         assert!(!writes(super::TABLES));
     }

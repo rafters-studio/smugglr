@@ -5,9 +5,10 @@
 //! The stand-in keeps D1's quirks that smugglr must meet: a bearer token;
 //! databases found by a name filter that also matches other names; every
 //! parameter text only; integers back as plain JSON numbers; its own
-//! `_cf_*` tables not to be read. It runs a batch as one transaction, as
-//! the D1 place takes it to (d1.rs). Before a release the @hosted scenario
-//! runs against the real service with credentials.
+//! `_cf_*` tables not to be read. It runs a batch as one transaction, which
+//! is the stand-in's own assumption, not D1's documented behaviour (d1.rs).
+//! Before a release the @hosted scenario runs against the real service with
+//! credentials.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
