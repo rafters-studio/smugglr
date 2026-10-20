@@ -13,6 +13,8 @@ mod setup;
 mod shape;
 #[path = "steps/sync.rs"]
 mod sync;
+#[path = "steps/whole.rs"]
+mod whole;
 
 use std::process::{Command, Output};
 
@@ -20,6 +22,7 @@ use rstest::fixture;
 use rstest_bdd::Slot;
 use rstest_bdd_macros::{ScenarioState, scenarios, then, when};
 use setup::{World, world};
+use whole::{Soak, soak};
 
 #[derive(Debug, Default, ScenarioState)]
 struct Run {
@@ -55,4 +58,4 @@ fn prints_name_and_version(run: &Run) -> Result<(), String> {
     }
 }
 
-scenarios!("tests", fixtures = [run: Run, world: World]);
+scenarios!("tests", fixtures = [run: Run, world: World, soak: Soak]);
