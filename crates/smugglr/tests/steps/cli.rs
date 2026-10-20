@@ -1,8 +1,15 @@
 //! Steps for smugglr sync on the command line.
 
-use rstest_bdd_macros::{given, then, when};
+use std::io::{BufRead, BufReader};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
-use crate::setup::{NOTES, ORDERS, World};
+use rstest_bdd_macros::{given, then, when};
+use serde_json::Value;
+use smugglr::{Options, sync};
+use smugglr_place::LocalFile;
+
+use crate::setup::{NOTES, ORDERS, THREE_NOTES, World, rows_of, sql_on};
 
 #[given("a local file and a postgres:// address")]
 fn file_and_postgres(world: &World) -> Result<(), String> {
@@ -64,24 +71,18 @@ fn record_as_text(world: &World) -> Result<(), String> {
     }
 }
 
-use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
-
-use serde_json::Value;
-use smugglr::{Options, sync};
-use smugglr_place::LocalFile;
-
-use crate::setup::{THREE_NOTES, rows_of, sql_on};
-
 const LINE_ITEMS: &str = "CREATE TABLE line_items (id TEXT PRIMARY KEY, qty INTEGER)";
+
+/// A source whose notes and orders tables both have rows.
+fn notes_and_orders_source() -> String {
+    format!("{NOTES}; {THREE_NOTES}; {ORDERS}; INSERT INTO orders VALUES ('o1', 'tent')")
+}
 
 #[given("two places whose notes and orders tables both have rows to move")]
 fn notes_and_orders(world: &World) -> Result<(), String> {
-    world.source.set(world.place(
-        "source.db",
-        &format!("{NOTES}; {THREE_NOTES}; {ORDERS}; INSERT INTO orders VALUES ('o1', 'tent')"),
-    )?);
+    world
+        .source
+        .set(world.place("source.db", &notes_and_orders_source())?);
     world
         .target
         .set(world.place("target.db", &format!("{NOTES}; {ORDERS}"))?);
@@ -122,8 +123,8 @@ fn three_tables(world: &World) -> Result<(), String> {
     world.source.set(world.place(
         "source.db",
         &format!(
-            "{NOTES}; {THREE_NOTES}; {ORDERS}; INSERT INTO orders VALUES ('o1', 'tent'); \
-             {LINE_ITEMS}; INSERT INTO line_items VALUES ('l1', 2)"
+            "{}; {LINE_ITEMS}; INSERT INTO line_items VALUES ('l1', 2)",
+            notes_and_orders_source()
         ),
     )?);
     world
@@ -158,10 +159,7 @@ fn lists_two_tables(world: &World) -> Result<(), String> {
 
 /// Makes one copy of the pair, syncs it once, then changes the same rows.
 fn copy(world: &World, name: &str) -> Result<(String, String), String> {
-    let source = world.place(
-        &format!("{name}-source.db"),
-        &format!("{NOTES}; {THREE_NOTES}; {ORDERS}; INSERT INTO orders VALUES ('o1', 'tent')"),
-    )?;
+    let source = world.place(&format!("{name}-source.db"), &notes_and_orders_source())?;
     let target = world.place(&format!("{name}-target.db"), &format!("{NOTES}; {ORDERS}"))?;
     let output = world.smugglr(&["sync", &source, &target])?;
     if !output.status.success() {
