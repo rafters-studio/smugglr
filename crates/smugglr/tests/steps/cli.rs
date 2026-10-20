@@ -352,6 +352,49 @@ fn every_sixty_seconds(world: &World) -> Result<(), String> {
     }
 }
 
+#[when("the agent runs smugglr sync on them with --watch 0")]
+fn watch_zero(world: &World) -> Result<(), String> {
+    let source = world.source.get().ok_or("no source")?;
+    let target = world.target.get().ok_or("no target")?;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_smugglr"))
+        .args(["sync", &source, &target, "--watch", "0"])
+        .env("XDG_CONFIG_HOME", world.xdg()?)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("failed to start smugglr: {err}"))?;
+    // A refusal exits at once; one still running is rerunning the sync.
+    let started = Instant::now();
+    while child.try_wait().map_err(|err| err.to_string())?.is_none() {
+        if started.elapsed() > Duration::from_secs(10) {
+            child.kill().map_err(|err| err.to_string())?;
+            let _ = child.wait();
+            return Err("smugglr sync --watch 0 was still running after 10 seconds".to_owned());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let output = child.wait_with_output().map_err(|err| err.to_string())?;
+    world.output.set(output);
+    Ok(())
+}
+
+#[then("smugglr exits with code 2 and makes no run")]
+fn refused_without_run(world: &World) -> Result<(), String> {
+    let output = world.output.get().ok_or("smugglr was not run")?;
+    let target = world.target.get().ok_or("no target")?;
+    let notes = rows_of(&target, "SELECT id FROM notes")?;
+    if output.status.code() == Some(2) && output.stdout.is_empty() && notes.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "smugglr exited {:?}, printing {:?} and saying {:?}, and the target holds {notes:?}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+}
+
 #[given("the smugglr CLI")]
 fn the_cli(world: &World) -> Result<(), String> {
     world.folder().map(|_| ())
