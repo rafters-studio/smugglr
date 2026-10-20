@@ -2,7 +2,7 @@
 //! (FR-SMUGGLR-070); smugglr never changes a shape.
 
 use smugglr_core::shape::{self, Column, Mismatch, Shape, TableShape};
-use smugglr_place::{Place, Table};
+use smugglr_place::Table;
 
 use crate::sync::Error;
 
@@ -27,14 +27,14 @@ fn shape_of(tables: &[Table]) -> Shape {
     }
 }
 
-/// How the shapes of `source` and `target`, whose tables are `ours` and
-/// `theirs`, differ; `None` when they are the same. Reads no row.
+/// How the shapes of the places at `source` and `target`, whose tables are
+/// `ours` and `theirs`, differ; `None` when they are the same. Reads no row.
 ///
 /// # Errors
-/// When a table has no primary key (#507's).
+/// When a table has no primary key.
 pub(crate) fn check(
-    source: &mut dyn Place,
-    target: &mut dyn Place,
+    source: &str,
+    target: &str,
     ours: &[Table],
     theirs: &[Table],
 ) -> Result<Option<Mismatch>, Error> {
@@ -42,7 +42,7 @@ pub(crate) fn check(
     if mismatch.is_some() {
         return Ok(mismatch);
     }
-    for (tables, here) in [(ours, source.address()), (theirs, target.address())] {
+    for (tables, here) in [(ours, source), (theirs, target)] {
         if let Some(table) = tables.iter().find(|table| table.key.is_empty()) {
             return Err(Error::Shape(format!(
                 "the table {} in {here} has no primary key",

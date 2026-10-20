@@ -63,7 +63,8 @@ pub fn sync(
     let theirs: Vec<Table> = theirs_every.iter().filter(|t| named(t)).cloned().collect();
     // The whole places' shapes, not only the tables named: any mismatch
     // stops the whole run (FR-SMUGGLR-070).
-    if let Some(mismatch) = shape::check(&mut *source, &mut *target, &every, &theirs_every)? {
+    if let Some(mismatch) = shape::check(source.address(), target.address(), &every, &theirs_every)?
+    {
         return Ok(Record::shape_mismatch(mismatch));
     }
     if let Some(name) = options
