@@ -3,6 +3,8 @@
 //! `scenarios!` discovers every `.feature` file under `tests/` and emits one
 //! test per scenario. Step definitions must compile into this binary.
 
+#[path = "steps/ignore.rs"]
+mod ignore_steps;
 #[path = "steps/plan.rs"]
 mod plan_steps;
 #[path = "steps/shape.rs"]

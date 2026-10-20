@@ -348,3 +348,36 @@ fn every_sixty_seconds(world: &World) -> Result<(), String> {
         Err(format!("runs at {runs:?} seconds"))
     }
 }
+
+#[given("the smugglr CLI")]
+fn the_cli(world: &World) -> Result<(), String> {
+    world.folder().map(|_| ())
+}
+
+#[when("the agent runs smugglr sync --help")]
+fn sync_help(world: &World) -> Result<(), String> {
+    world.smugglr(&["sync", "--help"]).map(|_| ())
+}
+
+#[then("the help lists no flag for ignoring tables")]
+fn no_ignore_flag(world: &World) -> Result<(), String> {
+    let output = world.output.get().ok_or("smugglr was not run")?;
+    let help = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() || !help.contains("usage: smugglr sync") {
+        return Err(format!(
+            "smugglr sync --help exited {} printing {help:?}",
+            output.status
+        ));
+    }
+    let flags: Vec<&str> = help
+        .split(|c: char| c.is_whitespace() || "[]|".contains(c))
+        .filter(|word| word.starts_with('-'))
+        .collect();
+    match flags
+        .iter()
+        .find(|flag| flag.to_ascii_lowercase().contains("ignore"))
+    {
+        Some(flag) => Err(format!("the help lists {flag}")),
+        None => Ok(()),
+    }
+}
