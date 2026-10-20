@@ -156,3 +156,27 @@ Feature: one sync between two places, with places and memory as they are
     Given a target that drops its connection after the run has written some rows
     When the agent runs smugglr sync --json on the source and that target
     Then the record names the tables and keys of the rows written before the connection dropped
+
+  @criterion-01a14c16-945a-78c1-8bac-db98708c7c59
+  Scenario: Over 200 smugglr sync runs with clocks agreeing, 0 rows, deletes or edits are lost
+    Given two local files with no steering column, keyed in order, whose writers' clocks agree
+    When the agent runs smugglr sync on them 200 times, with inserts, edits and deletes on both sides between runs
+    Then against the reference, 0 rows are lost, 0 deletes undone and 0 edits lost
+
+  @criterion-01a14c16-945a-78c1-8bac-dba83684cc59
+  Scenario: Over 200 smugglr sync runs with one place's clock 60 s behind, 0 rows, deletes or edits are lost
+    Given two local files with no steering column, keyed in order, the target's writer's clock 60 seconds behind
+    When the agent runs smugglr sync on them 200 times, with inserts, edits and deletes on both sides between runs
+    Then against the reference, 0 rows are lost, 0 deletes undone and 0 edits lost
+
+  @criterion-01a14c16-945a-78c1-8bac-dbb061c8b66b
+  Scenario: Over 200 smugglr sync runs on tables with random 64-bit keys, 0 rows, deletes or edits are lost
+    Given two local files with no steering column, keyed by random 64-bit keys, whose writers' clocks agree
+    When the agent runs smugglr sync on them 200 times, with inserts, edits and deletes on both sides between runs
+    Then against the reference, 0 rows are lost, 0 deletes undone and 0 edits lost
+
+  @criterion-01a14c16-945a-78c1-8bac-dbc8cf2efbf1
+  Scenario: Over 200 smugglr sync runs with rows committed while a run reads, 0 rows, deletes or edits are lost
+    Given two local files with no steering column, keyed in order, whose writers' clocks agree
+    When the agent runs smugglr sync on them 200 times, with inserts, edits and deletes on both sides between runs, and rows committed into the source while each run reads
+    Then against the reference, 0 rows are lost, 0 deletes undone and 0 edits lost
