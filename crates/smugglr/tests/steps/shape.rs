@@ -97,7 +97,7 @@ fn agent_syncs_json(world: &World) -> Result<(), String> {
 }
 
 /// The record smugglr printed as JSON.
-fn record(world: &World) -> Result<Value, String> {
+pub(crate) fn record(world: &World) -> Result<Value, String> {
     let output = world.output.get().ok_or("smugglr was not run")?;
     let said = String::from_utf8_lossy(&output.stdout);
     serde_json::from_str(&said).map_err(|err| {

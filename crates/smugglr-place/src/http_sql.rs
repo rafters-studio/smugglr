@@ -10,17 +10,64 @@
 
 use serde_json::{Value as Json, json};
 use smugglr_core::change::{Change, Op};
+use smugglr_core::ignore::Ignore;
 use smugglr_core::row_hash::row_hash;
 
 use crate::queries;
 use crate::value::param;
 use crate::{Error, Key, Place, Table};
 
-/// A service at an `http://` or `https://` address that speaks HTTP-SQL.
+/// A service that speaks HTTP-SQL: at an `http://` or `https://` address,
+/// or reached through an adapter ([`Transport`]).
 #[derive(Debug)]
 pub struct HttpSql {
     address: String,
+    transport: Box<dyn Transport>,
+}
+
+/// How HTTP-SQL requests reach a service: an HTTP POST to its URL, or an
+/// adapter that answers them by speaking another API underneath, as the D1
+/// adapter speaks D1's REST API.
+pub trait Transport: std::fmt::Debug {
+    /// Sends one HTTP-SQL request body, and returns whether it succeeded and
+    /// the HTTP-SQL response body.
+    ///
+    /// # Errors
+    /// When the request does not reach the service, in the transport's own
+    /// words.
+    fn send(&self, request: &str) -> Result<(bool, String), String>;
+
+    /// The host's own tables, as names or patterns ([`Place::own_tables`]).
+    fn own_tables(&self) -> &[&str] {
+        &[]
+    }
+}
+
+/// An HTTP POST to the service's URL.
+#[derive(Debug)]
+struct Post {
+    url: String,
     agent: ureq::Agent,
+}
+
+impl Transport for Post {
+    fn send(&self, request: &str) -> Result<(bool, String), String> {
+        let mut response = self
+            .agent
+            .post(&self.url)
+            .header("Content-Type", "application/json")
+            .header("Http-Sql-Accept-Version", "0.0.1")
+            .send(request)
+            .map_err(|err| err.to_string())?;
+        let status = response.status();
+        let text = response
+            .body_mut()
+            .with_config()
+            .limit(u64::MAX)
+            .read_to_string()
+            .map_err(|err| err.to_string())?;
+        Ok((status.is_success(), text))
+    }
 }
 
 /// One statement and its parameters.
@@ -34,9 +81,22 @@ impl HttpSql {
             .http_status_as_error(false)
             .build()
             .into();
+        Self::through(
+            url,
+            Box::new(Post {
+                url: url.to_owned(),
+                agent,
+            }),
+        )
+    }
+
+    /// The service at `address`, reached through `transport`. Nothing is
+    /// sent until the place is read.
+    #[must_use]
+    pub fn through(address: &str, transport: Box<dyn Transport>) -> Self {
         Self {
-            address: url.to_owned(),
-            agent,
+            address: address.to_owned(),
+            transport,
         }
     }
 
@@ -44,24 +104,14 @@ impl HttpSql {
         Error::Adapter(format!("{}: {what}", self.address))
     }
 
-    /// Posts `body` and returns the success envelope.
+    /// Sends `body` and returns the success envelope.
     fn post(&self, body: &Json) -> Result<Json, Error> {
-        let mut response = self
-            .agent
-            .post(&self.address)
-            .header("Content-Type", "application/json")
-            .header("Http-Sql-Accept-Version", "0.0.1")
-            .send(body.to_string())
-            .map_err(|err| self.failed(err))?;
-        let status = response.status();
-        let text = response
-            .body_mut()
-            .with_config()
-            .limit(u64::MAX)
-            .read_to_string()
+        let (succeeded, text) = self
+            .transport
+            .send(&body.to_string())
             .map_err(|err| self.failed(err))?;
         let envelope: Json = serde_json::from_str(&text).map_err(|err| self.failed(err))?;
-        if status.is_success() {
+        if succeeded {
             Ok(envelope)
         } else {
             let error = &envelope["error"];
@@ -179,7 +229,12 @@ impl Place for HttpSql {
         &self.address
     }
 
+    fn own_tables(&self) -> &[&str] {
+        self.transport.own_tables()
+    }
+
     fn tables(&mut self) -> Result<Vec<Table>, Error> {
+        let own = Ignore::new(self.own_tables().iter().copied());
         let names = self.query(queries::TABLES, &[])?;
         names
             .iter()
@@ -188,6 +243,16 @@ impl Place for HttpSql {
                     .first()
                     .and_then(Json::as_str)
                     .ok_or_else(|| self.failed("a table without a name"))?;
+                if own.ignores(name) {
+                    // The host's own: named, never read.
+                    return Ok(Table {
+                        name: name.to_owned(),
+                        columns: Vec::new(),
+                        types: Vec::new(),
+                        key: Vec::new(),
+                        self_keyed: false,
+                    });
+                }
                 let mut columns = Vec::new();
                 let mut types = Vec::new();
                 let mut key = Vec::new();
