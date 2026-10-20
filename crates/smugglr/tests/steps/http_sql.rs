@@ -129,7 +129,7 @@ fn param(value: &Json) -> Result<Value, String> {
 fn emit(value: Value) -> Result<Json, String> {
     Ok(match value {
         Value::Null => Json::Null,
-        Value::Integer(integer) if integer.abs() <= JSON_SAFE => json!(integer),
+        Value::Integer(integer) if (-JSON_SAFE..=JSON_SAFE).contains(&integer) => json!(integer),
         Value::Integer(integer) => json!({"$type": "bigint", "$value": integer.to_string()}),
         Value::Real(real) => json!(real),
         Value::Text(text) => Json::String(text),

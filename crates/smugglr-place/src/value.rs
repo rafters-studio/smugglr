@@ -41,7 +41,7 @@ pub(crate) fn param(text: &str) -> Result<serde_json::Value, Error> {
     use serde_json::{Value as Json, json};
     Ok(match unquote(text)? {
         Value::Null => Json::Null,
-        Value::Integer(integer) if integer.abs() <= JSON_SAFE => json!(integer),
+        Value::Integer(integer) if (-JSON_SAFE..=JSON_SAFE).contains(&integer) => json!(integer),
         Value::Integer(integer) => json!({"$type": "bigint", "$value": integer.to_string()}),
         Value::Real(real) => serde_json::Number::from_f64(real)
             .map(Json::Number)
@@ -113,6 +113,10 @@ mod tests {
         );
         assert_eq!(param("'it''s'")?, json!("it's"));
         assert_eq!(param("NULL")?, json!(null));
+        assert_eq!(
+            param("-9223372036854775808")?,
+            json!({"$type": "bigint", "$value": "-9223372036854775808"})
+        );
         Ok(())
     }
 
