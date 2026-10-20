@@ -1032,3 +1032,145 @@ fn exits_5(world: &World) -> Result<(), String> {
         code => Err(format!("smugglr exited {code:?}{}", stderr(world))),
     }
 }
+
+/// What a `--sync-mode last` run on real files gives: its record, its exit
+/// code, and the source's and the target's orders afterwards.
+type LastRun = (
+    serde_json::Value,
+    Option<i32>,
+    Vec<Vec<String>>,
+    Vec<Vec<String>>,
+);
+
+/// Two real files holding one order, steered by `config`, synced once; then
+/// the order edited in both, its `version` set to `in_source` and
+/// `in_target`. Returns what `smugglr sync --sync-mode last --json` printed
+/// and exited with, and each place's order afterwards.
+fn last_on_real_files(
+    world: &World,
+    config: &str,
+    in_source: i64,
+    in_target: i64,
+) -> Result<LastRun, String> {
+    let orders = "CREATE TABLE orders (id TEXT PRIMARY KEY, item TEXT, version INTEGER)";
+    let source = world.place(
+        "source.db",
+        &format!("{orders}; INSERT INTO orders VALUES ('o1', 'tent', 1)"),
+    )?;
+    let target = world.place("target.db", orders)?;
+    world.source.set(source.clone());
+    world.target.set(target.clone());
+    world.sync_ok()?;
+    crate::cli::config(world, config)?;
+    sql_on(
+        &source,
+        &format!("UPDATE orders SET item = 'source copy', version = {in_source}"),
+    )?;
+    sql_on(
+        &target,
+        &format!("UPDATE orders SET item = 'target copy', version = {in_target}"),
+    )?;
+    let output = world.sync(&["--sync-mode", "last", "--json"])?;
+    let said = String::from_utf8_lossy(&output.stdout);
+    let record = serde_json::from_str(&said)
+        .map_err(|err| format!("the record is not JSON ({err}): {said}{}", stderr(world)))?;
+    let query = "SELECT item, version FROM orders";
+    Ok((
+        record,
+        output.status.code(),
+        rows_of(&source, query)?,
+        rows_of(&target, query)?,
+    ))
+}
+
+/// #510 through the real CLI: an integer steering value of 10 is further on
+/// than 9, so the target's copy is kept in both places and named.
+#[test]
+fn real_files_keep_the_copy_further_on_by_number() -> Result<(), String> {
+    let world = World::default();
+    let (record, code, source, target) =
+        last_on_real_files(&world, "steering = \"version\"\n", 9, 10)?;
+    let orders = &record["tables"]["orders"];
+    if code == Some(0)
+        && orders["overwritten_in_source"] == serde_json::json!(["o1"])
+        && source == target
+        && format!("{source:?}").contains("target copy")
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "the source holds {source:?}; the record is {record}"
+        ))
+    }
+}
+
+/// #510 through the real CLI: a per-table steering column is used for its
+/// table, and equal values stop the table, naming the row.
+#[test]
+fn real_files_stop_on_equal_values_of_a_per_table_column() -> Result<(), String> {
+    let world = World::default();
+    let (record, _, source, target) =
+        last_on_real_files(&world, "[tables.orders]\nsteering = \"version\"\n", 7, 7)?;
+    let orders = &record["tables"]["orders"];
+    if orders["status"] == "stopped"
+        && orders["rows"] == serde_json::json!(["o1"])
+        && source != target
+    {
+        Ok(())
+    } else {
+        Err(format!("the record is {record}"))
+    }
+}
+
+/// #510 through the real CLI: a refusal for want of a steering column
+/// writes nothing and keeps no memory.
+#[test]
+fn real_files_refused_for_want_of_steering_keep_nothing() -> Result<(), String> {
+    let world = World::default();
+    world.source.set(world.place(
+        "source.db",
+        &format!("{NOTES}; {THREE_NOTES}; {ORDERS}; INSERT INTO orders VALUES ('o1', 'tent')"),
+    )?);
+    world
+        .target
+        .set(world.place("target.db", &format!("{NOTES}; {ORDERS}"))?);
+    crate::cli::config(&world, "[tables.notes]\nsteering = \"created_at\"\n")?;
+    let before = crate::shape::snapshot(&world)?;
+    let output = world.sync(&["--sync-mode", "last"])?;
+    let said = String::from_utf8_lossy(&output.stderr);
+    let kept: Vec<String> = files_under(&world.config()?)?
+        .into_iter()
+        .map(|(path, _)| path)
+        .filter(|path| !path.ends_with("config.toml"))
+        .collect();
+    if output.status.code() == Some(2)
+        && said.contains("needs a steering column for: orders.")
+        && crate::shape::snapshot(&world)? == before
+        && kept.is_empty()
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "smugglr exited {} saying {said:?}; kept {kept:?}",
+            output.status
+        ))
+    }
+}
+
+#[given(
+    "two places with rows to move, whose orders table has no steering column named in the config"
+)]
+fn rows_to_move_without_steering(world: &World) -> Result<(), String> {
+    world.source.set(world.place(
+        "source.db",
+        &format!("{NOTES}; {THREE_NOTES}; {ORDERS}; INSERT INTO orders VALUES ('o1', 'tent')"),
+    )?);
+    world
+        .target
+        .set(world.place("target.db", &format!("{NOTES}; {ORDERS}"))?);
+    // notes steers; orders has none named.
+    crate::cli::config(world, "[tables.notes]\nsteering = \"created_at\"\n")?;
+    // The shape steps' "neither place has changed" compares this snapshot.
+    world.watched.set(crate::shape::snapshot(world)?);
+    Ok(())
+}

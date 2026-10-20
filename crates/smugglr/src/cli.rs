@@ -23,7 +23,7 @@ const TOO_MUCH: u8 = 5;
 const WATCH_SECONDS: u64 = 60;
 
 const HELP: &str = "usage: smugglr sync <source> <target> [--dryrun] [--json] \
-     [--sync-type direct] [--sync-mode stop|source|target] [--table <name>]... \
+     [--sync-type direct] [--sync-mode stop|source|target|last] [--table <name>]... \
      [--watch [seconds]]
 
 The first place named is the source, the second the target.
@@ -31,10 +31,11 @@ The first place named is the source, the second the target.
   --json                   print the record as JSON
   --sync-type direct       how the places connect; direct is the default
                            (hub, multi and mesh are not built yet)
-  --sync-mode stop|source|target
+  --sync-mode stop|source|target|last
                            what happens to a row changed in both places: stop
                            (the default) names it, source keeps the source's
-                           copy, target the target's
+                           copy, target the target's, last the copy whose
+                           steering column (named in config) is further on
   --table <name>           limit the run to this table; repeatable
   --watch [seconds]        rerun every given number of seconds, 60 when none
                            is given, until stopped";
@@ -99,9 +100,11 @@ fn parse(args: &[String]) -> Result<Sync, String> {
                     "stop" => SyncMode::Stop,
                     "source" => SyncMode::Source,
                     "target" => SyncMode::Target,
-                    "last" => return Err("--sync-mode last is not built yet".to_owned()),
+                    "last" => SyncMode::Last,
                     other => {
-                        return Err(format!("--sync-mode {other}: use stop, source or target"));
+                        return Err(format!(
+                            "--sync-mode {other}: use stop, source, target or last"
+                        ));
                     }
                 };
             }
@@ -137,8 +140,8 @@ fn sync_command(command: &Sync) -> ExitCode {
 }
 
 fn sync_once(command: &Sync) -> ExitCode {
-    // The tables to ignore and max_wire come from the config, never from a
-    // flag.
+    // The tables to ignore, max_wire and the steering columns come from the
+    // config, never from a flag.
     let mut options = command.options.clone();
     let dir = options
         .config_dir
@@ -149,6 +152,7 @@ fn sync_once(command: &Sync) -> ExitCode {
             Ok(config) => {
                 options.ignore = config.ignore;
                 options.max_wire = config.max_wire;
+                options.steering = config.steering;
             }
             Err(err) => {
                 eprintln!("{err}");
@@ -173,6 +177,11 @@ fn sync_once(command: &Sync) -> ExitCode {
                 print!("{record}");
             }
             exit(&record)
+        }
+        // A usage error: the one message, without the usage after it.
+        Err(err @ smugglr::Error::NoSteering(_)) => {
+            eprintln!("{err}");
+            ExitCode::from(USAGE)
         }
         Err(err) => {
             eprintln!("{err}");

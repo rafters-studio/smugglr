@@ -384,3 +384,69 @@ fn no_ignore_flag(world: &World) -> Result<(), String> {
         None => Ok(()),
     }
 }
+
+/// What smugglr says when `--sync-mode last` meets tables with no steering
+/// column.
+const NEEDS_STEERING: &str = "--sync-mode last needs a steering column for:";
+
+/// Writes `text` as the config smugglr reads.
+pub(crate) fn config(world: &World, text: &str) -> Result<(), String> {
+    let dir = world.config()?;
+    std::fs::create_dir_all(&dir).map_err(|err| format!("{}: {err}", dir.display()))?;
+    let file = dir.join("config.toml");
+    std::fs::write(&file, text).map_err(|err| format!("{}: {err}", file.display()))
+}
+
+#[given(
+    "two places whose orders and line_items tables have no steering column named in the config"
+)]
+fn no_steering_for_orders_and_line_items(world: &World) -> Result<(), String> {
+    let shape = format!("{NOTES}; {ORDERS}; {LINE_ITEMS}");
+    world.source.set(world.place(
+        "source.db",
+        &format!("{shape}; {THREE_NOTES}; INSERT INTO orders VALUES ('o1', 'tent')"),
+    )?);
+    world.target.set(world.place("target.db", &shape)?);
+    // notes steers; orders and line_items have none named.
+    config(world, "[tables.notes]\nsteering = \"created_at\"\n")
+}
+
+#[when("the agent runs smugglr sync on them with --sync-mode last")]
+fn sync_last(world: &World) -> Result<(), String> {
+    world.sync(&["--sync-mode", "last"]).map(|_| ())
+}
+
+#[then("smugglr exits 2")]
+fn exits_2(world: &World) -> Result<(), String> {
+    let output = world.output.get().ok_or("smugglr was not run")?;
+    let said = String::from_utf8_lossy(&output.stderr);
+    match output.status.code() {
+        Some(2) if said.contains(NEEDS_STEERING) => Ok(()),
+        code => Err(format!("smugglr exited {code:?} saying {said:?}")),
+    }
+}
+
+#[then("one error names both orders and line_items")]
+fn one_error_names_both(world: &World) -> Result<(), String> {
+    let output = world.output.get().ok_or("smugglr was not run")?;
+    let said = String::from_utf8_lossy(&output.stderr);
+    let lines: Vec<&str> = said
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    match lines.as_slice() {
+        [line]
+            if line.starts_with(NEEDS_STEERING)
+                && line.contains("orders")
+                && line.contains("line_items")
+                && !line.contains("notes")
+                && output.stdout.is_empty() =>
+        {
+            Ok(())
+        }
+        _ => Err(format!(
+            "smugglr said {said:?} and printed {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        )),
+    }
+}
