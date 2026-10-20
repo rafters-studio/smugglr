@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use smugglr_core::change::{Change, Op};
 use smugglr_core::plan::{Hashes, Plan, Side, SyncMode, Write, not_read_back, plan, recover};
-use smugglr_core::record::{self, Record, Status};
+use smugglr_core::record::{self, Record};
 use smugglr_core::row_hash::row_hash;
 use smugglr_memory::Memory;
 use smugglr_place::{Place, Table};
@@ -63,6 +63,7 @@ pub fn sync(
     )?;
     finish_cut_off_run(&mut memory, &tables, source, target, options.dryrun)?;
     let mut done = BTreeMap::new();
+    let mut unmatched = false;
     for table in tables {
         let here: Hashes = source.hashes(&table)?.into_iter().collect();
         let there: Hashes = target.hashes(&table)?.into_iter().collect();
@@ -102,6 +103,7 @@ pub fn sync(
         )?);
         if !mismatched.is_empty() {
             // Not done: the table keeps its old memory.
+            unmatched = true;
             done.insert(table.name.clone(), record::not_read_back(mismatched));
             continue;
         }
@@ -110,8 +112,10 @@ pub fn sync(
     let record = Record::new(done, options.dryrun);
     if !options.dryrun {
         memory.save()?;
-        // Kept after a run that is not done, so the next run finishes it.
-        if record.status == Status::Done {
+        // Kept after a run whose rows read back different (exit 4), so
+        // the next run finishes it; any other run's memory already holds
+        // what it wrote.
+        if !unmatched {
             memory.clear_journal()?;
         }
     }
@@ -131,6 +135,11 @@ fn finish_cut_off_run(
 ) -> Result<(), Error> {
     let journaled = memory.journaled()?;
     if journaled.is_empty() {
+        // A journal holding only a line torn by a crash names no row
+        // written; it goes, so the next lines are not appended to it.
+        if !dryrun {
+            memory.clear_journal()?;
+        }
         return Ok(());
     }
     for table in tables {

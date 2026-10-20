@@ -487,12 +487,15 @@ impl Place for Cut {
         if self.after {
             self.file.write(table, changes)?;
         }
-        Err(Error::Adapter("the run was cut off".to_owned()))
+        Err(Error::Adapter(CUT_OFF.to_owned()))
     }
 }
 
+/// What a `Cut` place says when the run is cut off.
+const CUT_OFF: &str = "the run was cut off";
+
 /// Runs a sync through the Rust crates whose target is cut off while
-/// writing `table`, and fails unless the run ends early.
+/// writing `table`, and fails unless the run ends there.
 fn cut_run(world: &World, table: &'static str, after: bool) -> Result<(), String> {
     let (source, target) = places(world)?;
     let mut source = LocalFile::open(&source).map_err(|err| err.to_string())?;
@@ -502,7 +505,8 @@ fn cut_run(world: &World, table: &'static str, after: bool) -> Result<(), String
         after,
     };
     match sync(&mut source, &mut target, &options(world)?) {
-        Err(_) => Ok(()),
+        Err(smugglr::Error::Place(Error::Adapter(message))) if message == CUT_OFF => Ok(()),
+        Err(err) => Err(format!("the run ended before the cut: {err}")),
         Ok(record) => Err(format!("the run was not cut off: {}", record.json())),
     }
 }
@@ -558,7 +562,12 @@ fn cut_part_way(world: &World) -> Result<(), String> {
         &format!("{NOTES}; {ORDERS}; INSERT INTO orders VALUES ('o3', 'lamp')"),
     )?);
     // notes is written, then the run is cut before orders.
-    cut_run(world, "orders", false)
+    cut_run(world, "orders", false)?;
+    let (_, target) = places(world)?;
+    match rows_of(&target, "SELECT id FROM notes")?.len() {
+        3 => Ok(()),
+        n => Err(format!("the cut-off run wrote {n} of the 3 notes")),
+    }
 }
 
 #[when("the agent runs smugglr sync on them again")]
