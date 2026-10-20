@@ -75,16 +75,6 @@ fn sqlite_sequence_differs(pair: &Pair) {
     );
 }
 
-#[given("two places whose _migratr_migrations tables differ only in a row the source has")]
-fn ledger_differs(pair: &Pair) {
-    let ledger = [("0001", "create notes"), ("0002", "add body")];
-    places(
-        pair,
-        vec![("_migratr_migrations", rows(&ledger))],
-        vec![("_migratr_migrations", rows(&ledger[..1]))],
-    );
-}
-
 #[given(
     "a config whose ignore list holds cache_* and sessions_tmp, and two places holding cache_pages, cache_thumbs and sessions_tmp"
 )]
@@ -123,11 +113,6 @@ fn sessions_tmp_unchanged(pair: &Pair) -> Result<(), String> {
 #[then("the target's sqlite_sequence is unchanged")]
 fn sqlite_sequence_unchanged(pair: &Pair) -> Result<(), String> {
     target_unchanged(pair, "sqlite_sequence")
-}
-
-#[then("the target's _migratr_migrations is unchanged")]
-fn ledger_unchanged(pair: &Pair) -> Result<(), String> {
-    target_unchanged(pair, "_migratr_migrations")
 }
 
 /// The record's ignored list, and the record.

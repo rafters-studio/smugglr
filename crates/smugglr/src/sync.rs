@@ -410,12 +410,8 @@ mod tests {
         // tags is in step, but each place's sqlite_sequence counts it
         // differently; SQLite itself moves the counter of a table written.
         // notes is keyed by text: a rowid key would stop it (#507).
-        // The ledgers differ in an older row only: at different latest
-        // migrations the shape check would stop the run (FR-SMUGGLR-070).
         let shape = "CREATE TABLE notes (id TEXT PRIMARY KEY, body TEXT); \
                      CREATE TABLE tags (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT); \
-                     CREATE TABLE _migratr_migrations (version INTEGER PRIMARY KEY, \
-                     name TEXT NOT NULL, checksum TEXT NOT NULL, applied_at TEXT NOT NULL); \
                      CREATE TABLE sessions_tmp (id TEXT PRIMARY KEY, who TEXT);";
         let source = sqlite(
             &dir.join("source.db"),
@@ -423,7 +419,6 @@ mod tests {
                 "{shape} CREATE TABLE cache_pages (url TEXT, body BLOB); \
                  INSERT INTO notes VALUES ('n1', 'a'), ('n2', 'b'); \
                  INSERT INTO tags (name) VALUES ('t'); \
-                 INSERT INTO _migratr_migrations VALUES (1, 'a', 'c1', 't'), (2, 'b', 'c2', 't'); \
                  INSERT INTO sessions_tmp VALUES ('s1', 'source'); \
                  INSERT INTO cache_pages VALUES ('/', x'00');"
             ),
@@ -432,11 +427,10 @@ mod tests {
             &dir.join("target.db"),
             &format!(
                 "{shape} INSERT INTO tags (name) VALUES ('t'), ('gone'); \
-                 DELETE FROM tags WHERE name = 'gone'; \
-                 INSERT INTO _migratr_migrations VALUES (2, 'b', 'c2', 't');"
+                 DELETE FROM tags WHERE name = 'gone';"
             ),
         )?;
-        let watched = ["sqlite_sequence", "_migratr_migrations", "sessions_tmp"];
+        let watched = ["sqlite_sequence", "sessions_tmp"];
         let before = watched
             .iter()
             .map(|table| dump(&target, table))
@@ -463,7 +457,7 @@ mod tests {
                 .iter()
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
-            ["_migratr_migrations", "cache_pages", "sessions_tmp"]
+            ["cache_pages", "sessions_tmp"]
         );
         assert_eq!(record.tables.keys().collect::<Vec<_>>(), ["notes", "tags"]);
         drop((source, target));

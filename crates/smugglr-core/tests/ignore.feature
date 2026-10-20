@@ -19,12 +19,6 @@ Feature: ignored tables are never read, written, hashed or sent (FR-SMUGGLR-066)
     When the agent runs smugglr sync on them
     Then the target's sqlite_sequence is unchanged
 
-  @criterion-01a14bed-6a79-7543-91fd-0020bc92b1db @module-smugglr-core
-  Scenario: migratr's ledger is ignored
-    Given two places whose _migratr_migrations tables differ only in a row the source has
-    When the agent runs smugglr sync on them
-    Then the target's _migratr_migrations is unchanged
-
   @criterion-01a14bed-6a79-7543-91fd-003421b1475b @module-smugglr-core
   Scenario: the record lists ignored tables once
     Given a config whose ignore list holds cache_* and sessions_tmp, and two places holding cache_pages, cache_thumbs and sessions_tmp
