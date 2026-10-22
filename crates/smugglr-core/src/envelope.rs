@@ -15,7 +15,7 @@
 //! The signature is BLAKE3 keyed with the shared key the caller chooses.
 
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::change::{Change, Decision, Op, decide};
 use crate::plan::SyncMode;
@@ -160,51 +160,104 @@ pub enum Arrival {
 }
 
 /// Decides each of `envelopes` arriving together, in order, verified with
-/// `key`, against the row `here` gives for its change. A conflict follows
-/// `mode`: under [`SyncMode::Last`] the copy whose steering value is further
-/// on is kept, and a row whose two values are equal, or that has none,
-/// stops; under every other mode the row stops. A change of a transaction
-/// (its maker's `node` and the transaction's `id`) is applied only when all
-/// of the transaction's distinct changes have arrived and each is applied
-/// or skipped; otherwise it is held.
+/// `key`. The first envelope of a row is decided against the row `here`
+/// gives for its change, and each later one against the row as the
+/// envelopes before it leave it, so a batch arrives as the same envelopes
+/// would one call at a time. A conflict follows `mode`: under
+/// [`SyncMode::Last`] the copy whose steering value is further on is kept,
+/// and a row whose two values are equal, or that has none, stops; under
+/// every other mode the row stops. A change of a transaction (its maker's
+/// `node` and the transaction's `id`) is applied only when all of the
+/// transaction's distinct changes have arrived unrefused and each is applied
+/// or skipped; otherwise it is held, and leaves its row as it was.
 pub fn receive(
     envelopes: &[Envelope],
     key: &[u8; 32],
     mode: SyncMode,
     here: impl Fn(&Change) -> Here,
 ) -> Vec<Arrival> {
-    let mut arrivals: Vec<Arrival> = envelopes
-        .iter()
-        .map(|envelope| arrive(envelope, key, mode, &here(&envelope.change)))
-        .collect();
-    // A transaction is its maker's: the same id from two nodes is two
-    // transactions. A member is counted once however many copies arrive.
+    // Holding a member can change what follows it, so decide again until no
+    // further member is held.
+    let mut held = BTreeSet::new();
+    loop {
+        let arrivals = in_order(envelopes, key, mode, &here, &held);
+        let broken = broken(envelopes, &arrivals);
+        let before = held.len();
+        for (index, (envelope, arrival)) in envelopes.iter().zip(&arrivals).enumerate() {
+            let in_broken = envelope
+                .txn
+                .as_ref()
+                .is_some_and(|txn| broken.contains(&(envelope.node.as_str(), txn.id.as_str())));
+            if in_broken && *arrival == Arrival::Apply {
+                held.insert(index);
+            }
+        }
+        if held.len() == before {
+            return arrivals;
+        }
+    }
+}
+
+/// Decides each envelope against its row as the envelopes before it leave
+/// it; an envelope in `held` that would apply is held instead.
+fn in_order(
+    envelopes: &[Envelope],
+    key: &[u8; 32],
+    mode: SyncMode,
+    here: impl Fn(&Change) -> Here,
+    held: &BTreeSet<usize>,
+) -> Vec<Arrival> {
+    let mut rows: BTreeMap<(&str, &[String]), Here> = BTreeMap::new();
+    let mut arrivals = Vec::with_capacity(envelopes.len());
+    for (index, envelope) in envelopes.iter().enumerate() {
+        let change = &envelope.change;
+        let row = rows
+            .entry((change.table.as_str(), change.key.as_slice()))
+            .or_insert_with(|| here(change));
+        let mut arrival = arrive(envelope, key, mode, row);
+        if arrival == Arrival::Apply && held.contains(&index) {
+            arrival = Arrival::Hold;
+        }
+        if arrival == Arrival::Apply {
+            row.hash = change.to;
+            row.last_from = Some(change.from);
+            row.steering = row
+                .steering
+                .take()
+                .and_then(|(at, _)| Some((at, change.values.get(at)?.clone())));
+        }
+        arrivals.push(arrival);
+    }
+    arrivals
+}
+
+/// The transactions, by maker and id, that cannot be applied: one of their
+/// distinct unrefused members is missing or neither applied nor skipped. The
+/// same id from two nodes is two transactions, and a member is counted once
+/// however many copies arrive.
+fn broken<'a>(envelopes: &'a [Envelope], arrivals: &[Arrival]) -> BTreeSet<(&'a str, &'a str)> {
     let mut broken = BTreeSet::new();
-    for (envelope, arrival) in envelopes.iter().zip(&arrivals) {
+    for (envelope, arrival) in envelopes.iter().zip(arrivals) {
         let Some(txn) = &envelope.txn else { continue };
+        if *arrival == Arrival::Refused {
+            continue;
+        }
         let members: BTreeSet<&[u8; 32]> = envelopes
             .iter()
-            .filter(|other| {
-                other.node == envelope.node
+            .zip(arrivals)
+            .filter(|(other, arrival)| {
+                **arrival != Arrival::Refused
+                    && other.node == envelope.node
                     && other.txn.as_ref().is_some_and(|other| other.id == txn.id)
             })
-            .map(|other| &other.signature)
+            .map(|(other, _)| &other.signature)
             .collect();
         if members.len() != txn.count as usize || !matches!(arrival, Arrival::Apply | Arrival::Skip)
         {
             broken.insert((envelope.node.as_str(), txn.id.as_str()));
         }
     }
-    for (envelope, arrival) in envelopes.iter().zip(&mut arrivals) {
-        let in_broken = envelope
-            .txn
-            .as_ref()
-            .is_some_and(|txn| broken.contains(&(envelope.node.as_str(), txn.id.as_str())));
-        if in_broken && *arrival == Arrival::Apply {
-            *arrival = Arrival::Hold;
-        }
-    }
-    arrivals
+    broken
 }
 
 fn arrive(envelope: &Envelope, key: &[u8; 32], mode: SyncMode, here: &Here) -> Arrival {
@@ -375,6 +428,87 @@ mod tests {
         assert_eq!(
             receive(&[b], &KEY, SyncMode::Last, |_| here.clone()),
             [Arrival::Stop]
+        );
+    }
+
+    fn from_node(mut envelope: Envelope, node: &str) -> Envelope {
+        node.clone_into(&mut envelope.node);
+        envelope.sign(&KEY);
+        envelope
+    }
+
+    #[test]
+    fn a_same_from_conflict_in_one_call_applies_the_first_and_stops_the_second() {
+        let f = row_hash(&["1", "'f'"]);
+        let here = Here {
+            hash: Some(f),
+            last_from: None,
+            steering: None,
+        };
+        let a = signed(Some(f), &["1", "'a'"]);
+        let b = from_node(signed(Some(f), &["1", "'b'"]), "b");
+        assert_eq!(
+            receive(&[a, b], &KEY, SyncMode::Stop, |_| here.clone()),
+            [Arrival::Apply, Arrival::Stop]
+        );
+    }
+
+    #[test]
+    fn a_same_from_conflict_in_one_call_under_last_keeps_the_copy_further_on() {
+        let f = row_hash(&["1", "'f'"]);
+        let here = Here {
+            hash: Some(f),
+            last_from: None,
+            steering: Some((1, "'f'".to_owned())),
+        };
+        let a = signed(Some(f), &["1", "'z'"]);
+        let b = from_node(signed(Some(f), &["1", "'m'"]), "b");
+        let batch = receive(&[a.clone(), b.clone()], &KEY, SyncMode::Last, |_| {
+            here.clone()
+        });
+        let first = receive(std::slice::from_ref(&a), &KEY, SyncMode::Last, |_| {
+            here.clone()
+        });
+        let after = Here {
+            hash: a.change.to,
+            last_from: Some(a.change.from),
+            steering: Some((1, "'z'".to_owned())),
+        };
+        let second = receive(&[b], &KEY, SyncMode::Last, |_| after.clone());
+        assert_eq!(batch, [Arrival::Apply, Arrival::Skip]);
+        assert_eq!(batch, [first, second].concat());
+    }
+
+    #[test]
+    fn a_transaction_changing_one_row_twice_in_one_call_applies() {
+        let (f, a) = (row_hash(&["1", "'f'"]), row_hash(&["1", "'a'"]));
+        let here = Here {
+            hash: Some(f),
+            last_from: None,
+            steering: None,
+        };
+        let first = in_txn(signed(Some(f), &["1", "'a'"]), 2);
+        let second = in_txn(signed(Some(a), &["1", "'b'"]), 2);
+        assert_eq!(
+            receive(&[first, second], &KEY, SyncMode::Stop, |_| here.clone()),
+            [Arrival::Apply, Arrival::Apply]
+        );
+    }
+
+    #[test]
+    fn a_refused_envelope_is_not_a_member_of_the_transaction_it_names() {
+        let f = row_hash(&["1", "'f'"]);
+        let here = Here {
+            hash: Some(f),
+            last_from: None,
+            steering: None,
+        };
+        let member = in_txn(signed(Some(f), &["1", "'a'"]), 1);
+        let mut forged = in_txn(signed(Some(f), &["1", "'b'"]), 1);
+        forged.signature = [9; 32];
+        assert_eq!(
+            receive(&[member, forged], &KEY, SyncMode::Stop, |_| here.clone()),
+            [Arrival::Apply, Arrival::Refused]
         );
     }
 
