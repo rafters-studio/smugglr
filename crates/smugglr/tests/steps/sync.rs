@@ -1287,18 +1287,18 @@ fn call_previews(world: &World) -> Result<(), String> {
     }
 }
 
-/// Two places never synced, each holding the notes `notes` inserts: orders
-/// o1 and o2 alike in both, o3 written differently in each, so orders stops
-/// on o3.
-fn orders_changed_in_both(world: &World, notes: &str) -> Result<(), String> {
+/// Two places never synced, each holding an empty notes table and orders o1
+/// and o2 alike in both, o3 written differently in each, so orders stops on
+/// o3.
+fn orders_changed_in_both(world: &World) -> Result<(), String> {
     let orders = "INSERT INTO orders VALUES ('o1', 'tent'), ('o2', 'stove')";
     world.source.set(world.place(
         "source.db",
-        &format!("{NOTES}; {notes}; {ORDERS}; {orders}, ('o3', 'lamp')"),
+        &format!("{NOTES}; {ORDERS}; {orders}, ('o3', 'lamp')"),
     )?);
     world.target.set(world.place(
         "target.db",
-        &format!("{NOTES}; {notes}; {ORDERS}; {orders}, ('o3', 'rope')"),
+        &format!("{NOTES}; {ORDERS}; {orders}, ('o3', 'rope')"),
     )?);
     Ok(())
 }
@@ -1317,7 +1317,7 @@ fn sync_stopping_orders(world: &World) -> Result<(), String> {
     "two places that hold orders alike except one row changed in both places, never synced before"
 )]
 fn orders_alike_never_synced(world: &World) -> Result<(), String> {
-    orders_changed_in_both(world, "SELECT 1")?;
+    orders_changed_in_both(world)?;
     world.watched.set("o1".to_owned());
     Ok(())
 }
@@ -1369,7 +1369,7 @@ fn synced_with_unknown_table(world: &World) -> Result<(), String> {
 
 #[given("two places never synced, holding orders alike except one row changed in both places")]
 fn orders_alike_but_one(world: &World) -> Result<(), String> {
-    orders_changed_in_both(world, "SELECT 1")
+    orders_changed_in_both(world)
 }
 
 #[when("the agent runs smugglr sync on them and orders stops")]
