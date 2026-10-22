@@ -164,8 +164,9 @@ pub enum Arrival {
 /// `mode`: under [`SyncMode::Last`] the copy whose steering value is further
 /// on is kept, and a row whose two values are equal, or that has none,
 /// stops; under every other mode the row stops. A change of a transaction
-/// is applied only when all of the transaction's changes have arrived and
-/// each is applied or skipped; otherwise it is held.
+/// (its maker's `node` and the transaction's `id`) is applied only when all
+/// of the transaction's distinct changes have arrived and each is applied
+/// or skipped; otherwise it is held.
 pub fn receive(
     envelopes: &[Envelope],
     key: &[u8; 32],
@@ -176,22 +177,29 @@ pub fn receive(
         .iter()
         .map(|envelope| arrive(envelope, key, mode, &here(&envelope.change)))
         .collect();
+    // A transaction is its maker's: the same id from two nodes is two
+    // transactions. A member is counted once however many copies arrive.
     let mut broken = BTreeSet::new();
     for (envelope, arrival) in envelopes.iter().zip(&arrivals) {
         let Some(txn) = &envelope.txn else { continue };
-        let arrived = envelopes
+        let members: BTreeSet<&[u8; 32]> = envelopes
             .iter()
-            .filter(|other| other.txn.as_ref().is_some_and(|other| other.id == txn.id))
-            .count();
-        if arrived != txn.count as usize || !matches!(arrival, Arrival::Apply | Arrival::Skip) {
-            broken.insert(txn.id.as_str());
+            .filter(|other| {
+                other.node == envelope.node
+                    && other.txn.as_ref().is_some_and(|other| other.id == txn.id)
+            })
+            .map(|other| &other.signature)
+            .collect();
+        if members.len() != txn.count as usize || !matches!(arrival, Arrival::Apply | Arrival::Skip)
+        {
+            broken.insert((envelope.node.as_str(), txn.id.as_str()));
         }
     }
     for (envelope, arrival) in envelopes.iter().zip(&mut arrivals) {
         let in_broken = envelope
             .txn
             .as_ref()
-            .is_some_and(|txn| broken.contains(txn.id.as_str()));
+            .is_some_and(|txn| broken.contains(&(envelope.node.as_str(), txn.id.as_str())));
         if in_broken && *arrival == Arrival::Apply {
             *arrival = Arrival::Hold;
         }
@@ -236,7 +244,7 @@ fn arrive(envelope: &Envelope, key: &[u8; 32], mode: SyncMode, here: &Here) -> A
 
 #[cfg(test)]
 mod tests {
-    use super::{Arrival, Envelope, Here, VERSION, receive};
+    use super::{Arrival, Envelope, Here, Txn, VERSION, receive};
     use crate::change::{Change, Op};
     use crate::plan::SyncMode;
     use crate::row_hash::row_hash;
@@ -294,6 +302,79 @@ mod tests {
         assert_eq!(
             receive(&[c], &KEY, SyncMode::Stop, |_| here.clone()),
             [Arrival::Apply]
+        );
+    }
+
+    fn in_txn(mut envelope: Envelope, count: u32) -> Envelope {
+        envelope.txn = Some(Txn {
+            id: "t1".to_owned(),
+            count,
+        });
+        envelope.sign(&KEY);
+        envelope
+    }
+
+    #[test]
+    fn copies_of_one_member_do_not_complete_a_transaction() {
+        let f = row_hash(&["1", "'f'"]);
+        let here = Here {
+            hash: Some(f),
+            last_from: None,
+            steering: None,
+        };
+        let member = in_txn(signed(Some(f), &["1", "'a'"]), 2);
+        assert_eq!(
+            receive(&[member.clone(), member], &KEY, SyncMode::Stop, |_| here
+                .clone()),
+            [Arrival::Hold, Arrival::Hold]
+        );
+    }
+
+    #[test]
+    fn the_same_txn_id_from_another_node_is_another_transaction() {
+        let f = row_hash(&["1", "'f'"]);
+        let here = Here {
+            hash: Some(f),
+            last_from: None,
+            steering: None,
+        };
+        let mine = in_txn(signed(Some(f), &["1", "'a'"]), 2);
+        let mut theirs = signed(Some(f), &["1", "'b'"]);
+        "b".clone_into(&mut theirs.node);
+        let theirs = in_txn(theirs, 2);
+        assert_eq!(
+            receive(&[mine, theirs], &KEY, SyncMode::Stop, |_| here.clone()),
+            [Arrival::Hold, Arrival::Hold]
+        );
+    }
+
+    #[test]
+    fn a_replayed_change_already_applied_is_skipped() {
+        let (f, a) = (row_hash(&["1", "'f'"]), row_hash(&["1", "'a'"]));
+        let here = Here {
+            hash: Some(a),
+            last_from: Some(Some(f)),
+            steering: None,
+        };
+        let replay = signed(Some(f), &["1", "'a'"]);
+        assert_eq!(
+            receive(&[replay], &KEY, SyncMode::Stop, |_| here.clone()),
+            [Arrival::Skip]
+        );
+    }
+
+    #[test]
+    fn a_steering_position_past_the_values_stops_without_panicking() {
+        let (f, a) = (row_hash(&["1", "'f'"]), row_hash(&["1", "'a'"]));
+        let here = Here {
+            hash: Some(a),
+            last_from: Some(Some(f)),
+            steering: Some((9, "'2026'".to_owned())),
+        };
+        let b = signed(Some(f), &["1", "'b'"]);
+        assert_eq!(
+            receive(&[b], &KEY, SyncMode::Last, |_| here.clone()),
+            [Arrival::Stop]
         );
     }
 
