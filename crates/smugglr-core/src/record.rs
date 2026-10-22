@@ -1,16 +1,18 @@
 //! The record: what a sync did, table by table, in smugglr's own words
-//! (FR-SMUGGLR-063, FR-SMUGGLR-065, FR-SMUGGLR-067, FR-SMUGGLR-069).
+//! (FR-SMUGGLR-063, FR-SMUGGLR-065, FR-SMUGGLR-067, FR-SMUGGLR-069,
+//! FR-SMUGGLR-076).
 //!
 //! Key lists name rows only where they were deleted, overwritten by
 //! `--sync-mode`, or stopped; rows copied or carried over appear only in the
 //! counts. No word for one copy being better than another appears in it.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
+use std::fmt::{self, Write as _};
 
 use serde::{Serialize, Serializer};
 
 use crate::change::Op;
+use crate::envelope::Envelope;
 use crate::plan::{Plan, Side};
 use crate::shape::Mismatch;
 use crate::weight::Weight;
@@ -30,6 +32,12 @@ pub const NOT_READ_BACK: &str = "smugglr wrote these rows and read them back dif
 pub const SELF_KEYED: &str = "This table's database hands out its own keys (INTEGER PRIMARY \
      KEY), so two places would hand out the same key to different rows and one would erase the \
      other. smugglr does no re-sequencing. Any random, unique key, such as UUIDv7, lets it sync.";
+
+/// Why a row stops when an edit was made to it after it was deleted
+/// elsewhere (FR-SMUGGLR-076).
+pub const EDIT_VERSUS_DELETE: &str = "These rows were edited in one place after they were \
+     deleted in another. smugglr stops rather than choose. Rerun with --sync-mode source or \
+     target to keep one place's copy.";
 
 /// What a run did as a whole.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -80,6 +88,53 @@ pub struct Record {
     /// read (FR-SMUGGLR-070).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shape: Option<ShapeStop>,
+    /// The changes the run dropped, each kept in the dropped log.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dropped: Vec<Dropped>,
+}
+
+/// Why a change was dropped (FR-SMUGGLR-076).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum Reason {
+    /// It arrived, or waited, past its sunset.
+    #[serde(rename = "its sunset passed")]
+    Sunset,
+    /// It is an insert or a waiting change for a key in the graveyard.
+    #[serde(rename = "its key is in the graveyard")]
+    Graveyard,
+}
+
+/// A change the run dropped, named by its table, key, reason and change
+/// hash, by which a replay re-sends it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Dropped {
+    /// The table the change's row is in.
+    pub table: String,
+    /// The row's key.
+    pub key: Key,
+    /// Why it was dropped.
+    pub reason: Reason,
+    /// The change hash, as lowercase hex.
+    pub change: String,
+}
+
+impl Dropped {
+    /// The record's name for `envelope`, dropped for `reason`.
+    #[must_use]
+    pub fn new(envelope: &Envelope, reason: Reason) -> Self {
+        Self {
+            table: envelope.change.table.clone(),
+            key: Key(envelope.change.key.clone()),
+            reason,
+            change: envelope
+                .signature
+                .iter()
+                .fold(String::new(), |mut hex, byte| {
+                    let _ = write!(hex, "{byte:02x}");
+                    hex
+                }),
+        }
+    }
 }
 
 /// A run stopped because the places' shapes differ.
@@ -122,6 +177,7 @@ impl Record {
             tables,
             ignored,
             shape: None,
+            dropped: Vec::new(),
         }
     }
 
@@ -143,6 +199,7 @@ impl Record {
                 why: mismatch.why(),
                 mismatch,
             }),
+            dropped: Vec::new(),
         }
     }
 
@@ -160,6 +217,7 @@ impl Record {
             tables: BTreeMap::new(),
             ignored,
             shape: None,
+            dropped: Vec::new(),
         }
     }
 
@@ -320,6 +378,17 @@ pub fn lost(rows: Vec<Vec<String>>, cause: &str) -> Table {
     }
 }
 
+/// The record of rows `keys` edited after they were deleted elsewhere:
+/// stopped, naming them.
+#[must_use]
+pub fn edit_versus_delete(keys: Vec<Vec<String>>) -> Table {
+    Table::Stopped {
+        rows: keys.into_iter().map(Key).collect(),
+        not_read_back: Vec::new(),
+        why: EDIT_VERSUS_DELETE.to_owned(),
+    }
+}
+
 /// The record of a table whose database hands out its own keys: stopped,
 /// with no rows read.
 #[must_use]
@@ -423,6 +492,19 @@ impl fmt::Display for Record {
                     writeln!(f, "    {why}")?;
                 }
             }
+        }
+        for dropped in &self.dropped {
+            let reason = match dropped.reason {
+                Reason::Sunset => "its sunset passed",
+                Reason::Graveyard => "its key is in the graveyard",
+            };
+            writeln!(
+                f,
+                "  dropped: {} {}, {reason}, change {}",
+                dropped.table,
+                keys(std::slice::from_ref(&dropped.key)),
+                dropped.change
+            )?;
         }
         Ok(())
     }

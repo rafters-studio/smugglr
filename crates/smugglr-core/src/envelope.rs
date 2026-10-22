@@ -13,18 +13,32 @@
 //! envelope, or whose values do not hash to its `to`, is refused.
 //!
 //! The signature is BLAKE3 keyed with the shared key the caller chooses.
+//!
+//! Every delete leaves a tombstone, and every change carries a sunset
+//! (FR-SMUGGLR-076). A change past its sunset is dead: dropped on arrival
+//! and dropped if waiting. An insert or a waiting change for a key whose
+//! tombstone is live is dropped; an edit built on the deleted row, whose
+//! `from` is the tombstone's `from`, is an edit-versus-delete conflict. A
+//! dropped change goes to the place's dropped log, and [`replay`] re-sends
+//! it with a fresh sunset.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::change::{Change, Decision, Op, decide};
 use crate::plan::SyncMode;
+use crate::record::Reason;
 use crate::row_hash::row_hash;
 use crate::shape::Stamp;
 use crate::steering::further_on;
 
 /// The envelope format version, `v`.
 pub const VERSION: u32 = 1;
+
+/// The graveyard setting's default, in seconds: how long a change is
+/// carried, and so how long a delete's tombstone is kept, when its sender
+/// names no other.
+pub const GRAVEYARD: u64 = 12 * 60 * 60;
 
 /// The transaction a change was one part of at its source.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,7 +61,8 @@ pub struct Envelope {
     /// Who still needs the change (multi only; the mesh tracks
     /// acknowledgements).
     pub targets: Vec<String>,
-    /// When the change stops being carried.
+    /// When the change stops being carried, in seconds since the Unix
+    /// epoch; past it the change is dead.
     pub sunset: u64,
     /// The source transaction the change was part of, if any.
     pub txn: Option<Txn>,
@@ -55,7 +70,13 @@ pub struct Envelope {
     pub key_id: String,
     /// The table's shape stamp.
     pub stamp: Stamp,
-    /// The signature over every field above but the values.
+    /// The signature over every field above but the values. It is also the
+    /// change hash the record and the dropped log name the change by.
+    ///
+    /// Current choice (2026-10-22): the signature is the change hash,
+    /// because it is already a digest of every field, the same for every
+    /// copy of the change, and new once a replay gives a fresh sunset;
+    /// revisable.
     pub signature: [u8; 32],
 }
 
@@ -137,6 +158,10 @@ pub struct Here {
     /// The steering column's position among the row's columns and its value
     /// here, as SQLite's `quote()` text; for [`SyncMode::Last`].
     pub steering: Option<(usize, String)>,
+    /// The key's tombstone: the delete envelope the place keeps for it until
+    /// the delete's sunset. A delete applied or skipped here is the key's
+    /// tombstone.
+    pub tombstone: Option<Envelope>,
 }
 
 /// What a place does with an envelope that arrives.
@@ -152,35 +177,43 @@ pub enum Arrival {
     /// of its transaction cannot be applied yet.
     Hold,
     /// The row changed here and in the change from the same `from`, and
-    /// `--sync-mode` stops the row: name it.
+    /// `--sync-mode` stops the row: name it. Against a key that holds no row
+    /// here, it is an edit versus a delete.
     Stop,
+    /// The change is past its sunset, or an insert or waiting change for a
+    /// key in the graveyard: keep it in the dropped log and name it in the
+    /// record.
+    Dropped(Reason),
     /// The signature does not match the envelope under the key, or the
     /// values do not hash to the change's `to`.
     Refused,
 }
 
-/// Decides each of `envelopes` arriving together, in order, verified with
-/// `key`. The first envelope of a row is decided against the row `here`
-/// gives for its change, and each later one against the row as the
-/// envelopes before it leave it, so a batch arrives as the same envelopes
-/// would one call at a time. A conflict follows `mode`: under
-/// [`SyncMode::Last`] the copy whose steering value is further on is kept,
-/// and a row whose two values are equal, or that has none, stops; under
-/// every other mode the row stops. A change of a transaction (its maker's
-/// `node` and the transaction's `id`) is applied only when all of the
-/// transaction's distinct changes have arrived unrefused and each is applied
-/// or skipped; otherwise it is held, and leaves its row as it was.
+/// Decides each of `envelopes` arriving together, in order, at `now`
+/// (seconds since the Unix epoch), verified with `key`. The first envelope of
+/// a row is decided against the row `here` gives for its change, and each
+/// later one against the row as the envelopes before it leave it, so a batch
+/// arrives as the same envelopes would one call at a time. What waits is
+/// received again with what arrives next, so a waiting change past its sunset
+/// is dropped. A conflict follows `mode`: under [`SyncMode::Last`] the copy
+/// whose steering value is further on is kept, and a row whose two values are
+/// equal, or that has none, stops; under every other mode the row stops. A
+/// change of a transaction (its maker's `node` and the transaction's `id`) is
+/// applied only when all of the transaction's distinct changes have arrived
+/// unrefused and each is applied or skipped; otherwise it is held, and leaves
+/// its row as it was.
 pub fn receive(
     envelopes: &[Envelope],
     key: &[u8; 32],
     mode: SyncMode,
+    now: u64,
     here: impl Fn(&Change) -> Here,
 ) -> Vec<Arrival> {
     // Holding a member can change what follows it, so decide again until no
     // further member is held.
     let mut held = BTreeSet::new();
     loop {
-        let arrivals = in_order(envelopes, key, mode, &here, &held);
+        let arrivals = in_order(envelopes, key, mode, now, &here, &held);
         let broken = broken(envelopes, &arrivals);
         let before = held.len();
         for (index, (envelope, arrival)) in envelopes.iter().zip(&arrivals).enumerate() {
@@ -204,6 +237,7 @@ fn in_order(
     envelopes: &[Envelope],
     key: &[u8; 32],
     mode: SyncMode,
+    now: u64,
     here: impl Fn(&Change) -> Here,
     held: &BTreeSet<usize>,
 ) -> Vec<Arrival> {
@@ -214,7 +248,7 @@ fn in_order(
         let row = rows
             .entry((change.table.as_str(), change.key.as_slice()))
             .or_insert_with(|| here(change));
-        let mut arrival = arrive(envelope, key, mode, row);
+        let mut arrival = arrive(envelope, key, mode, now, row);
         if arrival == Arrival::Apply && held.contains(&index) {
             arrival = Arrival::Hold;
         }
@@ -225,6 +259,9 @@ fn in_order(
                 .steering
                 .take()
                 .and_then(|(at, _)| Some((at, change.values.get(at)?.clone())));
+        }
+        if change.to.is_none() && matches!(arrival, Arrival::Apply | Arrival::Skip) {
+            row.tombstone = Some(envelope.clone());
         }
         arrivals.push(arrival);
     }
@@ -260,21 +297,39 @@ fn broken<'a>(envelopes: &'a [Envelope], arrivals: &[Arrival]) -> BTreeSet<(&'a 
     broken
 }
 
-fn arrive(envelope: &Envelope, key: &[u8; 32], mode: SyncMode, here: &Here) -> Arrival {
+fn arrive(envelope: &Envelope, key: &[u8; 32], mode: SyncMode, now: u64, here: &Here) -> Arrival {
     if !envelope.verify(key) {
         return Arrival::Refused;
     }
+    if now > envelope.sunset {
+        return Arrival::Dropped(Reason::Sunset);
+    }
     let change = &envelope.change;
-    // The change that brought the row here, as decide() reads it.
-    let last = here.last_from.map(|from| Change {
-        op: change.op,
-        table: change.table.clone(),
-        key: change.key.clone(),
-        from,
-        to: here.hash,
-        values: Vec::new(),
-    });
-    match decide(change, here.hash, last.as_ref()) {
+    let tombstone = here
+        .tombstone
+        .as_ref()
+        .filter(|tombstone| now <= tombstone.sunset);
+    // The change that brought the row here, as decide() reads it: for an
+    // edit built on a row in the graveyard, its delete.
+    let last = match tombstone {
+        Some(tombstone) if change.to.is_some() && change.from == tombstone.change.from => {
+            Some(tombstone.change.clone())
+        }
+        _ => here.last_from.map(|from| Change {
+            op: change.op,
+            table: change.table.clone(),
+            key: change.key.clone(),
+            from,
+            to: here.hash,
+            values: Vec::new(),
+        }),
+    };
+    let decision = decide(change, here.hash, last.as_ref());
+    let insert = decision == Decision::Apply && change.from.is_none();
+    if tombstone.is_some() && (insert || decision == Decision::Hold) {
+        return Arrival::Dropped(Reason::Graveyard);
+    }
+    match decision {
         Decision::Apply => Arrival::Apply,
         Decision::Skip => Arrival::Skip,
         Decision::Hold => Arrival::Hold,
@@ -295,11 +350,27 @@ fn arrive(envelope: &Envelope, key: &[u8; 32], mode: SyncMode, here: &Here) -> A
     }
 }
 
+/// Re-sends the change in the dropped log `log` whose change hash is
+/// `hash`, with the fresh `sunset` and signed with `key`, overriding its
+/// drop; [`receive`] then decides it like any change. `None` when the log
+/// holds no such change.
+#[must_use]
+pub fn replay(log: &[Envelope], hash: &[u8; 32], sunset: u64, key: &[u8; 32]) -> Option<Envelope> {
+    let mut envelope = log
+        .iter()
+        .find(|envelope| &envelope.signature == hash)?
+        .clone();
+    envelope.sunset = sunset;
+    envelope.sign(key);
+    Some(envelope)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Arrival, Envelope, Here, Txn, VERSION, receive};
     use crate::change::{Change, Op};
     use crate::plan::SyncMode;
+    use crate::record::Reason;
     use crate::row_hash::row_hash;
     use crate::shape::Stamp;
 
@@ -335,10 +406,11 @@ mod tests {
             hash: Some(a),
             last_from: Some(Some(f)),
             steering: None,
+            tombstone: None,
         };
         let b = signed(Some(f), &["1", "'b'"]);
         assert_eq!(
-            receive(&[b], &KEY, SyncMode::Stop, |_| here.clone()),
+            receive(&[b], &KEY, SyncMode::Stop, 0, |_| here.clone()),
             [Arrival::Stop]
         );
     }
@@ -350,10 +422,11 @@ mod tests {
             hash: Some(a),
             last_from: Some(Some(f)),
             steering: None,
+            tombstone: None,
         };
         let c = signed(Some(a), &["1", "'c'"]);
         assert_eq!(
-            receive(&[c], &KEY, SyncMode::Stop, |_| here.clone()),
+            receive(&[c], &KEY, SyncMode::Stop, 0, |_| here.clone()),
             [Arrival::Apply]
         );
     }
@@ -374,10 +447,11 @@ mod tests {
             hash: Some(f),
             last_from: None,
             steering: None,
+            tombstone: None,
         };
         let member = in_txn(signed(Some(f), &["1", "'a'"]), 2);
         assert_eq!(
-            receive(&[member.clone(), member], &KEY, SyncMode::Stop, |_| here
+            receive(&[member.clone(), member], &KEY, SyncMode::Stop, 0, |_| here
                 .clone()),
             [Arrival::Hold, Arrival::Hold]
         );
@@ -390,13 +464,14 @@ mod tests {
             hash: Some(f),
             last_from: None,
             steering: None,
+            tombstone: None,
         };
         let mine = in_txn(signed(Some(f), &["1", "'a'"]), 2);
         let mut theirs = signed(Some(f), &["1", "'b'"]);
         "b".clone_into(&mut theirs.node);
         let theirs = in_txn(theirs, 2);
         assert_eq!(
-            receive(&[mine, theirs], &KEY, SyncMode::Stop, |_| here.clone()),
+            receive(&[mine, theirs], &KEY, SyncMode::Stop, 0, |_| here.clone()),
             [Arrival::Hold, Arrival::Hold]
         );
     }
@@ -408,10 +483,11 @@ mod tests {
             hash: Some(a),
             last_from: Some(Some(f)),
             steering: None,
+            tombstone: None,
         };
         let replay = signed(Some(f), &["1", "'a'"]);
         assert_eq!(
-            receive(&[replay], &KEY, SyncMode::Stop, |_| here.clone()),
+            receive(&[replay], &KEY, SyncMode::Stop, 0, |_| here.clone()),
             [Arrival::Skip]
         );
     }
@@ -423,10 +499,11 @@ mod tests {
             hash: Some(a),
             last_from: Some(Some(f)),
             steering: Some((9, "'2026'".to_owned())),
+            tombstone: None,
         };
         let b = signed(Some(f), &["1", "'b'"]);
         assert_eq!(
-            receive(&[b], &KEY, SyncMode::Last, |_| here.clone()),
+            receive(&[b], &KEY, SyncMode::Last, 0, |_| here.clone()),
             [Arrival::Stop]
         );
     }
@@ -444,11 +521,12 @@ mod tests {
             hash: Some(f),
             last_from: None,
             steering: None,
+            tombstone: None,
         };
         let a = signed(Some(f), &["1", "'a'"]);
         let b = from_node(signed(Some(f), &["1", "'b'"]), "b");
         assert_eq!(
-            receive(&[a, b], &KEY, SyncMode::Stop, |_| here.clone()),
+            receive(&[a, b], &KEY, SyncMode::Stop, 0, |_| here.clone()),
             [Arrival::Apply, Arrival::Stop]
         );
     }
@@ -460,21 +538,23 @@ mod tests {
             hash: Some(f),
             last_from: None,
             steering: Some((1, "'f'".to_owned())),
+            tombstone: None,
         };
         let a = signed(Some(f), &["1", "'z'"]);
         let b = from_node(signed(Some(f), &["1", "'m'"]), "b");
-        let batch = receive(&[a.clone(), b.clone()], &KEY, SyncMode::Last, |_| {
+        let batch = receive(&[a.clone(), b.clone()], &KEY, SyncMode::Last, 0, |_| {
             here.clone()
         });
-        let first = receive(std::slice::from_ref(&a), &KEY, SyncMode::Last, |_| {
+        let first = receive(std::slice::from_ref(&a), &KEY, SyncMode::Last, 0, |_| {
             here.clone()
         });
         let after = Here {
             hash: a.change.to,
             last_from: Some(a.change.from),
             steering: Some((1, "'z'".to_owned())),
+            tombstone: None,
         };
-        let second = receive(&[b], &KEY, SyncMode::Last, |_| after.clone());
+        let second = receive(&[b], &KEY, SyncMode::Last, 0, |_| after.clone());
         assert_eq!(batch, [Arrival::Apply, Arrival::Skip]);
         assert_eq!(batch, [first, second].concat());
     }
@@ -486,11 +566,12 @@ mod tests {
             hash: Some(f),
             last_from: None,
             steering: None,
+            tombstone: None,
         };
         let first = in_txn(signed(Some(f), &["1", "'a'"]), 2);
         let second = in_txn(signed(Some(a), &["1", "'b'"]), 2);
         assert_eq!(
-            receive(&[first, second], &KEY, SyncMode::Stop, |_| here.clone()),
+            receive(&[first, second], &KEY, SyncMode::Stop, 0, |_| here.clone()),
             [Arrival::Apply, Arrival::Apply]
         );
     }
@@ -502,12 +583,13 @@ mod tests {
             hash: Some(f),
             last_from: None,
             steering: None,
+            tombstone: None,
         };
         let member = in_txn(signed(Some(f), &["1", "'a'"]), 1);
         let mut forged = in_txn(signed(Some(f), &["1", "'b'"]), 1);
         forged.signature = [9; 32];
         assert_eq!(
-            receive(&[member, forged], &KEY, SyncMode::Stop, |_| here.clone()),
+            receive(&[member, forged], &KEY, SyncMode::Stop, 0, |_| here.clone()),
             [Arrival::Apply, Arrival::Refused]
         );
     }
@@ -517,5 +599,29 @@ mod tests {
         let envelope = signed(None, &["1", "'a'"]);
         assert!(envelope.verify(&KEY));
         assert!(!envelope.verify(&[8; 32]));
+    }
+
+    #[test]
+    fn an_insert_after_a_delete_in_one_call_is_dropped_for_the_graveyard() {
+        let f = row_hash(&["1", "'f'"]);
+        let here = Here {
+            hash: Some(f),
+            last_from: None,
+            steering: None,
+            tombstone: None,
+        };
+        let mut delete = signed(Some(f), &["1", "'f'"]);
+        delete.change.op = Op::Down;
+        delete.change.to = None;
+        delete.change.values = Vec::new();
+        delete.sunset = 100;
+        delete.sign(&KEY);
+        let mut insert = signed(None, &["1", "'again'"]);
+        insert.sunset = 100;
+        insert.sign(&KEY);
+        assert_eq!(
+            receive(&[delete, insert], &KEY, SyncMode::Stop, 0, |_| here.clone()),
+            [Arrival::Apply, Arrival::Dropped(Reason::Graveyard)]
+        );
     }
 }
