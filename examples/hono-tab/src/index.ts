@@ -36,11 +36,22 @@ app.use("*", async (c, next) => {
   await next();
 });
 
-app.onError((err, c) => (err instanceof Refused ? c.text(err.message, err.status) : c.text(err.message, 500)));
+// A refusal says why; any other failure is logged here and the client
+// hears only that it failed, never D1's own words.
+app.onError((err, c) => {
+  if (err instanceof Refused) {
+    return c.text(err.message, err.status);
+  }
+  console.error(err);
+  return c.text("internal error", 500);
+});
 
 // The endpoint a tab names in open(): one place operation a request.
 app.post("/place", async (c) => {
-  const answered = await answer(c.env.DB, c.get("owner"), await c.req.json<unknown>());
+  const request = await c.req.json<unknown>().catch(() => {
+    throw new Refused(400, "the body is not JSON");
+  });
+  const answered = await answer(c.env.DB, c.get("owner"), request);
   return c.body(JSON.stringify(answered), 200, { "content-type": "application/json" });
 });
 

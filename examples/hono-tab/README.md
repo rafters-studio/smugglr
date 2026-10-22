@@ -39,7 +39,7 @@ const tab = await open({
 
 Each request is one place operation as JSON: `tables`, `hashes`, `rows`,
 `weights` or `write`. Rows travel as SQLite's `quote()` text, each row's hash
-is the engine's own (`rowHash`, from `@smugglr/web`), and a write applies
+is the engine's own (`rowHash`, from `@smugglr/web/engine`), and a write applies
 each change only where its row is still at the change's `from`, all in one
 D1 batch.
 
@@ -47,7 +47,7 @@ D1 batch.
 
 `GET /stash/:device` stashes the person's rows for that device: the Worker
 reads them from D1 and the engine's own stash (`stashRows`, from
-`@smugglr/web`) makes the blob, signed with `SMUGGLR_KEY`, node `server`.
+`@smugglr/web/engine`) makes the blob, signed with `SMUGGLR_KEY`, node `server`.
 
 ```js
 const blob = await (await fetch('/stash/laptop', { headers })).text();

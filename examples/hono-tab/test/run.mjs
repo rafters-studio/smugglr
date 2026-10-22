@@ -177,6 +177,16 @@ try {
     assert.deepEqual(d1('notes', 'grace'), [["'n3'", "'grace'", "'grace''s'"]]);
   });
 
+  await check('a body that is not JSON is refused with 400', async () => {
+    const response = await fetch(`${origin}/place`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer t-ada', 'content-type': 'application/json' },
+      body: '{"op":',
+    });
+    assert.equal(response.status, 400, await response.clone().text());
+    assert.equal(await response.text(), 'the body is not JSON');
+  });
+
   await check('no session, no answer', async () => {
     const response = await fetch(`${origin}/place`, { method: 'POST', body: '{"op":"tables"}' });
     assert.equal(response.status, 401);

@@ -3,7 +3,7 @@
 // and in it only the rows whose owner is the signed-in person.
 //
 // Rows travel as SQLite's quote() text of each column, and each row's hash
-// is the engine's own (rowHash, from @smugglr/web), so the tab compares
+// is the engine's own (rowHash, from @smugglr/web/engine), so the tab compares
 // like with like. A write is applied only where its row is still at the
 // change's `from`, all in one D1 batch, the same rule as smugglr's HTTP-SQL
 // place.

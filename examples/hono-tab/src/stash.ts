@@ -1,6 +1,6 @@
 // A stash blob of one person's rows (FR-SMUGGLR-077), for a tab to fill
 // itself with retrieve(). The Worker reads the rows from D1 and hands them
-// to the engine (stashRows, from @smugglr/web), whose own stash makes the
+// to the engine (stashRows, from @smugglr/web/engine), whose own stash makes the
 // blob, signed with the app's key: no blob format is written here.
 
 import { stashRows } from "@smugglr/web/engine";
