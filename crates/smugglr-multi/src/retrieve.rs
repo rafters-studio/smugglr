@@ -128,8 +128,9 @@ pub fn retrieve(
 
 /// Why `blob` is refused whole, with nothing of it applied: its header's
 /// signature fails, or it is whole and one of its envelopes fails its
-/// signature or is past its sunset (FR-SMUGGLR-076), so an old whole blob
-/// cannot roll a device back. `None` when it is not refused.
+/// signature, or the blob or one of its envelopes is past its sunset
+/// (FR-SMUGGLR-076), so an old whole blob, even an empty one, cannot roll a
+/// device back. `None` when it is not refused.
 fn refusal(blob: &Blob, settings: &Settings) -> Option<&'static str> {
     if !blob.verify(&settings.key) {
         return Some(REFUSED);
@@ -143,7 +144,8 @@ fn refusal(blob: &Blob, settings: &Settings) -> Option<&'static str> {
         .any(|envelope| !envelope.verify(&settings.key))
     {
         Some(REFUSED)
-    } else if envelopes.any(|envelope| settings.now > envelope.sunset) {
+    } else if settings.now > blob.sunset || envelopes.any(|envelope| settings.now > envelope.sunset)
+    {
         Some(PAST_SUNSET)
     } else {
         None

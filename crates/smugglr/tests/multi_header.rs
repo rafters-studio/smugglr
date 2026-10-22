@@ -43,6 +43,12 @@ fn devices() -> Result<(PathBuf, Settings), String> {
         steering: Steering::default(),
         ignore: Vec::new(),
     };
+    // b has stashed, so a whole take would replace each row of b's.
+    let b = Settings {
+        node: "b".to_owned(),
+        ..settings.clone()
+    };
+    stash(&mut place(&folder, "b")?, &b, false).map_err(|err| err.to_string())?;
     Ok((folder, settings))
 }
 
@@ -53,7 +59,7 @@ fn sql(folder: &std::path::Path, device: &str, statement: &str) -> Result<(), St
 }
 
 fn place(folder: &std::path::Path, device: &str) -> Result<LocalFile, String> {
-    LocalFile::open(&folder.join(format!("{device}.db")).display().to_string())
+    LocalFile::open(folder.join(format!("{device}.db")).display().to_string())
         .map_err(|err| err.to_string())
 }
 
@@ -139,6 +145,28 @@ fn a_whole_blob_past_its_sunset_is_refused() -> Result<(), String> {
         "b",
         "UPDATE notes SET body = 'newer' WHERE id = 'n3'",
     )?;
+    let later = Settings {
+        now: NOW + 601,
+        ..settings.clone()
+    };
+    let b = Settings {
+        node: "b".to_owned(),
+        ..later.clone()
+    };
+    stash(&mut place(&folder, "b")?, &b, false).map_err(|err| err.to_string())?;
+    let before = notes(&folder, "b")?;
+    assert_eq!(retrieve_on_b(&folder, &later, &blob)?, before);
+    Ok(())
+}
+
+#[test]
+fn an_empty_whole_blob_past_its_sunset_is_refused() -> Result<(), String> {
+    let (folder, settings) = devices()?;
+    // A place with no rows stashes a whole blob that holds no envelopes;
+    // taken, it would delete every row of b's.
+    sql(&folder, "a", "DELETE FROM notes")?;
+    let blob = stash(&mut place(&folder, "a")?, &settings, true).map_err(|e| e.to_string())?;
+    assert!(blob.changes.is_empty() && blob.graveyard.is_empty());
     let later = Settings {
         now: NOW + 601,
         ..settings.clone()

@@ -30,6 +30,7 @@ pub fn stash(place: &mut dyn Place, settings: &Settings, whole: bool) -> Result<
         changes: Vec::new(),
         graveyard: Vec::new(),
         signature: [0; 32],
+        sunset: settings.now.saturating_add(settings.graveyard),
     };
     for table in &tables {
         let stamp = stamp(table);

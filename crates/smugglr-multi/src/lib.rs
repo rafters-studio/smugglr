@@ -92,9 +92,14 @@ pub struct Blob {
     pub changes: Vec<Envelope>,
     /// A whole blob's graveyard: the delete envelopes still in their sunset.
     pub graveyard: Vec<Envelope>,
-    /// The header's signature: over `whole`, `node`, `targets`, each
-    /// table's stamp, and the count and change hash of every envelope.
+    /// The header's signature: over `whole`, `node`, the blob's `sunset`,
+    /// `targets`, each table's stamp, and the count and change hash of
+    /// every envelope.
     pub signature: [u8; 32],
+    /// When the blob stops being taken, in seconds since the Unix epoch: its
+    /// stash time plus the graveyard window. A whole blob past it is dead,
+    /// even one with no envelopes.
+    pub sunset: u64,
 }
 
 impl Blob {
@@ -122,6 +127,7 @@ impl Blob {
         field(&mut hasher, &VERSION.to_be_bytes());
         field(&mut hasher, if self.whole { b"whole" } else { b"since" });
         field(&mut hasher, self.node.as_bytes());
+        field(&mut hasher, &self.sunset.to_be_bytes());
         field(&mut hasher, &(self.targets.len() as u64).to_be_bytes());
         for target in &self.targets {
             field(&mut hasher, target.as_bytes());
@@ -170,6 +176,7 @@ impl Blob {
             "changes": envelopes(&self.changes),
             "graveyard": envelopes(&self.graveyard),
             "signature": hex(&self.signature),
+            "sunset": self.sunset,
         })
         .to_string()
     }
@@ -215,6 +222,7 @@ impl Blob {
             changes: envelopes("changes")?,
             graveyard: envelopes("graveyard")?,
             signature: unhex(json.get("signature")?.as_str()?)?.try_into().ok()?,
+            sunset: json.get("sunset")?.as_u64()?,
             stamps,
         })
     }
