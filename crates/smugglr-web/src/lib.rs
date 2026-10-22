@@ -4,11 +4,14 @@
 //! the command line. The browser's SQLite registers [`row_hash`] as its
 //! `smugglr_row_hash` function, so each row is hashed where it lives, from
 //! its columns' `quote()` text, exactly as a local file hashes it. The
-//! tab's worker runs each sync, stash, retrieve and replay ([`tab`]).
+//! tab's worker runs each sync, stash, retrieve and replay ([`tab`]). An
+//! app's server stashes rows it hands over whole, for a tab's retrieve
+//! ([`rows`]).
 
 mod fetcher;
 mod host;
 mod opfs;
+pub mod rows;
 pub mod tab;
 
 use wasm_bindgen::prelude::wasm_bindgen;

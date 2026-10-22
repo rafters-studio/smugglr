@@ -6,7 +6,11 @@
   "description": "The smugglr engine in a browser tab.",
   "license": "MIT",
   "exports": {
-    ".": "./src/index.js"
+    ".": "./src/index.js",
+    "./engine": {
+      "workerd": "./src/workerd.js",
+      "default": "./src/engine/smugglr_web.js"
+    }
   },
   "files": [
     "src"

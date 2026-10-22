@@ -163,26 +163,7 @@ impl Tab {
 
     /// The settings of a stash, a retrieve or a replay, from the app's.
     fn settings(&self, text: &str) -> Result<Settings, JsValue> {
-        let json: Json = serde_json::from_str(text).map_err(fail)?;
-        let key = json["key"]
-            .as_str()
-            .and_then(unhex)
-            .and_then(|bytes| bytes.try_into().ok())
-            .ok_or_else(|| JsValue::from_str("the key is 32 bytes as hex"))?;
-        Ok(Settings {
-            store: Self::store(),
-            key,
-            node: json["node"].as_str().unwrap_or_default().to_owned(),
-            targets: texts(&json["targets"]),
-            graveyard: json["graveyard"].as_u64().unwrap_or(GRAVEYARD),
-            // With no time, no sunset could pass: refuse rather than guess.
-            now: json["now"]
-                .as_u64()
-                .ok_or_else(|| JsValue::from_str("the settings need now, in seconds"))?,
-            sync_mode: smugglr_core::plan::SyncMode::Stop,
-            steering: smugglr_core::steering::Steering::default(),
-            ignore: self.ignore.clone(),
-        })
+        settings(text, Self::store(), self.ignore.clone())
     }
 
     /// A retrieve into a tab that has no memory with its endpoint fills it
@@ -215,7 +196,36 @@ impl Tab {
     }
 }
 
-fn texts(json: &Json) -> Vec<String> {
+/// The settings of a stash, a retrieve or a replay, from the app's
+/// (`{key, node, targets, graveyard, now}`), with memory kept in `store`.
+pub(crate) fn settings(
+    text: &str,
+    store: Arc<dyn Store>,
+    ignore: Vec<String>,
+) -> Result<Settings, JsValue> {
+    let json: Json = serde_json::from_str(text).map_err(fail)?;
+    let key = json["key"]
+        .as_str()
+        .and_then(unhex)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| JsValue::from_str("the key is 32 bytes as hex"))?;
+    Ok(Settings {
+        store,
+        key,
+        node: json["node"].as_str().unwrap_or_default().to_owned(),
+        targets: texts(&json["targets"]),
+        graveyard: json["graveyard"].as_u64().unwrap_or(GRAVEYARD),
+        // With no time, no sunset could pass: refuse rather than guess.
+        now: json["now"]
+            .as_u64()
+            .ok_or_else(|| JsValue::from_str("the settings need now, in seconds"))?,
+        sync_mode: smugglr_core::plan::SyncMode::Stop,
+        steering: smugglr_core::steering::Steering::default(),
+        ignore,
+    })
+}
+
+pub(crate) fn texts(json: &Json) -> Vec<String> {
     json.as_array()
         .map(|items| {
             items
@@ -226,7 +236,7 @@ fn texts(json: &Json) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn fail(err: impl std::fmt::Display) -> JsValue {
+pub(crate) fn fail(err: impl std::fmt::Display) -> JsValue {
     JsValue::from_str(&err.to_string())
 }
 
