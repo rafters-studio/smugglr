@@ -468,11 +468,16 @@ fn steered(
         return Ok(Steered::new());
     };
     let values = |place: &mut dyn Place| -> Result<BTreeMap<Vec<String>, String>, Error> {
-        Ok(place
-            .rows(table, &keys)?
-            .into_iter()
-            .filter_map(|row| Some((key_of(table, &row)?, row.get(column)?.clone())))
-            .collect())
+        let mut values = BTreeMap::new();
+        for keys in keys.chunks(CHUNK) {
+            values.extend(
+                place
+                    .rows(table, keys)?
+                    .into_iter()
+                    .filter_map(|row| Some((key_of(table, &row)?, row.get(column)?.clone()))),
+            );
+        }
+        Ok(values)
     };
     let ours = values(source)?;
     let mut theirs = values(target)?;
@@ -592,14 +597,14 @@ fn read_hashes(
     place: &mut dyn Place,
     keys: &[Vec<String>],
 ) -> Result<Hashes, Error> {
-    Ok(place
-        .rows(table, keys)?
-        .into_iter()
-        .filter_map(|row| {
+    let mut hashes = Hashes::new();
+    for keys in keys.chunks(CHUNK) {
+        hashes.extend(place.rows(table, keys)?.into_iter().filter_map(|row| {
             let columns: Vec<&str> = row.iter().map(String::as_str).collect();
             Some((key_of(table, &row)?, row_hash(&columns)))
-        })
-        .collect())
+        }));
+    }
+    Ok(hashes)
 }
 
 /// Carries `writes` each way: those for the target from the source, then
