@@ -1,9 +1,13 @@
 //! One direct sync between two places: read each place's hashes, let the
 //! engine plan each table, weigh a first sync, write, and keep the pair's
-//! memory.
+//! memory. The command line and a browser tab run this same run
+//! (FR-SMUGGLR-058).
+
+mod shape;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use smugglr_core::change::{Change, Op};
@@ -16,10 +20,8 @@ use smugglr_core::record::{self, Record};
 use smugglr_core::row_hash::row_hash;
 use smugglr_core::steering::{Steering, needs_steering};
 use smugglr_core::weight::{DEFAULT_MAX_WIRE, Weight, too_much};
-use smugglr_memory::Memory;
+use smugglr_memory::{Memory, Store};
 use smugglr_place::{Place, Table};
-
-use crate::shape;
 
 /// How the places connect, as `--sync-type` names it.
 ///
@@ -39,6 +41,9 @@ pub enum SyncType {
 pub struct Options {
     /// Where smugglr keeps its memory; `None` is smugglr's config directory.
     pub config_dir: Option<PathBuf>,
+    /// The store memory is kept in, instead of files in `config_dir`: a
+    /// browser tab's own storage.
+    pub memory: Option<Arc<dyn Store>>,
     /// What happens to a row changed in both places.
     pub sync_mode: SyncMode,
     /// How the places connect.
@@ -126,12 +131,15 @@ pub fn sync(
     let theirs: Vec<Table> = theirs_every.iter().filter(|t| named(t)).cloned().collect();
     // Before memory is touched or a row read.
     steering_named(&tables, &theirs, options)?;
-    let config = match &options.config_dir {
-        Some(dir) => dir.clone(),
-        None => smugglr_memory::config_dir().ok_or(Error::NoConfigDir)?,
-    };
     // Memory is only read here; a shape stop says whether the pair is new.
-    let mut memory = Memory::open(&config, source.address(), target.address())?;
+    let mut memory = match (&options.memory, &options.config_dir) {
+        (Some(store), _) => Memory::open_in(Arc::clone(store), source.address(), target.address())?,
+        (None, Some(dir)) => Memory::open(dir, source.address(), target.address())?,
+        (None, None) => {
+            let dir = smugglr_memory::config_dir().ok_or(Error::NoConfigDir)?;
+            Memory::open(&dir, source.address(), target.address())?
+        }
+    };
     // The whole places' shapes, not only the tables named: any mismatch
     // stops the whole run (FR-SMUGGLR-070).
     if let Some(mismatch) = shape::check(source.address(), target.address(), &every, &theirs_every)?

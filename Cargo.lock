@@ -1266,6 +1266,7 @@ dependencies = [
  "smugglr-memory",
  "smugglr-multi",
  "smugglr-place",
+ "smugglr-sync",
  "thiserror 2.0.21",
  "toml 1.1.8+spec-1.1.0",
 ]
@@ -1315,13 +1316,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "smugglr-sync"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "smugglr-core",
+ "smugglr-memory",
+ "smugglr-place",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "smugglr-web"
 version = "0.1.0"
 dependencies = [
  "rstest",
  "rstest-bdd",
  "rstest-bdd-macros",
+ "rusqlite",
+ "serde_json",
  "smugglr-core",
+ "smugglr-memory",
+ "smugglr-multi",
+ "smugglr-place",
+ "smugglr-sync",
  "wasm-bindgen",
 ]
 

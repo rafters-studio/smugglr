@@ -384,7 +384,7 @@ fn the_app_calls_retrieve(world: &World, devices: &Devices) -> Result<(), String
     let mut key = [0; 32];
     key.fill(7);
     let settings = Settings {
-        config_dir: world.config()?,
+        store: std::sync::Arc::new(smugglr_memory::Files::new(world.config()?)),
         key,
         node: "b".to_owned(),
         targets: Vec::new(),

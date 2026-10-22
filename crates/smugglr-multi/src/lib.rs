@@ -7,13 +7,14 @@
 //! (FR-SMUGGLR-075, FR-SMUGGLR-076), in any order. A whole blob holds every
 //! row and the graveyard: a place's first stash is whole, and a device away
 //! past the sunset catches up from one. Where blobs are kept, the device
-//! list, crossing off and keys are the app's.
+//! list, crossing off and keys are the app's. A change a retrieve drops is
+//! kept in the dropped log, and [`replay`] re-sends it.
 
 mod retrieve;
 mod stash;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde_json::{Value, json};
 use smugglr_core::envelope::Envelope;
@@ -23,9 +24,10 @@ use smugglr_core::plan::{Hashes, SyncMode};
 use smugglr_core::row_hash::row_hash;
 use smugglr_core::shape::{Column, Stamp};
 use smugglr_core::steering::Steering;
+use smugglr_memory::Store;
 use smugglr_place::{Key, Place, Table};
 
-pub use retrieve::retrieve;
+pub use retrieve::{replay, retrieve};
 pub use stash::stash;
 
 /// The blob format version.
@@ -46,13 +48,17 @@ pub enum Error {
     /// The caller could not keep the blob; the device's stash is as it was.
     #[error("{0}")]
     Keep(String),
+    /// A replay named a change the dropped log does not hold.
+    #[error("the dropped log holds no change {0}")]
+    NotDropped(String),
 }
 
 /// How a stash or a retrieve runs.
 #[derive(Debug, Clone)]
 pub struct Settings {
-    /// smugglr's config directory, where it keeps what each device needs.
-    pub config_dir: PathBuf,
+    /// Where smugglr keeps what each device needs: files in smugglr's config
+    /// directory, or a browser tab's own storage.
+    pub store: Arc<dyn Store>,
     /// The shared key that signs and verifies envelopes.
     pub key: [u8; 32],
     /// This device's name.

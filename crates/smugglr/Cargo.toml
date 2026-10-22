@@ -19,7 +19,8 @@ path = "src/main.rs"
 smugglr-core = { workspace = true }
 smugglr-memory = { workspace = true }
 smugglr-multi = { workspace = true }
-smugglr-place = { workspace = true }
+smugglr-place = { workspace = true, features = ["native"] }
+smugglr-sync = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }

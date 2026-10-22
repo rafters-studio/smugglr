@@ -2,27 +2,30 @@
 //! (FR-SMUGGLR-072).
 //!
 //! For each pair of places, memory keeps each key's last hash from the last
-//! done run, per table. The CLI and mesh nodes keep it in smugglr's config
-//! directory, one folder per pair of places; the folder is named by a hash of
-//! the two places' addresses, the same whichever is named first.
+//! done run, per table, in a [`Store`]. The CLI and mesh nodes keep it in
+//! smugglr's config directory ([`Files`]), one folder per pair of places; the
+//! folder is named by a hash of the two places' addresses, the same whichever
+//! is named first.
 //!
 //! While a run writes, the pair's folder also holds the run's journal,
 //! `smugglr.sync` (FR-SMUGGLR-073): one line per row, holding its table,
 //! side, key and from and to hashes, written and flushed before the row is.
 
 mod device;
+mod store;
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write as _};
+use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use smugglr_core::change::Op;
 use smugglr_core::plan::{Hashes, Side, Write};
 use smugglr_core::row_hash::row_hash;
 
 pub use device::{Device, Row};
+pub use store::{Files, Store};
 
 /// The file in a pair's folder that holds each key's last hash.
 const LAST: &str = "last";
@@ -42,6 +45,9 @@ pub enum Error {
         #[source]
         source: io::Error,
     },
+    /// A store other than files could not read or write, in its own words.
+    #[error("{0}")]
+    Store(String),
     /// A line of a memory file is not one smugglr wrote.
     #[error("{}: line {line} is not smugglr's memory", path.display())]
     Unreadable {
@@ -66,7 +72,8 @@ pub fn config_dir() -> Option<PathBuf> {
 /// The memory of one pair of places.
 #[derive(Debug)]
 pub struct Memory {
-    folder: PathBuf,
+    store: Arc<dyn Store>,
+    folder: String,
     tables: BTreeMap<String, Hashes>,
     /// A run of this pair that wrote saved memory, even of empty tables.
     synced: bool,
@@ -74,19 +81,28 @@ pub struct Memory {
 
 impl Memory {
     /// Opens the memory of the pair of places at addresses `a` and `b`, kept
-    /// under `config`; a pair never synced has none.
+    /// in files under `config`; a pair never synced has none.
     ///
     /// # Errors
     /// When the pair's memory cannot be read.
     pub fn open(config: &Path, a: &str, b: &str) -> Result<Self, Error> {
+        Self::open_in(Arc::new(Files::new(config)), a, b)
+    }
+
+    /// Opens the memory of the pair of places at addresses `a` and `b`, kept
+    /// in `store`; a pair never synced has none.
+    ///
+    /// # Errors
+    /// When the pair's memory cannot be read.
+    pub fn open_in(store: Arc<dyn Store>, a: &str, b: &str) -> Result<Self, Error> {
         let (first, second) = if a <= b { (a, b) } else { (b, a) };
-        let folder = config.join(hex(&row_hash(&[first, second])));
-        let path = folder.join(LAST);
-        let (text, synced) = match fs::read_to_string(&path) {
-            Ok(text) => (text, true),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => (String::new(), false),
-            Err(source) => return Err(Error::Io { path, source }),
+        let folder = hex(&row_hash(&[first, second]));
+        let path = format!("{folder}/{LAST}");
+        let (text, synced) = match store.read(&path)? {
+            Some(text) => (text, true),
+            None => (String::new(), false),
         };
+        let path = PathBuf::from(path);
         let mut tables: BTreeMap<String, Hashes> = BTreeMap::new();
         for (i, line) in text.lines().enumerate() {
             let unreadable = || Error::Unreadable {
@@ -106,6 +122,7 @@ impl Memory {
             tables.entry(table).or_default().insert(key, hash);
         }
         Ok(Self {
+            store,
             folder,
             tables,
             synced,
@@ -135,7 +152,6 @@ impl Memory {
     /// # Errors
     /// When the folder or its file cannot be written.
     pub fn save(&self) -> Result<(), Error> {
-        fs::create_dir_all(&self.folder).map_err(io_at(&self.folder))?;
         let mut text = String::new();
         for (table, hashes) in &self.tables {
             for (key, hash) in hashes {
@@ -149,16 +165,12 @@ impl Memory {
                 text.push('\n');
             }
         }
-        let path = self.folder.join(LAST);
-        let next = self.folder.join("last.next");
-        // The new file's data reaches the disk before the rename, and the
-        // rename before save returns, so a power cut leaves the old memory
-        // or the new, never an empty file.
-        let mut file = fs::File::create(&next).map_err(io_at(&next))?;
-        file.write_all(text.as_bytes()).map_err(io_at(&next))?;
-        file.sync_all().map_err(io_at(&next))?;
-        fs::rename(&next, &path).map_err(io_at(&path))?;
-        sync_folder(&self.folder).map_err(io_at(&self.folder))
+        // The store keeps the old memory or the new, never part of either.
+        self.store.replace(&self.path(LAST), &text)
+    }
+
+    fn path(&self, file: &str) -> String {
+        format!("{}/{file}", self.folder)
     }
 
     /// Adds a line per write to the journal and flushes it to disk; call it
@@ -170,8 +182,6 @@ impl Memory {
         if writes.is_empty() {
             return Ok(());
         }
-        fs::create_dir_all(&self.folder).map_err(io_at(&self.folder))?;
-        let path = self.folder.join(JOURNAL);
         let mut text = String::new();
         for write in writes {
             let hash = |hash: Option<[u8; 16]>| hash.map_or_else(|| "-".to_owned(), |h| hex(&h));
@@ -192,13 +202,7 @@ impl Memory {
             }
             text.push('\n');
         }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(io_at(&path))?;
-        file.write_all(text.as_bytes()).map_err(io_at(&path))?;
-        file.sync_data().map_err(io_at(&path))
+        self.store.append(&self.path(JOURNAL), &text)
     }
 
     /// The journal a cut-off run left, by table; empty when there is none.
@@ -206,12 +210,11 @@ impl Memory {
     /// # Errors
     /// When the journal cannot be read.
     pub fn journaled(&self) -> Result<Vec<(String, Write)>, Error> {
-        let path = self.folder.join(JOURNAL);
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(source) => return Err(Error::Io { path, source }),
+        let path = self.path(JOURNAL);
+        let Some(text) = self.store.read(&path)? else {
+            return Ok(Vec::new());
         };
+        let path = PathBuf::from(path);
         let mut lines = Vec::new();
         // A line cut off by a crash ends without its newline; its row was
         // never written, since a row is written only after its line is on
@@ -272,13 +275,7 @@ impl Memory {
     /// # Errors
     /// When the journal is there and cannot be deleted.
     pub fn clear_journal(&self) -> Result<(), Error> {
-        let path = self.folder.join(JOURNAL);
-        match fs::remove_file(&path) {
-            Err(err) if err.kind() != io::ErrorKind::NotFound => {
-                Err(Error::Io { path, source: err })
-            }
-            _ => Ok(()),
-        }
+        self.store.remove(&self.path(JOURNAL))
     }
 }
 
@@ -286,18 +283,6 @@ impl Memory {
 fn io_at(path: &Path) -> impl FnOnce(io::Error) -> Error {
     let path = path.to_owned();
     move |source| Error::Io { path, source }
-}
-
-/// Flushes a folder's entries (a rename into it) to disk. Windows cannot
-/// open a folder as a file, so there the step is skipped.
-#[cfg(unix)]
-fn sync_folder(folder: &Path) -> io::Result<()> {
-    fs::File::open(folder)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn sync_folder(_: &Path) -> io::Result<()> {
-    Ok(())
 }
 
 fn hex(bytes: &[u8]) -> String {

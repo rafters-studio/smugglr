@@ -46,12 +46,14 @@ pub trait Transport: std::fmt::Debug {
 }
 
 /// An HTTP POST to the service's URL.
+#[cfg(feature = "native")]
 #[derive(Debug)]
 struct Post {
     url: String,
     agent: ureq::Agent,
 }
 
+#[cfg(feature = "native")]
 impl Transport for Post {
     fn send(&self, request: &Json) -> Result<(bool, Json), String> {
         let mut response = self
@@ -79,6 +81,7 @@ type Statement = (String, Vec<Json>);
 
 impl HttpSql {
     /// The service at `url`. Nothing is sent until the place is read.
+    #[cfg(feature = "native")]
     #[must_use]
     pub fn open(url: &str) -> Self {
         let agent = ureq::Agent::config_builder()

@@ -1,20 +1,19 @@
 //! What multi keeps for one device between runs, in smugglr's own files
 //! (FR-SMUGGLR-077): each key's hash at the last stash, each key's last
-//! applied `from`, and the graveyard, the delete envelopes kept until their
-//! sunset (FR-SMUGGLR-076). The device's folder is named by a hash of its
-//! place's address.
+//! applied `from`, the graveyard, the delete envelopes kept until their
+//! sunset, and the dropped log, each change a retrieve dropped
+//! (FR-SMUGGLR-076). The device's folder is named by a hash of its place's
+//! address.
 
 use std::collections::BTreeMap;
-use std::fs;
-use std::io::{self, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde_json::{Value, json};
 use smugglr_core::envelope::Envelope;
 use smugglr_core::plan::Hashes;
 use smugglr_core::row_hash::row_hash;
 
-use crate::{Error, hex, io_at, sync_folder, unhex};
+use crate::{Error, Store, hex, unhex};
 
 /// The file in a device's folder.
 const FILE: &str = "device.json";
@@ -25,7 +24,7 @@ pub type Row = (String, Vec<String>);
 /// What multi keeps for one device.
 #[derive(Debug, Default)]
 pub struct Device {
-    folder: PathBuf,
+    folder: String,
     /// The device has stashed before: its next stash holds only what
     /// changed since.
     pub stashed: bool,
@@ -36,28 +35,28 @@ pub struct Device {
     pub last_from: BTreeMap<Row, Option<[u8; 16]>>,
     /// The delete envelopes kept until their sunset, one per key.
     pub graveyard: BTreeMap<Row, Envelope>,
+    /// The dropped log: each change dropped here, envelope and values, by
+    /// which a replay re-sends it.
+    pub dropped: Vec<Envelope>,
 }
 
 impl Device {
-    /// Opens what multi keeps for the place at `address`, under `config`; a
+    /// Opens what multi keeps for the place at `address`, in `store`; a
     /// place that never stashed or retrieved has nothing.
     ///
     /// # Errors
     /// When the file is there and cannot be read, or is not one smugglr
     /// wrote.
-    pub fn open(config: &Path, address: &str) -> Result<Self, Error> {
-        let folder = config.join(hex(&row_hash(&["multi", address])));
-        let path = folder.join(FILE);
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                return Ok(Self {
-                    folder,
-                    ..Self::default()
-                });
-            }
-            Err(source) => return Err(Error::Io { path, source }),
+    pub fn open(store: &dyn Store, address: &str) -> Result<Self, Error> {
+        let folder = hex(&row_hash(&["multi", address]));
+        let path = format!("{folder}/{FILE}");
+        let Some(text) = store.read(&path)? else {
+            return Ok(Self {
+                folder,
+                ..Self::default()
+            });
         };
+        let path = PathBuf::from(path);
         let unreadable = || Error::Unreadable {
             path: path.clone(),
             line: 1,
@@ -100,15 +99,20 @@ impl Device {
             let row = (tombstone.change.table.clone(), tombstone.change.key.clone());
             device.graveyard.insert(row, tombstone);
         }
+        let dropped = json.get("dropped").and_then(Value::as_array);
+        for envelope in dropped.into_iter().flatten() {
+            let envelope = Envelope::from_json(envelope).ok_or_else(unreadable)?;
+            device.dropped.push(envelope);
+        }
         Ok(device)
     }
 
-    /// Saves what the device keeps, replacing what was there, less the
-    /// tombstones whose sunset is before `now`.
+    /// Saves what the device keeps in `store`, replacing what was there, less
+    /// the tombstones whose sunset is before `now`.
     ///
     /// # Errors
     /// When the folder or its file cannot be written.
-    pub fn save(&mut self, now: u64) -> Result<(), Error> {
+    pub fn save(&mut self, store: &dyn Store, now: u64) -> Result<(), Error> {
         self.graveyard
             .retain(|_, tombstone| now <= tombstone.sunset);
         let mut rows: BTreeMap<Row, serde_json::Map<String, Value>> = BTreeMap::new();
@@ -133,17 +137,15 @@ impl Device {
             })
             .collect();
         let graveyard: Vec<Value> = self.graveyard.values().map(Envelope::to_json).collect();
-        let text = json!({"stashed": self.stashed, "rows": rows, "graveyard": graveyard});
-        fs::create_dir_all(&self.folder).map_err(io_at(&self.folder))?;
-        let path = self.folder.join(FILE);
-        let next = self.folder.join("device.json.next");
-        // As memory's save: the old file or the new one, never an empty one.
-        let mut file = fs::File::create(&next).map_err(io_at(&next))?;
-        file.write_all(text.to_string().as_bytes())
-            .map_err(io_at(&next))?;
-        file.sync_all().map_err(io_at(&next))?;
-        fs::rename(&next, &path).map_err(io_at(&path))?;
-        sync_folder(&self.folder).map_err(io_at(&self.folder))
+        let dropped: Vec<Value> = self.dropped.iter().map(Envelope::to_json).collect();
+        let text = json!({
+            "stashed": self.stashed,
+            "rows": rows,
+            "graveyard": graveyard,
+            "dropped": dropped,
+        });
+        // As memory's save: the old file or the new one, never part of one.
+        store.replace(&format!("{}/{FILE}", self.folder), &text.to_string())
     }
 }
 

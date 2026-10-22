@@ -158,7 +158,7 @@ fn settings(command: &Multi) -> Result<Settings, String> {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_secs());
     Ok(Settings {
-        config_dir,
+        store: std::sync::Arc::new(smugglr_memory::Files::new(&config_dir)),
         key: key(key_file)?,
         node,
         targets: command.targets.clone(),

@@ -2,9 +2,31 @@
 //! value as a parameter and loses nothing, to a local file or as an
 //! HTTP-SQL parameter.
 
-use rusqlite::types::Value;
-
 use crate::Error;
+
+/// A SQLite value.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Value {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text(String),
+    Blob(Vec<u8>),
+}
+
+#[cfg(feature = "native")]
+impl rusqlite::ToSql for Value {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        use rusqlite::types::{ToSqlOutput, ValueRef};
+        Ok(ToSqlOutput::Borrowed(match self {
+            Self::Null => ValueRef::Null,
+            Self::Integer(integer) => ValueRef::Integer(*integer),
+            Self::Real(real) => ValueRef::Real(*real),
+            Self::Text(text) => ValueRef::Text(text.as_bytes()),
+            Self::Blob(bytes) => ValueRef::Blob(bytes),
+        }))
+    }
+}
 
 /// The value whose `quote()` text this is.
 pub(crate) fn unquote(text: &str) -> Result<Value, Error> {
@@ -73,6 +95,7 @@ pub(crate) fn base64(bytes: &[u8]) -> String {
     out
 }
 
+#[cfg(feature = "native")]
 /// The bytes RFC 4648 base64 `text` names, with or without padding; `None`
 /// when it is not base64.
 pub(crate) fn unbase64(text: &str) -> Option<Vec<u8>> {
@@ -104,10 +127,9 @@ pub(crate) fn unbase64(text: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use rusqlite::types::Value;
     use serde_json::json;
 
-    use super::{base64, param, unbase64, unquote};
+    use super::{Value, base64, param, unbase64, unquote};
 
     #[test]
     fn base64_known_answers() {

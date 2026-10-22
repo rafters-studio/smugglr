@@ -15,11 +15,12 @@ use cargo_metadata::{DependencyKind, Metadata};
 const CORE: &str = "smugglr-core";
 
 /// Each crate the map names, and the workspace crates it may depend on.
-/// Current choice 2026-10-19 (NFR-SMUGGLR-009 rev 5); revisable.
+/// Current choice 2026-10-22 (NFR-SMUGGLR-009 rev 7); revisable.
 const CRATE_MAP: &[(&str, &[&str])] = &[
     (CORE, &[]),
     ("smugglr-memory", &[CORE]),
     ("smugglr-place", &[CORE]),
+    ("smugglr-sync", &[CORE, "smugglr-memory", "smugglr-place"]),
     ("smugglr-multi", &[CORE, "smugglr-memory", "smugglr-place"]),
     (
         "smugglr-mesh",
@@ -31,11 +32,21 @@ const CRATE_MAP: &[(&str, &[&str])] = &[
             CORE,
             "smugglr-memory",
             "smugglr-place",
+            "smugglr-sync",
             "smugglr-multi",
             "smugglr-mesh",
         ],
     ),
-    ("smugglr-web", &[CORE, "smugglr-memory"]),
+    (
+        "smugglr-web",
+        &[
+            CORE,
+            "smugglr-memory",
+            "smugglr-place",
+            "smugglr-multi",
+            "smugglr-sync",
+        ],
+    ),
     ("xtask", &[]),
 ];
 
