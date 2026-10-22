@@ -1,0 +1,4 @@
+# @smugglr/web, packed from this repository by `pnpm vendor`
+/vendor/
+# wrangler's local state
+/.wrangler/

@@ -1,0 +1,14 @@
+name = "hono-tab"
+main = "src/index.ts"
+compatibility_date = "2026-10-01"
+
+# The only Cloudflare access the Worker has: its D1 binding.
+[[d1_databases]]
+binding = "DB"
+database_name = "hono-tab"
+database_id = "00000000-0000-0000-0000-000000000000"
+
+# SQLite's and the engine's WebAssembly, compiled at deploy.
+[[rules]]
+type = "CompiledWasm"
+globs = ["**/*.wasm"]
