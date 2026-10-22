@@ -1,4 +1,5 @@
 # Generated from the legion requirement. Do not hand-edit this file.
+# FR-SMUGGLR-081 rev 2 holds the scenarios of a first sync's baseline.
 Feature: one sync between two places, with places and memory as they are
 
   @criterion-01a14bed-7cc2-7a31-be37-6083dd3bd3e7 @module-places
@@ -192,3 +193,22 @@ Feature: one sync between two places, with places and memory as they are
     Given a local file and a D1 database that holds a _cf_KV table, with no ignore list in the config
     When the agent runs smugglr sync on them with --json
     Then the record lists _cf_KV once among the ignored tables and the run does not stop on it
+
+  @criterion-01a162d4-3aff-71a3-84cf-2d93036ee1ed @module-memory
+  Scenario: a stopped first sync still keeps its baseline
+    Given two places that hold notes alike and orders with one row changed in both places, never synced before
+    When the agent runs smugglr sync on them, orders stops, and a notes row is then deleted from the source
+    And the agent runs smugglr sync on them again
+    Then that notes row is gone from the target
+
+  @criterion-01a162d4-3aff-71a3-84cf-2dacd71e9f50 @module-memory
+  Scenario: an unknown table cannot see deletes
+    Given two places that synced before, and a table memory holds nothing for
+    When the agent runs smugglr sync on them with --json
+    Then the record says deletes_seen false
+
+  @criterion-01a162d4-3aff-71a3-84cf-2dbcf9a224b4 @module-memory
+  Scenario: a stopped table records its alike keys
+    Given two places never synced, holding orders alike except one row changed in both places
+    When the agent runs smugglr sync on them and orders stops
+    Then memory holds the hash of every orders key whose rows were alike

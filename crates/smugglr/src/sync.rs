@@ -162,10 +162,13 @@ pub fn sync(
         &theirs,
         &mut *source,
         &mut *target,
-        &memory,
+        &mut memory,
         options,
         &mut done,
     )?;
+    // A table memory holds nothing for is in its first sync, even when the
+    // pair synced before, and cannot tell a delete (FR-SMUGGLR-081).
+    let unknown = memory.first_sync() || plans.iter().any(|(_, last, _)| last.is_empty());
     let weight = if memory.first_sync() {
         Some(weigh(&plans, &mut *source, &mut *target)?)
     } else {
@@ -196,12 +199,14 @@ pub fn sync(
             if let Some(name) = wrote.writing.take() {
                 done.insert(name, record::lost(wrote.keys, &cause.to_string()));
             }
-            let record = Record::new(done, ignored, false, weight);
+            let mut record = Record::new(done, ignored, false, weight);
+            record.deletes_seen = !unknown;
             return Err(cut_off(record, cause));
         }
         Err(cause) => return Err(cause),
     };
-    let record = Record::new(done, ignored, options.dryrun, weight);
+    let mut record = Record::new(done, ignored, options.dryrun, weight);
+    record.deletes_seen = !unknown;
     if !options.dryrun {
         let kept = memory.save().and_then(|()| {
             // Kept after a run whose rows read back different (exit 4), so
@@ -248,8 +253,8 @@ struct Wrote {
 
 /// Writes each table's planned moves, table by table, recording each in
 /// `done` and noting in `wrote` what is written as it goes. Memory is set
-/// for each table that read back whole, not saved. Returns whether any
-/// table's rows read back different.
+/// for each table written, not saved: a row that read back different keeps
+/// its last hash. Returns whether any table's rows read back different.
 fn write_all(
     plans: Vec<(Table, Hashes, Plan)>,
     source: &mut dyn Place,
@@ -292,10 +297,15 @@ fn write_all(
         };
         done.insert(table.name.clone(), record::table(&moved, false));
         if !mismatched.is_empty() {
-            // Not done: the table keeps its old memory.
+            // Not done: a row that read back different keeps its last hash.
             unmatched = true;
+            for key in &mismatched {
+                match last.get(key) {
+                    Some(&hash) => next.insert(key.clone(), hash),
+                    None => next.remove(key),
+                };
+            }
             done.insert(table.name.clone(), record::not_read_back(mismatched));
-            continue;
         }
         memory.set_table(&table.name, next);
     }
@@ -344,13 +354,14 @@ fn steering_named(tables: &[Table], theirs: &[Table], options: &Options) -> Resu
 /// Plans every table before any is written, so a first sync can weigh
 /// itself whole. A table whose database hands out its own keys, in either
 /// place, goes into `done` as stopped before any row is read; the run's other
-/// tables go on.
+/// tables go on. A table that stops has its alike rows set in memory, not
+/// saved (FR-SMUGGLR-081).
 fn plan_tables(
     tables: Vec<Table>,
     theirs: &[Table],
     source: &mut dyn Place,
     target: &mut dyn Place,
-    memory: &Memory,
+    memory: &mut Memory,
     options: &Options,
     done: &mut BTreeMap<String, record::Table>,
 ) -> Result<Vec<(Table, Hashes, Plan)>, Error> {
@@ -388,9 +399,25 @@ fn plan_tables(
             options.sync_mode,
             &steered,
         );
+        if let Plan::Stop { .. } = planned {
+            memory.set_table(&table.name, agreed(&here, &there, last.clone()));
+        }
         plans.push((table, last, planned));
     }
     Ok(plans)
+}
+
+/// `last` with each key whose rows are alike in both places, `here` and
+/// `there`, at their hash, and gone when neither holds it; every other key
+/// keeps its last agreed hash.
+fn agreed(here: &Hashes, there: &Hashes, mut last: Hashes) -> Hashes {
+    last.retain(|key, _| here.contains_key(key) || there.contains_key(key));
+    for (key, hash) in here {
+        if there.get(key) == Some(hash) {
+            last.insert(key.clone(), *hash);
+        }
+    }
+    last
 }
 
 /// The steering values, in each place, of the rows changed in both: read
@@ -741,6 +768,40 @@ mod tests {
                     .map(|values| format!("{values:?}"))
             })?
             .collect()
+    }
+
+    /// A later sync whose table stops keeps the last hash of a row deleted
+    /// in one place since, so the delete is not undone once the stop is
+    /// settled.
+    #[test]
+    fn a_stopped_table_keeps_the_last_hash_of_a_row_deleted_since()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join(format!("smugglr-stop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let rows = "CREATE TABLE notes (id TEXT PRIMARY KEY, body TEXT); \
+                    INSERT INTO notes VALUES ('n1', 'a'), ('n2', 'b');";
+        let source = sqlite(&dir.join("source.db"), rows)?;
+        let target = sqlite(&dir.join("target.db"), rows)?;
+        let options = Options {
+            config_dir: Some(dir.join("config")),
+            ..Options::default()
+        };
+        let mut here = LocalFile::open(dir.join("source.db"))?;
+        let mut there = LocalFile::open(dir.join("target.db"))?;
+        sync(&mut here, &mut there, &options)?;
+        let addresses = (here.address().to_owned(), there.address().to_owned());
+        let open = || Memory::open(&dir.join("config"), &addresses.0, &addresses.1);
+        let before = open()?.table("notes");
+        source.execute_batch(
+            "DELETE FROM notes WHERE id = 'n1'; UPDATE notes SET body = 'x' WHERE id = 'n2';",
+        )?;
+        target.execute_batch("UPDATE notes SET body = 'y' WHERE id = 'n2';")?;
+        sync(&mut here, &mut there, &options)?;
+        assert_eq!(open()?.table("notes"), before);
+        drop((source, target));
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
     }
 
     /// Real files: ignored tables, one only in the source and without a

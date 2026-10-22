@@ -1286,3 +1286,123 @@ fn call_previews(world: &World) -> Result<(), String> {
         Err(err) => Err(format!("the call failed: {err}")),
     }
 }
+
+/// Two places never synced, each holding the notes `notes` inserts: orders
+/// o1 and o2 alike in both, o3 written differently in each, so orders stops
+/// on o3.
+fn orders_changed_in_both(world: &World, notes: &str) -> Result<(), String> {
+    let orders = "INSERT INTO orders VALUES ('o1', 'tent'), ('o2', 'stove')";
+    world.source.set(world.place(
+        "source.db",
+        &format!("{NOTES}; {notes}; {ORDERS}; {orders}, ('o3', 'lamp')"),
+    )?);
+    world.target.set(world.place(
+        "target.db",
+        &format!("{NOTES}; {notes}; {ORDERS}; {orders}, ('o3', 'rope')"),
+    )?);
+    Ok(())
+}
+
+/// Runs smugglr sync and fails unless the record stops orders.
+fn sync_stopping_orders(world: &World) -> Result<(), String> {
+    world.sync(&["--json"])?;
+    let record = record(world)?;
+    match record.pointer("/tables/orders/status") {
+        Some(serde_json::Value::String(status)) if status == "stopped" => Ok(()),
+        _ => Err(format!("orders did not stop: {record}{}", stderr(world))),
+    }
+}
+
+#[given(
+    "two places that hold notes alike and orders with one row changed in both places, never synced before"
+)]
+fn notes_alike_orders_changed(world: &World) -> Result<(), String> {
+    orders_changed_in_both(world, THREE_NOTES)?;
+    world.watched.set("n2".to_owned());
+    Ok(())
+}
+
+#[when(
+    "the agent runs smugglr sync on them, orders stops, and a notes row is then deleted from the source"
+)]
+fn stop_then_delete_note(world: &World) -> Result<(), String> {
+    sync_stopping_orders(world)?;
+    let (source, _) = places(world)?;
+    let id = world.watched.get().ok_or("no row watched")?;
+    sql_on(&source, &format!("DELETE FROM notes WHERE id = '{id}'"))
+}
+
+#[then("that notes row is gone from the target")]
+fn note_gone_from_target(world: &World) -> Result<(), String> {
+    let (_, target) = places(world)?;
+    let id = world.watched.get().ok_or("no row watched")?;
+    match note(&target, &id)? {
+        None => Ok(()),
+        Some(row) => Err(format!("the target holds {row:?}{}", stderr(world))),
+    }
+}
+
+#[given("two places that synced before, and a table memory holds nothing for")]
+fn synced_with_unknown_table(world: &World) -> Result<(), String> {
+    world
+        .source
+        .set(world.place("source.db", &format!("{NOTES}; {THREE_NOTES}"))?);
+    world.target.set(world.place("target.db", NOTES)?);
+    world.sync_ok()?;
+    // orders comes after that sync, in both places, so the shapes match and
+    // memory holds nothing for it.
+    let (source, target) = places(world)?;
+    sql_on(
+        &source,
+        &format!("{ORDERS}; INSERT INTO orders VALUES ('o1', 'tent')"),
+    )?;
+    sql_on(&target, ORDERS)
+}
+
+#[given("two places never synced, holding orders alike except one row changed in both places")]
+fn orders_alike_but_one(world: &World) -> Result<(), String> {
+    orders_changed_in_both(world, "SELECT 1")
+}
+
+#[when("the agent runs smugglr sync on them and orders stops")]
+fn sync_orders_stops(world: &World) -> Result<(), String> {
+    sync_stopping_orders(world)
+}
+
+/// Each orders key's hash in the place at `path`, and the place's address.
+fn orders_hashes(path: &str) -> Result<(String, BTreeMap<Key, [u8; 16]>), String> {
+    let mut place = LocalFile::open(path).map_err(|err| err.to_string())?;
+    let table = place
+        .tables()
+        .map_err(|err| err.to_string())?
+        .into_iter()
+        .find(|table| table.name == "orders")
+        .ok_or_else(|| format!("{path} has no orders"))?;
+    let hashes = place
+        .hashes(&table)
+        .map_err(|err| err.to_string())?
+        .into_iter()
+        .collect();
+    Ok((place.address().to_owned(), hashes))
+}
+
+#[then("memory holds the hash of every orders key whose rows were alike")]
+fn memory_holds_alike_orders(world: &World) -> Result<(), String> {
+    let (source, target) = places(world)?;
+    let (here, ours) = orders_hashes(&source)?;
+    let (there, theirs) = orders_hashes(&target)?;
+    let alike: BTreeMap<Key, [u8; 16]> = ours
+        .into_iter()
+        .filter(|(key, hash)| theirs.get(key) == Some(hash))
+        .collect();
+    let kept = smugglr_memory::Memory::open(&world.config()?, &here, &there)
+        .map_err(|err| err.to_string())?
+        .table("orders");
+    if alike.len() == 2 && kept == alike {
+        Ok(())
+    } else {
+        Err(format!(
+            "memory holds {kept:?} for orders, the alike rows hash {alike:?}"
+        ))
+    }
+}
