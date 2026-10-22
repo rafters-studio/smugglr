@@ -10,7 +10,9 @@ use rstest::fixture;
 use rstest_bdd::Slot;
 use rstest_bdd_macros::{ScenarioState, given, then, when};
 use smugglr_core::change::{Change, op};
-use smugglr_core::envelope::{Arrival, Envelope, GRAVEYARD, Here, Txn, VERSION, receive, replay};
+use smugglr_core::envelope::{
+    Arrival, Envelope, GRAVEYARD, Here, Txn, VERSION, receive, receive_replayed, replay,
+};
 use smugglr_core::plan::SyncMode;
 use smugglr_core::record::{self, Dropped, Reason, Record};
 use smugglr_core::row_hash::row_hash;
@@ -193,37 +195,55 @@ impl Node {
             let arrivals = receive(&pending, &KEY, mode, self.now, |change| self.here(change));
             let mut moved = false;
             for (envelope, arrival) in pending.drain(..).zip(arrivals) {
-                let change = &envelope.change;
-                if matches!(arrival, Arrival::Apply | Arrival::Skip) && change.to.is_none() {
-                    self.graveyard.insert(change.key.clone(), envelope.clone());
-                }
-                match arrival {
-                    Arrival::Apply => {
-                        let values = change.to.map(|_| change.values.clone());
-                        self.rows.insert(
-                            change.key.clone(),
-                            Row {
-                                values,
-                                last_from: change.from,
-                            },
-                        );
-                        self.applied += 1;
-                        moved = true;
-                    }
-                    Arrival::Hold => self.held.push(envelope),
-                    Arrival::Stop => self.stopped.push(change.key.clone()),
-                    Arrival::Dropped(reason) => {
-                        self.dropped.push(Dropped::new(&envelope, reason));
-                        self.log.push(envelope);
-                    }
-                    Arrival::Skip | Arrival::Refused => {}
-                }
+                moved |= self.settle(envelope, arrival);
             }
             if !moved || self.held.is_empty() {
                 return;
             }
             pending = std::mem::take(&mut self.held);
         }
+    }
+
+    /// Replays `envelopes` in a new run, whose record starts empty, then
+    /// receives what waits here.
+    fn replay(&mut self, envelopes: &[Envelope], mode: SyncMode) {
+        self.dropped.clear();
+        let arrivals =
+            receive_replayed(envelopes, &KEY, mode, self.now, |change| self.here(change));
+        for (envelope, arrival) in envelopes.iter().cloned().zip(arrivals) {
+            self.settle(envelope, arrival);
+        }
+        self.deliver(&[], mode);
+    }
+
+    /// Does what `arrival` says with `envelope`; whether a row was written.
+    fn settle(&mut self, envelope: Envelope, arrival: Arrival) -> bool {
+        let change = &envelope.change;
+        if matches!(arrival, Arrival::Apply | Arrival::Skip) && change.to.is_none() {
+            self.graveyard.insert(change.key.clone(), envelope.clone());
+        }
+        match arrival {
+            Arrival::Apply => {
+                let values = change.to.map(|_| change.values.clone());
+                self.rows.insert(
+                    change.key.clone(),
+                    Row {
+                        values,
+                        last_from: change.from,
+                    },
+                );
+                self.applied += 1;
+                return true;
+            }
+            Arrival::Hold => self.held.push(envelope),
+            Arrival::Stop => self.stopped.push(change.key.clone()),
+            Arrival::Dropped(reason) => {
+                self.dropped.push(Dropped::new(&envelope, reason));
+                self.log.push(envelope);
+            }
+            Arrival::Skip | Arrival::Refused => {}
+        }
+        false
     }
 
     fn row(&self, id: &str) -> Result<&[String], String> {
@@ -882,7 +902,13 @@ fn logged_late_edit(mesh: &Mesh) -> Result<(), String> {
 
 #[when("the agent replays it with --replay and its change hash, under --sync-mode stop")]
 fn replays(mesh: &Mesh) -> Result<(), String> {
-    let place = watched(mesh)?;
+    let replayed = replayed_first(&watched(mesh)?)?;
+    at_place(mesh, |place| place.replay(&[replayed], SyncMode::Stop))
+}
+
+/// The change hash of the first change the watched place's record names
+/// under dropped, replayed with a fresh sunset.
+fn replayed_first(place: &Node) -> Result<Envelope, String> {
     let named = place.record().dropped;
     let hash = unhex(
         &named
@@ -890,9 +916,42 @@ fn replays(mesh: &Mesh) -> Result<(), String> {
             .ok_or("the record names nothing dropped")?
             .change,
     )?;
-    let replayed = replay(&place.log, &hash, place.now + GRAVEYARD, &KEY)
-        .ok_or("the dropped log holds no change with that hash")?;
-    at_place(mesh, |place| place.deliver(&[replayed], SyncMode::Stop))
+    replay(&place.log, &hash, place.now + GRAVEYARD, &KEY)
+        .ok_or_else(|| "the dropped log holds no change with that hash".to_owned())
+}
+
+#[given("a place whose dropped log holds an insert dropped because its key's tombstone was live")]
+fn insert_dropped_by_graveyard(mesh: &Mesh) -> Result<(), String> {
+    deleted_at_place(mesh, T0 + HOUR);
+    insert_arrives(mesh)?;
+    let place = watched(mesh)?;
+    let insert = mesh.arriving.get().ok_or("no insert arrived")?;
+    names_dropped(&place, &insert[0], Reason::Graveyard)
+}
+
+#[when("the agent replays it with its change hash while that tombstone is still live")]
+fn replays_in_window(mesh: &Mesh) -> Result<(), String> {
+    let place = watched(mesh)?;
+    if place.now > T0 + GRAVEYARD {
+        return Err("the tombstone is no longer live".to_owned());
+    }
+    let replayed = replayed_first(&place)?;
+    at_place(mesh, |place| place.replay(&[replayed], SyncMode::Stop))
+}
+
+#[then("the place holds the inserted row")]
+fn holds_inserted(mesh: &Mesh) -> Result<(), String> {
+    holds_row(mesh)
+}
+
+#[then("the record does not name it under dropped")]
+fn not_named_dropped(mesh: &Mesh) -> Result<(), String> {
+    let dropped = watched(mesh)?.record().dropped;
+    if dropped.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("the record names {dropped:?} under dropped"))
+    }
 }
 
 #[then("it stops as edit versus delete")]

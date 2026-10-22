@@ -209,11 +209,35 @@ pub fn receive(
     now: u64,
     here: impl Fn(&Change) -> Here,
 ) -> Vec<Arrival> {
+    decide_all(envelopes, key, mode, now, here, false)
+}
+
+/// Decides `envelopes` the place replays ([`replay`]) as [`receive`] does,
+/// except that a replay overrides the graveyard: a live tombstone does not
+/// drop them.
+pub fn receive_replayed(
+    envelopes: &[Envelope],
+    key: &[u8; 32],
+    mode: SyncMode,
+    now: u64,
+    here: impl Fn(&Change) -> Here,
+) -> Vec<Arrival> {
+    decide_all(envelopes, key, mode, now, here, true)
+}
+
+fn decide_all(
+    envelopes: &[Envelope],
+    key: &[u8; 32],
+    mode: SyncMode,
+    now: u64,
+    here: impl Fn(&Change) -> Here,
+    replayed: bool,
+) -> Vec<Arrival> {
     // Holding a member can change what follows it, so decide again until no
     // further member is held.
     let mut held = BTreeSet::new();
     loop {
-        let arrivals = in_order(envelopes, key, mode, now, &here, &held);
+        let arrivals = in_order(envelopes, key, (mode, now, replayed), &here, &held);
         let broken = broken(envelopes, &arrivals);
         let before = held.len();
         for (index, (envelope, arrival)) in envelopes.iter().zip(&arrivals).enumerate() {
@@ -236,8 +260,7 @@ pub fn receive(
 fn in_order(
     envelopes: &[Envelope],
     key: &[u8; 32],
-    mode: SyncMode,
-    now: u64,
+    (mode, now, replayed): (SyncMode, u64, bool),
     here: impl Fn(&Change) -> Here,
     held: &BTreeSet<usize>,
 ) -> Vec<Arrival> {
@@ -248,7 +271,7 @@ fn in_order(
         let row = rows
             .entry((change.table.as_str(), change.key.as_slice()))
             .or_insert_with(|| here(change));
-        let mut arrival = arrive(envelope, key, mode, now, row);
+        let mut arrival = arrive(envelope, key, mode, now, row, replayed);
         if arrival == Arrival::Apply && held.contains(&index) {
             arrival = Arrival::Hold;
         }
@@ -297,7 +320,14 @@ fn broken<'a>(envelopes: &'a [Envelope], arrivals: &[Arrival]) -> BTreeSet<(&'a 
     broken
 }
 
-fn arrive(envelope: &Envelope, key: &[u8; 32], mode: SyncMode, now: u64, here: &Here) -> Arrival {
+fn arrive(
+    envelope: &Envelope,
+    key: &[u8; 32],
+    mode: SyncMode,
+    now: u64,
+    here: &Here,
+    replayed: bool,
+) -> Arrival {
     if !envelope.verify(key) {
         return Arrival::Refused;
     }
@@ -326,7 +356,7 @@ fn arrive(envelope: &Envelope, key: &[u8; 32], mode: SyncMode, now: u64, here: &
     };
     let decision = decide(change, here.hash, last.as_ref());
     let insert = decision == Decision::Apply && change.from.is_none();
-    if tombstone.is_some() && (insert || decision == Decision::Hold) {
+    if !replayed && tombstone.is_some() && (insert || decision == Decision::Hold) {
         return Arrival::Dropped(Reason::Graveyard);
     }
     match decision {
@@ -352,7 +382,7 @@ fn arrive(envelope: &Envelope, key: &[u8; 32], mode: SyncMode, now: u64, here: &
 
 /// Re-sends the change in the dropped log `log` whose change hash is
 /// `hash`, with the fresh `sunset` and signed with `key`, overriding its
-/// drop; [`receive`] then decides it like any change. `None` when the log
+/// drop; [`receive_replayed`] then decides it like any change. `None` when the log
 /// holds no such change.
 #[must_use]
 pub fn replay(log: &[Envelope], hash: &[u8; 32], sunset: u64, key: &[u8; 32]) -> Option<Envelope> {

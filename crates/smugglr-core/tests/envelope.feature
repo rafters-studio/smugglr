@@ -120,3 +120,10 @@ Feature: the signed envelope multi and the mesh carry each Change in, its sunset
     When the run ends
     Then the dropped log holds the change's envelope and values
     And the record names it under dropped with its table, key, reason and change hash
+
+  @criterion-01a1638c-55d7-7623-b420-fccf1a159557 @module-smugglr-core
+  Scenario: a replay overrides the graveyard
+    Given a place whose dropped log holds an insert dropped because its key's tombstone was live
+    When the agent replays it with its change hash while that tombstone is still live
+    Then the place holds the inserted row
+    And the record does not name it under dropped
