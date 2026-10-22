@@ -624,7 +624,10 @@ fn no_row_retrieve(web: &Web) -> Result<(), String> {
     }
     let record = web.record()?;
     let why = record["why"].as_str().unwrap_or_default();
-    if record["status"] == json!("too much") && why.contains("smugglr retrieve opfs:/app.db") {
+    if record["status"] == json!("too much")
+        && why.contains("Fill the tab with retrieve()")
+        && !why.contains("smugglr ")
+    {
         Ok(())
     } else {
         Err(format!("the record is {record}"))
@@ -709,7 +712,10 @@ fn retrieve_dropped(web: &Web) -> Result<(), String> {
 #[when("the app calls replay() with that change hash")]
 fn replays(web: &Web) -> Result<(), String> {
     let change = web.watched.get().ok_or("no change hash")?;
-    web.call(0, &format!("replay({}, {})", json!(change), multi()))
+    // Past the change's own sunset: only a change re-sent with a fresh
+    // sunset is decided rather than dropped as dead.
+    let later = json!({"key": hex(&KEY), "node": "tab", "now": now() + GRAVEYARD + 3600});
+    web.call(0, &format!("replay({}, {later})", json!(change)))
         .map(drop)
 }
 

@@ -16,7 +16,7 @@ use smugglr_core::change::Change;
 use smugglr_core::envelope::GRAVEYARD;
 use smugglr_core::hex::unhex;
 use smugglr_core::plan::Hashes;
-use smugglr_core::record::Record;
+use smugglr_core::record::{Record, Status};
 use smugglr_memory::{Memory, Store};
 use smugglr_multi::{Blob, Settings};
 use smugglr_place::{Error, HttpSql, Key, Place, Table, Transport};
@@ -138,7 +138,20 @@ impl Tab {
         };
         let mut endpoint = Fetcher::new(&self.endpoint);
         match smugglr_sync::sync(&mut endpoint, &mut tab, &options) {
-            Ok(record) => Ok(answer(&record, &tab.changed)),
+            Ok(mut record) => {
+                // Too much for one first sync: the app fills the tab with
+                // retrieve(), so the record says so in the app's words.
+                if record.status == Status::TooMuch
+                    && let Some(weight) = &record.weight
+                {
+                    record.why = Some(format!(
+                        "Too much for one sync: {weight}.\nFill the tab with retrieve() from a blob \
+                         stashed from {}, then call sync().",
+                        self.endpoint
+                    ));
+                }
+                Ok(answer(&record, &tab.changed))
+            }
             // A run cut off after writing rows into the tab still names
             // them, so table-changed goes out before the error.
             Err(err) if !tab.changed.is_empty() => {

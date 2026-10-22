@@ -6,7 +6,6 @@
 //! address.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 
 use serde_json::{Value, json};
 use smugglr_core::envelope::Envelope;
@@ -56,7 +55,7 @@ impl Device {
                 ..Self::default()
             });
         };
-        let path = PathBuf::from(path);
+        let path = store.locate(&path);
         let unreadable = || Error::Unreadable {
             path: path.clone(),
             line: 1,

@@ -102,7 +102,7 @@ impl Memory {
             Some(text) => (text, true),
             None => (String::new(), false),
         };
-        let path = PathBuf::from(path);
+        let path = store.locate(&path);
         let mut tables: BTreeMap<String, Hashes> = BTreeMap::new();
         for (i, line) in text.lines().enumerate() {
             let unreadable = || Error::Unreadable {
@@ -214,7 +214,7 @@ impl Memory {
         let Some(text) = self.store.read(&path)? else {
             return Ok(Vec::new());
         };
-        let path = PathBuf::from(path);
+        let path = self.store.locate(&path);
         let mut lines = Vec::new();
         // A line cut off by a crash ends without its newline; its row was
         // never written, since a row is written only after its line is on
@@ -320,6 +320,30 @@ mod tests {
             hashes
         );
         let _ = std::fs::remove_dir_all(&config);
+        Ok(())
+    }
+
+    #[test]
+    fn an_unreadable_memory_file_is_named_by_its_full_path() -> Result<(), Error> {
+        let config =
+            std::env::temp_dir().join(format!("smugglr-memory-bad-{}", std::process::id()));
+        Memory::open(&config, "./a.db", "./b.db")?.save()?;
+        let folder = std::fs::read_dir(&config)
+            .ok()
+            .and_then(|mut entries| entries.next()?.ok())
+            .map(|entry| entry.path())
+            .ok_or_else(|| Error::Store("no pair folder".to_owned()))?;
+        let last = folder.join("last");
+        std::fs::write(&last, "not memory\n").map_err(|source| Error::Io {
+            path: last.clone(),
+            source,
+        })?;
+        let named = match Memory::open(&config, "./a.db", "./b.db") {
+            Err(Error::Unreadable { path, .. }) => path,
+            other => return Err(Error::Store(format!("read back {other:?}"))),
+        };
+        let _ = std::fs::remove_dir_all(&config);
+        assert_eq!(named, last);
         Ok(())
     }
 }

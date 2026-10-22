@@ -37,6 +37,12 @@ pub trait Store: std::fmt::Debug + Send + Sync {
     /// # Errors
     /// When the file is there and cannot be removed.
     fn remove(&self, path: &str) -> Result<(), Error>;
+
+    /// Where the file at `path` is, to name it in an error; the path itself
+    /// by default.
+    fn locate(&self, path: &str) -> PathBuf {
+        PathBuf::from(path)
+    }
 }
 
 /// Memory's files in a folder on this machine: smugglr's config directory.
@@ -58,6 +64,10 @@ impl Files {
 }
 
 impl Store for Files {
+    fn locate(&self, path: &str) -> PathBuf {
+        self.at(path)
+    }
+
     fn read(&self, path: &str) -> Result<Option<String>, Error> {
         let path = self.at(path);
         match fs::read_to_string(&path) {
