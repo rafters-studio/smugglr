@@ -32,9 +32,15 @@ use shape_steps::{Device, device};
 
 /// Rows as SQLite's `quote()` text of each column, and the hashes taken.
 #[derive(Debug, Default, ScenarioState)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "the scenarios' steps name the given rows `rows`"
+)]
 struct Rows {
     rows: Slot<Vec<Vec<String>>>,
     hashes: Slot<Vec<String>>,
+    /// Each row's `quote()` text and hash, as the browser's SQLite build gave them.
+    browser: Slot<Vec<(String, String)>>,
 }
 
 #[fixture]
@@ -115,29 +121,125 @@ const [module, ...columns] = process.argv.slice(1);
 const wasi = new WASI({ version: 'preview1', args: ['row_hash', ...columns] });
 WebAssembly.instantiate(readFileSync(module), wasi.getImportObject())
   .then(({ instance }) => { process.exitCode = wasi.start(instance); });";
-    let output = Command::new("node")
-        .arg("-e")
-        .arg(RUN)
-        .arg(module)
-        .args(row)
-        .output()
-        .map_err(|err| {
-            if err.kind() == ErrorKind::NotFound {
-                "node is missing: the WASM engine runs under node's node:wasi, \
-                 and no `node` was found on PATH"
-                    .to_owned()
-            } else {
-                format!("failed to start node: {err}")
-            }
-        })?;
+    let stdout = run(
+        Command::new("node")
+            .arg("-e")
+            .arg(RUN)
+            .arg(module)
+            .args(row),
+        "node",
+        "the WASM engine runs under node's node:wasi",
+    )?;
+    Ok(stdout.trim().to_owned())
+}
+
+/// Starts `program`, naming what to install when it is missing.
+fn run(command: &mut Command, program: &str, install: &str) -> Result<String, String> {
+    let output = command.output().map_err(|err| {
+        if err.kind() == ErrorKind::NotFound {
+            format!("{program} is missing: no `{program}` was found on PATH; {install}")
+        } else {
+            format!("failed to start {program}: {err}")
+        }
+    })?;
     if !output.status.success() {
         return Err(format!(
-            "the WASM engine failed under node ({}):\n{}",
+            "{program} failed ({}):\n{}{}",
             output.status,
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         ));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Builds smugglr-web with wasm-pack, then hashes each one-column row in the
+/// browser's SQLite build under headless Chromium, through
+/// `packages/web/test/row-hash.mjs`. Returns each row's `quote()` text and
+/// hash as the browser gave them.
+fn browser_hashes(rows: &[Vec<String>]) -> Result<Vec<(String, String)>, String> {
+    let web = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/web");
+    let pnpm = if cfg!(windows) { "pnpm.cmd" } else { "pnpm" };
+    run(
+        Command::new(pnpm)
+            .current_dir(&web)
+            .args(["run", "build:wasm"])
+            .env(
+                "CARGO_TARGET_DIR",
+                Path::new(env!("CARGO_TARGET_TMPDIR")).join("smugglr-web"),
+            ),
+        "pnpm",
+        "install pnpm and wasm-pack, then run `pnpm install` at the repo root",
+    )?;
+    let literals = rows
+        .iter()
+        .map(|row| match row.as_slice() {
+            [column] => Ok(column.as_str()),
+            _ => Err(format!("the browser hashes one-column rows, not {row:?}")),
+        })
+        .collect::<Result<Vec<&str>, String>>()?;
+    let stdout = run(
+        Command::new("node")
+            .current_dir(&web)
+            .arg("test/row-hash.mjs")
+            .args(literals),
+        "node",
+        "then run `pnpm exec playwright install chromium-headless-shell` in packages/web",
+    )?;
+    serde_json::from_str(stdout.trim())
+        .map_err(|err| format!("the browser gave no hashes ({err}): {stdout}"))
+}
+
+/// One-column rows, as `quote()` text: an integer beyond 2^53, i64 max and
+/// min, NULL, empty text and an empty blob.
+#[given("a row holding 9007199254740993 and rows holding NULL, empty text and an empty blob")]
+fn browser_rows(rows: &Rows) {
+    rows.rows.set(
+        [
+            "9007199254740993",
+            "9223372036854775807",
+            "-9223372036854775808",
+            "NULL",
+            "''",
+            "X''",
+        ]
+        .iter()
+        .map(|&column| vec![column.to_owned()])
+        .collect(),
+    );
+}
+
+#[when("the browser's SQLite build and the native engine each hash them")]
+fn browser_and_native(rows: &Rows) -> Result<(), String> {
+    let all = rows.rows.get().ok_or("no rows were given")?;
+    rows.browser.set(browser_hashes(&all)?);
+    rows.hashes
+        .set(all.iter().map(|row| native_hash(row)).collect());
+    Ok(())
+}
+
+#[then("each row's two hashes are identical")]
+fn each_identical(rows: &Rows) -> Result<(), String> {
+    let all = rows.rows.take().ok_or("no rows were given")?;
+    let native = rows
+        .hashes
+        .take()
+        .ok_or("the native engine hashed nothing")?;
+    let browser = rows.browser.take().ok_or("the browser hashed nothing")?;
+    if browser.len() != all.len() {
+        return Err(format!(
+            "{} rows given, the browser hashed {browser:?}",
+            all.len()
+        ));
+    }
+    for ((row, native), (quoted, hash)) in all.iter().zip(&native).zip(&browser) {
+        if row.as_slice() != [quoted.as_str()] || native != hash {
+            return Err(format!(
+                "row {row:?}: native {native}, the browser read {quoted} and hashed {hash}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[given("a row holding the integer 9007199254740993")]

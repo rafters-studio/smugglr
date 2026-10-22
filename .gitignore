@@ -4,6 +4,9 @@
 # WASM package output
 /crates/*/pkg/
 
+# JS dependencies (pnpm workspace)
+node_modules/
+
 # Config with credentials (use config.example.toml as a template)
 config.toml
 
