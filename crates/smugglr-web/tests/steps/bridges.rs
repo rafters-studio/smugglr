@@ -156,26 +156,26 @@ fn store_loaded(web: &Web, bridge: String) -> Result<(), String> {
     make(web, &bridge).map(drop)
 }
 
-#[given("a store made with {bridge} bound to todos, loaded, holding a row")]
-fn store_one_row(web: &Web, bridge: String) -> Result<(), String> {
-    tab_with(web, 1)?;
-    let loaded = make(web, &bridge)?;
-    if loaded == items(1) {
+/// `bridge`'s store, loaded from a tab holding the first `n` rows; fails
+/// unless it loaded exactly those.
+fn loaded_with(web: &Web, bridge: &str, n: usize) -> Result<(), String> {
+    tab_with(web, n)?;
+    let loaded = make(web, bridge)?;
+    if loaded == items(n) {
         Ok(())
     } else {
         Err(format!("the store loaded {loaded}"))
     }
 }
 
+#[given("a store made with {bridge} bound to todos, loaded, holding a row")]
+fn store_one_row(web: &Web, bridge: String) -> Result<(), String> {
+    loaded_with(web, &bridge, 1)
+}
+
 #[given("a store made with {bridge} bound to todos, loaded, holding two rows")]
 fn store_two_rows(web: &Web, bridge: String) -> Result<(), String> {
-    tab_with(web, 2)?;
-    let loaded = make(web, &bridge)?;
-    if loaded == items(2) {
-        Ok(())
-    } else {
-        Err(format!("the store loaded {loaded}"))
-    }
+    loaded_with(web, &bridge, 2)
 }
 
 #[when("the app sets one key in the store")]
