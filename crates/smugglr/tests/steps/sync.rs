@@ -1314,29 +1314,37 @@ fn sync_stopping_orders(world: &World) -> Result<(), String> {
 }
 
 #[given(
-    "two places that hold notes alike and orders with one row changed in both places, never synced before"
+    "two places that hold orders alike except one row changed in both places, never synced before"
 )]
-fn notes_alike_orders_changed(world: &World) -> Result<(), String> {
-    orders_changed_in_both(world, THREE_NOTES)?;
-    world.watched.set("n2".to_owned());
+fn orders_alike_never_synced(world: &World) -> Result<(), String> {
+    orders_changed_in_both(world, "SELECT 1")?;
+    world.watched.set("o1".to_owned());
     Ok(())
 }
 
 #[when(
-    "the agent runs smugglr sync on them, orders stops, and a notes row is then deleted from the source"
+    "the agent runs smugglr sync on them, orders stops, and another orders row that both places held alike is then deleted from the source"
 )]
-fn stop_then_delete_note(world: &World) -> Result<(), String> {
+fn stop_then_delete_order(world: &World) -> Result<(), String> {
     sync_stopping_orders(world)?;
     let (source, _) = places(world)?;
     let id = world.watched.get().ok_or("no row watched")?;
-    sql_on(&source, &format!("DELETE FROM notes WHERE id = '{id}'"))
+    sql_on(&source, &format!("DELETE FROM orders WHERE id = '{id}'"))
 }
 
-#[then("that notes row is gone from the target")]
-fn note_gone_from_target(world: &World) -> Result<(), String> {
+#[when("the agent runs smugglr sync on them again with --sync-mode source")]
+fn sync_again_source(world: &World) -> Result<(), String> {
+    world.sync(&["--sync-mode", "source"]).map(|_| ())
+}
+
+#[then("that orders row is gone from the target")]
+fn order_gone_from_target(world: &World) -> Result<(), String> {
     let (_, target) = places(world)?;
     let id = world.watched.get().ok_or("no row watched")?;
-    match note(&target, &id)? {
+    match rows_of(&target, &format!("SELECT * FROM orders WHERE id = '{id}'"))?
+        .into_iter()
+        .next()
+    {
         None => Ok(()),
         Some(row) => Err(format!("the target holds {row:?}{}", stderr(world))),
     }

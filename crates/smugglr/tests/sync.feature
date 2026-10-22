@@ -1,5 +1,5 @@
 # Generated from the legion requirement. Do not hand-edit this file.
-# FR-SMUGGLR-081 rev 2 holds the scenarios of a first sync's baseline.
+# FR-SMUGGLR-081 rev 3 holds the scenarios of a first sync's baseline.
 Feature: one sync between two places, with places and memory as they are
 
   @criterion-01a14bed-7cc2-7a31-be37-6083dd3bd3e7 @module-places
@@ -196,10 +196,10 @@ Feature: one sync between two places, with places and memory as they are
 
   @criterion-01a162d4-3aff-71a3-84cf-2d93036ee1ed @module-memory
   Scenario: a stopped first sync still keeps its baseline
-    Given two places that hold notes alike and orders with one row changed in both places, never synced before
-    When the agent runs smugglr sync on them, orders stops, and a notes row is then deleted from the source
-    And the agent runs smugglr sync on them again
-    Then that notes row is gone from the target
+    Given two places that hold orders alike except one row changed in both places, never synced before
+    When the agent runs smugglr sync on them, orders stops, and another orders row that both places held alike is then deleted from the source
+    And the agent runs smugglr sync on them again with --sync-mode source
+    Then that orders row is gone from the target
 
   @criterion-01a162d4-3aff-71a3-84cf-2dacd71e9f50 @module-memory
   Scenario: an unknown table cannot see deletes
