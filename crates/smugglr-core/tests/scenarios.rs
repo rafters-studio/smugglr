@@ -121,29 +121,16 @@ const [module, ...columns] = process.argv.slice(1);
 const wasi = new WASI({ version: 'preview1', args: ['row_hash', ...columns] });
 WebAssembly.instantiate(readFileSync(module), wasi.getImportObject())
   .then(({ instance }) => { process.exitCode = wasi.start(instance); });";
-    let output = Command::new("node")
-        .arg("-e")
-        .arg(RUN)
-        .arg(module)
-        .args(row)
-        .output()
-        .map_err(|err| {
-            if err.kind() == ErrorKind::NotFound {
-                "node is missing: the WASM engine runs under node's node:wasi, \
-                 and no `node` was found on PATH"
-                    .to_owned()
-            } else {
-                format!("failed to start node: {err}")
-            }
-        })?;
-    if !output.status.success() {
-        return Err(format!(
-            "the WASM engine failed under node ({}):\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    let stdout = run(
+        Command::new("node")
+            .arg("-e")
+            .arg(RUN)
+            .arg(module)
+            .args(row),
+        "node",
+        "the WASM engine runs under node's node:wasi",
+    )?;
+    Ok(stdout.trim().to_owned())
 }
 
 /// Starts `program`, naming what to install when it is missing.
