@@ -59,19 +59,15 @@ function transaction(db, body) {
 
 function host() {
   return {
-    sql(text) {
-      try {
-        const request = JSON.parse(text);
-        if (request.batch === undefined) {
-          return JSON.stringify(run(app, request));
-        }
-        const all = () => request.batch.map((statement) => run(app, statement));
-        const results = request.atomic ? transaction(app, all) : all();
-        return JSON.stringify({ results });
-      } catch (err) {
-        throw words(err);
+    sql: inWords((text) => {
+      const request = JSON.parse(text);
+      if (request.batch === undefined) {
+        return JSON.stringify(run(app, request));
       }
-    },
+      const all = () => request.batch.map((statement) => run(app, statement));
+      const results = request.atomic ? transaction(app, all) : all();
+      return JSON.stringify({ results });
+    }),
     fetch(body) {
       const request = new XMLHttpRequest();
       try {
@@ -89,38 +85,33 @@ function host() {
       }
       return request.responseText;
     },
-    memRead(path) {
-      try {
-        const rows = memory.selectArrays('SELECT text FROM files WHERE path = ?', [path]);
-        return rows.length ? rows[0][0] : undefined;
-      } catch (err) {
-        throw words(err);
-      }
-    },
-    memReplace(path, text) {
-      try {
-        memory.exec({ sql: 'INSERT OR REPLACE INTO files (path, text) VALUES (?, ?)', bind: [path, text] });
-      } catch (err) {
-        throw words(err);
-      }
-    },
-    memAppend(path, text) {
-      try {
-        memory.exec({
-          sql: 'INSERT INTO files (path, text) VALUES (?, ?) ON CONFLICT (path) DO UPDATE SET text = text || excluded.text',
-          bind: [path, text],
-        });
-      } catch (err) {
-        throw words(err);
-      }
-    },
-    memRemove(path) {
-      try {
-        memory.exec({ sql: 'DELETE FROM files WHERE path = ?', bind: [path] });
-      } catch (err) {
-        throw words(err);
-      }
-    },
+    memRead: inWords((path) => {
+      const rows = memory.selectArrays('SELECT text FROM files WHERE path = ?', [path]);
+      return rows.length ? rows[0][0] : undefined;
+    }),
+    memReplace: inWords((path, text) => {
+      memory.exec({ sql: 'INSERT OR REPLACE INTO files (path, text) VALUES (?, ?)', bind: [path, text] });
+    }),
+    memAppend: inWords((path, text) => {
+      memory.exec({
+        sql: 'INSERT INTO files (path, text) VALUES (?, ?) ON CONFLICT (path) DO UPDATE SET text = text || excluded.text',
+        bind: [path, text],
+      });
+    }),
+    memRemove: inWords((path) => {
+      memory.exec({ sql: 'DELETE FROM files WHERE path = ?', bind: [path] });
+    }),
+  };
+}
+
+// The engine reads a host failure as text.
+function inWords(call) {
+  return (...args) => {
+    try {
+      return call(...args);
+    } catch (err) {
+      throw words(err);
+    }
   };
 }
 

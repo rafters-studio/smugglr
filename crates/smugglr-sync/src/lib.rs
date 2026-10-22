@@ -20,7 +20,7 @@ use smugglr_core::record::{self, Record};
 use smugglr_core::row_hash::row_hash;
 use smugglr_core::steering::{Steering, needs_steering};
 use smugglr_core::weight::{DEFAULT_MAX_WIRE, Weight, too_much};
-use smugglr_memory::{Memory, Store};
+use smugglr_memory::{Files, Memory, Store};
 use smugglr_place::{Place, Table};
 
 /// How the places connect, as `--sync-type` names it.
@@ -132,14 +132,14 @@ pub fn sync(
     // Before memory is touched or a row read.
     steering_named(&tables, &theirs, options)?;
     // Memory is only read here; a shape stop says whether the pair is new.
-    let mut memory = match (&options.memory, &options.config_dir) {
-        (Some(store), _) => Memory::open_in(Arc::clone(store), source.address(), target.address())?,
-        (None, Some(dir)) => Memory::open(dir, source.address(), target.address())?,
-        (None, None) => {
-            let dir = smugglr_memory::config_dir().ok_or(Error::NoConfigDir)?;
-            Memory::open(&dir, source.address(), target.address())?
-        }
+    let store: Arc<dyn Store> = match (&options.memory, &options.config_dir) {
+        (Some(store), _) => Arc::clone(store),
+        (None, Some(dir)) => Arc::new(Files::new(dir)),
+        (None, None) => Arc::new(Files::new(
+            smugglr_memory::config_dir().ok_or(Error::NoConfigDir)?,
+        )),
     };
+    let mut memory = Memory::open_in(store, source.address(), target.address())?;
     // The whole places' shapes, not only the tables named: any mismatch
     // stops the whole run (FR-SMUGGLR-070).
     if let Some(mismatch) = shape::check(source.address(), target.address(), &every, &theirs_every)?

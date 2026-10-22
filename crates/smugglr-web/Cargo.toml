@@ -22,8 +22,6 @@ wasm-bindgen = { workspace = true }
 
 [dev-dependencies]
 smugglr-place = { workspace = true, features = ["native"] }
-smugglr-sync = { workspace = true }
-smugglr-multi = { workspace = true }
 rusqlite = { workspace = true }
 rstest = { workspace = true }
 rstest-bdd = { workspace = true }

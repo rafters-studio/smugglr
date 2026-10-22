@@ -162,7 +162,10 @@ impl Tab {
             node: json["node"].as_str().unwrap_or_default().to_owned(),
             targets: texts(&json["targets"]),
             graveyard: json["graveyard"].as_u64().unwrap_or(GRAVEYARD),
-            now: json["now"].as_u64().unwrap_or_default(),
+            // With no time, no sunset could pass: refuse rather than guess.
+            now: json["now"]
+                .as_u64()
+                .ok_or_else(|| JsValue::from_str("the settings need now, in seconds"))?,
             sync_mode: smugglr_core::plan::SyncMode::Stop,
             steering: smugglr_core::steering::Steering::default(),
             ignore: self.ignore.clone(),
