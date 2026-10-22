@@ -8,7 +8,7 @@
 // Values travel only as SQL text, never as JS numbers, so none is rounded.
 //
 // Needs crates/smugglr-web/pkg (`pnpm run build:wasm`) and Playwright's
-// Chromium (`pnpm exec playwright install chromium`).
+// Chromium (`pnpm exec playwright install chromium-headless-shell`).
 
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';

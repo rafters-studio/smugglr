@@ -1304,6 +1304,9 @@ dependencies = [
 name = "smugglr-web"
 version = "0.1.0"
 dependencies = [
+ "rstest",
+ "rstest-bdd",
+ "rstest-bdd-macros",
  "smugglr-core",
  "wasm-bindgen",
 ]
