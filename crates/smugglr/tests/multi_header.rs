@@ -175,3 +175,31 @@ fn an_empty_whole_blob_past_its_sunset_is_refused() -> Result<(), String> {
     assert_eq!(retrieve_on_b(&folder, &later, &blob)?, before);
     Ok(())
 }
+
+#[test]
+fn a_whole_blob_whose_tombstone_died_after_the_stash_is_still_taken() -> Result<(), String> {
+    let (folder, settings) = devices()?;
+    stash(&mut place(&folder, "a")?, &settings, false).map_err(|err| err.to_string())?;
+    // a deletes n2 at NOW: its tombstone's sunset is NOW + 600.
+    sql(&folder, "a", "DELETE FROM notes WHERE id = 'n2'")?;
+    stash(&mut place(&folder, "a")?, &settings, false).map_err(|err| err.to_string())?;
+    sql(
+        &folder,
+        "a",
+        "UPDATE notes SET body = 'edited' WHERE id = 'n1'",
+    )?;
+    // The whole stash at NOW + 550 lives until NOW + 1150 and carries the
+    // tombstone, which dies at NOW + 600, before b retrieves at NOW + 700.
+    let at = |now| Settings {
+        now,
+        ..settings.clone()
+    };
+    let blob =
+        stash(&mut place(&folder, "a")?, &at(NOW + 550), true).map_err(|err| err.to_string())?;
+    assert_eq!(blob.graveyard.len(), 1);
+    assert_eq!(
+        retrieve_on_b(&folder, &at(NOW + 700), &blob)?,
+        notes(&folder, "a")?
+    );
+    Ok(())
+}

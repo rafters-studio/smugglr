@@ -72,7 +72,7 @@ pub fn retrieve(
         run.refuse(blob, why);
     }
     for blob in blobs.iter().filter(|blob| blob.whole) {
-        run.take_whole(place, blob)?;
+        run.take_whole(place, blob, settings.now)?;
     }
     let envelopes = blobs
         .iter()
@@ -128,9 +128,11 @@ pub fn retrieve(
 
 /// Why `blob` is refused whole, with nothing of it applied: its header's
 /// signature fails, or it is whole and one of its envelopes fails its
-/// signature, or the blob or one of its envelopes is past its sunset
+/// signature, or it is whole and past the blob's own sunset in its header
 /// (FR-SMUGGLR-076), so an old whole blob, even an empty one, cannot roll a
-/// device back. `None` when it is not refused.
+/// device back. An envelope past its own sunset inside a live whole blob
+/// never refuses the blob; taking it skips that envelope alone. `None` when
+/// it is not refused.
 fn refusal(blob: &Blob, settings: &Settings) -> Option<&'static str> {
     if !blob.verify(&settings.key) {
         return Some(REFUSED);
@@ -138,14 +140,14 @@ fn refusal(blob: &Blob, settings: &Settings) -> Option<&'static str> {
     if !blob.whole {
         return None;
     }
-    let mut envelopes = blob.changes.iter().chain(&blob.graveyard);
-    if envelopes
-        .clone()
+    if blob
+        .changes
+        .iter()
+        .chain(&blob.graveyard)
         .any(|envelope| !envelope.verify(&settings.key))
     {
         Some(REFUSED)
-    } else if settings.now > blob.sunset || envelopes.any(|envelope| settings.now > envelope.sunset)
-    {
+    } else if settings.now > blob.sunset {
         Some(PAST_SUNSET)
     } else {
         None
@@ -269,11 +271,18 @@ impl Run {
     /// Takes a whole blob: every row not changed here since the last stash
     /// becomes the blob's, and its graveyard joins the device's. This
     /// device's own changes since its last stash stay, for its next stash.
-    fn take_whole(&mut self, place: &mut dyn Place, blob: &Blob) -> Result<(), Error> {
+    /// An envelope past its own sunset is dead (FR-SMUGGLR-076): its row is
+    /// left as it is here, and a dead tombstone is not kept.
+    fn take_whole(&mut self, place: &mut dyn Place, blob: &Blob, now: u64) -> Result<(), Error> {
         let mut rows: BTreeMap<&str, BTreeMap<&Key, &Envelope>> = BTreeMap::new();
+        let mut dead: BTreeMap<&str, BTreeSet<&Key>> = BTreeMap::new();
         for envelope in &blob.changes {
             let change = &envelope.change;
             if !self.tables.contains_key(&change.table) {
+                continue;
+            }
+            if now > envelope.sunset {
+                dead.entry(&change.table).or_default().insert(&change.key);
                 continue;
             }
             // Every envelope of a whole blob verified before it was taken.
@@ -292,7 +301,10 @@ impl Run {
             let here = self.here.get(&name).cloned().unwrap_or_default();
             let at_stash = self.device.baseline.remove(&name).unwrap_or_default();
             let mut baseline = at_stash.clone();
-            let own = |key: &Key| here.get(key) != at_stash.get(key);
+            let dead = dead.remove(name.as_str()).unwrap_or_default();
+            // A row changed here since the last stash, or whose envelope in
+            // the blob is dead, is left as it is here.
+            let own = |key: &Key| here.get(key) != at_stash.get(key) || dead.contains(key);
             let theirs = rows.remove(name.as_str()).unwrap_or_default();
             let mut changes = Vec::new();
             for (key, envelope) in &theirs {
@@ -336,11 +348,11 @@ impl Run {
             }
             self.device.baseline.insert(name, baseline);
         }
-        // The graveyard verified, and is within its sunset, before the blob
-        // was taken (`refusal`).
+        // The graveyard verified before the blob was taken (`refusal`); a
+        // tombstone past its own sunset is dead, and skipped on its own.
         for tombstone in &blob.graveyard {
             let change = &tombstone.change;
-            if self.tables.contains_key(&change.table) {
+            if self.tables.contains_key(&change.table) && now <= tombstone.sunset {
                 self.device
                     .graveyard
                     .entry((change.table.clone(), change.key.clone()))
