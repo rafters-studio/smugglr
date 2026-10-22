@@ -1,7 +1,7 @@
 //! Retrieve: verify blobs and apply them by the envelope rules, in any
 //! order.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use smugglr_core::change::{Change, op};
 use smugglr_core::envelope::{self, Arrival, Envelope, Here, receive, receive_replayed};
@@ -294,6 +294,7 @@ impl Run {
             return Ok(Vec::new());
         };
         let written = place.write(table, &changes)?;
+        let written: HashSet<&Key> = written.iter().collect();
         let mut landed = Vec::new();
         for change in changes {
             if !written.contains(&change.key) {
@@ -485,10 +486,15 @@ impl Run {
             for (name, envelopes) in applying {
                 let before = self.here.get(&name).cloned().unwrap_or_default();
                 let changes = envelopes.iter().map(|e| e.change.clone()).collect();
-                let landed = self.write(place, &name, changes)?;
+                // A change lands when its key was written, so its key says it.
+                let landed: HashSet<Key> = self
+                    .write(place, &name, changes)?
+                    .into_iter()
+                    .map(|change| change.key)
+                    .collect();
                 for envelope in envelopes {
                     let change = &envelope.change;
-                    if !landed.iter().any(|landed| landed == change) {
+                    if !landed.contains(&change.key) {
                         continue;
                     }
                     applied = true;
