@@ -63,6 +63,12 @@ pub(crate) struct Web {
     /// The module the app imports @smugglr/web as; the repo's files when
     /// none.
     module: Slot<String>,
+    /// The app's SQL that makes its tables; SCHEMA when none.
+    pub(crate) schema: Slot<String>,
+    /// The store bridge a scenario uses, as the app imports it.
+    pub(crate) bridge: Slot<String>,
+    /// What the bridge read, wrote and held on a server.
+    pub(crate) server: Slot<Json>,
 }
 
 #[fixture]
@@ -84,6 +90,10 @@ fn named(tab: usize) -> &'static str {
 }
 
 impl Web {
+    fn schema(&self) -> String {
+        self.schema.get().unwrap_or_else(|| SCHEMA.to_owned())
+    }
+
     fn folder(&self) -> Result<PathBuf, String> {
         if let Some(folder) = self.folder.get() {
             return Ok(folder);
@@ -101,11 +111,11 @@ impl Web {
 
     /// Starts the stand-in endpoint, its file made with the app's tables
     /// and `sql`, and a browser for its origin.
-    fn start(&self, sql: &str) -> Result<(), String> {
+    pub(crate) fn start(&self, sql: &str) -> Result<(), String> {
         let db = self.folder()?.join("endpoint.db");
         let connection = Connection::open(&db).map_err(|err| err.to_string())?;
         connection
-            .execute_batch(SCHEMA)
+            .execute_batch(&self.schema())
             .and_then(|()| connection.execute_batch(sql))
             .map_err(|err| err.to_string())?;
         let standin = StandIn::start(db, self.app.get())?;
@@ -121,12 +131,12 @@ impl Web {
             .ok_or_else(|| "no stand-in endpoint".to_owned())
     }
 
-    fn browser(&self) -> Result<Arc<Browser>, String> {
+    pub(crate) fn browser(&self) -> Result<Arc<Browser>, String> {
         self.browser.get().ok_or_else(|| "no browser".to_owned())
     }
 
     /// Runs `sql` on the endpoint's file.
-    fn at_endpoint(&self, sql: &str) -> Result<(), String> {
+    pub(crate) fn at_endpoint(&self, sql: &str) -> Result<(), String> {
         Connection::open(&self.standin()?.db)
             .and_then(|connection| connection.execute_batch(sql))
             .map_err(|err| err.to_string())
@@ -159,7 +169,7 @@ impl Web {
 
     /// Opens tab `tab` with @smugglr/web, naming the stand-in endpoint, and
     /// returns the record of the first sync `open()` ran (null when none).
-    fn open(&self, tab: usize) -> Result<Json, String> {
+    pub(crate) fn open(&self, tab: usize) -> Result<Json, String> {
         let module = json!(
             self.module
                 .get()
@@ -168,7 +178,7 @@ impl Web {
         let options = json!({
             "endpoint": format!("{}/endpoint", self.standin()?.origin),
             "headers": {"x-tab": named(tab)},
-            "schema": SCHEMA,
+            "schema": self.schema(),
             "maxWire": self.max_wire.get(),
             "ignore": self.ignore.get().unwrap_or_default(),
         });

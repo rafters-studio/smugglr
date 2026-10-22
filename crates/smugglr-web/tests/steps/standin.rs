@@ -1,9 +1,10 @@
 //! The stand-in endpoint: a local HTTP server that answers the place
 //! operations from rows the test sets in a SQLite file, records every
 //! request it receives, and can drop the connection. It
-//! also serves the page, @smugglr/web, the engine and SQLite to the tabs,
-//! from one origin, cross-origin isolated as SQLite's OPFS needs; or, for an
-//! app that installed the packed package, that app's own folder.
+//! also serves the page, @smugglr/web, its store bridges, the engine and
+//! SQLite to the tabs, from one origin, cross-origin isolated as SQLite's
+//! OPFS needs; or, for an app that installed the packed package, that app's
+//! own folder.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -85,6 +86,17 @@ impl StandIn {
 
 const ROOT: &str = env!("CARGO_MANIFEST_DIR");
 
+/// The page the tabs load: the bridges import nanostores and zustand by
+/// name, and nanostores reads `process.env.NODE_ENV`, as an app's bundler
+/// would resolve and replace them.
+const PAGE: &str = concat!(
+    "<!doctype html><title>smugglr</title>",
+    "<script>globalThis.process = { env: { NODE_ENV: 'development' } };</script>",
+    r#"<script type="importmap">{"imports": {"#,
+    r#""nanostores": "/node_modules/nanostores/index.js", "#,
+    r#""zustand/vanilla": "/node_modules/zustand/esm/vanilla.mjs"}}</script>"#,
+);
+
 /// Where each path the tabs load is served from: the app's folder when
 /// there is one, else the repo's files.
 fn served(path: &str, app: Option<&Path>) -> Option<PathBuf> {
@@ -93,8 +105,19 @@ fn served(path: &str, app: Option<&Path>) -> Option<PathBuf> {
         let rest = if rest.is_empty() { "index.html" } else { rest };
         return (!rest.contains("..")).then(|| app.join(rest));
     }
-    let web = Path::new(ROOT).join("../../packages/web");
+    let packages = Path::new(ROOT).join("../../packages");
+    let web = packages.join("web");
     let routes = [
+        (
+            "/node_modules/nanostores/",
+            packages.join("nanostores/node_modules/nanostores"),
+        ),
+        (
+            "/node_modules/zustand/",
+            packages.join("zustand/node_modules/zustand"),
+        ),
+        ("/nanostores/", packages.join("nanostores/src")),
+        ("/zustand/", packages.join("zustand/src")),
         ("/web/engine/", Path::new(ROOT).join("pkg")),
         (
             "/web/sqlite/",
@@ -161,12 +184,9 @@ fn serve(
     let mut body = vec![0; length];
     reader.read_exact(&mut body)?;
     match (method, path) {
-        ("GET", "/") if app.is_none() => respond(
-            &mut stream,
-            "200 OK",
-            "text/html",
-            b"<!doctype html><title>smugglr</title>",
-        ),
+        ("GET", "/") if app.is_none() => {
+            respond(&mut stream, "200 OK", "text/html", PAGE.as_bytes())
+        }
         ("GET", _) => {
             match served(path, app).and_then(|file| Some((std::fs::read(&file).ok()?, file))) {
                 Some((bytes, file)) => respond(&mut stream, "200 OK", kind(&file), &bytes),

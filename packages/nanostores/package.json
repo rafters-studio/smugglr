@@ -1,0 +1,20 @@
+{
+  "name": "@smugglr/nanostores",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A nanostores map store as a view on a table of the tab's database.",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "src"
+  ],
+  "peerDependencies": {
+    "nanostores": "^1.0.0"
+  },
+  "devDependencies": {
+    "nanostores": "1.5.5"
+  }
+}
