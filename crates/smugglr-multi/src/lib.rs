@@ -92,9 +92,54 @@ pub struct Blob {
     pub changes: Vec<Envelope>,
     /// A whole blob's graveyard: the delete envelopes still in their sunset.
     pub graveyard: Vec<Envelope>,
+    /// The header's signature: over `whole`, `node`, `targets`, each
+    /// table's stamp, and the count and change hash of every envelope.
+    pub signature: [u8; 32],
 }
 
 impl Blob {
+    /// Signs the header with `key`.
+    pub fn sign(&mut self, key: &[u8; 32]) {
+        self.signature = *self.signed(key).as_bytes();
+    }
+
+    /// Whether the header's signature matches under `key`: nothing in the
+    /// header changed, and every envelope it lists is there and no other.
+    #[must_use]
+    pub fn verify(&self, key: &[u8; 32]) -> bool {
+        // blake3::Hash compares in constant time.
+        self.signed(key) == blake3::Hash::from(self.signature)
+    }
+
+    /// BLAKE3 keyed with `key` over each header field, each prefixed with
+    /// its byte length, so no field can run into the next.
+    fn signed(&self, key: &[u8; 32]) -> blake3::Hash {
+        fn field(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+            hasher.update(&(bytes.len() as u64).to_be_bytes());
+            hasher.update(bytes);
+        }
+        let mut hasher = blake3::Hasher::new_keyed(key);
+        field(&mut hasher, &VERSION.to_be_bytes());
+        field(&mut hasher, if self.whole { b"whole" } else { b"since" });
+        field(&mut hasher, self.node.as_bytes());
+        field(&mut hasher, &(self.targets.len() as u64).to_be_bytes());
+        for target in &self.targets {
+            field(&mut hasher, target.as_bytes());
+        }
+        field(&mut hasher, &(self.stamps.len() as u64).to_be_bytes());
+        for (table, stamp) in &self.stamps {
+            field(&mut hasher, table.as_bytes());
+            field(&mut hasher, &stamp.0);
+        }
+        for envelopes in [&self.changes, &self.graveyard] {
+            field(&mut hasher, &(envelopes.len() as u64).to_be_bytes());
+            for envelope in envelopes {
+                field(&mut hasher, &envelope.signature);
+            }
+        }
+        hasher.finalize()
+    }
+
     /// The blob as JSON text: its header, then each envelope without the
     /// stamp the header holds.
     #[must_use]
@@ -124,6 +169,7 @@ impl Blob {
             "stamps": stamps,
             "changes": envelopes(&self.changes),
             "graveyard": envelopes(&self.graveyard),
+            "signature": hex(&self.signature),
         })
         .to_string()
     }
@@ -168,6 +214,7 @@ impl Blob {
             whole: json.get("whole")?.as_bool()?,
             changes: envelopes("changes")?,
             graveyard: envelopes("graveyard")?,
+            signature: unhex(json.get("signature")?.as_str()?)?.try_into().ok()?,
             stamps,
         })
     }

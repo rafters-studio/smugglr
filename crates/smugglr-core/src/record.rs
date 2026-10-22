@@ -50,10 +50,16 @@ pub const CHANGED_HERE_AND_IN_BLOB: &str = "These rows changed here and in the b
 pub const WAITING: &str = "These rows wait for an earlier change to them that this place has \
      not seen. Retrieve the blob that holds it, then this blob again.";
 
-/// Why a table is not done when a blob's changes do not match their
-/// signature under the key, or their values do not hash to their `to`.
-pub const REFUSED: &str = "These changes do not match their signature under this key, or \
-     their values do not match their hash. smugglr applied none of them.";
+/// Why a table is not done when a blob's header or changes do not match
+/// their signature under the key, or their values do not hash to their `to`.
+pub const REFUSED: &str = "This blob's header or changes do not match their signature under \
+     this key, or their values do not match their hash. smugglr applied none of them.";
+
+/// Why a table is not done when a whole blob is older than its sunset
+/// (FR-SMUGGLR-076).
+pub const PAST_SUNSET: &str = "This whole blob is past its sunset, so taking it could undo \
+     newer changes. smugglr applied none of it. Stash a whole blob again from a device that \
+     stayed in step.";
 
 /// What a run did as a whole.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

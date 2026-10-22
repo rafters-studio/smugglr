@@ -29,6 +29,7 @@ pub fn stash(place: &mut dyn Place, settings: &Settings, whole: bool) -> Result<
         stamps: BTreeMap::new(),
         changes: Vec::new(),
         graveyard: Vec::new(),
+        signature: [0; 32],
     };
     for table in &tables {
         let stamp = stamp(table);
@@ -111,6 +112,7 @@ pub fn stash(place: &mut dyn Place, settings: &Settings, whole: bool) -> Result<
             .cloned()
             .collect();
     }
+    blob.sign(&settings.key);
     device.stashed = true;
     device.save(settings.now)?;
     Ok(blob)

@@ -7,8 +7,8 @@ use smugglr_core::change::{Change, op};
 use smugglr_core::envelope::{Arrival, Envelope, Here, receive};
 use smugglr_core::plan::{Hashes, Side, SyncMode};
 use smugglr_core::record::{
-    self, CHANGED_HERE_AND_IN_BLOB, Dropped, EDIT_VERSUS_DELETE, Key as Named, Moves, REFUSED,
-    Record, WAITING,
+    self, CHANGED_HERE_AND_IN_BLOB, Dropped, EDIT_VERSUS_DELETE, Key as Named, Moves, PAST_SUNSET,
+    REFUSED, Record, WAITING,
 };
 use smugglr_core::shape::Mismatch;
 use smugglr_memory::{Device, Row};
@@ -46,6 +46,14 @@ pub fn retrieve(
         ),
         _ => None,
     };
+    let (mut accepted, mut refused) = (Vec::new(), Vec::new());
+    for blob in blobs {
+        match refusal(blob, settings) {
+            Some(why) => refused.push((blob, why)),
+            None => accepted.push(blob.clone()),
+        }
+    }
+    let blobs = accepted.as_slice();
     let (tables, ignored) = tables(place, settings)?;
     if let Some(mismatch) = mismatch(blobs, &tables, &ignored) {
         let mut record = Record::shape_mismatch(mismatch, ignored, false);
@@ -60,6 +68,9 @@ pub fn retrieve(
             .collect(),
         ..Run::default()
     };
+    for (blob, why) in refused {
+        run.refuse(blob, why);
+    }
     for blob in blobs.iter().filter(|blob| blob.whole) {
         run.take_whole(place, blob, settings)?;
     }
@@ -90,7 +101,11 @@ pub fn retrieve(
     }
     for (name, named) in std::mem::take(&mut run.named) {
         let why = named.first().map_or(WAITING, |(_, why)| why).to_owned();
-        let rows = named.into_iter().map(|(key, _)| Named(key)).collect();
+        let rows = named
+            .into_iter()
+            .filter(|(key, _)| !key.is_empty())
+            .map(|(key, _)| Named(key))
+            .collect();
         let stopped = record::Table::Stopped {
             rows,
             not_read_back: Vec::new(),
@@ -109,6 +124,30 @@ pub fn retrieve(
     record.dropped = run.dropped;
     record.targets_remaining = remaining;
     Ok(record)
+}
+
+/// Why `blob` is refused whole, with nothing of it applied: its header's
+/// signature fails, or it is whole and one of its envelopes fails its
+/// signature or is past its sunset (FR-SMUGGLR-076), so an old whole blob
+/// cannot roll a device back. `None` when it is not refused.
+fn refusal(blob: &Blob, settings: &Settings) -> Option<&'static str> {
+    if !blob.verify(&settings.key) {
+        return Some(REFUSED);
+    }
+    if !blob.whole {
+        return None;
+    }
+    let mut envelopes = blob.changes.iter().chain(&blob.graveyard);
+    if envelopes
+        .clone()
+        .any(|envelope| !envelope.verify(&settings.key))
+    {
+        Some(REFUSED)
+    } else if envelopes.any(|envelope| settings.now > envelope.sunset) {
+        Some(PAST_SUNSET)
+    } else {
+        None
+    }
 }
 
 /// The first table whose stamp in a blob's header differs from the place's,
@@ -160,6 +199,22 @@ impl Run {
             self.here.insert(name.to_owned(), read);
         }
         Ok(())
+    }
+
+    /// Names every table a refused blob holds, with each of its rows.
+    fn refuse(&mut self, blob: &Blob, why: &'static str) {
+        let names: Vec<String> = blob
+            .stamps
+            .keys()
+            .filter(|name| self.tables.contains_key(*name))
+            .cloned()
+            .collect();
+        for name in names {
+            self.name(&name, &[], why);
+            for envelope in blob.changes.iter().filter(|e| e.change.table == name) {
+                self.name(&name, &envelope.change.key, why);
+            }
+        }
     }
 
     fn name(&mut self, table: &str, key: &[String], why: &'static str) {
@@ -224,13 +279,10 @@ impl Run {
             if !self.tables.contains_key(&change.table) {
                 continue;
             }
-            if envelope.verify(&settings.key) {
-                rows.entry(&change.table)
-                    .or_default()
-                    .insert(&change.key, envelope);
-            } else {
-                self.name(&change.table, &change.key, REFUSED);
-            }
+            // Every envelope of a whole blob verified before it was taken.
+            rows.entry(&change.table)
+                .or_default()
+                .insert(&change.key, envelope);
         }
         let names: Vec<String> = blob
             .stamps
