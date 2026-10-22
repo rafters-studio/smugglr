@@ -7,7 +7,7 @@
 //! counts. No word for one copy being better than another appears in it.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::{self, Write as _};
+use std::fmt;
 
 use serde::{Serialize, Serializer};
 
@@ -94,14 +94,29 @@ pub struct Record {
 }
 
 /// Why a change was dropped (FR-SMUGGLR-076).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reason {
     /// It arrived, or waited, past its sunset.
-    #[serde(rename = "its sunset passed")]
     Sunset,
     /// It is an insert or a waiting change for a key in the graveyard.
-    #[serde(rename = "its key is in the graveyard")]
     Graveyard,
+}
+
+impl Reason {
+    /// The record's words for the reason, in the text and the JSON alike.
+    #[must_use]
+    pub const fn words(self) -> &'static str {
+        match self {
+            Self::Sunset => "its sunset passed",
+            Self::Graveyard => "its key is in the graveyard",
+        }
+    }
+}
+
+impl Serialize for Reason {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.words())
+    }
 }
 
 /// A change the run dropped, named by its table, key, reason and change
@@ -118,6 +133,9 @@ pub struct Dropped {
     pub change: String,
 }
 
+/// Lowercase hex digits, for the change hash.
+const HEX: &[u8; 16] = b"0123456789abcdef";
+
 impl Dropped {
     /// The record's name for `envelope`, dropped for `reason`.
     #[must_use]
@@ -129,10 +147,9 @@ impl Dropped {
             change: envelope
                 .signature
                 .iter()
-                .fold(String::new(), |mut hex, byte| {
-                    let _ = write!(hex, "{byte:02x}");
-                    hex
-                }),
+                .flat_map(|byte| [HEX[usize::from(byte >> 4)], HEX[usize::from(byte & 0xf)]])
+                .map(char::from)
+                .collect(),
         }
     }
 }
@@ -509,15 +526,12 @@ impl fmt::Display for Record {
             }
         }
         for dropped in &self.dropped {
-            let reason = match dropped.reason {
-                Reason::Sunset => "its sunset passed",
-                Reason::Graveyard => "its key is in the graveyard",
-            };
             writeln!(
                 f,
-                "  dropped: {} {}, {reason}, change {}",
+                "  dropped: {} {}, {}, change {}",
                 printable(&dropped.table),
                 keys(std::slice::from_ref(&dropped.key)),
+                dropped.reason.words(),
                 dropped.change
             )?;
         }
