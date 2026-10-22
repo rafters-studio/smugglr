@@ -14,7 +14,8 @@ authors = ["Rafters Studio"]
 smugglr-core = { path = "crates/smugglr-core", version = "0.1.0" }
 smugglr-memory = { path = "crates/smugglr-memory", version = "0.1.0" }
 smugglr-multi = { path = "crates/smugglr-multi", version = "0.1.0" }
-smugglr-place = { path = "crates/smugglr-place", version = "0.1.0" }
+smugglr-place = { path = "crates/smugglr-place", version = "0.1.0", default-features = false }
+smugglr-sync = { path = "crates/smugglr-sync", version = "0.1.0" }
 # The local file place (smugglr-place). `bundled`: SQLite is built in, so the
 # binary reads any file the same way; `functions`: the row hash runs as a SQL
 # function on the connection, where the data lives.

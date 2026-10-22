@@ -3,6 +3,14 @@
 //! `scenarios!` discovers every `.feature` file under `tests/` and emits one
 //! test per scenario. Step definitions must compile into this binary.
 
-use rstest_bdd_macros::scenarios;
+#[path = "steps/browser.rs"]
+mod browser;
+#[path = "steps/standin.rs"]
+mod standin;
+#[path = "steps/tab.rs"]
+mod tab;
 
-scenarios!("tests");
+use rstest_bdd_macros::scenarios;
+use tab::{Web, web};
+
+scenarios!("tests", fixtures = [web: Web]);

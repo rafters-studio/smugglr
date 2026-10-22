@@ -4,7 +4,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use smugglr_core::change::{Change, op};
-use smugglr_core::envelope::{Arrival, Envelope, Here, receive};
+use smugglr_core::envelope::{self, Arrival, Envelope, Here, receive, receive_replayed};
+use smugglr_core::hex::{hex, unhex};
 use smugglr_core::plan::{Hashes, Side, SyncMode};
 use smugglr_core::record::{
     self, CHANGED_HERE_AND_IN_BLOB, Dropped, EDIT_VERSUS_DELETE, Key as Named, Moves, PAST_SUNSET,
@@ -60,14 +61,7 @@ pub fn retrieve(
         record.targets_remaining = remaining;
         return Ok(record);
     }
-    let mut run = Run {
-        device: Device::open(&settings.config_dir, place.address())?,
-        tables: tables
-            .into_iter()
-            .map(|table| (table.name.clone(), table))
-            .collect(),
-        ..Run::default()
-    };
+    let mut run = Run::open(place, tables, settings)?;
     for (blob, why) in refused {
         run.refuse(blob, why);
     }
@@ -82,48 +76,103 @@ pub fn retrieve(
         .cloned()
         .collect();
     run.receive_all(place, envelopes, settings)?;
-    let mut done = BTreeMap::new();
-    let written: Vec<String> = run.expected.keys().cloned().collect();
-    for name in written {
-        let table = &run.tables[&name];
-        let read = hashes(place, table)?;
-        let unmatched: Vec<Key> = run.expected[&name]
-            .iter()
-            .filter(|(key, to)| read.get(*key) != to.as_ref())
-            .map(|(key, _)| key.clone())
-            .collect();
-        if !unmatched.is_empty() {
-            done.insert(name, record::not_read_back(unmatched));
-        }
-    }
-    for (name, moves) in std::mem::take(&mut run.moves) {
-        done.entry(name).or_insert(record::Table::Moved(moves));
-    }
-    for (name, named) in std::mem::take(&mut run.named) {
-        let why = named.first().map_or(WAITING, |(_, why)| why).to_owned();
-        let rows = named
-            .into_iter()
-            .filter(|(key, _)| !key.is_empty())
-            .map(|(key, _)| Named(key))
-            .collect();
-        let stopped = record::Table::Stopped {
-            rows,
-            not_read_back: Vec::new(),
-            why,
-        };
-        done.entry(name)
-            .and_modify(|table| {
-                if !matches!(table, record::Table::Stopped { .. }) {
-                    *table = stopped.clone();
-                }
-            })
-            .or_insert(stopped);
-    }
-    run.device.save(settings.now)?;
-    let mut record = Record::new(done, ignored, false, None);
-    record.dropped = run.dropped;
+    let mut record = run.finish(place, ignored, settings)?;
     record.targets_remaining = remaining;
     Ok(record)
+}
+
+/// Replays the change the dropped log names by `change`, its change hash as
+/// hex (FR-SMUGGLR-076): re-sends it with a fresh sunset, overriding the
+/// drop, and decides it like any change. The record names it under
+/// `replayed`.
+///
+/// # Errors
+/// [`Error::NotDropped`] when the dropped log holds no such change; and as
+/// [`retrieve`] does.
+pub fn replay(place: &mut dyn Place, change: &str, settings: &Settings) -> Result<Record, Error> {
+    let (tables, ignored) = tables(place, settings)?;
+    let mut run = Run::open(place, tables, settings)?;
+    run.replayed = true;
+    let not_dropped = || Error::NotDropped(change.to_owned());
+    let hash: [u8; 32] = unhex(change)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(not_dropped)?;
+    let sunset = settings.now.saturating_add(settings.graveyard);
+    let resent = envelope::replay(&run.device.dropped, &hash, sunset, &settings.key)
+        .ok_or_else(not_dropped)?;
+    // Re-sent, it leaves the log; dropped again, it goes back in.
+    run.device.dropped.retain(|logged| logged.signature != hash);
+    run.receive_all(place, vec![resent], settings)?;
+    let mut record = run.finish(place, ignored, settings)?;
+    record.replayed = Some(hex(&hash));
+    Ok(record)
+}
+
+impl Run {
+    /// A run of `place`, whose tables are `tables`, with what the device
+    /// keeps.
+    fn open(place: &dyn Place, tables: Vec<Table>, settings: &Settings) -> Result<Self, Error> {
+        Ok(Self {
+            device: Device::open(&*settings.store, place.address())?,
+            tables: tables
+                .into_iter()
+                .map(|table| (table.name.clone(), table))
+                .collect(),
+            ..Self::default()
+        })
+    }
+
+    /// Checks every row written reads back as written, keeps what the device
+    /// keeps, and returns the record.
+    fn finish(
+        self,
+        place: &mut dyn Place,
+        ignored: BTreeSet<String>,
+        settings: &Settings,
+    ) -> Result<Record, Error> {
+        let mut run = self;
+        let mut done = BTreeMap::new();
+        let written: Vec<String> = run.expected.keys().cloned().collect();
+        for name in written {
+            let table = &run.tables[&name];
+            let read = hashes(place, table)?;
+            let unmatched: Vec<Key> = run.expected[&name]
+                .iter()
+                .filter(|(key, to)| read.get(*key) != to.as_ref())
+                .map(|(key, _)| key.clone())
+                .collect();
+            if !unmatched.is_empty() {
+                done.insert(name, record::not_read_back(unmatched));
+            }
+        }
+        for (name, moves) in std::mem::take(&mut run.moves) {
+            done.entry(name).or_insert(record::Table::Moved(moves));
+        }
+        for (name, named) in std::mem::take(&mut run.named) {
+            let why = named.first().map_or(WAITING, |(_, why)| why).to_owned();
+            let rows = named
+                .into_iter()
+                .filter(|(key, _)| !key.is_empty())
+                .map(|(key, _)| Named(key))
+                .collect();
+            let stopped = record::Table::Stopped {
+                rows,
+                not_read_back: Vec::new(),
+                why,
+            };
+            done.entry(name)
+                .and_modify(|table| {
+                    if !matches!(table, record::Table::Stopped { .. }) {
+                        *table = stopped.clone();
+                    }
+                })
+                .or_insert(stopped);
+        }
+        run.device.save(&*settings.store, settings.now)?;
+        let mut record = Record::new(done, ignored, false, None);
+        record.dropped = run.dropped;
+        Ok(record)
+    }
 }
 
 /// Why `blob` is refused whole, with nothing of it applied: its header's
@@ -191,6 +240,9 @@ struct Run {
     /// Each row written and the hash it must read back with.
     expected: BTreeMap<String, BTreeMap<Key, Option<[u8; 16]>>>,
     dropped: Vec<Dropped>,
+    /// The run replays a change from the dropped log: the graveyard does
+    /// not drop it.
+    replayed: bool,
 }
 
 impl Run {
@@ -380,13 +432,13 @@ impl Run {
                 self.load(place, name)?;
             }
             let steering = self.steering(place, &pending, settings)?;
-            let arrivals = receive(
-                &pending,
-                &settings.key,
-                settings.sync_mode,
-                settings.now,
-                |change| self.arrives_at(change, &steering),
-            );
+            let here = |change: &Change| self.arrives_at(change, &steering);
+            let (key, mode, now) = (&settings.key, settings.sync_mode, settings.now);
+            let arrivals = if self.replayed {
+                receive_replayed(&pending, key, mode, now, here)
+            } else {
+                receive(&pending, key, mode, now, here)
+            };
             let mut applying: BTreeMap<String, Vec<&Envelope>> = BTreeMap::new();
             let mut waiting = Vec::new();
             for (envelope, arrival) in pending.iter().zip(arrivals) {
@@ -415,7 +467,17 @@ impl Run {
                         };
                         self.name(&row.0, &row.1, why);
                     }
-                    Arrival::Dropped(reason) => self.dropped.push(Dropped::new(envelope, reason)),
+                    Arrival::Dropped(reason) => {
+                        self.dropped.push(Dropped::new(envelope, reason));
+                        if !self
+                            .device
+                            .dropped
+                            .iter()
+                            .any(|logged| logged.signature == envelope.signature)
+                        {
+                            self.device.dropped.push(envelope.clone());
+                        }
+                    }
                     Arrival::Refused => self.name(&row.0, &row.1, REFUSED),
                 }
             }

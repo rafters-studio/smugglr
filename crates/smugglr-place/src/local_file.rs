@@ -8,13 +8,12 @@
 use std::path::Path;
 
 use rusqlite::functions::FunctionFlags;
-use rusqlite::types::Value;
 use rusqlite::{Connection, OpenFlags, params_from_iter};
 use smugglr_core::change::{Change, Op};
 use smugglr_core::row_hash::row_hash;
 
 use crate::queries::{self, ROW_HASH};
-use crate::value::unquote;
+use crate::value::{Value, unquote};
 use crate::{Error, Key, Place, Table};
 
 /// A SQLite file on this machine.

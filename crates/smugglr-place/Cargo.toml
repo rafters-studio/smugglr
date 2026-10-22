@@ -10,10 +10,17 @@ authors.workspace = true
 
 [dependencies]
 smugglr-core = { workspace = true }
-rusqlite = { workspace = true }
+rusqlite = { workspace = true, optional = true }
 thiserror = { workspace = true }
 serde_json = { workspace = true }
-ureq = { workspace = true }
+ureq = { workspace = true, optional = true }
+
+[features]
+default = ["native"]
+# The places that need a native build: a local file (rusqlite) and an
+# HTTP-SQL service over HTTP (ureq), D1 included. Without it, the place
+# interface and HTTP-SQL through a caller's own transport build for wasm32.
+native = ["dep:rusqlite", "dep:ureq"]
 
 [lints]
 workspace = true

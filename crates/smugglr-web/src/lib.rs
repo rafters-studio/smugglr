@@ -1,9 +1,15 @@
-//! The smugglr engine in the browser (FR-SMUGGLR-058).
+//! The smugglr engine in the browser (FR-SMUGGLR-058, FR-SMUGGLR-062).
 //!
 //! Compiled to wasm32 with wasm-bindgen, so a tab runs the same engine as
 //! the command line. The browser's SQLite registers [`row_hash`] as its
 //! `smugglr_row_hash` function, so each row is hashed where it lives, from
-//! its columns' `quote()` text, exactly as a local file hashes it.
+//! its columns' `quote()` text, exactly as a local file hashes it. The
+//! tab's worker runs each sync, stash, retrieve and replay ([`tab`]).
+
+mod fetcher;
+mod host;
+mod opfs;
+pub mod tab;
 
 use wasm_bindgen::prelude::wasm_bindgen;
 

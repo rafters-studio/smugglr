@@ -13,12 +13,23 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 smugglr-core = { workspace = true }
+smugglr-memory = { workspace = true }
+smugglr-multi = { workspace = true }
+smugglr-place = { workspace = true }
+smugglr-sync = { workspace = true }
+serde_json = { workspace = true }
 wasm-bindgen = { workspace = true }
 
 [dev-dependencies]
+smugglr-place = { workspace = true, features = ["native"] }
+rusqlite = { workspace = true }
 rstest = { workspace = true }
 rstest-bdd = { workspace = true }
 rstest-bdd-macros = { workspace = true }
 
 [lints]
 workspace = true
+
+# wasm-opt for the packed engine: Rust emits bulk memory operations.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-O", "--enable-bulk-memory", "--enable-nontrapping-float-to-int", "--enable-sign-ext", "--enable-mutable-globals", "--enable-reference-types", "--enable-multivalue"]

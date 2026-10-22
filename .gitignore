@@ -26,3 +26,7 @@ Thumbs.db
 
 # Embedded legion working directory
 /legion/
+
+# @smugglr/web laid out for packing (packages/web/scripts/prepack.mjs)
+/packages/web/src/engine/
+/packages/web/src/sqlite/

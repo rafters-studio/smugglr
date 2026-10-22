@@ -117,6 +117,10 @@ pub struct Record {
     /// those the app crossed off and this device (FR-SMUGGLR-077).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub targets_remaining: Option<Vec<String>>,
+    /// The change a replay re-sent from the dropped log, by its change hash
+    /// as lowercase hex.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replayed: Option<String>,
 }
 
 /// Why a change was dropped (FR-SMUGGLR-076).
@@ -222,6 +226,7 @@ impl Record {
             shape: None,
             dropped: Vec::new(),
             targets_remaining: None,
+            replayed: None,
         }
     }
 
@@ -245,6 +250,7 @@ impl Record {
             }),
             dropped: Vec::new(),
             targets_remaining: None,
+            replayed: None,
         }
     }
 
@@ -264,6 +270,7 @@ impl Record {
             shape: None,
             dropped: Vec::new(),
             targets_remaining: None,
+            replayed: None,
         }
     }
 

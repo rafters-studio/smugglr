@@ -33,7 +33,7 @@ fn devices() -> Result<(PathBuf, Settings), String> {
         )?;
     }
     let settings = Settings {
-        config_dir: folder.join("config"),
+        store: std::sync::Arc::new(smugglr_memory::Files::new(folder.join("config"))),
         key: [7; 32],
         node: "a".to_owned(),
         targets: vec!["b".to_owned()],

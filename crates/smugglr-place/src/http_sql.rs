@@ -10,6 +10,7 @@
 
 use serde_json::{Value as Json, json};
 use smugglr_core::change::{Change, Op};
+use smugglr_core::hex::unhex;
 use smugglr_core::ignore::Ignore;
 use smugglr_core::row_hash::row_hash;
 
@@ -43,15 +44,24 @@ pub trait Transport: std::fmt::Debug {
     fn own_tables(&self) -> &[&str] {
         &[]
     }
+
+    /// The service runs the engine's row hash as `smugglr_row_hash`, a
+    /// function registered on its connection, as the browser's SQLite does:
+    /// each row is then hashed where it lives. False by default.
+    fn hashes_where_rows_live(&self) -> bool {
+        false
+    }
 }
 
 /// An HTTP POST to the service's URL.
+#[cfg(feature = "native")]
 #[derive(Debug)]
 struct Post {
     url: String,
     agent: ureq::Agent,
 }
 
+#[cfg(feature = "native")]
 impl Transport for Post {
     fn send(&self, request: &Json) -> Result<(bool, Json), String> {
         let mut response = self
@@ -79,6 +89,7 @@ type Statement = (String, Vec<Json>);
 
 impl HttpSql {
     /// The service at `url`. Nothing is sent until the place is read.
+    #[cfg(feature = "native")]
     #[must_use]
     pub fn open(url: &str) -> Self {
         let agent = ureq::Agent::config_builder()
@@ -297,6 +308,21 @@ impl Place for HttpSql {
 
     fn hashes(&mut self, table: &Table) -> Result<Vec<(Key, [u8; 16])>, Error> {
         let width = table.key.len();
+        if self.transport.hashes_where_rows_live() {
+            return self
+                .query(&queries::hex_hashes(table), &[])?
+                .iter()
+                .map(|row| {
+                    let mut texts = self.texts(row)?;
+                    let hash = texts
+                        .pop()
+                        .and_then(|hash| unhex(&hash))
+                        .and_then(|bytes| bytes.try_into().ok())
+                        .ok_or_else(|| self.failed("a row without its row hash"))?;
+                    Ok((texts, hash))
+                })
+                .collect();
+        }
         self.query(&queries::quoted_rows(table), &[])?
             .iter()
             .map(|row| {

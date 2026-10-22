@@ -4,7 +4,7 @@
 use smugglr_core::shape::{self, Column, Mismatch, Shape, TableShape};
 use smugglr_place::Table;
 
-use crate::sync::Error;
+use crate::Error;
 
 /// A place's shape: its tables.
 fn shape_of(tables: &[Table]) -> Shape {

@@ -27,7 +27,7 @@ pub fn stash(
     whole: bool,
     keep: impl FnOnce(&Blob) -> Result<(), String>,
 ) -> Result<Blob, Error> {
-    let mut device = Device::open(&settings.config_dir, place.address())?;
+    let mut device = Device::open(&*settings.store, place.address())?;
     let whole = whole || !device.stashed;
     let sunset = settings.now.saturating_add(settings.graveyard);
     let (tables, _) = tables(place, settings)?;
@@ -125,6 +125,6 @@ pub fn stash(
     blob.sign(&settings.key);
     keep(&blob).map_err(Error::Keep)?;
     device.stashed = true;
-    device.save(settings.now)?;
+    device.save(&*settings.store, settings.now)?;
     Ok(blob)
 }

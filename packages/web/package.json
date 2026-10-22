@@ -5,8 +5,15 @@
   "type": "module",
   "description": "The smugglr engine in a browser tab.",
   "license": "MIT",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "src"
+  ],
   "scripts": {
-    "build:wasm": "wasm-pack build ../../crates/smugglr-web --target web --dev --no-pack"
+    "build:wasm": "wasm-pack build ../../crates/smugglr-web --target web --dev --no-pack",
+    "prepack": "node scripts/prepack.mjs"
   },
   "devDependencies": {
     "@sqlite.org/sqlite-wasm": "3.54.1-build1",

@@ -12,16 +12,21 @@
 //! Rows travel as SQLite's `quote()` text of each column, so every value,
 //! integers beyond 2^53 included, is read without loss.
 
+#[cfg(feature = "native")]
 pub mod d1;
 pub mod http_sql;
+#[cfg(feature = "native")]
 pub mod local_file;
+#[cfg_attr(not(feature = "native"), allow(dead_code))]
 mod queries;
 mod value;
 
 use smugglr_core::change::Change;
 
+#[cfg(feature = "native")]
 pub use d1::D1;
 pub use http_sql::{HttpSql, Transport};
+#[cfg(feature = "native")]
 pub use local_file::LocalFile;
 
 /// What a place says when it cannot do what was asked.
@@ -45,6 +50,7 @@ pub enum Error {
     #[error("{0:?} is not SQLite quote() text")]
     Value(String),
     /// SQLite refused, in the file at `address`.
+    #[cfg(feature = "native")]
     #[error("{address}: {source}")]
     Sqlite {
         /// The place's address.
@@ -165,6 +171,7 @@ pub trait Place {
 }
 
 /// Database addresses that name another engine.
+#[cfg(feature = "native")]
 const OTHER_ENGINES: &[&str] = &[
     "postgres",
     "postgresql",
@@ -190,6 +197,7 @@ const OTHER_ENGINES: &[&str] = &[
 /// [`Error::Unreachable`] for a kind of place smugglr cannot reach,
 /// [`Error::Missing`] for a D1 database without its account id or token,
 /// and the place's own error when it cannot be opened.
+#[cfg(feature = "native")]
 pub fn open(address: &str) -> Result<Box<dyn Place>, Error> {
     match address.split_once("://") {
         None => Ok(Box::new(LocalFile::open(address)?)),
@@ -207,7 +215,7 @@ pub fn open(address: &str) -> Result<Box<dyn Place>, Error> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "native"))]
 mod tests {
     use super::{Error, open};
 
