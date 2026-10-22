@@ -1,12 +1,17 @@
 // Drives tabs of one origin in headless Chromium for smugglr-web's
 // scenarios (FR-SMUGGLR-062).
 //
-// Usage: node test/driver.mjs <origin>. Reads one JSON command per line on
+// Usage: node test/driver.mjs <origin> [<profile>]. With a profile folder,
+// the tabs run in a browser profile kept on disk there, as a person's are.
+// Reads one JSON command per line on
 // stdin and answers each with one JSON line on stdout, carrying its id;
 // commands run at once, so two tabs can act at the same moment:
 //   {"id", "op": "eval", "tab": n, "js": "<expression>"}  evaluates in tab n
 //     (opened at <origin>/ on first use) and answers its value;
 //   {"id", "op": "close", "tab": n}                        closes tab n;
+//   {"id", "op": "kill", "tab": n, "after": ms, "how"}     waits, then closes
+//     tab n ("close") or kills its renderer process ("crash"), and answers
+//     whether its window.pending was still true when it went;
 //   {"id", "op": "clear"}                                  clears the
 //     origin's data: every file in its origin private file system.
 //
@@ -16,10 +21,12 @@
 import { createInterface } from 'node:readline';
 import { chromium } from 'playwright';
 
-const origin = process.argv[2];
-const browser = await chromium.launch();
-const context = await browser.newContext();
+const [origin, profile] = process.argv.slice(2);
+const context = profile
+  ? await chromium.launchPersistentContext(profile)
+  : await (await chromium.launch()).newContext();
 const tabs = new Map();
+context.on('close', () => process.stderr.write('driver: the browser closed\n'));
 
 async function tab(n) {
   if (!tabs.has(n)) {
@@ -49,6 +56,21 @@ const ops = {
     await page.close();
     return null;
   },
+  async kill({ tab: n, after, how }) {
+    const page = await tab(n);
+    await new Promise((done) => setTimeout(done, after));
+    tabs.delete(n);
+    const pending = await page.evaluate(() => window.pending === true).catch(() => false);
+    if (how === 'crash') {
+      const cdp = await context.newCDPSession(page);
+      // Page.crash never answers: the page's crash event says it went.
+      const crashed = new Promise((done) => page.once('crash', done));
+      cdp.send('Page.crash').catch(() => {});
+      await crashed;
+    }
+    await page.close();
+    return pending;
+  },
   async clear() {
     const page = await context.newPage();
     await page.goto(`${origin}/`);
@@ -75,5 +97,5 @@ lines.on('line', async (line) => {
   }
 });
 lines.on('close', async () => {
-  await browser.close();
+  await context.close();
 });

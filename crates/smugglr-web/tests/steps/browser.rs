@@ -61,6 +61,8 @@ pub(crate) struct Browser {
     stdin: Mutex<ChildStdin>,
     answers: Answers,
     next: AtomicU64,
+    /// How long an answer may take.
+    wait: Duration,
 }
 
 impl Browser {
@@ -68,6 +70,17 @@ impl Browser {
     /// scenarios' browsers is free.
     pub(crate) fn start(origin: &str) -> Result<Self, String> {
         built()?;
+        Self::launch(origin, None, Duration::from_secs(180))
+    }
+
+    /// Starts the browser for tabs of `origin` loading an app's own files,
+    /// so building no engine, in a profile kept on disk at `profile` when
+    /// one is named; an answer may take up to `wait`.
+    pub(crate) fn launch(
+        origin: &str,
+        profile: Option<&Path>,
+        wait: Duration,
+    ) -> Result<Self, String> {
         {
             let (running, freed) = &RUNNING;
             let mut running = running.lock().unwrap_or_else(PoisonError::into_inner);
@@ -79,7 +92,9 @@ impl Browser {
         let web = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/web");
         let mut child = Command::new("node")
             .current_dir(&web)
-            .args(["test/driver.mjs", origin])
+            .arg("test/driver.mjs")
+            .arg(origin)
+            .args(profile)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -117,6 +132,7 @@ impl Browser {
             stdin: Mutex::new(stdin),
             answers,
             next: AtomicU64::new(0),
+            wait,
         })
     }
 
@@ -150,7 +166,7 @@ impl Browser {
                 };
             }
             let (next, timeout) = arrived
-                .wait_timeout(map, Duration::from_secs(180))
+                .wait_timeout(map, self.wait)
                 .unwrap_or_else(PoisonError::into_inner);
             if timeout.timed_out() {
                 return Err(format!("the driver gave no answer to command {id}"));
@@ -169,6 +185,16 @@ impl Browser {
     pub(crate) fn close(&self, tab: usize) -> Result<(), String> {
         let id = self.send(json!({"op": "close", "tab": tab}))?;
         self.answer(id).map(drop)
+    }
+
+    /// Waits `after`, then closes tab `tab` (`how` "close") or kills its
+    /// renderer process ("crash"); returns whether its `window.pending` was
+    /// still true when it went.
+    #[allow(dead_code, reason = "the load run uses it; the scenarios do not")]
+    pub(crate) fn kill(&self, tab: usize, after: Duration, how: &str) -> Result<bool, String> {
+        let after = u64::try_from(after.as_millis()).unwrap_or(u64::MAX);
+        let id = self.send(json!({"op": "kill", "tab": tab, "after": after, "how": how}))?;
+        Ok(self.answer(id)? == json!(true))
     }
 
     /// Clears the origin's data.

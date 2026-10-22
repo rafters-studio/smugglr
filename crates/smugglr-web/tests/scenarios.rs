@@ -3,6 +3,8 @@
 //! `scenarios!` discovers every `.feature` file under `tests/` and emits one
 //! test per scenario. Step definitions must compile into this binary.
 
+#[path = "steps/app.rs"]
+mod app;
 #[path = "steps/browser.rs"]
 mod browser;
 #[path = "steps/standin.rs"]
