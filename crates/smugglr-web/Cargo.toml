@@ -1,0 +1,19 @@
+[package]
+name = "smugglr-web"
+description = "The smugglr engine in the browser, compiled to WASM with wasm-bindgen."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+smugglr-core = { workspace = true }
+wasm-bindgen = { workspace = true }
+
+[lints]
+workspace = true

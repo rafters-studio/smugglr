@@ -53,6 +53,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      # The browser row-hash scenario builds smugglr-web with wasm-pack and
+      # hashes in @sqlite.org/sqlite-wasm under Playwright's headless Chromium.
+      - uses: pnpm/action-setup@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --dir packages/web exec playwright install --with-deps chromium-headless-shell
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-features
 

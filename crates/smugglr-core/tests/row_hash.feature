@@ -18,3 +18,9 @@ Feature: one engine, one row hash, native and in WASM (FR-SMUGGLR-058)
     Given the row whose columns' quote() text is 1 and 'smugglr'
     When the engine hashes the row
     Then the hash is the 16-byte value recorded for that row
+
+  @criterion-01a14be5-057d-7163-9138-909f4c4ba1a0 @module-smugglr-core
+  Scenario: the browser build hashes like native
+    Given a row holding 9007199254740993 and rows holding NULL, empty text and an empty blob
+    When the browser's SQLite build and the native engine each hash them
+    Then each row's two hashes are identical

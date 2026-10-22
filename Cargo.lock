@@ -1301,6 +1301,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "smugglr-web"
+version = "0.1.0"
+dependencies = [
+ "smugglr-core",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "sqlite-wasm-rs"
 version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
