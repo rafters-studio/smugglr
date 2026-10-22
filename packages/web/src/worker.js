@@ -137,9 +137,12 @@ async function alone(body) {
   if (answer === undefined || answer === null) {
     return null;
   }
-  const { record, changed } = JSON.parse(answer);
+  const { record, changed, error } = JSON.parse(answer);
   for (const [table, keys] of Object.entries(changed)) {
     channel.postMessage({ type: 'table-changed', table, keys });
+  }
+  if (error !== undefined) {
+    throw error;
   }
   return record;
 }

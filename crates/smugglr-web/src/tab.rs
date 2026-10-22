@@ -37,6 +37,10 @@ impl Transport for TabSql {
         let answer = serde_json::from_str(&answer).map_err(|err| err.to_string())?;
         Ok((true, answer))
     }
+
+    fn hashes_where_rows_live(&self) -> bool {
+        true
+    }
 }
 
 /// The tab's database, its writes noted: the keys written, by table.
@@ -133,8 +137,15 @@ impl Tab {
             ..Options::default()
         };
         let mut endpoint = Fetcher::new(&self.endpoint);
-        let record = smugglr_sync::sync(&mut endpoint, &mut tab, &options).map_err(fail)?;
-        Ok(answer(&record, &tab.changed))
+        match smugglr_sync::sync(&mut endpoint, &mut tab, &options) {
+            Ok(record) => Ok(answer(&record, &tab.changed)),
+            // A run cut off after writing rows into the tab still names
+            // them, so table-changed goes out before the error.
+            Err(err) if !tab.changed.is_empty() => {
+                Ok(json!({"error": err.to_string(), "changed": tab.changed}).to_string())
+            }
+            Err(err) => Err(fail(err)),
+        }
     }
 
     /// The settings of a stash, a retrieve or a replay, from the app's.

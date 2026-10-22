@@ -66,6 +66,17 @@ pub(crate) fn hashes(table: &Table) -> String {
     )
 }
 
+/// Each row's key columns' `quote()` text, then its row hash as hex, for an
+/// HTTP-SQL place whose connection runs the row hash.
+pub(crate) fn hex_hashes(table: &Table) -> String {
+    format!(
+        "SELECT {}, hex({ROW_HASH}({})) FROM {}",
+        quoted(&table.key),
+        quoted(&table.columns),
+        ident(&table.name)
+    )
+}
+
 /// Each row's key columns' `quote()` text, then every column's, for a place
 /// that cannot run the row hash where the rows live.
 pub(crate) fn quoted_rows(table: &Table) -> String {
