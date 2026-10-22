@@ -921,6 +921,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let smaller = time_first_sync("linear-200k", 200_000)?;
         let larger = time_first_sync("linear-400k", 400_000)?;
+        println!("200,000 rows took {smaller:?}, 400,000 rows took {larger:?}");
         assert!(
             larger < smaller * 3,
             "200,000 rows took {smaller:?}, 400,000 rows took {larger:?}"

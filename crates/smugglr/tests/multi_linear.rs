@@ -64,6 +64,7 @@ fn a_whole_retrieve_twice_as_big_takes_less_than_three_times_as_long()
 -> Result<(), Box<dyn std::error::Error>> {
     let smaller = time_whole_retrieve(200_000)?;
     let larger = time_whole_retrieve(400_000)?;
+    println!("200,000 rows took {smaller:?}, 400,000 rows took {larger:?}");
     assert!(
         larger < smaller * 3,
         "200,000 rows took {smaller:?}, 400,000 rows took {larger:?}"
