@@ -5,7 +5,7 @@
 //! shape is known only by a stamp (in a blob or an envelope) is compared by
 //! stamp: the 16-byte column hash.
 
-use std::fmt::Write as _;
+use crate::hex::hex;
 
 use serde::{Serialize, Serializer};
 
@@ -46,13 +46,6 @@ impl Serialize for Stamp {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&hex(&self.0))
     }
-}
-
-pub(crate) fn hex(hash: &[u8]) -> String {
-    hash.iter().fold(String::new(), |mut hex, byte| {
-        let _ = write!(hex, "{byte:02x}");
-        hex
-    })
 }
 
 impl Stamp {

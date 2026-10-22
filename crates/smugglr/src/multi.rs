@@ -1,7 +1,6 @@
 //! `smugglr stash <place> <dir>` and `smugglr retrieve <place> <blob or
 //! dir>` (FR-SMUGGLR-059, FR-SMUGGLR-077).
 
-use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -9,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use smugglr::Config;
 use smugglr_core::envelope::GRAVEYARD;
+use smugglr_core::hex::{hex, unhex};
 use smugglr_core::plan::SyncMode;
 use smugglr_core::row_hash::row_hash;
 use smugglr_multi::{Blob, Settings, retrieve};
@@ -171,14 +171,7 @@ fn key(path: &Path) -> Result<[u8; 32], String> {
     let bytes = fs::read(path).map_err(|err| format!("{}: {err}", path.display()))?;
     let text = String::from_utf8_lossy(&bytes);
     let text = text.trim();
-    let hex: Option<Vec<u8>> = (text.len() == 64 && text.is_ascii())
-        .then(|| {
-            (0..64)
-                .step_by(2)
-                .map(|i| u8::from_str_radix(&text[i..i + 2], 16).ok())
-                .collect()
-        })
-        .flatten();
+    let hex = (text.len() == 64).then(|| unhex(text)).flatten();
     hex.unwrap_or(bytes).try_into().map_err(|_| {
         format!(
             "{}: a key file holds 64 hex digits or 32 bytes",
@@ -194,12 +187,7 @@ fn keep(blob: &Blob, dir: &Path) -> Result<PathBuf, String> {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_millis());
-    let hash: String = row_hash(&[&text])
-        .iter()
-        .fold(String::new(), |mut hex, byte| {
-            let _ = write!(hex, "{byte:02x}");
-            hex
-        });
+    let hash = hex(&row_hash(&[&text]));
     let file = dir.join(format!("{millis:013}-{hash}.{BLOB}"));
     fs::create_dir_all(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
     fs::write(&file, text).map_err(|err| format!("{}: {err}", file.display()))?;

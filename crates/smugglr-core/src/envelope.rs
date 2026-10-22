@@ -26,10 +26,11 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::change::{Change, Decision, Op, decide};
+use crate::hex::{hex, unhex};
 use crate::plan::SyncMode;
 use crate::record::Reason;
 use crate::row_hash::row_hash;
-use crate::shape::{Stamp, hex};
+use crate::shape::Stamp;
 use crate::steering::further_on;
 
 /// The envelope format version, `v`.
@@ -195,7 +196,7 @@ impl Envelope {
         let hash = |name: &str| -> Option<Option<[u8; 16]>> {
             match json.get(name)? {
                 serde_json::Value::Null => Some(None),
-                value => Some(Some(unhex(value.as_str()?)?)),
+                value => Some(Some(bytes(value.as_str()?)?)),
             }
         };
         let op = match json.get("op")?.as_str()? {
@@ -226,22 +227,15 @@ impl Envelope {
             sunset: json.get("sunset")?.as_u64()?,
             txn,
             key_id: text("key_id")?,
-            stamp: Stamp(unhex(&text("stamp")?)?),
-            signature: unhex(&text("signature")?)?,
+            stamp: Stamp(bytes(&text("stamp")?)?),
+            signature: bytes(&text("signature")?)?,
         })
     }
 }
 
 /// The `N` bytes the hex `text` holds; `None` when it holds anything else.
-fn unhex<const N: usize>(text: &str) -> Option<[u8; N]> {
-    if text.len() != 2 * N || !text.is_ascii() {
-        return None;
-    }
-    let mut bytes = [0; N];
-    for (i, byte) in bytes.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&text[2 * i..2 * i + 2], 16).ok()?;
-    }
-    Some(bytes)
+fn bytes<const N: usize>(text: &str) -> Option<[u8; N]> {
+    unhex(text)?.try_into().ok()
 }
 
 /// A change's row as the place it arrives at holds it.

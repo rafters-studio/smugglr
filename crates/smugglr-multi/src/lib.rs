@@ -13,11 +13,11 @@ mod retrieve;
 mod stash;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use serde_json::{Value, json};
 use smugglr_core::envelope::Envelope;
+use smugglr_core::hex::{hex, unhex};
 use smugglr_core::ignore::Ignore;
 use smugglr_core::plan::{Hashes, SyncMode};
 use smugglr_core::row_hash::row_hash;
@@ -296,21 +296,4 @@ fn rows(
             (key, row)
         })
         .collect())
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().fold(String::new(), |mut hex, byte| {
-        let _ = write!(hex, "{byte:02x}");
-        hex
-    })
-}
-
-fn unhex(text: &str) -> Option<Vec<u8>> {
-    if !text.is_ascii() || !text.len().is_multiple_of(2) {
-        return None;
-    }
-    (0..text.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).ok())
-        .collect()
 }
