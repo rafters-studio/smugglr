@@ -1,0 +1,20 @@
+{
+  "name": "@smugglr/zustand",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A zustand middleware that makes one collection of the state a view on a table of the tab's database.",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "src"
+  ],
+  "peerDependencies": {
+    "zustand": "^5.0.0"
+  },
+  "devDependencies": {
+    "zustand": "5.0.15"
+  }
+}

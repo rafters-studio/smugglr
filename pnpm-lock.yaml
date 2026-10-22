@@ -166,6 +166,12 @@ importers:
 
   .: {}
 
+  packages/nanostores:
+    devDependencies:
+      nanostores:
+        specifier: 1.5.5
+        version: 1.5.5
+
   packages/web:
     devDependencies:
       '@sqlite.org/sqlite-wasm':
@@ -175,11 +181,21 @@ importers:
         specifier: 1.64.0
         version: 1.64.0
 
+  packages/zustand:
+    devDependencies:
+      zustand:
+        specifier: 5.0.15
+        version: 5.0.15
+
 packages:
 
   '@sqlite.org/sqlite-wasm@3.54.1-build1':
     resolution: {integrity: sha512-foW427VBLJ3G87bsnvQTZCc9zYe0Fq1wH0pz1I6BlKLKXcArIAyTkHtq0iT2llmhcMQt9T/p6l5PpQQh+6O8uQ==}
     engines: {node: '>=22'}
+
+  nanostores@1.5.5:
+    resolution: {integrity: sha512-FixtE239Gl6Gz0ZGCK0WzvNwObNCIwVT+L7zQcf1QgcA6AzBxblzqe9OT88qiucNkhsjSOqiogSaF5jVbJiqSA==}
+    engines: {node: ^20.0.0 || >=22.0.0}
 
   playwright-core@1.64.0:
     resolution: {integrity: sha512-T9r+MZkTECl2+oUcZ26YgZzTrYidTsIhYYkJix+6iDOymOb1FB2RLLSOxRGnZGv5DStt+aduIVbt+E8WygXYpg==}
@@ -191,12 +207,34 @@ packages:
     engines: {node: '>=20'}
     hasBin: true
 
+  zustand@5.0.15:
+    resolution: {integrity: sha512-MpSEjRiBkA9crSYeOUH32rJC7SVqAbm0Fqcqge/bUi2PPoLcBWKOsG+C8mevmpr8TwXHBVkChbbJiyvkE+i/3A==}
+    engines: {node: '>=12.20.0'}
+    peerDependencies:
+      '@types/react': '>=18.0.0'
+      immer: '>=9.0.6'
+      react: '>=18.0.0'
+      use-sync-external-store: '>=1.2.0'
+    peerDependenciesMeta:
+      '@types/react':
+        optional: true
+      immer:
+        optional: true
+      react:
+        optional: true
+      use-sync-external-store:
+        optional: true
+
 snapshots:
 
   '@sqlite.org/sqlite-wasm@3.54.1-build1': {}
+
+  nanostores@1.5.5: {}
 
   playwright-core@1.64.0: {}
 
   playwright@1.64.0:
     dependencies:
       playwright-core: 1.64.0
+
+  zustand@5.0.15: {}
