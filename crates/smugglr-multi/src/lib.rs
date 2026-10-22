@@ -1,0 +1,261 @@
+//! Multi: a person's own devices keep in step through stash and retrieve,
+//! without the hub holding that data (FR-SMUGGLR-077).
+//!
+//! [`stash`] makes a [`Blob`] of one envelope per row changed since the
+//! device's last stash, each table's shape stamp once in its header;
+//! [`retrieve`] verifies blobs and applies them by the envelope rules
+//! (FR-SMUGGLR-075, FR-SMUGGLR-076), in any order. A whole blob holds every
+//! row and the graveyard: a place's first stash is whole, and a device away
+//! past the sunset catches up from one. Where blobs are kept, the device
+//! list, crossing off and keys are the app's.
+
+mod retrieve;
+mod stash;
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
+use std::path::PathBuf;
+
+use serde_json::{Value, json};
+use smugglr_core::envelope::Envelope;
+use smugglr_core::ignore::Ignore;
+use smugglr_core::plan::{Hashes, SyncMode};
+use smugglr_core::row_hash::row_hash;
+use smugglr_core::shape::{Column, Stamp};
+use smugglr_core::steering::Steering;
+use smugglr_place::{Key, Place, Table};
+
+pub use retrieve::retrieve;
+pub use stash::stash;
+
+/// The blob format version.
+const VERSION: u64 = 1;
+
+/// Why a stash or a retrieve could not run.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// A place could not be reached, read or written.
+    #[error(transparent)]
+    Place(#[from] smugglr_place::Error),
+    /// What smugglr keeps for the device could not be read or written.
+    #[error(transparent)]
+    Memory(#[from] smugglr_memory::Error),
+    /// A table has no primary key; nothing is read.
+    #[error("{0}")]
+    Shape(String),
+}
+
+/// How a stash or a retrieve runs.
+#[derive(Debug, Clone)]
+pub struct Settings {
+    /// smugglr's config directory, where it keeps what each device needs.
+    pub config_dir: PathBuf,
+    /// The shared key that signs and verifies envelopes.
+    pub key: [u8; 32],
+    /// This device's name.
+    pub node: String,
+    /// The devices a stash is for.
+    pub targets: Vec<String>,
+    /// The graveyard window in seconds: each change's sunset is `now` plus
+    /// this.
+    pub graveyard: u64,
+    /// Now, in seconds since the Unix epoch.
+    pub now: u64,
+    /// What happens to a row changed here and in a blob: stop or last.
+    pub sync_mode: SyncMode,
+    /// The steering columns `last` reads.
+    pub steering: Steering,
+    /// The tables to ignore, beside those smugglr always ignores.
+    pub ignore: Vec<String>,
+}
+
+impl Settings {
+    /// The id of the key that signs: the first 8 bytes of its hash, as hex.
+    fn key_id(&self) -> String {
+        hex(&row_hash(&[&hex(&self.key)])[..8])
+    }
+}
+
+/// What stash makes and retrieve applies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Blob {
+    /// The device that stashed it.
+    pub node: String,
+    /// The devices it is for.
+    pub targets: Vec<String>,
+    /// It holds every row and the graveyard, not what changed since the
+    /// last stash.
+    pub whole: bool,
+    /// Each table's shape stamp, once.
+    pub stamps: BTreeMap<String, Stamp>,
+    /// One envelope per row.
+    pub changes: Vec<Envelope>,
+    /// A whole blob's graveyard: the delete envelopes still in their sunset.
+    pub graveyard: Vec<Envelope>,
+}
+
+impl Blob {
+    /// The blob as JSON text: its header, then each envelope without the
+    /// stamp the header holds.
+    #[must_use]
+    pub fn to_json(&self) -> String {
+        let envelopes = |envelopes: &[Envelope]| -> Vec<Value> {
+            envelopes
+                .iter()
+                .map(|envelope| {
+                    let mut json = envelope.to_json();
+                    if let Some(fields) = json.as_object_mut() {
+                        fields.remove("stamp");
+                    }
+                    json
+                })
+                .collect()
+        };
+        let stamps: BTreeMap<&String, String> = self
+            .stamps
+            .iter()
+            .map(|(table, stamp)| (table, hex(&stamp.0)))
+            .collect();
+        json!({
+            "v": VERSION,
+            "node": self.node,
+            "targets": self.targets,
+            "whole": self.whole,
+            "stamps": stamps,
+            "changes": envelopes(&self.changes),
+            "graveyard": envelopes(&self.graveyard),
+        })
+        .to_string()
+    }
+
+    /// The blob [`Blob::to_json`] wrote; `None` when `text` is not one. Each
+    /// envelope takes its table's stamp from the header, so a header changed
+    /// after stashing fails each envelope's signature.
+    #[must_use]
+    pub fn from_json(text: &str) -> Option<Self> {
+        let json: Value = serde_json::from_str(text).ok()?;
+        if json.get("v")?.as_u64()? != VERSION {
+            return None;
+        }
+        let mut stamps = BTreeMap::new();
+        for (table, stamp) in json.get("stamps")?.as_object()? {
+            let bytes = unhex(stamp.as_str()?)?;
+            stamps.insert(table.clone(), Stamp(bytes.try_into().ok()?));
+        }
+        let envelopes = |name: &str| -> Option<Vec<Envelope>> {
+            json.get(name)?
+                .as_array()?
+                .iter()
+                .map(|envelope| {
+                    let mut envelope = envelope.clone();
+                    let table = envelope.get("table")?.as_str()?;
+                    let stamp = hex(&stamps.get(table)?.0);
+                    envelope
+                        .as_object_mut()?
+                        .insert("stamp".to_owned(), json!(stamp));
+                    Envelope::from_json(&envelope)
+                })
+                .collect()
+        };
+        Some(Self {
+            node: json.get("node")?.as_str()?.to_owned(),
+            targets: json
+                .get("targets")?
+                .as_array()?
+                .iter()
+                .map(|target| target.as_str().map(str::to_owned))
+                .collect::<Option<_>>()?,
+            whole: json.get("whole")?.as_bool()?,
+            changes: envelopes("changes")?,
+            graveyard: envelopes("graveyard")?,
+            stamps,
+        })
+    }
+}
+
+/// The place's tables, less those ignored, and the names of the ignored.
+fn tables(
+    place: &mut dyn Place,
+    settings: &Settings,
+) -> Result<(Vec<Table>, BTreeSet<String>), Error> {
+    let ignore = Ignore::new(
+        settings
+            .ignore
+            .iter()
+            .map(String::as_str)
+            .chain(place.own_tables().iter().copied())
+            .map(str::to_owned),
+    );
+    let (tables, ignored) = ignore.split(place.tables()?, |table| &table.name);
+    if let Some(table) = tables.iter().find(|table| table.key.is_empty()) {
+        return Err(Error::Shape(format!(
+            "the table {} in {} has no primary key",
+            table.name,
+            place.address()
+        )));
+    }
+    Ok((tables, ignored))
+}
+
+/// A table's shape stamp.
+fn stamp(table: &Table) -> Stamp {
+    Stamp::of(&columns(table))
+}
+
+fn columns(table: &Table) -> Vec<Column> {
+    table
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(i, name)| Column {
+            name: name.clone(),
+            kind: table.types.get(i).cloned().unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// Each row's hash in `table`, by key.
+fn hashes(place: &mut dyn Place, table: &Table) -> Result<Hashes, Error> {
+    Ok(place.hashes(table)?.into_iter().collect())
+}
+
+/// The columns of each row of `table` whose key is in `keys`, by key.
+fn rows(
+    place: &mut dyn Place,
+    table: &Table,
+    keys: &[Key],
+) -> Result<BTreeMap<Key, Vec<String>>, Error> {
+    let positions: Vec<usize> = table
+        .key
+        .iter()
+        .filter_map(|column| table.columns.iter().position(|c| c == column))
+        .collect();
+    Ok(place
+        .rows(table, keys)?
+        .into_iter()
+        .map(|row| {
+            let key = positions
+                .iter()
+                .filter_map(|&i| row.get(i).cloned())
+                .collect();
+            (key, row)
+        })
+        .collect())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::new(), |mut hex, byte| {
+        let _ = write!(hex, "{byte:02x}");
+        hex
+    })
+}
+
+fn unhex(text: &str) -> Option<Vec<u8>> {
+    if !text.is_ascii() || !text.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).ok())
+        .collect()
+}

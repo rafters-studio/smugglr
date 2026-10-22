@@ -39,6 +39,22 @@ pub const EDIT_VERSUS_DELETE: &str = "These rows were edited in one place after 
      deleted in another. smugglr stops rather than choose. Rerun with --sync-mode source or \
      target to keep one place's copy.";
 
+/// Why a table stops when a blob changes rows that also changed here since
+/// the last stash (FR-SMUGGLR-077).
+pub const CHANGED_HERE_AND_IN_BLOB: &str = "These rows changed here and in the blob, each \
+     from the same row. smugglr stops rather than choose. Name a steering column and \
+     retrieve with --sync-mode last to keep the copy further on.";
+
+/// Why a table is not done when a blob's changes wait for an earlier change
+/// this place has not seen (FR-SMUGGLR-077).
+pub const WAITING: &str = "These rows wait for an earlier change to them that this place has \
+     not seen. Retrieve the blob that holds it, then this blob again.";
+
+/// Why a table is not done when a blob's changes do not match their
+/// signature under the key, or their values do not hash to their `to`.
+pub const REFUSED: &str = "These changes do not match their signature under this key, or \
+     their values do not match their hash. smugglr applied none of them.";
+
 /// What a run did as a whole.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Status {
@@ -91,6 +107,10 @@ pub struct Record {
     /// The changes the run dropped, each kept in the dropped log.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub dropped: Vec<Dropped>,
+    /// A retrieve's blob's targets that still need it: its targets less
+    /// those the app crossed off and this device (FR-SMUGGLR-077).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub targets_remaining: Option<Vec<String>>,
 }
 
 /// Why a change was dropped (FR-SMUGGLR-076).
@@ -195,6 +215,7 @@ impl Record {
             ignored,
             shape: None,
             dropped: Vec::new(),
+            targets_remaining: None,
         }
     }
 
@@ -217,6 +238,7 @@ impl Record {
                 mismatch,
             }),
             dropped: Vec::new(),
+            targets_remaining: None,
         }
     }
 
@@ -235,6 +257,7 @@ impl Record {
             ignored,
             shape: None,
             dropped: Vec::new(),
+            targets_remaining: None,
         }
     }
 
@@ -534,6 +557,10 @@ impl fmt::Display for Record {
                 dropped.reason.words(),
                 dropped.change
             )?;
+        }
+        if let Some(remaining) = &self.targets_remaining {
+            let remaining: Vec<String> = remaining.iter().map(|t| printable(t)).collect();
+            writeln!(f, "  targets remaining: {}", remaining.join(", "))?;
         }
         Ok(())
     }

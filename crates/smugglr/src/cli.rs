@@ -11,10 +11,10 @@ use smugglr_core::record::{Record, Status};
 
 /// Exit status for a usage error, a config smugglr cannot read, or a place
 /// smugglr refuses.
-const USAGE: u8 = 2;
+pub(crate) const USAGE: u8 = 2;
 
 /// Exit status for a run that stopped before writing anything.
-const STOPPED: u8 = 3;
+pub(crate) const STOPPED: u8 = 3;
 
 /// Exit status for a run that wrote something and is not done.
 pub(crate) const NOT_DONE: u8 = 4;
@@ -68,7 +68,10 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
                 Err(err) => usage(&err),
             }
         }
-        Some(_) => usage("smugglr knows one command: sync"),
+        Some((command, rest)) if command == "stash" || command == "retrieve" => {
+            crate::multi::run(command == "stash", rest)
+        }
+        Some(_) => usage("smugglr knows sync, stash and retrieve"),
     }
 }
 
@@ -198,7 +201,7 @@ fn sync_once(command: &Sync) -> ExitCode {
     }
 }
 
-fn print_record(record: &Record, json: bool) {
+pub(crate) fn print_record(record: &Record, json: bool) {
     if json {
         println!("{}", record.json());
     } else {
@@ -210,7 +213,7 @@ fn print_record(record: &Record, json: bool) {
 /// preview), 3 stopped before writing anything, 4 wrote something and is not
 /// done, 5 too much for the wire. A shape mismatch stops before any row is
 /// read, so it is 3.
-fn exit(record: &Record) -> ExitCode {
+pub(crate) fn exit(record: &Record) -> ExitCode {
     match record.status {
         Status::Done | Status::Preview => ExitCode::SUCCESS,
         Status::TooMuch => ExitCode::from(TOO_MUCH),

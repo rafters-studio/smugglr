@@ -10,6 +10,8 @@
 //! `smugglr.sync` (FR-SMUGGLR-073): one line per row, holding its table,
 //! side, key and from and to hashes, written and flushed before the row is.
 
+mod device;
+
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
@@ -19,6 +21,8 @@ use std::path::{Path, PathBuf};
 use smugglr_core::change::Op;
 use smugglr_core::plan::{Hashes, Side, Write};
 use smugglr_core::row_hash::row_hash;
+
+pub use device::{Device, Row};
 
 /// The file in a pair's folder that holds each key's last hash.
 const LAST: &str = "last";

@@ -48,7 +48,7 @@ impl Serialize for Stamp {
     }
 }
 
-fn hex(hash: &[u8]) -> String {
+pub(crate) fn hex(hash: &[u8]) -> String {
     hash.iter().fold(String::new(), |mut hex, byte| {
         let _ = write!(hex, "{byte:02x}");
         hex

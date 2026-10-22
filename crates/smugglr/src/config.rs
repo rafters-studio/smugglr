@@ -10,7 +10,8 @@
 //! with a decimal unit such as `"250 MB"`; and the steering column
 //! `--sync-mode last` reads (FR-SMUGGLR-068), once for all tables
 //! (`steering = "updated_at"`) or per table (`[tables.orders] steering =
-//! "modified"`). Other settings are left alone.
+//! "modified"`); and `graveyard`, the seconds a change is carried and a
+//! delete's tombstone kept (FR-SMUGGLR-076). Other settings are left alone.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -33,6 +34,8 @@ pub struct Config {
     pub max_wire: Option<u64>,
     /// The steering columns named, for all tables and per table.
     pub steering: Steering,
+    /// The graveyard window in seconds; `None` when not set, 12 hours.
+    pub graveyard: Option<u64>,
 }
 
 /// The config as the file holds it, before its settings are checked.
@@ -41,6 +44,7 @@ struct File {
     #[serde(default)]
     ignore: Vec<String>,
     max_wire: Option<toml::Value>,
+    graveyard: Option<u64>,
     steering: Option<String>,
     #[serde(default)]
     tables: BTreeMap<String, TableFile>,
@@ -139,6 +143,7 @@ fn parse(text: &str) -> Result<Config, Problem> {
             all: file.steering,
             tables,
         },
+        graveyard: file.graveyard,
     })
 }
 
