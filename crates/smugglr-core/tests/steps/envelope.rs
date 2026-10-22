@@ -1,15 +1,20 @@
 //! Steps for the signed envelope: nodes that each hold rows of one notes
 //! table (`id`, `body`, `updated_at`), make signed envelopes of their own changes,
-//! and receive each other's through the engine's one decision path.
+//! and receive each other's through the engine's one decision path; each
+//! keeps its graveyard and its dropped log, and reads the time from `now`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 
 use rstest::fixture;
 use rstest_bdd::Slot;
 use rstest_bdd_macros::{ScenarioState, given, then, when};
 use smugglr_core::change::{Change, op};
-use smugglr_core::envelope::{Arrival, Envelope, Here, Txn, VERSION, receive};
+use smugglr_core::envelope::{
+    Arrival, Envelope, GRAVEYARD, Here, Txn, VERSION, receive, receive_replayed, replay,
+};
 use smugglr_core::plan::SyncMode;
+use smugglr_core::record::{self, Dropped, Reason, Record};
 use smugglr_core::row_hash::row_hash;
 use smugglr_core::shape::Stamp;
 
@@ -19,23 +24,33 @@ use crate::Place;
 const KEY: [u8; 32] = [42; 32];
 /// The position of `updated_at`, the steering column, in a notes row.
 const UPDATED_AT: usize = 2;
+/// When the graveyard scenarios begin, in seconds since the Unix epoch.
+const T0: u64 = 1_800_000_000;
+/// One hour, in seconds.
+const HOUR: u64 = 60 * 60;
 
-/// A row a node holds, and the `from` of the change that brought it here
-/// (`None` for a row that came from no row).
+/// A row a node holds (`values` is `None` once it is deleted), and the
+/// `from` of the change that brought it here (`None` for a row that came
+/// from no row).
 #[derive(Debug, Clone)]
 struct Row {
-    values: Vec<String>,
+    values: Option<Vec<String>>,
     last_from: Option<[u8; 16]>,
 }
 
-/// One node: its rows by key, what waits, and the rows it stopped.
+/// One node: its rows by key, what waits, the rows it stopped, its
+/// graveyard, its dropped log and what its record names as dropped.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Node {
     name: String,
+    now: u64,
     rows: BTreeMap<Vec<String>, Row>,
     held: Vec<Envelope>,
     stopped: Vec<Vec<String>>,
     applied: usize,
+    graveyard: BTreeMap<Vec<String>, Envelope>,
+    log: Vec<Envelope>,
+    dropped: Vec<Dropped>,
 }
 
 /// The nodes of a scenario and the envelopes in flight.
@@ -46,6 +61,8 @@ pub(crate) struct Mesh {
     made: Slot<Vec<Vec<Envelope>>>,
     /// The envelopes a single place is about to receive.
     arriving: Slot<Vec<Envelope>>,
+    /// The record of the run that ended.
+    record: Slot<Record>,
 }
 
 #[fixture]
@@ -70,21 +87,29 @@ fn hash(values: &[String]) -> [u8; 16] {
     row_hash(&columns)
 }
 
-fn envelope(node: &str, from: Option<[u8; 16]>, values: Vec<String>) -> Envelope {
-    let to = Some(hash(&values));
+/// The signed envelope of `node`'s change of row `id` from `from` to
+/// `values` (`None` deletes the row), carried until `sunset`.
+fn envelope(
+    node: &str,
+    id: &str,
+    from: Option<[u8; 16]>,
+    values: Option<Vec<String>>,
+    sunset: u64,
+) -> Envelope {
+    let to = values.as_deref().map(hash);
     let mut envelope = Envelope {
         v: VERSION,
         node: node.to_owned(),
         change: Change {
             op: op(from, to),
             table: "notes".to_owned(),
-            key: vec![values[0].clone()],
+            key: key(id),
             from,
             to,
-            values,
+            values: values.unwrap_or_default(),
         },
         targets: Vec::new(),
-        sunset: 0,
+        sunset,
         txn: None,
         key_id: "k1".to_owned(),
         stamp: Stamp([0; 16]),
@@ -100,7 +125,7 @@ impl Node {
             .iter()
             .map(|values| {
                 let row = Row {
-                    values: values.clone(),
+                    values: Some(values.clone()),
                     last_from: None,
                 };
                 (vec![values[0].clone()], row)
@@ -113,13 +138,25 @@ impl Node {
         }
     }
 
-    /// Changes a row here and returns the signed envelope of the change.
-    fn edit(&mut self, values: Vec<String>) -> Envelope {
-        let row = self.rows.get(&vec![values[0].clone()]);
-        let from = row.map(|row| hash(&row.values));
-        let made = envelope(&self.name, from, values.clone());
+    fn at(mut self, now: u64) -> Self {
+        self.now = now;
+        self
+    }
+
+    /// Changes row `id` here to `values` (`None` deletes it), and returns
+    /// the signed envelope of the change, carried for the default graveyard
+    /// window.
+    fn change(&mut self, id: &str, values: Option<Vec<String>>) -> Envelope {
+        let from = self
+            .rows
+            .get(&key(id))
+            .and_then(|row| row.values.as_deref().map(hash));
+        let made = envelope(&self.name, id, from, values.clone(), self.now + GRAVEYARD);
+        if values.is_none() {
+            self.graveyard.insert(key(id), made.clone());
+        }
         self.rows.insert(
-            vec![values[0].clone()],
+            key(id),
             Row {
                 values,
                 last_from: from,
@@ -128,41 +165,37 @@ impl Node {
         made
     }
 
+    fn edit(&mut self, values: Vec<String>) -> Envelope {
+        let id = values[0].clone();
+        self.change(&id, Some(values))
+    }
+
+    fn delete(&mut self, id: &str) -> Envelope {
+        self.change(id, None)
+    }
+
     fn here(&self, change: &Change) -> Here {
         let row = self.rows.get(&change.key);
+        let values = row.and_then(|row| row.values.as_ref());
         Here {
-            hash: row.map(|row| hash(&row.values)),
+            hash: values.map(|values| hash(values)),
             last_from: row.map(|row| row.last_from),
-            steering: row.map(|row| (UPDATED_AT, row.values[UPDATED_AT].clone())),
+            steering: values.map(|values| (UPDATED_AT, values[UPDATED_AT].clone())),
+            tombstone: self.graveyard.get(&change.key).cloned(),
         }
     }
 
     /// Receives `envelopes` with what waits here, applying what applies,
-    /// until nothing more does.
+    /// until nothing more does. A delete applied or skipped is the key's
+    /// tombstone; a dropped change goes to the dropped log and the record.
     fn deliver(&mut self, envelopes: &[Envelope], mode: SyncMode) {
         let mut pending: Vec<Envelope> = std::mem::take(&mut self.held);
         pending.extend_from_slice(envelopes);
         loop {
-            let arrivals = receive(&pending, &KEY, mode, |change| self.here(change));
+            let arrivals = receive(&pending, &KEY, mode, self.now, |change| self.here(change));
             let mut moved = false;
             for (envelope, arrival) in pending.drain(..).zip(arrivals) {
-                let change = &envelope.change;
-                match arrival {
-                    Arrival::Apply => {
-                        self.rows.insert(
-                            change.key.clone(),
-                            Row {
-                                values: change.values.clone(),
-                                last_from: change.from,
-                            },
-                        );
-                        self.applied += 1;
-                        moved = true;
-                    }
-                    Arrival::Hold => self.held.push(envelope),
-                    Arrival::Stop => self.stopped.push(change.key.clone()),
-                    Arrival::Skip | Arrival::Refused => {}
-                }
+                moved |= self.settle(envelope, arrival);
             }
             if !moved || self.held.is_empty() {
                 return;
@@ -171,11 +204,75 @@ impl Node {
         }
     }
 
+    /// Replays `envelopes` in a new run, whose record starts empty, then
+    /// receives what waits here.
+    fn replay(&mut self, envelopes: &[Envelope], mode: SyncMode) {
+        self.dropped.clear();
+        let arrivals =
+            receive_replayed(envelopes, &KEY, mode, self.now, |change| self.here(change));
+        for (envelope, arrival) in envelopes.iter().cloned().zip(arrivals) {
+            self.settle(envelope, arrival);
+        }
+        self.deliver(&[], mode);
+    }
+
+    /// Does what `arrival` says with `envelope`; whether a row was written.
+    fn settle(&mut self, envelope: Envelope, arrival: Arrival) -> bool {
+        let change = &envelope.change;
+        if matches!(arrival, Arrival::Apply | Arrival::Skip) && change.to.is_none() {
+            self.graveyard.insert(change.key.clone(), envelope.clone());
+        }
+        match arrival {
+            Arrival::Apply => {
+                let values = change.to.map(|_| change.values.clone());
+                self.rows.insert(
+                    change.key.clone(),
+                    Row {
+                        values,
+                        last_from: change.from,
+                    },
+                );
+                self.applied += 1;
+                return true;
+            }
+            Arrival::Hold => self.held.push(envelope),
+            Arrival::Stop => self.stopped.push(change.key.clone()),
+            Arrival::Dropped(reason) => {
+                self.dropped.push(Dropped::new(&envelope, reason));
+                self.log.push(envelope);
+            }
+            Arrival::Skip | Arrival::Refused => {}
+        }
+        false
+    }
+
     fn row(&self, id: &str) -> Result<&[String], String> {
         self.rows
             .get(&key(id))
-            .map(|row| row.values.as_slice())
+            .and_then(|row| row.values.as_deref())
             .ok_or_else(|| format!("node {} holds no row {id}", self.name))
+    }
+
+    fn absent(&self, id: &str) -> Result<(), String> {
+        match self.row(id) {
+            Ok(row) => Err(format!("node {} holds {row:?}", self.name)),
+            Err(_) => Ok(()),
+        }
+    }
+
+    /// The record of what this node did: the rows it stopped, edits of rows
+    /// deleted here, and what it dropped.
+    fn record(&self) -> Record {
+        let mut tables = BTreeMap::new();
+        if !self.stopped.is_empty() {
+            tables.insert(
+                "notes".to_owned(),
+                record::edit_versus_delete(self.stopped.clone()),
+            );
+        }
+        let mut record = Record::new(tables, BTreeSet::new(), false, None);
+        record.dropped.clone_from(&self.dropped);
+        record
     }
 }
 
@@ -299,14 +396,18 @@ fn transaction(mesh: &Mesh) {
     };
     let applies = envelope(
         "source",
+        "1",
         Some(hash(&rows[0])),
-        note("1", "one, changed", "2026-10-01T10:00:00Z"),
+        Some(note("1", "one, changed", "2026-10-01T10:00:00Z")),
+        GRAVEYARD,
     );
     // Built on a row this place never held.
     let waits = envelope(
         "source",
+        "2",
         Some(hash(&note("2", "elsewhere", "2026-10-01T09:30:00Z"))),
-        note("2", "two, changed", "2026-10-01T10:00:00Z"),
+        Some(note("2", "two, changed", "2026-10-01T10:00:00Z")),
+        GRAVEYARD,
     );
     let made = [applies, waits]
         .into_iter()
@@ -351,8 +452,10 @@ fn place_and_change(mesh: &Mesh, place: &Place) -> Envelope {
         .set(vec![Node::holding("place", std::slice::from_ref(&row))]);
     envelope(
         "maker",
+        "1",
         Some(hash(&row)),
-        note("1", "final", "2026-10-01T10:00:00Z"),
+        Some(note("1", "final", "2026-10-01T10:00:00Z")),
+        GRAVEYARD,
     )
 }
 
@@ -413,5 +516,527 @@ fn third_stops(mesh: &Mesh) -> Result<(), String> {
             third.stopped,
             third.row("1")?
         ))
+    }
+}
+
+// The graveyard and sunsets (FR-SMUGGLR-076). The place a scenario watches
+// is the last of its nodes.
+
+fn draft() -> Vec<String> {
+    note("1", "draft", "2026-10-01T09:00:00Z")
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::new(), |mut hex, byte| {
+        let _ = write!(hex, "{byte:02x}");
+        hex
+    })
+}
+
+fn unhex(text: &str) -> Result<[u8; 32], String> {
+    let mut bytes = [0; 32];
+    if text.len() != 64 {
+        return Err(format!("{text} is not a change hash"));
+    }
+    for (at, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[at * 2..at * 2 + 2], 16)
+            .map_err(|err| format!("{text}: {err}"))?;
+    }
+    Ok(bytes)
+}
+
+fn watched(mesh: &Mesh) -> Result<Node, String> {
+    mesh.nodes
+        .get()
+        .and_then(|nodes| nodes.last().cloned())
+        .ok_or_else(|| "there is no place".to_owned())
+}
+
+/// Runs `f` on the watched place.
+fn at_place(mesh: &Mesh, f: impl FnOnce(&mut Node)) -> Result<(), String> {
+    mesh.nodes
+        .with_mut(|nodes| nodes.last_mut().map(f))
+        .flatten()
+        .ok_or_else(|| "there is no place".to_owned())
+}
+
+fn made(mesh: &Mesh, node: usize) -> Result<Envelope, String> {
+    mesh.made
+        .get()
+        .and_then(|made| made.get(node).and_then(|made| made.first().cloned()))
+        .ok_or_else(|| format!("node {node} made no change"))
+}
+
+fn names_dropped(node: &Node, envelope: &Envelope, reason: Reason) -> Result<(), String> {
+    let dropped = node.record().dropped;
+    let named = dropped.iter().any(|dropped| {
+        dropped.table == "notes"
+            && dropped.key == record::Key(envelope.change.key.clone())
+            && dropped.reason == reason
+            && dropped.change == hex(&envelope.signature)
+    });
+    if named {
+        Ok(())
+    } else {
+        Err(format!("node {}'s record names {dropped:?}", node.name))
+    }
+}
+
+#[given("a row inserted on one node and deleted on another")]
+fn inserted_then_deleted(mesh: &Mesh) {
+    let mut a = Node::holding("a", &[]).at(T0);
+    let mut b = Node::holding("b", &[]).at(T0);
+    let insert = a.edit(draft());
+    b.deliver(std::slice::from_ref(&insert), SyncMode::Stop);
+    let delete = b.delete("1");
+    mesh.made.set(vec![vec![insert], vec![delete]]);
+    mesh.nodes
+        .set(vec![a, b, Node::holding("place", &[]).at(T0 + HOUR)]);
+}
+
+#[when("a third place receives the delete before the insert, inside the graveyard window")]
+fn delete_first(mesh: &Mesh) -> Result<(), String> {
+    let (insert, delete) = (made(mesh, 0)?, made(mesh, 1)?);
+    at_place(mesh, |place| {
+        place.deliver(&[delete], SyncMode::Stop);
+        place.deliver(&[insert], SyncMode::Stop);
+    })
+}
+
+#[then("the row is absent at the third place")]
+fn absent_at_third(mesh: &Mesh) -> Result<(), String> {
+    watched(mesh)?.absent("1")
+}
+
+#[then("the row is absent at that place")]
+fn absent_at_that_place(mesh: &Mesh) -> Result<(), String> {
+    watched(mesh)?.absent("1")
+}
+
+#[then("the row is absent at the place")]
+fn absent_at_place(mesh: &Mesh) -> Result<(), String> {
+    watched(mesh)?.absent("1")
+}
+
+#[given("a row inserted, then edited, then deleted on other nodes")]
+fn inserted_edited_deleted(mesh: &Mesh) {
+    let mut a = Node::holding("a", &[]).at(T0);
+    let mut b = Node::holding("b", &[]).at(T0);
+    let mut c = Node::holding("c", &[]).at(T0);
+    let insert = a.edit(draft());
+    b.deliver(std::slice::from_ref(&insert), SyncMode::Stop);
+    let edit = b.edit(note("1", "edited", "2026-10-01T10:00:00Z"));
+    c.deliver(&[insert.clone(), edit.clone()], SyncMode::Stop);
+    let delete = c.delete("1");
+    mesh.made.set(vec![vec![insert], vec![edit], vec![delete]]);
+    mesh.nodes
+        .set(vec![a, b, c, Node::holding("place", &[]).at(T0 + HOUR)]);
+}
+
+#[when(
+    "a place receives the delete first, then the insert, then the edit, inside the graveyard window"
+)]
+fn delete_insert_edit(mesh: &Mesh) -> Result<(), String> {
+    let order = [made(mesh, 2)?, made(mesh, 0)?, made(mesh, 1)?];
+    at_place(mesh, |place| {
+        for envelope in order {
+            place.deliver(&[envelope], SyncMode::Stop);
+        }
+    })
+}
+
+#[given(
+    "a row deleted on every node, and then re-created with the same key on one node inside the graveyard window"
+)]
+fn recreated(mesh: &Mesh) {
+    let mut nodes: Vec<Node> = ["a", "b", "c"]
+        .iter()
+        .map(|name| Node::holding(name, &[draft()]).at(T0))
+        .collect();
+    let delete = nodes[0].delete("1");
+    for node in &mut nodes[1..] {
+        node.deliver(std::slice::from_ref(&delete), SyncMode::Stop);
+    }
+    for node in &mut nodes {
+        node.now = T0 + HOUR;
+    }
+    let insert = nodes[0].edit(note("1", "again", "2026-10-01T10:00:00Z"));
+    mesh.made.set(vec![vec![insert]]);
+    mesh.nodes.set(nodes);
+}
+
+#[when("the other places receive the insert")]
+fn others_receive(mesh: &Mesh) -> Result<(), String> {
+    let insert = made(mesh, 0)?;
+    mesh.nodes
+        .with_mut(|nodes| {
+            for node in &mut nodes[1..] {
+                node.deliver(std::slice::from_ref(&insert), SyncMode::Stop);
+            }
+        })
+        .ok_or_else(|| "there are no nodes".to_owned())
+}
+
+#[then("the row is absent at the other places")]
+fn absent_at_others(mesh: &Mesh) -> Result<(), String> {
+    let nodes = mesh.nodes.get().ok_or("there are no nodes")?;
+    nodes[1..].iter().try_for_each(|node| node.absent("1"))
+}
+
+#[then("it stays where it was made")]
+fn stays_at_maker(mesh: &Mesh) -> Result<(), String> {
+    let insert = made(mesh, 0)?;
+    let nodes = mesh.nodes.get().ok_or("there are no nodes")?;
+    let row = nodes[0].row("1")?;
+    if row == insert.change.values.as_slice() {
+        Ok(())
+    } else {
+        Err(format!("the maker holds {row:?}"))
+    }
+}
+
+#[then("the record at the other places names it under dropped")]
+fn others_name_it(mesh: &Mesh) -> Result<(), String> {
+    let insert = made(mesh, 0)?;
+    let nodes = mesh.nodes.get().ok_or("there are no nodes")?;
+    nodes[1..]
+        .iter()
+        .try_for_each(|node| names_dropped(node, &insert, Reason::Graveyard))
+}
+
+/// A place that deleted its row at `T0` and whose clock reads `now`.
+fn deleted_at_place(mesh: &Mesh, now: u64) {
+    let mut place = Node::holding("place", &[draft()]).at(T0);
+    place.delete("1");
+    mesh.nodes.set(vec![place.at(now)]);
+}
+
+#[given("a row deleted at a place longer ago than the graveyard window")]
+fn deleted_long_ago(mesh: &Mesh) {
+    deleted_at_place(mesh, T0 + GRAVEYARD + HOUR);
+}
+
+#[given("no graveyard setting, and a row deleted at a place less than 12 hours ago")]
+fn deleted_lately(mesh: &Mesh) {
+    deleted_at_place(mesh, T0 + 11 * HOUR);
+}
+
+#[when("the place receives an insert for that key")]
+fn insert_arrives(mesh: &Mesh) -> Result<(), String> {
+    let now = watched(mesh)?.now;
+    let insert = envelope(
+        "maker",
+        "1",
+        None,
+        Some(note("1", "again", "2026-10-01T10:00:00Z")),
+        now + GRAVEYARD,
+    );
+    mesh.arriving.set(vec![insert.clone()]);
+    at_place(mesh, |place| place.deliver(&[insert], SyncMode::Stop))
+}
+
+#[then("the place holds the row")]
+fn holds_row(mesh: &Mesh) -> Result<(), String> {
+    let insert = mesh.arriving.get().ok_or("no insert arrived")?;
+    let place = watched(mesh)?;
+    let row = place.row("1")?;
+    if row == insert[0].change.values.as_slice() {
+        Ok(())
+    } else {
+        Err(format!("the place holds {row:?}"))
+    }
+}
+
+#[given("a change whose sunset has passed")]
+fn dead_change(mesh: &Mesh) {
+    let change = envelope(
+        "maker",
+        "1",
+        Some(hash(&draft())),
+        Some(note("1", "late", "2026-10-01T10:00:00Z")),
+        T0,
+    );
+    mesh.arriving.set(vec![change]);
+    mesh.nodes
+        .set(vec![Node::holding("place", &[draft()]).at(T0 + HOUR)]);
+}
+
+#[when("a place receives it")]
+fn receives_it(mesh: &Mesh) -> Result<(), String> {
+    let arriving = mesh.arriving.get().ok_or("no change arrived")?;
+    at_place(mesh, |place| place.deliver(&arriving, SyncMode::Stop))
+}
+
+#[then("the place's row is unchanged")]
+fn row_unchanged(mesh: &Mesh) -> Result<(), String> {
+    let place = watched(mesh)?;
+    let row = place.row("1")?;
+    if row == draft().as_slice() && place.applied == 0 {
+        Ok(())
+    } else {
+        Err(format!("the place holds {row:?}"))
+    }
+}
+
+#[given("a place holding a change whose from matches nothing there")]
+fn holding_waiting(mesh: &Mesh) -> Result<(), String> {
+    waiting(mesh)
+}
+
+#[given("a change waiting on a device for the change it built on, which never arrives")]
+fn waiting(mesh: &Mesh) -> Result<(), String> {
+    let waits = envelope(
+        "maker",
+        "1",
+        Some(hash(&note("1", "elsewhere", "2026-10-01T09:30:00Z"))),
+        Some(note("1", "built on it", "2026-10-01T10:00:00Z")),
+        T0 + GRAVEYARD,
+    );
+    let mut place = Node::holding("place", &[draft()]).at(T0);
+    place.deliver(std::slice::from_ref(&waits), SyncMode::Stop);
+    if place.held.len() != 1 {
+        return Err(format!(
+            "the place holds {} waiting changes",
+            place.held.len()
+        ));
+    }
+    mesh.arriving.set(vec![waits]);
+    mesh.nodes.set(vec![place]);
+    Ok(())
+}
+
+#[when("the change's sunset passes")]
+fn its_sunset_passes(mesh: &Mesh) -> Result<(), String> {
+    sunset_passes(mesh)
+}
+
+#[when("the waiting change's sunset passes and the device next retrieves")]
+fn sunset_passes(mesh: &Mesh) -> Result<(), String> {
+    at_place(mesh, |place| {
+        place.now = T0 + GRAVEYARD + 1;
+        place.deliver(&[], SyncMode::Stop);
+    })
+}
+
+#[then("the place holds no waiting change")]
+fn none_waiting(mesh: &Mesh) -> Result<(), String> {
+    let place = watched(mesh)?;
+    if place.held.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "the place holds {} waiting changes",
+            place.held.len()
+        ))
+    }
+}
+
+#[then(
+    "the record names that change's table and key under dropped, with the reason that its sunset passed"
+)]
+fn names_waiting_dropped(mesh: &Mesh) -> Result<(), String> {
+    let waits = mesh.arriving.get().ok_or("no change waited")?;
+    names_dropped(&watched(mesh)?, &waits[0], Reason::Sunset)
+}
+
+/// Devices `a` and `b` holding the same row at `T0`; `a` deletes it and
+/// `b` edits it before hearing of the delete.
+fn deleted_and_edited() -> (Node, Node, Envelope, Envelope) {
+    let mut a = Node::holding("a", &[draft()]).at(T0);
+    let mut b = Node::holding("b", &[draft()]).at(T0);
+    let delete = a.delete("1");
+    let edit = b.edit(note("1", "edited", "2026-10-01T10:00:00Z"));
+    (a, b, delete, edit)
+}
+
+#[given("a row deleted on one device, and an edit to it made on another device")]
+fn late_edit(mesh: &Mesh) {
+    let (a, b, delete, edit) = deleted_and_edited();
+    let mut place = Node::holding("place", &[draft()]).at(T0);
+    place.deliver(std::slice::from_ref(&delete), SyncMode::Stop);
+    mesh.made.set(vec![vec![delete], vec![edit]]);
+    mesh.nodes.set(vec![a, b, place]);
+}
+
+#[when("a place receives the edit past its sunset, after the row's tombstone has gone")]
+fn edit_arrives_late(mesh: &Mesh) -> Result<(), String> {
+    let edit = made(mesh, 1)?;
+    at_place(mesh, |place| {
+        place.now = T0 + GRAVEYARD + HOUR;
+        place.deliver(&[edit], SyncMode::Stop);
+    })
+}
+
+#[then("the place ignores the edit")]
+fn ignores_edit(mesh: &Mesh) -> Result<(), String> {
+    let place = watched(mesh)?;
+    if place.stopped.is_empty() {
+        place.absent("1")
+    } else {
+        Err(format!("the place stopped {:?}", place.stopped))
+    }
+}
+
+#[then("its dropped log holds the edit")]
+fn log_holds_edit(mesh: &Mesh) -> Result<(), String> {
+    let edit = made(mesh, 1)?;
+    let place = watched(mesh)?;
+    if place.log == [edit] {
+        Ok(())
+    } else {
+        Err(format!("the dropped log holds {:?}", place.log))
+    }
+}
+
+#[then("the record names the edit by its change hash")]
+fn names_edit(mesh: &Mesh) -> Result<(), String> {
+    names_dropped(&watched(mesh)?, &made(mesh, 1)?, Reason::Sunset)
+}
+
+#[given("a place whose dropped log holds an edit to a row deleted elsewhere")]
+fn logged_late_edit(mesh: &Mesh) -> Result<(), String> {
+    late_edit(mesh);
+    edit_arrives_late(mesh)?;
+    log_holds_edit(mesh)
+}
+
+#[when("the agent replays it with --replay and its change hash, under --sync-mode stop")]
+fn replays(mesh: &Mesh) -> Result<(), String> {
+    let replayed = replayed_first(&watched(mesh)?)?;
+    at_place(mesh, |place| place.replay(&[replayed], SyncMode::Stop))
+}
+
+/// The change hash of the first change the watched place's record names
+/// under dropped, replayed with a fresh sunset.
+fn replayed_first(place: &Node) -> Result<Envelope, String> {
+    let named = place.record().dropped;
+    let hash = unhex(
+        &named
+            .first()
+            .ok_or("the record names nothing dropped")?
+            .change,
+    )?;
+    replay(&place.log, &hash, place.now + GRAVEYARD, &KEY)
+        .ok_or_else(|| "the dropped log holds no change with that hash".to_owned())
+}
+
+#[given("a place whose dropped log holds an insert dropped because its key's tombstone was live")]
+fn insert_dropped_by_graveyard(mesh: &Mesh) -> Result<(), String> {
+    deleted_at_place(mesh, T0 + HOUR);
+    insert_arrives(mesh)?;
+    let place = watched(mesh)?;
+    let insert = mesh.arriving.get().ok_or("no insert arrived")?;
+    names_dropped(&place, &insert[0], Reason::Graveyard)
+}
+
+#[when("the agent replays it with its change hash while that tombstone is still live")]
+fn replays_in_window(mesh: &Mesh) -> Result<(), String> {
+    let place = watched(mesh)?;
+    if place.now > T0 + GRAVEYARD {
+        return Err("the tombstone is no longer live".to_owned());
+    }
+    let replayed = replayed_first(&place)?;
+    at_place(mesh, |place| place.replay(&[replayed], SyncMode::Stop))
+}
+
+#[then("the place holds the inserted row")]
+fn holds_inserted(mesh: &Mesh) -> Result<(), String> {
+    holds_row(mesh)
+}
+
+#[then("the record does not name it under dropped")]
+fn not_named_dropped(mesh: &Mesh) -> Result<(), String> {
+    let dropped = watched(mesh)?.record().dropped;
+    if dropped.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("the record names {dropped:?} under dropped"))
+    }
+}
+
+#[then("it stops as edit versus delete")]
+fn stops_edit_versus_delete(mesh: &Mesh) -> Result<(), String> {
+    let place = watched(mesh)?;
+    if place.stopped == [key("1")] {
+        place.absent("1")
+    } else {
+        Err(format!("the place stopped {:?}", place.stopped))
+    }
+}
+
+#[then("the record names the row")]
+fn record_names_row(mesh: &Mesh) -> Result<(), String> {
+    let record = watched(mesh)?.record();
+    match record.tables.get("notes") {
+        Some(record::Table::Stopped { rows, why, .. })
+            if *rows == [record::Key(key("1"))] && why == record::EDIT_VERSUS_DELETE =>
+        {
+            Ok(())
+        }
+        other => Err(format!("the record gives notes {other:?}")),
+    }
+}
+
+#[given(
+    "a row deleted on one device, and on another device an edit made to that row before it heard of the delete"
+)]
+fn edit_before_hearing(mesh: &Mesh) {
+    let (a, b, delete, edit) = deleted_and_edited();
+    mesh.made.set(vec![vec![delete], vec![edit]]);
+    // The first device is the place watched.
+    mesh.nodes.set(vec![b, a.at(T0 + HOUR)]);
+}
+
+#[when("the edit's change arrives on the first device under --sync-mode stop")]
+fn edit_reaches_deleter(mesh: &Mesh) -> Result<(), String> {
+    let edit = made(mesh, 1)?;
+    at_place(mesh, |place| place.deliver(&[edit], SyncMode::Stop))
+}
+
+#[then("the row stops and is named by key")]
+fn stops_named(mesh: &Mesh) -> Result<(), String> {
+    stops_edit_versus_delete(mesh)?;
+    record_names_row(mesh)
+}
+
+#[given("a place that drops a change")]
+fn drops_a_change(mesh: &Mesh) -> Result<(), String> {
+    dead_change(mesh);
+    receives_it(mesh)
+}
+
+#[when("the run ends")]
+fn run_ends(mesh: &Mesh) -> Result<(), String> {
+    mesh.record.set(watched(mesh)?.record());
+    Ok(())
+}
+
+#[then("the dropped log holds the change's envelope and values")]
+fn log_holds_change(mesh: &Mesh) -> Result<(), String> {
+    let arriving = mesh.arriving.get().ok_or("no change arrived")?;
+    let place = watched(mesh)?;
+    let kept = place.log.first().ok_or("the dropped log is empty")?;
+    if place.log.len() == 1 && *kept == arriving[0] && !kept.change.values.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("the dropped log holds {:?}", place.log))
+    }
+}
+
+#[then("the record names it under dropped with its table, key, reason and change hash")]
+fn record_names_change(mesh: &Mesh) -> Result<(), String> {
+    let arriving = mesh.arriving.get().ok_or("no change arrived")?;
+    let record = mesh.record.get().ok_or("the run has not ended")?;
+    let change = &arriving[0];
+    let named = record.dropped.iter().any(|dropped| {
+        dropped.table == change.change.table
+            && dropped.key == record::Key(change.change.key.clone())
+            && dropped.reason == Reason::Sunset
+            && dropped.change == hex(&change.signature)
+    });
+    if named {
+        Ok(())
+    } else {
+        Err(format!("the record names {:?}", record.dropped))
     }
 }

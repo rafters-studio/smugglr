@@ -1,5 +1,6 @@
 //! The record: what a sync did, table by table, in smugglr's own words
-//! (FR-SMUGGLR-063, FR-SMUGGLR-065, FR-SMUGGLR-067, FR-SMUGGLR-069).
+//! (FR-SMUGGLR-063, FR-SMUGGLR-065, FR-SMUGGLR-067, FR-SMUGGLR-069,
+//! FR-SMUGGLR-076).
 //!
 //! Key lists name rows only where they were deleted, overwritten by
 //! `--sync-mode`, or stopped; rows copied or carried over appear only in the
@@ -11,6 +12,7 @@ use std::fmt;
 use serde::{Serialize, Serializer};
 
 use crate::change::Op;
+use crate::envelope::Envelope;
 use crate::plan::{Plan, Side};
 use crate::shape::Mismatch;
 use crate::weight::Weight;
@@ -30,6 +32,12 @@ pub const NOT_READ_BACK: &str = "smugglr wrote these rows and read them back dif
 pub const SELF_KEYED: &str = "This table's database hands out its own keys (INTEGER PRIMARY \
      KEY), so two places would hand out the same key to different rows and one would erase the \
      other. smugglr does no re-sequencing. Any random, unique key, such as UUIDv7, lets it sync.";
+
+/// Why a row stops when an edit was made to it after it was deleted
+/// elsewhere (FR-SMUGGLR-076).
+pub const EDIT_VERSUS_DELETE: &str = "These rows were edited in one place after they were \
+     deleted in another. smugglr stops rather than choose. Rerun with --sync-mode source or \
+     target to keep one place's copy.";
 
 /// What a run did as a whole.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -80,6 +88,70 @@ pub struct Record {
     /// read (FR-SMUGGLR-070).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shape: Option<ShapeStop>,
+    /// The changes the run dropped, each kept in the dropped log.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dropped: Vec<Dropped>,
+}
+
+/// Why a change was dropped (FR-SMUGGLR-076).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reason {
+    /// It arrived, or waited, past its sunset.
+    Sunset,
+    /// It is an insert or a waiting change for a key in the graveyard.
+    Graveyard,
+}
+
+impl Reason {
+    /// The record's words for the reason, in the text and the JSON alike.
+    #[must_use]
+    pub const fn words(self) -> &'static str {
+        match self {
+            Self::Sunset => "its sunset passed",
+            Self::Graveyard => "its key is in the graveyard",
+        }
+    }
+}
+
+impl Serialize for Reason {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.words())
+    }
+}
+
+/// A change the run dropped, named by its table, key, reason and change
+/// hash, by which a replay re-sends it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Dropped {
+    /// The table the change's row is in.
+    pub table: String,
+    /// The row's key.
+    pub key: Key,
+    /// Why it was dropped.
+    pub reason: Reason,
+    /// The change hash, as lowercase hex.
+    pub change: String,
+}
+
+/// Lowercase hex digits, for the change hash.
+const HEX: &[u8; 16] = b"0123456789abcdef";
+
+impl Dropped {
+    /// The record's name for `envelope`, dropped for `reason`.
+    #[must_use]
+    pub fn new(envelope: &Envelope, reason: Reason) -> Self {
+        Self {
+            table: envelope.change.table.clone(),
+            key: Key(envelope.change.key.clone()),
+            reason,
+            change: envelope
+                .signature
+                .iter()
+                .flat_map(|byte| [HEX[usize::from(byte >> 4)], HEX[usize::from(byte & 0xf)]])
+                .map(char::from)
+                .collect(),
+        }
+    }
 }
 
 /// A run stopped because the places' shapes differ.
@@ -122,6 +194,7 @@ impl Record {
             tables,
             ignored,
             shape: None,
+            dropped: Vec::new(),
         }
     }
 
@@ -143,6 +216,7 @@ impl Record {
                 why: mismatch.why(),
                 mismatch,
             }),
+            dropped: Vec::new(),
         }
     }
 
@@ -160,6 +234,7 @@ impl Record {
             tables: BTreeMap::new(),
             ignored,
             shape: None,
+            dropped: Vec::new(),
         }
     }
 
@@ -320,6 +395,17 @@ pub fn lost(rows: Vec<Vec<String>>, cause: &str) -> Table {
     }
 }
 
+/// The record of rows `keys` edited after they were deleted elsewhere:
+/// stopped, naming them.
+#[must_use]
+pub fn edit_versus_delete(keys: Vec<Vec<String>>) -> Table {
+    Table::Stopped {
+        rows: keys.into_iter().map(Key).collect(),
+        not_read_back: Vec::new(),
+        why: EDIT_VERSUS_DELETE.to_owned(),
+    }
+}
+
 /// The record of a table whose database hands out its own keys: stopped,
 /// with no rows read.
 #[must_use]
@@ -331,12 +417,26 @@ pub fn self_keyed() -> Table {
     }
 }
 
+/// `text` for a terminal: each control character escaped, so a table or key
+/// another node sent cannot drive the terminal the record is printed to.
+fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
 fn keys(keys: &[Key]) -> String {
     keys.iter()
         .map(|key| {
             key.0
                 .iter()
-                .map(|c| shown(c))
+                .map(|c| printable(&shown(c)))
                 .collect::<Vec<_>>()
                 .join(", ")
         })
@@ -378,6 +478,7 @@ impl fmt::Display for Record {
             writeln!(f, "  shape: {}", shape.why)?;
         }
         for (name, table) in &self.tables {
+            let name = printable(name);
             match table {
                 Table::InStep => writeln!(f, "  {name}: in step")?,
                 Table::WouldMove(moves) | Table::Moved(moves) => {
@@ -424,6 +525,34 @@ impl fmt::Display for Record {
                 }
             }
         }
+        for dropped in &self.dropped {
+            writeln!(
+                f,
+                "  dropped: {} {}, {}, change {}",
+                printable(&dropped.table),
+                keys(std::slice::from_ref(&dropped.key)),
+                dropped.reason.words(),
+                dropped.change
+            )?;
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Key, keys, printable};
+
+    #[test]
+    fn a_key_holding_an_escape_byte_prints_escaped() {
+        let key = Key(vec!["'a\u{1b}[2Jb'".to_owned()]);
+        let text = keys(&[key]);
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+        assert_eq!(text, "a\\u{1b}[2Jb");
+    }
+
+    #[test]
+    fn a_table_name_holding_a_newline_prints_on_one_line() {
+        assert_eq!(printable("notes\nfake: line"), "notes\\nfake: line");
     }
 }
