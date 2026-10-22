@@ -69,7 +69,8 @@ function texts(value: unknown, what: string): string[] {
   return value.map(quoted);
 }
 
-const quotes = (columns: string[]): string => columns.map((c) => `quote(${ident(c)})`).join(", ");
+/** Each column as its quote() text, for a SELECT list. */
+export const quotes = (columns: string[]): string => columns.map((c) => `quote(${ident(c)})`).join(", ");
 
 const hex = (bytes: Uint8Array): string => Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 

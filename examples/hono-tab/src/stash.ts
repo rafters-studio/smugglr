@@ -4,7 +4,7 @@
 // blob, signed with the app's key: no blob format is written here.
 
 import { stashRows } from "@smugglr/web/engine";
-import { ident, OWNER, type Table } from "./place";
+import { ident, OWNER, quotes, type Table } from "./place";
 
 /** What a stash names: the app's key (64 hex digits), this node, and the device it is for. */
 export type Multi = { key: string; node: string; target: string };
@@ -17,7 +17,7 @@ export async function stash(db: D1Database, tables: Table[], owner: string, mult
     // integers beyond 2^53 included.
     const rows = await db
       .prepare(
-        `SELECT ${table.columns.map((c) => `quote(${ident(c)})`).join(", ")} ` +
+        `SELECT ${quotes(table.columns)} ` +
           `FROM ${ident(table.name)} WHERE ${ident(OWNER)} IS ?1`,
       )
       .bind(owner)
