@@ -80,6 +80,18 @@ pub struct Table {
     pub self_keyed: bool,
 }
 
+impl Table {
+    /// The key of `row`, a row of this table in column order.
+    #[must_use]
+    pub fn key_of(&self, row: &[String]) -> Key {
+        self.key
+            .iter()
+            .filter_map(|column| self.columns.iter().position(|c| c == column))
+            .filter_map(|i| row.get(i).cloned())
+            .collect()
+    }
+}
+
 /// A database smugglr keeps in step.
 ///
 /// Keys and values are SQLite's `quote()` text of each column; hashes are
@@ -132,20 +144,12 @@ pub trait Place {
             .into_iter()
             .map(|(key, _)| key)
             .collect();
-        let positions: Vec<usize> = table
-            .key
-            .iter()
-            .filter_map(|column| table.columns.iter().position(|c| c == column))
-            .collect();
         Ok(self
             .rows(table, &keys)?
             .into_iter()
             .map(|row| {
-                let key = positions
-                    .iter()
-                    .filter_map(|&i| row.get(i).cloned())
-                    .collect();
-                (key, row.iter().map(|column| column.len() as u64).sum())
+                let weight = row.iter().map(|column| column.len() as u64).sum();
+                (table.key_of(&row), weight)
             })
             .collect())
     }

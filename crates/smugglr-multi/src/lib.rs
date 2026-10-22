@@ -280,20 +280,9 @@ fn rows(
     table: &Table,
     keys: &[Key],
 ) -> Result<BTreeMap<Key, Vec<String>>, Error> {
-    let positions: Vec<usize> = table
-        .key
-        .iter()
-        .filter_map(|column| table.columns.iter().position(|c| c == column))
-        .collect();
     Ok(place
         .rows(table, keys)?
         .into_iter()
-        .map(|row| {
-            let key = positions
-                .iter()
-                .filter_map(|&i| row.get(i).cloned())
-                .collect();
-            (key, row)
-        })
+        .map(|row| (table.key_of(&row), row))
         .collect())
 }
