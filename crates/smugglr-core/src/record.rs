@@ -400,12 +400,26 @@ pub fn self_keyed() -> Table {
     }
 }
 
+/// `text` for a terminal: each control character escaped, so a table or key
+/// another node sent cannot drive the terminal the record is printed to.
+fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
 fn keys(keys: &[Key]) -> String {
     keys.iter()
         .map(|key| {
             key.0
                 .iter()
-                .map(|c| shown(c))
+                .map(|c| printable(&shown(c)))
                 .collect::<Vec<_>>()
                 .join(", ")
         })
@@ -447,6 +461,7 @@ impl fmt::Display for Record {
             writeln!(f, "  shape: {}", shape.why)?;
         }
         for (name, table) in &self.tables {
+            let name = printable(name);
             match table {
                 Table::InStep => writeln!(f, "  {name}: in step")?,
                 Table::WouldMove(moves) | Table::Moved(moves) => {
@@ -501,11 +516,29 @@ impl fmt::Display for Record {
             writeln!(
                 f,
                 "  dropped: {} {}, {reason}, change {}",
-                dropped.table,
+                printable(&dropped.table),
                 keys(std::slice::from_ref(&dropped.key)),
                 dropped.change
             )?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Key, keys, printable};
+
+    #[test]
+    fn a_key_holding_an_escape_byte_prints_escaped() {
+        let key = Key(vec!["'a\u{1b}[2Jb'".to_owned()]);
+        let text = keys(&[key]);
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+        assert_eq!(text, "a\\u{1b}[2Jb");
+    }
+
+    #[test]
+    fn a_table_name_holding_a_newline_prints_on_one_line() {
+        assert_eq!(printable("notes\nfake: line"), "notes\\nfake: line");
     }
 }
