@@ -205,7 +205,7 @@ pub fn sync(
         // being written stops, naming the rows it wrote.
         Err(cause) if wrote.journaled => {
             if let Some(name) = wrote.writing.take() {
-                done.insert(name, record::lost(wrote.keys, &cause.to_string()));
+                done.insert(name, record::lost(wrote.written_keys(), &cause.to_string()));
             }
             let mut record = Record::new(done, ignored, false, weight);
             record.deletes_seen = !unknown;
@@ -255,8 +255,30 @@ struct Wrote {
     journaled: bool,
     /// The table being written.
     writing: Option<String>,
-    /// The keys of the rows the places answered as written in that table.
-    keys: Vec<Vec<String>>,
+    /// The writes planned for that table, those for the target first.
+    writes: Vec<Write>,
+    /// Whether the place answered each of `writes` as made.
+    made: Vec<bool>,
+}
+
+impl Wrote {
+    /// The writes the places answered as made, leaving none.
+    fn take_written(&mut self) -> Vec<Write> {
+        let made = std::mem::take(&mut self.made);
+        std::mem::take(&mut self.writes)
+            .into_iter()
+            .zip(made)
+            .filter_map(|(write, made)| made.then_some(write))
+            .collect()
+    }
+
+    /// The keys of the writes the places answered as made, leaving none.
+    fn written_keys(&mut self) -> Vec<Vec<String>> {
+        self.take_written()
+            .into_iter()
+            .map(|write| write.key)
+            .collect()
+    }
 }
 
 /// Writes each table's planned moves, table by table, recording each in
@@ -286,8 +308,7 @@ fn write_all(
             continue;
         }
         wrote.writing = Some(table.name.clone());
-        wrote.keys.clear();
-        let (mismatched, written) = carry_both(
+        let mismatched = carry_both(
             &table,
             &mut *source,
             &mut *target,
@@ -298,10 +319,10 @@ fn write_all(
             wrote,
         )?;
         wrote.writing = None;
-        // The record counts only the rows written.
+        // The record counts only the rows written, and reads no memory.
         let moved = Plan::Move {
-            writes: written,
-            memory: next.clone(),
+            writes: wrote.take_written(),
+            memory: Hashes::new(),
         };
         done.insert(table.name.clone(), record::table(&moved, false));
         if !mismatched.is_empty() {
@@ -481,24 +502,27 @@ fn weigh(
         if copies.is_empty() {
             continue;
         }
-        let weights = |place: &mut dyn Place, side: Side| -> Result<BTreeMap<_, _>, Error> {
-            if copies.iter().any(|write| write.side == side) {
-                Ok(place.weights(table)?.into_iter().collect())
-            } else {
-                Ok(BTreeMap::new())
+        // Each copied row's weight in the place it is copied from: rows
+        // written in the target are copied from the source.
+        let weighed = |place: &mut dyn Place, side: Side| -> Result<u64, Error> {
+            let keys: HashSet<&Vec<String>> = copies
+                .iter()
+                .filter(|write| write.side == side)
+                .map(|write| &write.key)
+                .collect();
+            if keys.is_empty() {
+                return Ok(0);
             }
+            Ok(place
+                .weights(table)?
+                .into_iter()
+                .filter(|(key, _)| keys.contains(key))
+                .map(|(_, bytes)| bytes)
+                .sum())
         };
-        // Rows written in the target are copied from the source.
-        let from_source = weights(&mut *source, Side::Target)?;
-        let from_target = weights(&mut *target, Side::Source)?;
-        for write in copies {
-            let from = match write.side {
-                Side::Target => &from_source,
-                Side::Source => &from_target,
-            };
-            weight.rows += 1;
-            weight.bytes += from.get(&write.key).copied().unwrap_or_default();
-        }
+        weight.bytes += weighed(&mut *source, Side::Target)?;
+        weight.bytes += weighed(&mut *target, Side::Source)?;
+        weight.rows += copies.len() as u64;
         weight.tables += 1;
     }
     Ok(weight)
@@ -580,81 +604,107 @@ fn read_hashes(
 
 /// Carries `writes` each way: those for the target from the source, then
 /// those for the source from the target. Returns the keys of rows that read
-/// back different, and the writes that were made.
+/// back different; the writes made are marked in `wrote`.
 #[allow(clippy::too_many_arguments)]
 fn carry_both(
     table: &Table,
     source: &mut dyn Place,
     target: &mut dyn Place,
-    writes: Vec<Write>,
+    mut writes: Vec<Write>,
     journal: &Memory,
     last: &Hashes,
     memory: &mut Hashes,
     wrote: &mut Wrote,
-) -> Result<(Vec<Vec<String>>, Vec<Write>), Error> {
-    let (to_target, to_source): (Vec<Write>, Vec<Write>) = writes
-        .into_iter()
-        .partition(|write| write.side == Side::Target);
-    let (mut mismatched, mut written) = carry(
-        table, source, target, &to_target, journal, last, memory, wrote,
+) -> Result<Vec<Vec<String>>, Error> {
+    writes.sort_by_key(|write| write.side == Side::Source);
+    let split = writes.partition_point(|write| write.side == Side::Target);
+    let all = writes.len();
+    wrote.made = vec![false; all];
+    wrote.writes = writes;
+    let mut mismatched = carry(
+        table,
+        source,
+        target,
+        0..split,
+        journal,
+        last,
+        memory,
+        wrote,
     )?;
-    let (more, also) = carry(
-        table, target, source, &to_source, journal, last, memory, wrote,
-    )?;
-    mismatched.extend(more);
-    written.extend(also);
-    Ok((mismatched, written))
+    mismatched.extend(carry(
+        table,
+        target,
+        source,
+        split..all,
+        journal,
+        last,
+        memory,
+        wrote,
+    )?);
+    Ok(mismatched)
 }
 
-/// Journals and writes `writes` in `to`, with `from`'s copy of each row,
-/// reads back the rows written and returns the keys of those that do not
-/// match what was written, and the writes that were made. Each write the
-/// place answers as made is noted in `wrote` before the rows are read back.
+/// The most rows carried at once. Each chunk's rows are read, journaled,
+/// written and read back, each step its own transaction, so a place's lock
+/// is held for one chunk, never a whole table, and only one chunk's rows
+/// are held. Current choice (2026-10-22, #580): 20,000; revisable.
+const CHUNK: usize = 20_000;
+
+/// Journals and writes `wrote`'s writes in `range` in `to`, [`CHUNK`] rows
+/// at a time, with `from`'s copy of each row, reads back the rows written
+/// and returns the keys of those that do not match what was written. Each
+/// write the place answers as made is marked in `wrote` before its rows are
+/// read back.
 #[allow(clippy::too_many_arguments)]
 fn carry(
     table: &Table,
     from: &mut dyn Place,
     to: &mut dyn Place,
-    writes: &[Write],
+    range: std::ops::Range<usize>,
     journal: &Memory,
     last: &Hashes,
     memory: &mut Hashes,
     wrote: &mut Wrote,
-) -> Result<(Vec<Vec<String>>, Vec<Write>), Error> {
-    let changes = changes(table, from, writes)?;
-    let to_change: HashSet<&Vec<String>> = changes.iter().map(|change| &change.key).collect();
-    let journaled: Vec<Write> = writes
-        .iter()
-        .filter(|write| to_change.contains(&write.key))
-        .cloned()
-        .collect();
-    // The journal line goes to disk before the row does.
-    journal.journal(&table.name, &journaled)?;
-    if !journaled.is_empty() {
-        wrote.journaled = true;
-    }
-    let made = to.write(table, &changes)?;
-    let made_keys: HashSet<&Vec<String>> = made.iter().collect();
-    // A row not written (gone from `from`, or no longer at the change's
-    // `from` in `to`) keeps its last hash, so the next run decides it from
-    // fresh reads.
-    for write in writes {
-        if !made_keys.contains(&write.key) {
-            match last.get(&write.key) {
-                Some(&hash) => memory.insert(write.key.clone(), hash),
-                None => memory.remove(&write.key),
-            };
+) -> Result<Vec<Vec<String>>, Error> {
+    let mut mismatched = Vec::new();
+    for start in range.clone().step_by(CHUNK) {
+        let end = (start + CHUNK).min(range.end);
+        let writes = &wrote.writes[start..end];
+        let changes = changes(table, from, writes)?;
+        let to_change: HashSet<&Vec<String>> = changes.iter().map(|change| &change.key).collect();
+        let journaled: Vec<Write> = writes
+            .iter()
+            .filter(|write| to_change.contains(&write.key))
+            .cloned()
+            .collect();
+        // The journal line goes to disk before the row does.
+        journal.journal(&table.name, &journaled)?;
+        if !journaled.is_empty() {
+            wrote.journaled = true;
         }
+        let made = to.write(table, &changes)?;
+        let made_keys: HashSet<&Vec<String>> = made.iter().collect();
+        for (i, write) in writes.iter().enumerate() {
+            if made_keys.contains(&write.key) {
+                wrote.made[start + i] = true;
+            } else {
+                // A row not written (gone from `from`, or no longer at the
+                // change's `from` in `to`) keeps its last hash, so the next
+                // run decides it from fresh reads.
+                match last.get(&write.key) {
+                    Some(&hash) => memory.insert(write.key.clone(), hash),
+                    None => memory.remove(&write.key),
+                };
+            }
+        }
+        let written: Vec<Write> = journaled
+            .into_iter()
+            .filter(|write| made_keys.contains(&write.key))
+            .collect();
+        let read_back = read_hashes(table, to, &made)?;
+        mismatched.extend(not_read_back(&written, &read_back));
     }
-    let written: Vec<Write> = journaled
-        .into_iter()
-        .filter(|write| made_keys.contains(&write.key))
-        .collect();
-    wrote
-        .keys
-        .extend(written.iter().map(|write| write.key.clone()));
-    let read_back = read_hashes(table, to, &made)?;
-    Ok((not_read_back(&written, &read_back), written))
+    Ok(mismatched)
 }
 
 /// A row's key, from its columns in column order.
@@ -912,6 +962,62 @@ mod tests {
         drop((here, there, source, target));
         let _ = std::fs::remove_dir_all(&dir);
         Ok(took)
+    }
+
+    /// During a first sync of 500,000 rows another connection's write to
+    /// the target commits within a second: it waits for one chunk, never
+    /// the whole sync (#580).
+    #[test]
+    fn another_write_to_the_target_commits_while_a_first_sync_runs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let rows = 500_000;
+        let dir = std::env::temp_dir().join(format!("smugglr-chunked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let shape = "CREATE TABLE notes (id TEXT PRIMARY KEY, body TEXT); \
+                     CREATE TABLE visits (id TEXT PRIMARY KEY);";
+        sqlite(
+            &dir.join("source.db"),
+            &format!(
+                "{shape} WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n \
+                 WHERE i < {rows}) INSERT INTO notes SELECT 'n' || i, 'body ' || i FROM n;"
+            ),
+        )?;
+        let target = sqlite(&dir.join("target.db"), shape)?;
+        let options = Options {
+            config_dir: Some(dir.join("config")),
+            max_wire: Some(u64::MAX),
+            ..Options::default()
+        };
+        let paths = (dir.join("source.db"), dir.join("target.db"));
+        let syncing = std::thread::spawn(move || -> Result<(), String> {
+            let open = |path| LocalFile::open(path).map_err(|err| err.to_string());
+            let (mut here, mut there) = (open(&paths.0)?, open(&paths.1)?);
+            sync(&mut here, &mut there, &options)
+                .map(|_| ())
+                .map_err(|err| err.to_string())
+        });
+        let count =
+            || target.query_row("SELECT count(*) FROM notes", [], |row| row.get::<_, i64>(0));
+        // Once the sync has written its first chunk, and while it writes the
+        // rest.
+        while count()? == 0 && !syncing.is_finished() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let start = std::time::Instant::now();
+        target.execute("INSERT INTO visits VALUES ('v1')", [])?;
+        let took = start.elapsed();
+        let written = count()?;
+        syncing.join().map_err(|_| "the sync panicked")??;
+        println!("the write committed in {took:?}, with {written} rows synced");
+        assert!(written < rows, "the sync was done before the write began");
+        assert!(
+            took < std::time::Duration::from_secs(1),
+            "the write took {took:?}"
+        );
+        drop(target);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
     }
 
     /// A sync's cost grows linearly with the rows it writes (#577): twice

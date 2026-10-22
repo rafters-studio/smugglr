@@ -173,7 +173,9 @@ pub fn plan_steered(
     steered: &Steered,
 ) -> Plan {
     let mut writes = Vec::new();
-    let mut next = Hashes::new();
+    // Gathered in key order and built into a map at once, so its nodes are
+    // full rather than half full from one insert at a time.
+    let mut next = Vec::new();
     let mut stopped = Vec::new();
     for (key, decided, side) in decisions(table, source, target, memory) {
         let (s, t) = (source.get(key).copied(), target.get(key).copied());
@@ -192,7 +194,7 @@ pub fn plan_steered(
         let (side, overwrite) = match (decided, mode, kept) {
             (Decision::Skip, ..) => {
                 if let Some(hash) = s {
-                    next.insert(key.clone(), hash);
+                    next.push((key.clone(), hash));
                 }
                 continue;
             }
@@ -210,7 +212,7 @@ pub fn plan_steered(
             Side::Source => (s, t),
         };
         if let Some(hash) = to {
-            next.insert(key.clone(), hash);
+            next.push((key.clone(), hash));
         }
         writes.push(Write {
             side,
@@ -224,7 +226,7 @@ pub fn plan_steered(
     if stopped.is_empty() {
         Plan::Move {
             writes,
-            memory: next,
+            memory: next.into_iter().collect(),
         }
     } else {
         Plan::Stop { rows: stopped }

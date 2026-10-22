@@ -175,25 +175,28 @@ impl Place for LocalFile {
             address: address.clone(),
             source,
         };
-        let mut statement = self
-            .connection
-            .prepare(&queries::row(table))
-            .map_err(sqlite)?;
+        // One read transaction for every key asked for, not a lock taken and
+        // dropped per statement.
+        let transaction = self.connection.transaction().map_err(sqlite)?;
         let mut found = Vec::new();
-        for key in keys {
-            let key = key
-                .iter()
-                .map(|column| unquote(column))
-                .collect::<Result<Vec<_>, Error>>()?;
-            let mut rows = statement.query(params_from_iter(key)).map_err(sqlite)?;
-            if let Some(row) = rows.next().map_err(sqlite)? {
-                let columns = (0..width)
-                    .map(|i| row.get::<_, String>(i))
-                    .collect::<rusqlite::Result<Vec<String>>>()
-                    .map_err(sqlite)?;
-                found.push(columns);
+        {
+            let mut statement = transaction.prepare(&queries::row(table)).map_err(sqlite)?;
+            for key in keys {
+                let key = key
+                    .iter()
+                    .map(|column| unquote(column))
+                    .collect::<Result<Vec<_>, Error>>()?;
+                let mut rows = statement.query(params_from_iter(key)).map_err(sqlite)?;
+                if let Some(row) = rows.next().map_err(sqlite)? {
+                    let columns = (0..width)
+                        .map(|i| row.get::<_, String>(i))
+                        .collect::<rusqlite::Result<Vec<String>>>()
+                        .map_err(sqlite)?;
+                    found.push(columns);
+                }
             }
         }
+        transaction.commit().map_err(sqlite)?;
         Ok(found)
     }
 

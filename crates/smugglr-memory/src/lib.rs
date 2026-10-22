@@ -152,10 +152,28 @@ impl Memory {
     /// # Errors
     /// When the folder or its file cannot be written.
     pub fn save(&self) -> Result<(), Error> {
-        let mut text = String::new();
+        // Sized up front: the memory is one string, and growing it by
+        // doubling would briefly hold it twice.
+        let size: usize = self
+            .tables
+            .iter()
+            .map(|(table, hashes)| {
+                hashes
+                    .keys()
+                    .map(|key| {
+                        2 * table.len()
+                            + 2
+                            + 32
+                            + key.iter().map(|column| 1 + 2 * column.len()).sum::<usize>()
+                    })
+                    .sum::<usize>()
+            })
+            .sum();
+        let mut text = String::with_capacity(size);
         for (table, hashes) in &self.tables {
+            let table = hex(table.as_bytes());
             for (key, hash) in hashes {
-                text.push_str(&hex(table.as_bytes()));
+                text.push_str(&table);
                 text.push(' ');
                 text.push_str(&hex(hash));
                 for column in key {
