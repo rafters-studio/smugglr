@@ -78,3 +78,36 @@ Feature: @smugglr/nanostores and @smugglr/zustand make an app's store a view on 
     Given a tab whose database holds rows in todos
     When the app mounts a store made with @smugglr/nanostores bound to todos and awaits allTasks()
     Then the store holds every row when allTasks() resolves
+
+  @criterion-01a1650a-6989-7173-870f-38f29c1875cd @module-front-ends
+  Scenario Outline: a refused write is put back and reported
+    Given a store made with <bridge> bound to todos, loaded, whose table refuses a row with no title
+    When the app sets a key in the store to a value with no title
+    Then the store holds what the table holds for that key, and the bridge's error listener received the refusal
+
+    Examples:
+      | bridge              |
+      | @smugglr/nanostores |
+      | @smugglr/zustand    |
+
+  @criterion-01a1650a-6989-7173-870f-390fb398fcda @module-front-ends
+  Scenario Outline: a change made before the load is kept
+    Given a tab whose database holds rows in todos, and a store made with <bridge> bound to todos whose load has not finished
+    When the app sets a new key in the store before the load finishes
+    Then once the load finishes, the store and the tab's database both hold that key
+
+    Examples:
+      | bridge              |
+      | @smugglr/nanostores |
+      | @smugglr/zustand    |
+
+  @criterion-01a1650a-6989-7173-870f-3919c06cc167 @module-front-ends
+  Scenario Outline: a reload does not overwrite a newer change
+    Given a store made with <bridge> bound to todos, loaded, holding two rows
+    When a sync changes one row and the app changes the other key in the store before the reload finishes
+    Then the store holds the synced row and the app's change, and the tab's database holds both
+
+    Examples:
+      | bridge              |
+      | @smugglr/nanostores |
+      | @smugglr/zustand    |

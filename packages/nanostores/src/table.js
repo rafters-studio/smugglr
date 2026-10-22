@@ -38,14 +38,24 @@ export async function table(tab, name) {
       );
       return texts.map((text) => [unquote(text), found[unquote(text)]]);
     },
-    /** Writes `item` as the row of `id`. */
-    write: (id, item) =>
-      tab.exec(
-        `INSERT OR REPLACE INTO ${ident(name)} (${columns.map(ident).join(', ')}) VALUES (${columns.map(() => '?').join(', ')})`,
-        columns.map((column) => (column === key ? id : (item[column] ?? null))),
-      ),
-    /** Deletes the row of `id`. */
-    remove: (id) => tab.exec(`DELETE FROM ${ident(name)} WHERE ${ident(key)} = ?`, [id]),
+    /**
+     * Writes `item` as the row of `id`, or deletes the row when `item` is
+     * undefined. When the tab refuses, calls `putBack(id, row)` with what
+     * the table holds for `id` (undefined when nothing), then `refused(err)`.
+     */
+    async save(id, item, putBack, refused) {
+      try {
+        await (item === undefined
+          ? tab.exec(`DELETE FROM ${ident(name)} WHERE ${ident(key)} = ?`, [id])
+          : tab.exec(
+              `INSERT OR REPLACE INTO ${ident(name)} (${columns.map(ident).join(', ')}) VALUES (${columns.map(() => '?').join(', ')})`,
+              columns.map((column) => (column === key ? id : (item[column] ?? null))),
+            ));
+      } catch (err) {
+        putBack(id, items(await tab.query(`${select} WHERE ${ident(key)} = ?`, [id]))[id]);
+        refused(err);
+      }
+    },
     /** Calls `heard` with the keys of each table-changed naming this table; returns its stop. */
     listen(heard) {
       const changed = ({ detail }) => {

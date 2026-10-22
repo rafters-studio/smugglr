@@ -11,9 +11,9 @@ use serde_json::{Value as Json, json};
 
 use crate::tab::Web;
 
-/// The app's table the stores are bound to.
+/// The app's table the stores are bound to; it refuses a row with no title.
 const TODOS: &str =
-    "CREATE TABLE IF NOT EXISTS todos (id TEXT PRIMARY KEY, title TEXT, done INTEGER)";
+    "CREATE TABLE IF NOT EXISTS todos (id TEXT PRIMARY KEY, title TEXT NOT NULL, done INTEGER)";
 
 /// Three rows; a scenario starts with the first `n` of them.
 const ROWS: [(&str, &str, i64); 3] = [("t1", "milk", 0), ("t2", "bread", 0), ("t3", "eggs", 1)];
@@ -51,61 +51,77 @@ fn tab_with(web: &Web, n: usize) -> Result<(), String> {
 
 /// Makes `bridge`'s store in tab 0, bound to todos, as `window.view`
 /// (`items()`, `set(id, item)`, `remove(id)`), counting each notice the
-/// store sends after its load in `window.notified`; returns the items the
-/// store held when its load finished.
-fn make(web: &Web, bridge: &str) -> Result<Json, String> {
+/// store sends after its load in `window.notified` and each refusal its
+/// error listener hears in `window.errors`. Returns the items the store held
+/// when its load finished; when `held`, the store's tab is held back until
+/// `release()` is called, and `window.ready` resolves to those items.
+fn make(web: &Web, bridge: &str, held: bool) -> Result<Json, String> {
     web.bridge.set(bridge.to_owned());
-    let js = match bridge {
-        "@smugglr/nanostores" => {
-            "(async () => {
-               const { map, allTasks } = await import('nanostores');
-               const { bind } = await import('/nanostores/index.js');
-               window.store = map({});
-               bind(store, { tab, table: 'todos' });
-               window.notified = 0;
-               store.listen(() => notified++);
-               await allTasks();
-               window.loaded = store.get();
-               notified = 0;
-               window.view = {
-                 items: () => store.get(),
-                 set: (id, item) => store.setKey(id, item),
-                 remove: (id) => store.setKey(id, undefined),
-               };
-               return loaded;
-             })()"
-        }
-        "@smugglr/zustand" => {
-            "(async () => {
-               const { createStore } = await import('zustand/vanilla');
-               const { smugglr } = await import('/zustand/index.js');
-               window.store = createStore(
-                 smugglr(() => ({ todos: {} }), { tab, table: 'todos', collection: 'todos' }),
-               );
-               window.hydrations = 0;
-               store.smugglr.onFinishHydration(() => hydrations++);
-               window.early = store.smugglr.hasHydrated();
+    let (create, view, load) = match bridge {
+        "@smugglr/nanostores" => (
+            "const { map, allTasks } = await import('nanostores');
+             const { bind } = await import('/nanostores/index.js');
+             window.store = map({});
+             bind(store, { tab: bound, table: 'todos', onError });
+             window.notified = 0;
+             store.listen(() => notified++);",
+            "items: () => store.get(),
+             set: (id, item) => store.setKey(id, item),
+             remove: (id) => store.setKey(id, undefined),",
+            "await allTasks();
+             window.loaded = store.get();",
+        ),
+        "@smugglr/zustand" => (
+            "const { createStore } = await import('zustand/vanilla');
+             const { smugglr } = await import('/zustand/index.js');
+             window.store = createStore(
+               smugglr(() => ({ todos: {} }), { tab: bound, table: 'todos', collection: 'todos', onError }),
+             );
+             window.hydrations = 0;
+             store.smugglr.onFinishHydration(() => hydrations++);
+             window.early = store.smugglr.hasHydrated();
+             window.notified = 0;
+             store.subscribe(() => notified++);",
+            "items: () => store.getState().todos,
+             set: (id, item) => store.setState((state) => ({ todos: { ...state.todos, [id]: item } })),
+             remove: (id) =>
+               store.setState((state) => {
+                 const todos = { ...state.todos };
+                 delete todos[id];
+                 return { todos };
+               }),",
+            "if (!store.smugglr.hasHydrated()) {
                await new Promise((done) => store.smugglr.onFinishHydration(done));
-               window.late = store.smugglr.hasHydrated();
-               window.loaded = store.getState().todos;
-               window.notified = 0;
-               store.subscribe(() => notified++);
-               window.view = {
-                 items: () => store.getState().todos,
-                 set: (id, item) => store.setState((state) => ({ todos: { ...state.todos, [id]: item } })),
-                 remove: (id) =>
-                   store.setState((state) => {
-                     const todos = { ...state.todos };
-                     delete todos[id];
-                     return { todos };
-                   }),
-               };
-               return loaded;
-             })()"
-        }
+             }
+             window.late = store.smugglr.hasHydrated();
+             window.loaded = store.getState().todos;",
+        ),
         other => return Err(format!("no bridge {other}")),
     };
-    web.browser()?.eval(0, js)
+    let bound = if held {
+        "new Promise((done) => { window.release = () => done(tab); })"
+    } else {
+        "tab"
+    };
+    let wait = if held { "" } else { "return await ready;" };
+    web.browser()?.eval(
+        0,
+        &format!(
+            "(async () => {{
+               window.errors = [];
+               const onError = (err) => errors.push(String(err?.message ?? err));
+               const bound = {bound};
+               {create}
+               window.view = {{ {view} }};
+               window.ready = (async () => {{
+                 {load}
+                 notified = 0;
+                 return loaded;
+               }})();
+               {wait}
+             }})()"
+        ),
+    )
 }
 
 /// Waits until `js`, evaluated in tab 0, is `want`.
@@ -142,7 +158,7 @@ fn tab_rows(web: &Web) -> Result<(), String> {
 
 #[when("the app makes a store with {bridge} bound to todos and its load finishes")]
 fn makes_store(web: &Web, bridge: String) -> Result<(), String> {
-    make(web, &bridge).map(drop)
+    make(web, &bridge, false).map(drop)
 }
 
 #[then("the store holds the three rows, each under its key")]
@@ -153,14 +169,14 @@ fn holds_three(web: &Web) -> Result<(), String> {
 #[given("a store made with {bridge} bound to todos, loaded")]
 fn store_loaded(web: &Web, bridge: String) -> Result<(), String> {
     tab_with(web, 3)?;
-    make(web, &bridge).map(drop)
+    make(web, &bridge, false).map(drop)
 }
 
 /// `bridge`'s store, loaded from a tab holding the first `n` rows; fails
 /// unless it loaded exactly those.
 fn loaded_with(web: &Web, bridge: &str, n: usize) -> Result<(), String> {
     tab_with(web, n)?;
-    let loaded = make(web, bridge)?;
+    let loaded = make(web, bridge, false)?;
     if loaded == items(n) {
         Ok(())
     } else {
@@ -299,7 +315,7 @@ fn nothing_on_server(web: &Web) -> Result<(), String> {
 
 #[when("the app makes a store with @smugglr/zustand bound to todos")]
 fn makes_zustand(web: &Web) -> Result<(), String> {
-    make(web, "@smugglr/zustand").map(drop)
+    make(web, "@smugglr/zustand", false).map(drop)
 }
 
 #[then(
@@ -321,7 +337,7 @@ fn hydrated(web: &Web) -> Result<(), String> {
 
 #[when("the app mounts a store made with @smugglr/nanostores bound to todos and awaits allTasks()")]
 fn mounts_nanostores(web: &Web) -> Result<(), String> {
-    make(web, "@smugglr/nanostores").map(drop)
+    make(web, "@smugglr/nanostores", false).map(drop)
 }
 
 #[then("the store holds every row when allTasks() resolves")]
@@ -332,4 +348,94 @@ fn held_at_all_tasks(web: &Web) -> Result<(), String> {
     } else {
         Err(format!("when allTasks() resolved the store held {loaded}"))
     }
+}
+
+#[given(
+    "a store made with {bridge} bound to todos, loaded, whose table refuses a row with no title"
+)]
+fn store_refusing(web: &Web, bridge: String) -> Result<(), String> {
+    // todos' title is NOT NULL.
+    loaded_with(web, &bridge, 3)
+}
+
+#[when("the app sets a key in the store to a value with no title")]
+fn sets_no_title(web: &Web) -> Result<(), String> {
+    web.browser()?
+        .eval(0, "view.set('t1', { id: 't1', done: 1 })")
+        .map(drop)
+}
+
+#[then(
+    "the store holds what the table holds for that key, and the bridge's error listener received the refusal"
+)]
+fn put_back_and_reported(web: &Web) -> Result<(), String> {
+    settles(web, "errors.length", &json!(1))?;
+    settles(web, "view.items().t1", &items(1)["t1"])?;
+    settles(web, &row("t1"), &json!([["t1", "milk", 0]]))?;
+    let errors = web.browser()?.eval(0, "errors")?;
+    if errors.to_string().contains("NOT NULL") {
+        Ok(())
+    } else {
+        Err(format!("the error listener heard {errors}"))
+    }
+}
+
+#[given(
+    "a tab whose database holds rows in todos, and a store made with {bridge} bound to todos whose load has not finished"
+)]
+fn store_not_loaded(web: &Web, bridge: String) -> Result<(), String> {
+    tab_with(web, 3)?;
+    make(web, &bridge, true).map(drop)
+}
+
+#[when("the app sets a new key in the store before the load finishes")]
+fn sets_before_load(web: &Web) -> Result<(), String> {
+    web.browser()?
+        .eval(
+            0,
+            "view.set('t9', { id: 't9', title: 'set in the store', done: 0 }); release()",
+        )
+        .map(drop)
+}
+
+#[then("once the load finishes, the store and the tab's database both hold that key")]
+fn kept_after_load(web: &Web) -> Result<(), String> {
+    let t9 = json!({"id": "t9", "title": "set in the store", "done": 0});
+    let loaded = web.browser()?.eval(0, "ready")?;
+    let mut want = items(3);
+    want["t9"] = t9.clone();
+    if loaded != want {
+        return Err(format!("when its load finished the store held {loaded}"));
+    }
+    settles(web, "view.items().t9", &t9)?;
+    settles(web, &row("t9"), &json!([["t9", "set in the store", 0]]))
+}
+
+#[when(
+    "a sync changes one row and the app changes the other key in the store before the reload finishes"
+)]
+fn sync_and_app_change(web: &Web) -> Result<(), String> {
+    let browser = web.browser()?;
+    // The app's change lands as table-changed is heard, while the bridge's
+    // reload is still reading the changed row.
+    browser.eval(
+        0,
+        "tab.addEventListener('table-changed', () => view.set('t2', { id: 't2', title: 'changed in the store', done: 1 }), { once: true })",
+    )?;
+    web.at_endpoint("UPDATE todos SET title = 'changed by a sync' WHERE id = 't1'")?;
+    browser.eval(0, "tab.sync()").map(drop)
+}
+
+#[then("the store holds the synced row and the app's change, and the tab's database holds both")]
+fn both_kept(web: &Web) -> Result<(), String> {
+    settles(web, "view.items().t1.title", &json!("changed by a sync"))?;
+    // A moment more: a late reload would overwrite the app's change by now.
+    std::thread::sleep(Duration::from_millis(500));
+    settles(
+        web,
+        "view.items().t2",
+        &json!({"id": "t2", "title": "changed in the store", "done": 1}),
+    )?;
+    settles(web, &row("t1"), &json!([["t1", "changed by a sync", 0]]))?;
+    settles(web, &row("t2"), &json!([["t2", "changed in the store", 1]]))
 }
