@@ -5,7 +5,7 @@
 
 mod shape;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -622,9 +622,10 @@ fn carry(
     wrote: &mut Wrote,
 ) -> Result<(Vec<Vec<String>>, Vec<Write>), Error> {
     let changes = changes(table, from, writes)?;
+    let to_change: HashSet<&Vec<String>> = changes.iter().map(|change| &change.key).collect();
     let journaled: Vec<Write> = writes
         .iter()
-        .filter(|write| changes.iter().any(|change| change.key == write.key))
+        .filter(|write| to_change.contains(&write.key))
         .cloned()
         .collect();
     // The journal line goes to disk before the row does.
@@ -633,11 +634,12 @@ fn carry(
         wrote.journaled = true;
     }
     let made = to.write(table, &changes)?;
+    let made_keys: HashSet<&Vec<String>> = made.iter().collect();
     // A row not written (gone from `from`, or no longer at the change's
     // `from` in `to`) keeps its last hash, so the next run decides it from
     // fresh reads.
     for write in writes {
-        if !made.contains(&write.key) {
+        if !made_keys.contains(&write.key) {
             match last.get(&write.key) {
                 Some(&hash) => memory.insert(write.key.clone(), hash),
                 None => memory.remove(&write.key),
@@ -646,7 +648,7 @@ fn carry(
     }
     let written: Vec<Write> = journaled
         .into_iter()
-        .filter(|write| made.contains(&write.key))
+        .filter(|write| made_keys.contains(&write.key))
         .collect();
     wrote
         .keys
@@ -875,6 +877,55 @@ mod tests {
         assert_eq!(record.tables.keys().collect::<Vec<_>>(), ["notes", "tags"]);
         drop((source, target));
         let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Syncs `rows` rows from a new source into an empty target, and
+    /// returns how long the sync took.
+    fn time_first_sync(
+        name: &str,
+        rows: u32,
+    ) -> Result<std::time::Duration, Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join(format!("smugglr-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let shape = "CREATE TABLE notes (id TEXT PRIMARY KEY, body TEXT);";
+        let source = sqlite(
+            &dir.join("source.db"),
+            &format!(
+                "{shape} WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n \
+                 WHERE i < {rows}) INSERT INTO notes SELECT 'n' || i, 'body ' || i FROM n;"
+            ),
+        )?;
+        let target = sqlite(&dir.join("target.db"), shape)?;
+        let options = Options {
+            config_dir: Some(dir.join("config")),
+            max_wire: Some(u64::MAX),
+            ..Options::default()
+        };
+        let mut here = LocalFile::open(dir.join("source.db"))?;
+        let mut there = LocalFile::open(dir.join("target.db"))?;
+        let start = std::time::Instant::now();
+        sync(&mut here, &mut there, &options)?;
+        let took = start.elapsed();
+        assert_eq!(dump(&target, "notes")?.len(), usize::try_from(rows)?);
+        drop((here, there, source, target));
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(took)
+    }
+
+    /// A sync's cost grows linearly with the rows it writes (#577): twice
+    /// the rows takes less than three times as long.
+    #[test]
+    fn a_sync_twice_as_big_takes_less_than_three_times_as_long()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let smaller = time_first_sync("linear-200k", 200_000)?;
+        let larger = time_first_sync("linear-400k", 400_000)?;
+        println!("200,000 rows took {smaller:?}, 400,000 rows took {larger:?}");
+        assert!(
+            larger < smaller * 3,
+            "200,000 rows took {smaller:?}, 400,000 rows took {larger:?}"
+        );
         Ok(())
     }
 }
