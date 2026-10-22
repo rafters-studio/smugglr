@@ -237,6 +237,9 @@ mod tests {
             &db,
             "SELECT quote(owner), quote(name), quote(n) FROM tags ORDER BY name",
         )?;
+        // Windows removes no file a connection still holds open.
+        drop(db);
+        drop(place);
         std::fs::remove_dir_all(&folder).map_err(|err| text(&err))?;
 
         assert_eq!(record.status, Status::Done);
