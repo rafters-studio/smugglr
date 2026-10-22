@@ -32,6 +32,10 @@ export function bind(store, { tab, table: name, onError = raise }) {
     let bound;
     // Keys the store changed before the load finished.
     const pending = new Set();
+    // When the store last changed each key, as a count of its changes; a
+    // reload skips a key the store changed after the reload began.
+    let clock = 0;
+    const touched = new Map();
     // Rows put into the store from the database are not written back.
     let loading = false;
     const put = (change) => {
@@ -53,6 +57,7 @@ export function bind(store, { tab, table: name, onError = raise }) {
           if (value[id] === old?.[id]) {
             continue;
           }
+          touched.set(id, ++clock);
           if (bound === undefined) {
             pending.add(id);
           } else {
@@ -83,10 +88,13 @@ export function bind(store, { tab, table: name, onError = raise }) {
       pending.clear();
       stops.push(
         bound.listen(async (keys) => {
+          const began = clock;
           const found = await bound.some(keys);
           if (mounted) {
             for (const [id, item] of found) {
-              putOne(id, item);
+              if (!(touched.get(id) > began)) {
+                putOne(id, item);
+              }
             }
           }
         }),

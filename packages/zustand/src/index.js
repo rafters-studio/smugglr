@@ -44,6 +44,10 @@ export const smugglr =
     let bound;
     // Items the app changed before the load finished.
     const pending = new Set();
+    // When the app last changed each item, as a count of its changes; a
+    // reload skips an item the app changed after the reload began.
+    let clock = 0;
+    const touched = new Map();
     // Rows put into the store from the database are not written back.
     let loading = false;
     const put = (items) => {
@@ -76,6 +80,7 @@ export const smugglr =
         if (after[id] === before[id]) {
           continue;
         }
+        touched.set(id, ++clock);
         if (bound === undefined) {
           pending.add(id);
         } else {
@@ -100,7 +105,11 @@ export const smugglr =
         bound.save(id, current[id], putOne, onError);
       }
       pending.clear();
-      bound.listen(async (keys) => putSome(await bound.some(keys)));
+      bound.listen(async (keys) => {
+        const began = clock;
+        const found = await bound.some(keys);
+        putSome(found.filter(([id]) => !(touched.get(id) > began)));
+      });
       hydrated = true;
       for (const listener of finished) {
         listener(get());

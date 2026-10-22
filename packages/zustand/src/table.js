@@ -41,7 +41,8 @@ export async function table(tab, name) {
     /**
      * Writes `item` as the row of `id`, or deletes the row when `item` is
      * undefined. When the tab refuses, calls `putBack(id, row)` with what
-     * the table holds for `id` (undefined when nothing), then `refused(err)`.
+     * the table holds for `id` (undefined when nothing), then `refused(err)`;
+     * when reading what the table holds fails too, `refused` hears that as well.
      */
     async save(id, item, putBack, refused) {
       try {
@@ -52,8 +53,16 @@ export async function table(tab, name) {
               columns.map((column) => (column === key ? id : (item[column] ?? null))),
             ));
       } catch (err) {
-        putBack(id, items(await tab.query(`${select} WHERE ${ident(key)} = ?`, [id]))[id]);
+        let unread;
+        try {
+          putBack(id, items(await tab.query(`${select} WHERE ${ident(key)} = ?`, [id]))[id]);
+        } catch (reading) {
+          unread = reading;
+        }
         refused(err);
+        if (unread !== undefined) {
+          refused(unread);
+        }
       }
     },
     /** Calls `heard` with the keys of each table-changed naming this table; returns its stop. */

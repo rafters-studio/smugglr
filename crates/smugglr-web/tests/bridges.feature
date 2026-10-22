@@ -111,3 +111,14 @@ Feature: @smugglr/nanostores and @smugglr/zustand make an app's store a view on 
       | bridge              |
       | @smugglr/nanostores |
       | @smugglr/zustand    |
+
+  @criterion-01a16511-f761-76b1-abd4-b50fc87d0d89 @module-front-ends
+  Scenario Outline: a reload does not overwrite a change to the same key
+    Given a store made with <bridge> bound to todos, loaded, holding a row
+    When a sync changes that row and the app changes the same key in the store before the reload finishes
+    Then the store and the tab's database both hold the app's change
+
+    Examples:
+      | bridge              |
+      | @smugglr/nanostores |
+      | @smugglr/zustand    |

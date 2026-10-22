@@ -439,3 +439,31 @@ fn both_kept(web: &Web) -> Result<(), String> {
     settles(web, &row("t1"), &json!([["t1", "changed by a sync", 0]]))?;
     settles(web, &row("t2"), &json!([["t2", "changed in the store", 1]]))
 }
+
+#[when(
+    "a sync changes that row and the app changes the same key in the store before the reload finishes"
+)]
+fn sync_and_app_change_same(web: &Web) -> Result<(), String> {
+    let browser = web.browser()?;
+    // The app's change lands as table-changed is heard, while the bridge's
+    // reload is still reading that same row.
+    browser.eval(
+        0,
+        "tab.addEventListener('table-changed', () => view.set('t1', { id: 't1', title: 'changed in the store', done: 1 }), { once: true })",
+    )?;
+    web.at_endpoint("UPDATE todos SET title = 'changed by a sync' WHERE id = 't1'")?;
+    browser.eval(0, "tab.sync()").map(drop)
+}
+
+#[then("the store and the tab's database both hold the app's change")]
+fn app_change_kept(web: &Web) -> Result<(), String> {
+    settles(web, &row("t1"), &json!([["t1", "changed in the store", 1]]))?;
+    // A moment more: a late reload would put the sync's older read back now.
+    std::thread::sleep(Duration::from_millis(500));
+    settles(
+        web,
+        "view.items().t1",
+        &json!({"id": "t1", "title": "changed in the store", "done": 1}),
+    )?;
+    settles(web, &row("t1"), &json!([["t1", "changed in the store", 1]]))
+}
