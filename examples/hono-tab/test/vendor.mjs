@@ -1,6 +1,6 @@
 // Packs @smugglr/web from this repository, as an app would install it, and
-// lays it out in vendor/smugglr-web: the Worker takes the engine from it,
-// and the test's tab page loads it.
+// lays it out in vendor/smugglr-web: the example installs it from there as
+// @smugglr/web, and the test's tab page loads it.
 
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';

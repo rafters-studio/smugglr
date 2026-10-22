@@ -3,7 +3,7 @@
 // to the engine (stashRows, from @smugglr/web), whose own stash makes the
 // blob, signed with the app's key: no blob format is written here.
 
-import { stashRows } from "../vendor/smugglr-web/src/engine/smugglr_web.js";
+import { stashRows } from "@smugglr/web/engine";
 import { ident, OWNER, type Table } from "./place";
 
 /** What a stash names: the app's key (64 hex digits), this node, and the device it is for. */

@@ -8,7 +8,7 @@ binding = "DB"
 database_name = "hono-tab"
 database_id = "00000000-0000-0000-0000-000000000000"
 
-# SQLite's and the engine's WebAssembly, compiled at deploy.
+# The engine's WebAssembly (@smugglr/web/engine), compiled at deploy.
 [[rules]]
 type = "CompiledWasm"
 globs = ["**/*.wasm"]

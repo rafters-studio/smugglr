@@ -61,13 +61,15 @@ after the retrieve carries only what changed since the blob.
 ## Run it locally
 
 ```console
-$ pnpm install
 $ pnpm vendor
+$ pnpm install
 $ pnpm test
 ```
 
 `pnpm vendor` packs `@smugglr/web` from this repository into
-`vendor/smugglr-web`, where the Worker takes the engine from. `pnpm test`
+`vendor/smugglr-web`, which the example installs as `@smugglr/web`. The
+Worker imports the engine as an app would, from `@smugglr/web/engine`; on
+Workers that export comes ready, its WebAssembly compiled at deploy. `pnpm test`
 runs `wrangler dev` with a local D1 and keeps tabs in headless Chromium in
 step with it; it needs Playwright's Chromium, as `@smugglr/web`'s own tests
 do.

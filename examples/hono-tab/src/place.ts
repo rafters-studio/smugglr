@@ -8,11 +8,9 @@
 // change's `from`, all in one D1 batch, the same rule as smugglr's HTTP-SQL
 // place.
 
-import { initSync, rowHash } from "../vendor/smugglr-web/src/engine/smugglr_web.js";
-import engineWasm from "../vendor/smugglr-web/src/engine/smugglr_web_bg.wasm";
-
-// The engine, compiled at deploy, instantiated once per isolate.
-initSync({ module: engineWasm });
+// On Workers, @smugglr/web/engine comes ready: its WebAssembly is compiled
+// at deploy and instantiated once per isolate.
+import { rowHash } from "@smugglr/web/engine";
 
 /** The column that says whose a row is. */
 export const OWNER = "owner";
