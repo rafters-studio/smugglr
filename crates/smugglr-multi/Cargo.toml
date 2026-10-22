@@ -1,0 +1,20 @@
+[package]
+name = "smugglr-multi"
+description = "smugglr multi: stash and retrieve keep a person's own devices in step through blobs the app stores."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+smugglr-core = { workspace = true }
+smugglr-memory = { workspace = true }
+smugglr-place = { workspace = true }
+blake3 = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

@@ -5,8 +5,10 @@
 //! `key_id`, the table's shape stamp and a signature over all of them; the
 //! row's values follow, bound by `to`, the hash they must have. On arrival
 //! each change goes through the one decision path ([`decide`]): skipped when
-//! its `to` is here, applied when its `from` is, held when its `from`
-//! matches nothing here, and a conflict when the place's last change of the
+//! its `to` is here or is the `from` of the last change applied to the row
+//! (a late copy the row has moved past), applied when its `from` is here,
+//! held when its `from` matches nothing else here, and a conflict when the
+//! place's last change of the
 //! row came from the same `from` to a different `to`, which `--sync-mode`
 //! settles (stop or last). Changes that were one transaction at the source
 //! are applied all or none. A change whose signature does not match its
@@ -26,6 +28,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::change::{Change, Decision, Op, decide};
+use crate::hex::{hex, unhex};
 use crate::plan::SyncMode;
 use crate::record::Reason;
 use crate::row_hash::row_hash;
@@ -147,6 +150,96 @@ impl Envelope {
     }
 }
 
+impl Envelope {
+    /// The envelope as JSON, its values included: how a blob and smugglr's
+    /// own files hold it.
+    #[must_use]
+    pub fn to_json(&self) -> serde_json::Value {
+        let change = &self.change;
+        let hash = |hash: Option<[u8; 16]>| hash.map(|hash| hex(&hash));
+        let txn = self
+            .txn
+            .as_ref()
+            .map(|txn| serde_json::json!({"id": txn.id, "count": txn.count}));
+        serde_json::json!({
+            "v": self.v,
+            "op": match change.op {
+                Op::Up => "up",
+                Op::Down => "down",
+                Op::Upsert => "upsert",
+            },
+            "node": self.node,
+            "table": change.table,
+            "key": change.key,
+            "from": hash(change.from),
+            "to": hash(change.to),
+            "targets": self.targets,
+            "sunset": self.sunset,
+            "txn": txn,
+            "key_id": self.key_id,
+            "stamp": hex(&self.stamp.0),
+            "signature": hex(&self.signature),
+            "values": change.values,
+        })
+    }
+
+    /// The envelope [`Envelope::to_json`] wrote; `None` when `json` is not
+    /// one. Whether it is signed is [`Envelope::verify`]'s to say.
+    #[must_use]
+    pub fn from_json(json: &serde_json::Value) -> Option<Self> {
+        let text = |name: &str| json.get(name)?.as_str().map(str::to_owned);
+        let texts = |name: &str| -> Option<Vec<String>> {
+            json.get(name)?
+                .as_array()?
+                .iter()
+                .map(|item| item.as_str().map(str::to_owned))
+                .collect()
+        };
+        let hash = |name: &str| -> Option<Option<[u8; 16]>> {
+            match json.get(name)? {
+                serde_json::Value::Null => Some(None),
+                value => Some(Some(bytes(value.as_str()?)?)),
+            }
+        };
+        let op = match json.get("op")?.as_str()? {
+            "up" => Op::Up,
+            "down" => Op::Down,
+            "upsert" => Op::Upsert,
+            _ => return None,
+        };
+        let txn = match json.get("txn") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(txn) => Some(Txn {
+                id: txn.get("id")?.as_str()?.to_owned(),
+                count: u32::try_from(txn.get("count")?.as_u64()?).ok()?,
+            }),
+        };
+        Some(Self {
+            v: u32::try_from(json.get("v")?.as_u64()?).ok()?,
+            node: text("node")?,
+            change: Change {
+                op,
+                table: text("table")?,
+                key: texts("key")?,
+                from: hash("from")?,
+                to: hash("to")?,
+                values: texts("values")?,
+            },
+            targets: texts("targets")?,
+            sunset: json.get("sunset")?.as_u64()?,
+            txn,
+            key_id: text("key_id")?,
+            stamp: Stamp(bytes(&text("stamp")?)?),
+            signature: bytes(&text("signature")?)?,
+        })
+    }
+}
+
+/// The `N` bytes the hex `text` holds; `None` when it holds anything else.
+fn bytes<const N: usize>(text: &str) -> Option<[u8; N]> {
+    unhex(text)?.try_into().ok()
+}
+
 /// A change's row as the place it arrives at holds it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Here {
@@ -170,8 +263,9 @@ pub enum Arrival {
     /// Write the change's values; the place keeps its `from` as the key's
     /// last applied `from`.
     Apply,
-    /// Leave the row: it is already at the change's `to`, or under
-    /// `--sync-mode last` the copy here is further on.
+    /// Leave the row: it is already at the change's `to`, the last change
+    /// applied here was built on its `to`, or under `--sync-mode last` the
+    /// copy here is further on.
     Skip,
     /// The change waits: its `from` matches nothing here, or another change
     /// of its transaction cannot be applied yet.
@@ -362,6 +456,11 @@ fn arrive(
     match decision {
         Decision::Apply => Arrival::Apply,
         Decision::Skip => Arrival::Skip,
+        // The last change applied here was built on this one's `to`: the
+        // row has moved past it, so a late copy is a repeat, not a gap
+        // (docs/mesh-protocol.md: "a peer whose last applied from equals
+        // the change's to built on it").
+        Decision::Hold if change.to.is_some() && here.last_from == Some(change.to) => Arrival::Skip,
         Decision::Hold => Arrival::Hold,
         Decision::Conflict => match (mode, &here.steering) {
             (SyncMode::Last, Some((at, mine))) => {
@@ -518,6 +617,26 @@ mod tests {
         let replay = signed(Some(f), &["1", "'a'"]);
         assert_eq!(
             receive(&[replay], &KEY, SyncMode::Stop, 0, |_| here.clone()),
+            [Arrival::Skip]
+        );
+    }
+
+    #[test]
+    fn a_late_copy_of_a_change_the_row_moved_past_is_skipped() {
+        let (f, a, b) = (
+            row_hash(&["1", "'f'"]),
+            row_hash(&["1", "'a'"]),
+            row_hash(&["1", "'b'"]),
+        );
+        let here = Here {
+            hash: Some(b),
+            last_from: Some(Some(a)),
+            steering: None,
+            tombstone: None,
+        };
+        let late = signed(Some(f), &["1", "'a'"]);
+        assert_eq!(
+            receive(&[late], &KEY, SyncMode::Stop, 0, |_| here.clone()),
             [Arrival::Skip]
         );
     }

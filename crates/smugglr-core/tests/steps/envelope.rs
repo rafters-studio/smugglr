@@ -1040,3 +1040,39 @@ fn record_names_change(mesh: &Mesh) -> Result<(), String> {
         Err(format!("the record names {:?}", record.dropped))
     }
 }
+
+#[given("a place that applied a change f to a, then a change a to b, for one row")]
+fn moved_past(mesh: &Mesh) {
+    let mut source = Node::holding("source", &[note("1", "f", "2026-10-01T09:00:00Z")]);
+    let mut place = source.clone();
+    "place".clone_into(&mut place.name);
+    let f_to_a = source.edit(note("1", "a", "2026-10-01T10:00:00Z"));
+    let a_to_b = source.edit(note("1", "b", "2026-10-01T11:00:00Z"));
+    place.deliver(&[f_to_a.clone(), a_to_b.clone()], SyncMode::Stop);
+    mesh.made.set(vec![vec![f_to_a, a_to_b]]);
+    mesh.nodes.set(vec![place]);
+}
+
+#[when("a copy of the change f to a arrives again")]
+fn late_copy_arrives(mesh: &Mesh) -> Result<(), String> {
+    let made = mesh.made.get().ok_or("no change was made")?;
+    at_place(mesh, |place| {
+        place.deliver(&made[0][..1], SyncMode::Stop);
+    })
+}
+
+#[then("the place skips it and the row stays at b")]
+fn skipped_and_stays(mesh: &Mesh) -> Result<(), String> {
+    let made = mesh.made.get().ok_or("no change was made")?;
+    let place = watched(mesh)?;
+    let b = &made[0][1].change.values;
+    if !place.held.is_empty() {
+        return Err(format!("the place holds {} waiting", place.held.len()));
+    }
+    let row = place.row("1")?;
+    if row == b.as_slice() {
+        Ok(())
+    } else {
+        Err(format!("the row holds {row:?}, not {b:?}"))
+    }
+}

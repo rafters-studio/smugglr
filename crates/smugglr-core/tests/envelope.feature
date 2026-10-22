@@ -127,3 +127,9 @@ Feature: the signed envelope multi and the mesh carry each Change in, its sunset
     When the agent replays it with its change hash while that tombstone is still live
     Then the place holds the inserted row
     And the record does not name it under dropped
+
+  @criterion-01a16446-b84a-7853-ab1a-00295cf52e6f @module-smugglr-core
+  Scenario: a late copy the row moved past is skipped
+    Given a place that applied a change f to a, then a change a to b, for one row
+    When a copy of the change f to a arrives again
+    Then the place skips it and the row stays at b

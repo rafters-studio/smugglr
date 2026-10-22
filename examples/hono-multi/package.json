@@ -1,0 +1,14 @@
+{
+  "name": "hono-multi",
+  "private": true,
+  "type": "module",
+  "description": "A Hono Worker that keeps a person's smugglr multi blobs: the bucket, the device list and crossing off.",
+  "license": "MIT",
+  "main": "src/index.ts",
+  "dependencies": {
+    "hono": "4.6.14"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "4.20241205.0"
+  }
+}

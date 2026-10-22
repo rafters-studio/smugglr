@@ -9,6 +9,8 @@ mod cli;
 mod d1;
 #[path = "steps/http_sql.rs"]
 mod http_sql;
+#[path = "steps/multi.rs"]
+mod multi;
 #[path = "steps/world.rs"]
 mod setup;
 #[path = "steps/shape.rs"]
@@ -20,6 +22,7 @@ mod whole;
 
 use std::process::{Command, Output};
 
+use multi::{Devices, devices};
 use rstest::fixture;
 use rstest_bdd::Slot;
 use rstest_bdd_macros::{ScenarioState, scenarios, then, when};
@@ -60,4 +63,7 @@ fn prints_name_and_version(run: &Run) -> Result<(), String> {
     }
 }
 
-scenarios!("tests", fixtures = [run: Run, world: World, soak: Soak]);
+scenarios!(
+    "tests",
+    fixtures = [run: Run, world: World, soak: Soak, devices: Devices]
+);

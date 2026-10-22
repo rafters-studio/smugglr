@@ -1264,6 +1264,7 @@ dependencies = [
  "serde_json",
  "smugglr-core",
  "smugglr-memory",
+ "smugglr-multi",
  "smugglr-place",
  "thiserror 2.0.21",
  "toml 1.1.8+spec-1.1.0",
@@ -1285,7 +1286,20 @@ dependencies = [
 name = "smugglr-memory"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "smugglr-core",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "smugglr-multi"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "serde_json",
+ "smugglr-core",
+ "smugglr-memory",
+ "smugglr-place",
  "thiserror 2.0.21",
 ]
 
