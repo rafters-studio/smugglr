@@ -2,7 +2,8 @@
 //! operations from rows the test sets in a SQLite file, records every
 //! request it receives, and can drop the connection. It
 //! also serves the page, @smugglr/web, the engine and SQLite to the tabs,
-//! from one origin, cross-origin isolated as SQLite's OPFS needs.
+//! from one origin, cross-origin isolated as SQLite's OPFS needs; or, for an
+//! app that installed the packed package, that app's own folder.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -43,8 +44,9 @@ pub(crate) struct StandIn {
 }
 
 impl StandIn {
-    /// Starts the stand-in on a free port, answering from `db`.
-    pub(crate) fn start(db: PathBuf) -> Result<Self, String> {
+    /// Starts the stand-in on a free port, answering from `db`. With `app`,
+    /// the tabs load that app's folder instead of the repo's files.
+    pub(crate) fn start(db: PathBuf, app: Option<PathBuf>) -> Result<Self, String> {
         let listener = TcpListener::bind("127.0.0.1:0").map_err(|err| err.to_string())?;
         let origin = format!(
             "http://127.0.0.1:{}",
@@ -54,9 +56,9 @@ impl StandIn {
         let (shared, file) = (Arc::clone(&state), db.clone());
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                let (state, file) = (Arc::clone(&shared), file.clone());
+                let (state, file, app) = (Arc::clone(&shared), file.clone(), app.clone());
                 std::thread::spawn(move || {
-                    let _ = serve(stream, &state, &file);
+                    let _ = serve(stream, &state, &file, app.as_deref());
                 });
             }
         });
@@ -83,8 +85,14 @@ impl StandIn {
 
 const ROOT: &str = env!("CARGO_MANIFEST_DIR");
 
-/// Where each path the tabs load is served from.
-fn served(path: &str) -> Option<PathBuf> {
+/// Where each path the tabs load is served from: the app's folder when
+/// there is one, else the repo's files.
+fn served(path: &str, app: Option<&Path>) -> Option<PathBuf> {
+    if let Some(app) = app {
+        let rest = path.trim_start_matches('/');
+        let rest = if rest.is_empty() { "index.html" } else { rest };
+        return (!rest.contains("..")).then(|| app.join(rest));
+    }
     let web = Path::new(ROOT).join("../../packages/web");
     let routes = [
         ("/web/engine/", Path::new(ROOT).join("pkg")),
@@ -105,6 +113,7 @@ fn kind(path: &Path) -> &'static str {
     match path.extension().and_then(|ext| ext.to_str()) {
         Some("js" | "mjs") => "text/javascript",
         Some("wasm") => "application/wasm",
+        Some("html") => "text/html",
         _ => "application/octet-stream",
     }
 }
@@ -122,7 +131,12 @@ fn respond(stream: &mut TcpStream, status: &str, kind: &str, body: &[u8]) -> std
     stream.flush()
 }
 
-fn serve(mut stream: TcpStream, state: &Mutex<State>, db: &Path) -> std::io::Result<()> {
+fn serve(
+    mut stream: TcpStream,
+    state: &Mutex<State>,
+    db: &Path,
+    app: Option<&Path>,
+) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
     reader.read_line(&mut line)?;
@@ -147,14 +161,14 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>, db: &Path) -> std::io::Res
     let mut body = vec![0; length];
     reader.read_exact(&mut body)?;
     match (method, path) {
-        ("GET", "/") => respond(
+        ("GET", "/") if app.is_none() => respond(
             &mut stream,
             "200 OK",
             "text/html",
             b"<!doctype html><title>smugglr</title>",
         ),
         ("GET", _) => {
-            match served(path).and_then(|file| Some((std::fs::read(&file).ok()?, file))) {
+            match served(path, app).and_then(|file| Some((std::fs::read(&file).ok()?, file))) {
                 Some((bytes, file)) => respond(&mut stream, "200 OK", kind(&file), &bytes),
                 None => respond(&mut stream, "404 Not Found", "text/plain", b"missing"),
             }

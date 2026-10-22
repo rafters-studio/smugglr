@@ -96,3 +96,9 @@ Feature: @smugglr/web is a tab's own database, kept in step by the engine in the
     Given a tab opened with @smugglr/web with ignore holding cache_*, naming an endpoint whose cache_pages has rows the tab lacks
     When the app calls sync()
     Then the tab's cache_pages has not changed
+
+  @criterion-01a164ab-3807-74a1-a2bb-fa20725c9077 @module-front-ends
+  Scenario: an app installs and imports the package
+    Given an app with @smugglr/web installed from the packed package, and a stand-in endpoint holding rows
+    When the app imports @smugglr/web and calls open() naming that endpoint
+    Then the tab's database holds every row the endpoint holds

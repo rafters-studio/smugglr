@@ -31,3 +31,7 @@ rstest-bdd-macros = { workspace = true }
 
 [lints]
 workspace = true
+
+# wasm-opt for the packed engine: Rust emits bulk memory operations.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-O", "--enable-bulk-memory", "--enable-nontrapping-float-to-int", "--enable-sign-ext", "--enable-mutable-globals", "--enable-reference-types", "--enable-multivalue"]
