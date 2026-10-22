@@ -43,6 +43,9 @@ pub enum Error {
     /// A table has no primary key; nothing is read.
     #[error("{0}")]
     Shape(String),
+    /// The caller could not keep the blob; the device's stash is as it was.
+    #[error("{0}")]
+    Keep(String),
 }
 
 /// How a stash or a retrieve runs.

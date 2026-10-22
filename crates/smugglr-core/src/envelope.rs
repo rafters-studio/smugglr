@@ -5,8 +5,10 @@
 //! `key_id`, the table's shape stamp and a signature over all of them; the
 //! row's values follow, bound by `to`, the hash they must have. On arrival
 //! each change goes through the one decision path ([`decide`]): skipped when
-//! its `to` is here, applied when its `from` is, held when its `from`
-//! matches nothing here, and a conflict when the place's last change of the
+//! its `to` is here or is the `from` of the last change applied to the row
+//! (a late copy the row has moved past), applied when its `from` is here,
+//! held when its `from` matches nothing else here, and a conflict when the
+//! place's last change of the
 //! row came from the same `from` to a different `to`, which `--sync-mode`
 //! settles (stop or last). Changes that were one transaction at the source
 //! are applied all or none. A change whose signature does not match its

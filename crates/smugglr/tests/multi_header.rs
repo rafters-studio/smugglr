@@ -48,7 +48,7 @@ fn devices() -> Result<(PathBuf, Settings), String> {
         node: "b".to_owned(),
         ..settings.clone()
     };
-    stash(&mut place(&folder, "b")?, &b, false).map_err(|err| err.to_string())?;
+    stash(&mut place(&folder, "b")?, &b, false, |_| Ok(())).map_err(|err| err.to_string())?;
     Ok((folder, settings))
 }
 
@@ -98,13 +98,15 @@ fn retrieve_on_b(
 #[test]
 fn a_blob_whose_header_was_changed_is_refused_whole() -> Result<(), String> {
     let (folder, settings) = devices()?;
-    stash(&mut place(&folder, "a")?, &settings, false).map_err(|err| err.to_string())?;
+    stash(&mut place(&folder, "a")?, &settings, false, |_| Ok(()))
+        .map_err(|err| err.to_string())?;
     sql(
         &folder,
         "a",
         "UPDATE notes SET body = 'edited' WHERE id = 'n1'",
     )?;
-    let mut blob = stash(&mut place(&folder, "a")?, &settings, false).map_err(|e| e.to_string())?;
+    let mut blob = stash(&mut place(&folder, "a")?, &settings, false, |_| Ok(()))
+        .map_err(|e| e.to_string())?;
     // Marked whole after signing, the one-change blob would delete n2 and n3.
     blob.whole = true;
     let before = notes(&folder, "b")?;
@@ -120,7 +122,8 @@ fn a_whole_blob_with_an_envelope_that_fails_applies_nothing() -> Result<(), Stri
         "a",
         "UPDATE notes SET body = 'edited' WHERE id = 'n1'",
     )?;
-    let mut blob = stash(&mut place(&folder, "a")?, &settings, true).map_err(|e| e.to_string())?;
+    let mut blob =
+        stash(&mut place(&folder, "a")?, &settings, true, |_| Ok(())).map_err(|e| e.to_string())?;
     // Values that no longer hash to the envelope's to; the header, which
     // lists the envelope's hash, still verifies.
     let n2 = blob
@@ -138,7 +141,8 @@ fn a_whole_blob_with_an_envelope_that_fails_applies_nothing() -> Result<(), Stri
 #[test]
 fn a_whole_blob_past_its_sunset_is_refused() -> Result<(), String> {
     let (folder, settings) = devices()?;
-    let blob = stash(&mut place(&folder, "a")?, &settings, true).map_err(|e| e.to_string())?;
+    let blob =
+        stash(&mut place(&folder, "a")?, &settings, true, |_| Ok(())).map_err(|e| e.to_string())?;
     // b moved on after the whole stash was made; taking it would roll b back.
     sql(
         &folder,
@@ -153,7 +157,7 @@ fn a_whole_blob_past_its_sunset_is_refused() -> Result<(), String> {
         node: "b".to_owned(),
         ..later.clone()
     };
-    stash(&mut place(&folder, "b")?, &b, false).map_err(|err| err.to_string())?;
+    stash(&mut place(&folder, "b")?, &b, false, |_| Ok(())).map_err(|err| err.to_string())?;
     let before = notes(&folder, "b")?;
     assert_eq!(retrieve_on_b(&folder, &later, &blob)?, before);
     Ok(())
@@ -165,7 +169,8 @@ fn an_empty_whole_blob_past_its_sunset_is_refused() -> Result<(), String> {
     // A place with no rows stashes a whole blob that holds no envelopes;
     // taken, it would delete every row of b's.
     sql(&folder, "a", "DELETE FROM notes")?;
-    let blob = stash(&mut place(&folder, "a")?, &settings, true).map_err(|e| e.to_string())?;
+    let blob =
+        stash(&mut place(&folder, "a")?, &settings, true, |_| Ok(())).map_err(|e| e.to_string())?;
     assert!(blob.changes.is_empty() && blob.graveyard.is_empty());
     let later = Settings {
         now: NOW + 601,
@@ -179,10 +184,12 @@ fn an_empty_whole_blob_past_its_sunset_is_refused() -> Result<(), String> {
 #[test]
 fn a_whole_blob_whose_tombstone_died_after_the_stash_is_still_taken() -> Result<(), String> {
     let (folder, settings) = devices()?;
-    stash(&mut place(&folder, "a")?, &settings, false).map_err(|err| err.to_string())?;
+    stash(&mut place(&folder, "a")?, &settings, false, |_| Ok(()))
+        .map_err(|err| err.to_string())?;
     // a deletes n2 at NOW: its tombstone's sunset is NOW + 600.
     sql(&folder, "a", "DELETE FROM notes WHERE id = 'n2'")?;
-    stash(&mut place(&folder, "a")?, &settings, false).map_err(|err| err.to_string())?;
+    stash(&mut place(&folder, "a")?, &settings, false, |_| Ok(()))
+        .map_err(|err| err.to_string())?;
     sql(
         &folder,
         "a",
@@ -194,12 +201,38 @@ fn a_whole_blob_whose_tombstone_died_after_the_stash_is_still_taken() -> Result<
         now,
         ..settings.clone()
     };
-    let blob =
-        stash(&mut place(&folder, "a")?, &at(NOW + 550), true).map_err(|err| err.to_string())?;
+    let blob = stash(&mut place(&folder, "a")?, &at(NOW + 550), true, |_| Ok(()))
+        .map_err(|err| err.to_string())?;
     assert_eq!(blob.graveyard.len(), 1);
     assert_eq!(
         retrieve_on_b(&folder, &at(NOW + 700), &blob)?,
         notes(&folder, "a")?
     );
+    Ok(())
+}
+
+#[test]
+fn a_stash_whose_blob_was_not_kept_leaves_the_baseline() -> Result<(), String> {
+    let (folder, settings) = devices()?;
+    stash(&mut place(&folder, "a")?, &settings, false, |_| Ok(())).map_err(|e| e.to_string())?;
+    sql(
+        &folder,
+        "a",
+        "UPDATE notes SET body = 'edited' WHERE id = 'n1'; DELETE FROM notes WHERE id = 'n2'",
+    )?;
+    // The blob could not be written: the device's stash stays where it was.
+    let failed = stash(&mut place(&folder, "a")?, &settings, false, |_| {
+        Err("the bucket is a file".to_owned())
+    });
+    assert!(failed.is_err());
+    let blob = stash(&mut place(&folder, "a")?, &settings, false, |_| Ok(()))
+        .map_err(|e| e.to_string())?;
+    let mut keys: Vec<&str> = blob
+        .changes
+        .iter()
+        .map(|envelope| envelope.change.key[0].as_str())
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["'n1'", "'n2'"]);
     Ok(())
 }

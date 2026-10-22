@@ -73,9 +73,13 @@ pub(crate) fn run(stash: bool, args: &[String]) -> ExitCode {
         Err(err) => return usage(&err.to_string()),
     };
     if stash {
-        return match smugglr_multi::stash(place.as_mut(), &settings, command.whole)
-            .map_err(|err| err.to_string())
-            .and_then(|blob| keep(&blob, Path::new(path)))
+        let mut kept = PathBuf::new();
+        let keep_it = |blob: &Blob| {
+            kept = keep(blob, Path::new(path))?;
+            Ok(())
+        };
+        return match smugglr_multi::stash(place.as_mut(), &settings, command.whole, keep_it)
+            .map(|_| &kept)
         {
             Ok(file) => {
                 println!("{}", file.display());

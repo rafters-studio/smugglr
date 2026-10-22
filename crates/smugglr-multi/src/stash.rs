@@ -13,12 +13,20 @@ use crate::{Blob, Error, Settings, hashes, rows, stamp, tables};
 /// Stashes `place`: a blob of one signed envelope per row changed since its
 /// last stash, a delete for each row deleted since, for `settings.targets`.
 /// With `whole`, or when the place never stashed, the blob holds every row
-/// and the graveyard instead. The device's hashes are kept as at this stash.
+/// and the graveyard instead. `keep` keeps the blob (writes it where the app
+/// takes it from); only once it has are the device's hashes kept as at this
+/// stash, so a blob that was never kept leaves the next stash carrying every
+/// change since the last blob that was.
 ///
 /// # Errors
-/// When the place cannot be read, a table has no primary key, or what the
-/// device keeps cannot be read or written.
-pub fn stash(place: &mut dyn Place, settings: &Settings, whole: bool) -> Result<Blob, Error> {
+/// When the place cannot be read, a table has no primary key, `keep` fails
+/// ([`Error::Keep`]), or what the device keeps cannot be read or written.
+pub fn stash(
+    place: &mut dyn Place,
+    settings: &Settings,
+    whole: bool,
+    keep: impl FnOnce(&Blob) -> Result<(), String>,
+) -> Result<Blob, Error> {
     let mut device = Device::open(&settings.config_dir, place.address())?;
     let whole = whole || !device.stashed;
     let sunset = settings.now.saturating_add(settings.graveyard);
@@ -115,6 +123,7 @@ pub fn stash(place: &mut dyn Place, settings: &Settings, whole: bool) -> Result<
             .collect();
     }
     blob.sign(&settings.key);
+    keep(&blob).map_err(Error::Keep)?;
     device.stashed = true;
     device.save(settings.now)?;
     Ok(blob)
