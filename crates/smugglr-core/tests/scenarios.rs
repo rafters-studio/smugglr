@@ -3,6 +3,8 @@
 //! `scenarios!` discovers every `.feature` file under `tests/` and emits one
 //! test per scenario. Step definitions must compile into this binary.
 
+#[path = "steps/envelope.rs"]
+mod envelope_steps;
 #[path = "steps/ignore.rs"]
 mod ignore_steps;
 #[path = "steps/plan.rs"]
@@ -24,6 +26,7 @@ use rstest_bdd_macros::{ScenarioState, given, scenarios, then, when};
 use smugglr_core::change::{Change, Decision, Op, decide};
 use smugglr_core::row_hash::row_hash;
 
+use envelope_steps::{Mesh, mesh};
 use plan_steps::{Pair, pair};
 use shape_steps::{Device, device};
 
@@ -326,5 +329,5 @@ fn unchanged(place: &Place) -> Result<(), String> {
 
 scenarios!(
     "tests",
-    fixtures = [rows: Rows, place: Place, pair: Pair, device: Device]
+    fixtures = [rows: Rows, place: Place, pair: Pair, device: Device, mesh: Mesh]
 );
