@@ -72,7 +72,7 @@ pub fn retrieve(
         run.refuse(blob, why);
     }
     for blob in blobs.iter().filter(|blob| blob.whole) {
-        run.take_whole(place, blob, settings)?;
+        run.take_whole(place, blob)?;
     }
     let envelopes = blobs
         .iter()
@@ -246,11 +246,11 @@ impl Run {
                 self.name(name, &change.key, WAITING);
                 continue;
             }
-            let here = self.here.entry(name.to_owned()).or_default();
-            match change.to {
-                Some(to) => drop(here.insert(change.key.clone(), to)),
-                None => drop(here.remove(&change.key)),
-            }
+            set(
+                self.here.entry(name.to_owned()).or_default(),
+                &change.key,
+                change.to,
+            );
             let moves = self.moves.entry(name.to_owned()).or_default();
             if change.to.is_some() {
                 moves.to_target += 1;
@@ -269,12 +269,7 @@ impl Run {
     /// Takes a whole blob: every row not changed here since the last stash
     /// becomes the blob's, and its graveyard joins the device's. This
     /// device's own changes since its last stash stay, for its next stash.
-    fn take_whole(
-        &mut self,
-        place: &mut dyn Place,
-        blob: &Blob,
-        settings: &Settings,
-    ) -> Result<(), Error> {
+    fn take_whole(&mut self, place: &mut dyn Place, blob: &Blob) -> Result<(), Error> {
         let mut rows: BTreeMap<&str, BTreeMap<&Key, &Envelope>> = BTreeMap::new();
         for envelope in &blob.changes {
             let change = &envelope.change;
@@ -337,19 +332,15 @@ impl Run {
                     continue;
                 }
                 self.device.last_from.remove(&(name.clone(), key.clone()));
-                match to {
-                    Some(to) => drop(baseline.insert(key.clone(), to)),
-                    None => drop(baseline.remove(key)),
-                }
+                set(&mut baseline, key, to);
             }
             self.device.baseline.insert(name, baseline);
         }
+        // The graveyard verified, and is within its sunset, before the blob
+        // was taken (`refusal`).
         for tombstone in &blob.graveyard {
             let change = &tombstone.change;
-            if self.tables.contains_key(&change.table)
-                && settings.now <= tombstone.sunset
-                && tombstone.verify(&settings.key)
-            {
+            if self.tables.contains_key(&change.table) {
                 self.device
                     .graveyard
                     .entry((change.table.clone(), change.key.clone()))
@@ -450,10 +441,7 @@ impl Run {
         let row: Row = (name.to_owned(), change.key.clone());
         let baseline = self.device.baseline.entry(name.to_owned()).or_default();
         if baseline.get(&change.key).copied() == before {
-            match change.to {
-                Some(to) => drop(baseline.insert(change.key.clone(), to)),
-                None => drop(baseline.remove(&change.key)),
-            }
+            set(baseline, &change.key, change.to);
         }
         self.device.last_from.insert(row.clone(), change.from);
         if change.to.is_none() {
@@ -527,5 +515,13 @@ impl Run {
             }
         }
         Ok(steering)
+    }
+}
+
+/// Sets `key`'s hash in `hashes` to `to`, or removes it when `to` is `None`.
+fn set(hashes: &mut Hashes, key: &Key, to: Option<[u8; 16]>) {
+    match to {
+        Some(to) => drop(hashes.insert(key.clone(), to)),
+        None => drop(hashes.remove(key)),
     }
 }

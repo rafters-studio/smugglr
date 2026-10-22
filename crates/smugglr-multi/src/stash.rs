@@ -21,6 +21,7 @@ use crate::{Blob, Error, Settings, hashes, rows, stamp, tables};
 pub fn stash(place: &mut dyn Place, settings: &Settings, whole: bool) -> Result<Blob, Error> {
     let mut device = Device::open(&settings.config_dir, place.address())?;
     let whole = whole || !device.stashed;
+    let sunset = settings.now.saturating_add(settings.graveyard);
     let (tables, _) = tables(place, settings)?;
     let mut blob = Blob {
         node: settings.node.clone(),
@@ -30,7 +31,7 @@ pub fn stash(place: &mut dyn Place, settings: &Settings, whole: bool) -> Result<
         changes: Vec::new(),
         graveyard: Vec::new(),
         signature: [0; 32],
-        sunset: settings.now.saturating_add(settings.graveyard),
+        sunset,
     };
     for table in &tables {
         let stamp = stamp(table);
@@ -87,7 +88,7 @@ pub fn stash(place: &mut dyn Place, settings: &Settings, whole: bool) -> Result<
                     values: values.clone(),
                 },
                 targets: settings.targets.clone(),
-                sunset: settings.now.saturating_add(settings.graveyard),
+                sunset,
                 txn: None,
                 key_id: settings.key_id(),
                 stamp,
