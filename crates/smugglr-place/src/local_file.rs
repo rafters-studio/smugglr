@@ -18,10 +18,9 @@ use crate::value::{Value, unquote};
 use crate::{Error, Key, Place, Table};
 
 /// How long a read or write waits for another writer to let go of the
-/// file's lock before the run stops. Current choice (2026-10-22): 30
-/// seconds, because a file other writers use routinely holds its lock past
-/// rusqlite's implicit 5; revisable.
-const BUSY: Duration = Duration::from_secs(30);
+/// file's lock before the run stops. Current choice (2026-10-22): 10
+/// seconds, twice the 5-second default most SQLite tools use; revisable.
+const BUSY: Duration = Duration::from_secs(10);
 
 /// A SQLite file on this machine.
 #[derive(Debug)]
