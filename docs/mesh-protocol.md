@@ -55,7 +55,8 @@ A node decides each envelope in this order, the same order `smugglr-core` uses f
 3. The key's last applied `from` equals this change's `from` and the row has moved: a conflict.
 4. The node has its own unacknowledged change on the key with the same `from` and a different `to`: a conflict.
 5. The row is at `from`: apply. A delete leaves a tombstone.
-6. Otherwise hold it until its `from` appears or its sunset passes. A held change dropped at its sunset is named in the record.
+6. The change's `to` is the `from` of the last change applied to this key: the row has already moved past it, so it is skipped, not held (current choice 2026-10-22: a late copy delivered after the row moved on otherwise waited forever).
+7. Otherwise hold it until its `from` appears or its sunset passes. A held change dropped at its sunset is named in the record.
 
 A conflict follows `--sync-mode`: `stop` (the default) names the row; `last` keeps the copy whose steering column is further on. `source` and `target` are for two places and are a usage error in the mesh.
 
@@ -88,7 +89,7 @@ Nothing past its sunset is resent blind. A row left named stays different until 
 
 Every change a node drops is kept, envelope and values, in a dropped log in smugglr's own files: a change arriving past its sunset, a change that waited past its sunset, an insert or waiting change for a key in the graveyard, and every own change the wazzup check leaves named. The record names each with its table, key, reason and change hash.
 
-`smugglr mesh ./node.db --key-file ./mesh.key --replay <change hash>` re-sends that change with a fresh sunset, overriding the drop. It is then decided like any change: an edit to a row deleted elsewhere stops as edit-versus-delete or follows `--sync-mode`; an insert dropped by the graveyard lands once the window has passed; an own change reaches the peer that lacked it. Replay adds no rule; it only sends again.
+`smugglr mesh ./node.db --key-file ./mesh.key --replay <change hash>` re-sends that change with a fresh sunset, overriding the drop. It is then decided like any change: an edit to a row deleted elsewhere stops as edit-versus-delete or follows `--sync-mode`; a replayed insert for a key whose tombstone is still live is not dropped again, since the replay overrides the drop, and is decided like any change; an own change reaches the peer that lacked it. Replay adds no rule; it only sends again.
 
 ## Leaving
 
