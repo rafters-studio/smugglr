@@ -564,34 +564,68 @@ fn run_with_commits(
     Ok((output, committed))
 }
 
+/// Exit statuses of a run cut off before it was done: 3 stopped before
+/// writing anything, 4 wrote something and is not done (FR-SMUGGLR-060).
+/// The next run finishes what it left.
+const CUT_OFF: [i32; 2] = [3, 4];
+
+/// Notes, for the side that may still hold what it held before, each key
+/// in `writes` with what it held `before` them. A key already pending keeps
+/// its first value.
+fn defer(pending: &mut BTreeMap<i64, Option<Row>>, writes: &[Write], before: &BTreeMap<i64, Row>) {
+    for write in writes {
+        pending
+            .entry(write.key())
+            .or_insert_with(|| before.get(&write.key()).cloned());
+    }
+}
+
 fn runs(soak: &Soak, world: &World) -> Result<(), String> {
     let condition = soak.condition.get().ok_or("no condition given")?;
     let mut pair = first_sync(world, condition)?;
     let mut tally = Tally::default();
-    // Keys written while the last run went, not yet sure to be carried.
-    let mut pending: BTreeMap<i64, Option<Row>> = BTreeMap::new();
+    // Keys a run may not yet have carried to each side: the other side's
+    // writes, held over while runs are cut off, and the source's commits
+    // while the last run went. A side's own writes are never pending on it.
+    let mut pending_source: BTreeMap<i64, Option<Row>> = BTreeMap::new();
+    let mut pending_target: BTreeMap<i64, Option<Row>> = BTreeMap::new();
     for run in 1..=RUNS {
-        let mut touched: BTreeSet<i64> = pending.keys().copied().collect();
+        let mut touched: BTreeSet<i64> = pending_source
+            .keys()
+            .chain(pending_target.keys())
+            .copied()
+            .collect();
+        let before = pair.reference.rows.clone();
         let source_writes = pair.writes(pair.source.stamp(), &mut touched);
         pair.source.commit(&source_writes)?;
         let target_writes = pair.writes(pair.target.stamp(), &mut touched);
         pair.target.commit(&target_writes)?;
-        let output = if condition.mid_run {
+        let (output, committed) = if condition.mid_run {
             let (output, writes) = run_with_commits(world, &mut pair, &touched)?;
             tally.committed_mid_run += writes.len();
             if writes.is_empty() {
                 tally.runs_without_commit += 1;
             }
-            pending = writes
-                .into_iter()
-                .map(|(write, before)| (write.key(), before))
-                .collect();
-            output
+            (output, writes)
         } else {
-            world.sync(&[])?
+            (world.sync(&[])?, Vec::new())
         };
         tally.runs += 1;
-        if !output.status.success() {
+        let cut_off = output
+            .status
+            .code()
+            .is_some_and(|code| CUT_OFF.contains(&code));
+        if cut_off {
+            defer(&mut pending_target, &source_writes, &before);
+            defer(&mut pending_source, &target_writes, &before);
+        } else {
+            pending_source.clear();
+            pending_target.clear();
+        }
+        for (write, held) in committed {
+            pending_target.entry(write.key()).or_insert(held);
+        }
+        if !output.status.success() && !cut_off {
             tally.failed += 1;
             tally.note(format!(
                 "run {run}: smugglr sync exited {}: {}",
@@ -599,14 +633,13 @@ fn runs(soak: &Soak, world: &World) -> Result<(), String> {
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
-        // The source took the commits itself: it holds them whatever the run.
         check(
             &mut tally,
             run,
             "source",
             &pair.source.path,
             &pair.reference,
-            &BTreeMap::new(),
+            &pending_source,
         )?;
         check(
             &mut tally,
@@ -614,7 +647,7 @@ fn runs(soak: &Soak, world: &World) -> Result<(), String> {
             "target",
             &pair.target.path,
             &pair.reference,
-            &pending,
+            &pending_target,
         )?;
     }
     // One run with no writer going carries what the last run could not.

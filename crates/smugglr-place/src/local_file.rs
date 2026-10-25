@@ -6,6 +6,7 @@
 //! the person, never from smugglr.
 
 use std::path::Path;
+use std::time::Duration;
 
 use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, OpenFlags, params_from_iter};
@@ -15,6 +16,11 @@ use smugglr_core::row_hash::row_hash;
 use crate::queries::{self, ROW_HASH};
 use crate::value::{Value, unquote};
 use crate::{Error, Key, Place, Table};
+
+/// How long a read or write waits for another writer to let go of the
+/// file's lock before the run stops. Current choice (2026-10-22): 10
+/// seconds, twice the 5-second default most SQLite tools use; revisable.
+const BUSY: Duration = Duration::from_secs(10);
 
 /// A SQLite file on this machine.
 #[derive(Debug)]
@@ -42,6 +48,7 @@ impl LocalFile {
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .map_err(sqlite)?;
+        connection.busy_timeout(BUSY).map_err(sqlite)?;
         connection
             .create_scalar_function(
                 ROW_HASH,
@@ -168,25 +175,28 @@ impl Place for LocalFile {
             address: address.clone(),
             source,
         };
-        let mut statement = self
-            .connection
-            .prepare(&queries::row(table))
-            .map_err(sqlite)?;
+        // One read transaction for every key asked for, not a lock taken and
+        // dropped per statement.
+        let transaction = self.connection.transaction().map_err(sqlite)?;
         let mut found = Vec::new();
-        for key in keys {
-            let key = key
-                .iter()
-                .map(|column| unquote(column))
-                .collect::<Result<Vec<_>, Error>>()?;
-            let mut rows = statement.query(params_from_iter(key)).map_err(sqlite)?;
-            if let Some(row) = rows.next().map_err(sqlite)? {
-                let columns = (0..width)
-                    .map(|i| row.get::<_, String>(i))
-                    .collect::<rusqlite::Result<Vec<String>>>()
-                    .map_err(sqlite)?;
-                found.push(columns);
+        {
+            let mut statement = transaction.prepare(&queries::row(table)).map_err(sqlite)?;
+            for key in keys {
+                let key = key
+                    .iter()
+                    .map(|column| unquote(column))
+                    .collect::<Result<Vec<_>, Error>>()?;
+                let mut rows = statement.query(params_from_iter(key)).map_err(sqlite)?;
+                if let Some(row) = rows.next().map_err(sqlite)? {
+                    let columns = (0..width)
+                        .map(|i| row.get::<_, String>(i))
+                        .collect::<rusqlite::Result<Vec<String>>>()
+                        .map_err(sqlite)?;
+                    found.push(columns);
+                }
             }
         }
+        transaction.commit().map_err(sqlite)?;
         Ok(found)
     }
 
@@ -290,6 +300,47 @@ mod tests {
         assert_eq!(place.weights(&table)?, vec![(change.key.clone(), 3 + 16)]);
         assert_eq!(place.rows(&table, &[change.key])?, vec![values]);
         let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn a_write_waits_out_another_connection_holding_the_lock() -> Result<(), Error> {
+        let path = file("busy")?;
+        let mut place = LocalFile::open(&path)?;
+        let table = place
+            .tables()?
+            .into_iter()
+            .next()
+            .ok_or(Error::Adapter("no table".to_owned()))?;
+        // Another writer holds the file's lock for 7 seconds, longer than
+        // rusqlite's implicit 5.
+        let (locked, held) = std::sync::mpsc::channel();
+        let other = path.clone();
+        let holder = std::thread::spawn(move || -> rusqlite::Result<()> {
+            let connection = rusqlite::Connection::open(other)?;
+            connection.execute_batch("BEGIN EXCLUSIVE")?;
+            let _ = locked.send(());
+            std::thread::sleep(std::time::Duration::from_secs(7));
+            connection.execute_batch("ROLLBACK")
+        });
+        let _ = held.recv();
+        let row = ["'a'", "1"];
+        let change = Change {
+            op: Op::Up,
+            table: "t".to_owned(),
+            key: vec!["'a'".to_owned()],
+            from: None,
+            to: Some(row_hash(&row)),
+            values: row.iter().map(|&c| c.to_owned()).collect(),
+        };
+        let wrote = place.write(&table, std::slice::from_ref(&change));
+        let released = holder.join();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            matches!(released, Ok(Ok(()))),
+            "the holder failed: {released:?}"
+        );
+        assert_eq!(wrote?, vec![change.key]);
         Ok(())
     }
 
