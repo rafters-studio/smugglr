@@ -171,7 +171,7 @@ fn settings(command: &Multi) -> Result<Settings, String> {
 }
 
 /// The shared key a key file holds: 64 hex digits, or 32 bytes.
-fn key(path: &Path) -> Result<[u8; 32], String> {
+pub(crate) fn key(path: &Path) -> Result<[u8; 32], String> {
     let bytes = fs::read(path).map_err(|err| format!("{}: {err}", path.display()))?;
     let text = String::from_utf8_lossy(&bytes);
     let text = text.trim();

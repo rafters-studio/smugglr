@@ -18,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 smugglr-core = { workspace = true }
 smugglr-memory = { workspace = true }
+smugglr-mesh = { workspace = true }
 smugglr-multi = { workspace = true }
 smugglr-place = { workspace = true, features = ["native"] }
 smugglr-sync = { workspace = true }

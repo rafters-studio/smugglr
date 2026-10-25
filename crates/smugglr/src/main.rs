@@ -1,6 +1,7 @@
 //! The smugglr command-line interface.
 
 mod cli;
+mod mesh;
 mod multi;
 
 use std::process::ExitCode;

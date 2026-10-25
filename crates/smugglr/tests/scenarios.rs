@@ -9,6 +9,8 @@ mod cli;
 mod d1;
 #[path = "steps/http_sql.rs"]
 mod http_sql;
+#[path = "steps/mesh.rs"]
+mod mesh;
 #[path = "steps/multi.rs"]
 mod multi;
 #[path = "steps/world.rs"]
@@ -22,6 +24,7 @@ mod whole;
 
 use std::process::{Command, Output};
 
+use mesh::{Front, front};
 use multi::{Devices, devices};
 use rstest::fixture;
 use rstest_bdd::Slot;
@@ -65,5 +68,11 @@ fn prints_name_and_version(run: &Run) -> Result<(), String> {
 
 scenarios!(
     "tests",
-    fixtures = [run: Run, world: World, soak: Soak, devices: Devices]
+    fixtures = [
+        run: Run,
+        world: World,
+        soak: Soak,
+        devices: Devices,
+        front: Front
+    ]
 );
