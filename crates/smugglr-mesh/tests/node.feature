@@ -1,5 +1,5 @@
 # Generated from the legion requirement. Do not hand-edit this file.
-Feature: smugglr mesh sends each change as it happens, sealed with one shared key, and resends it until every other node has it (FR-SMUGGLR-078)
+Feature: smugglr mesh, a local network where nobody is in charge, sends each change as it happens, signed and encrypted with one shared key, and resends it until every other node has it (FR-SMUGGLR-078)
 
   @criterion-01a14bed-95be-7e81-9e8e-2df3c09a5c01 @module-mesh
   Scenario: changes go out as they happen

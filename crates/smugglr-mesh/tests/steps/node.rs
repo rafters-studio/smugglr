@@ -640,7 +640,8 @@ fn a_node_with_one_key(mesh: &Mesh) -> Result<(), String> {
 fn a_change_from_outside(mesh: &Mesh) -> Result<(), String> {
     let net = mesh.net()?;
     let change = net.change("n1", Some("before"), "outside", &STRANGER)?;
-    net.relay.inject(&change, &STRANGER, net.port(0)?)
+    // Sealed with the mesh's key, so it reaches the signature check.
+    net.relay.inject(&change, &KEY, net.port(0)?)
 }
 
 #[then("the row is unchanged")]
