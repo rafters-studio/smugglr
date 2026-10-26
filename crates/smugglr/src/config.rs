@@ -11,7 +11,11 @@
 //! `--sync-mode last` reads (FR-SMUGGLR-068), once for all tables
 //! (`steering = "updated_at"`) or per table (`[tables.orders] steering =
 //! "modified"`); and `graveyard`, the seconds a change is carried and a
-//! delete's tombstone kept (FR-SMUGGLR-076). Other settings are left alone.
+//! delete's tombstone kept (FR-SMUGGLR-076); and `port`, the UDP port
+//! smugglr mesh broadcasts and listens on, and `backpressure`, the most its
+//! outbox holds, in bytes or text like `max_wire`, and `peers`, addresses a
+//! mesh node announces itself to on a network that carries no broadcast
+//! (FR-SMUGGLR-078). Other settings are left alone.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -36,6 +40,12 @@ pub struct Config {
     pub steering: Steering,
     /// The graveyard window in seconds; `None` when not set, 12 hours.
     pub graveyard: Option<u64>,
+    /// The mesh's UDP port; `None` when not set, 31337.
+    pub port: Option<u16>,
+    /// The most bytes the mesh's outbox holds; `None` when not set, 6 MB.
+    pub backpressure: Option<u64>,
+    /// Peer addresses for the mesh, as written: `host` or `host:port`.
+    pub peers: Vec<String>,
 }
 
 /// The config as the file holds it, before its settings are checked.
@@ -44,7 +54,11 @@ struct File {
     #[serde(default)]
     ignore: Vec<String>,
     max_wire: Option<toml::Value>,
+    backpressure: Option<toml::Value>,
+    #[serde(default)]
+    peers: Vec<String>,
     graveyard: Option<u64>,
+    port: Option<u16>,
     steering: Option<String>,
     #[serde(default)]
     tables: BTreeMap<String, TableFile>,
@@ -118,19 +132,8 @@ enum Problem {
 
 fn parse(text: &str) -> Result<Config, Problem> {
     let file: File = toml::from_str(text).map_err(Problem::Toml)?;
-    let max_wire = match file.max_wire {
-        None => None,
-        Some(toml::Value::Integer(bytes)) => Some(
-            u64::try_from(bytes)
-                .map_err(|_| Problem::Setting(format!("max_wire is {bytes}, below zero")))?,
-        ),
-        Some(toml::Value::String(text)) => Some(bytes(&text).map_err(Problem::Setting)?),
-        Some(other) => {
-            return Err(Problem::Setting(format!(
-                "max_wire is {other}; give bytes, or a size such as \"100 MB\""
-            )));
-        }
-    };
+    let max_wire = size("max_wire", file.max_wire)?;
+    let backpressure = size("backpressure", file.backpressure)?;
     let tables = file
         .tables
         .into_iter()
@@ -144,12 +147,29 @@ fn parse(text: &str) -> Result<Config, Problem> {
             tables,
         },
         graveyard: file.graveyard,
+        port: file.port,
+        backpressure,
+        peers: file.peers,
     })
 }
 
+/// The setting `name`, given as bytes or as text such as `"100 MB"`.
+fn size(name: &str, value: Option<toml::Value>) -> Result<Option<u64>, Problem> {
+    match value {
+        None => Ok(None),
+        Some(toml::Value::Integer(bytes)) => u64::try_from(bytes)
+            .map(Some)
+            .map_err(|_| Problem::Setting(format!("{name} is {bytes}, below zero"))),
+        Some(toml::Value::String(text)) => bytes(name, &text).map(Some).map_err(Problem::Setting),
+        Some(other) => Err(Problem::Setting(format!(
+            "{name} is {other}; give bytes, or a size such as \"100 MB\""
+        ))),
+    }
+}
+
 /// `"250 MB"` as bytes, in decimal units (`B`, `kB`, `MB`, `GB`, `TB`).
-fn bytes(text: &str) -> Result<u64, String> {
-    let bad = || format!("max_wire is {text:?}; give bytes, or a size such as \"100 MB\"");
+fn bytes(name: &str, text: &str) -> Result<u64, String> {
+    let bad = || format!("{name} is {text:?}; give bytes, or a size such as \"100 MB\"");
     let text = text.trim();
     let split = text
         .find(|c: char| !c.is_ascii_digit())
@@ -221,6 +241,36 @@ mod tests {
         assert_eq!(max_wire("max_wire = 2048"), Some(Some(2048)));
         assert_eq!(max_wire("max_wire = \"250 MB\""), Some(Some(250_000_000)));
         assert_eq!(parse("").ok(), Some(Config::default()));
+    }
+
+    #[test]
+    fn peers_are_read_as_written() {
+        let peers = parse("peers = [\"10.0.0.2\", \"rzr.local:40000\"]")
+            .ok()
+            .map(|c| c.peers);
+        assert_eq!(
+            peers,
+            Some(vec!["10.0.0.2".to_owned(), "rzr.local:40000".to_owned()])
+        );
+    }
+
+    #[test]
+    fn backpressure_reads_as_bytes_or_a_size() {
+        let read = |text| parse(text).ok().map(|config| config.backpressure);
+        assert_eq!(read("backpressure = \"1 MB\""), Some(Some(1_000_000)));
+        assert_eq!(read("backpressure = 2048"), Some(Some(2048)));
+        assert_eq!(read(""), Some(None));
+        assert!(parse("backpressure = \"lots\"").is_err());
+    }
+
+    #[test]
+    fn the_mesh_port_is_read_and_a_port_out_of_range_is_an_error() {
+        assert_eq!(
+            parse("port = 40000").ok().map(|c| c.port),
+            Some(Some(40000))
+        );
+        assert_eq!(parse("").ok().map(|c| c.port), Some(None));
+        assert!(parse("port = 70000").is_err());
     }
 
     #[test]
