@@ -42,6 +42,10 @@ const SKIPPED: u64 = 3;
 /// The shortest wait for a resend to an acknowledging peer.
 const SHORTEST: Duration = Duration::from_millis(50);
 
+/// The longest wait for a resend to an acknowledging peer, so a lost copy
+/// is repaired well within a second on a local network (FR-SMUGGLR-078).
+const LONGEST: Duration = Duration::from_millis(300);
+
 /// The acks file is rewritten only once it holds at least this many bytes.
 const COMPACT: u64 = 64 * 1024;
 
@@ -105,12 +109,15 @@ impl Timing {
         now.duration_since(self.last_ack) < SILENT
     }
 
-    /// The wait before a first resend: about two round trips, longer when
-    /// round trips vary (RFC 6298).
+    /// The wait before a resend: about two round trips, longer when round
+    /// trips vary (RFC 6298), but never past [`LONGEST`]: on a busy machine
+    /// the measured round trips swell with queueing, and an unbounded wait
+    /// left a lost copy unrepaired for seconds while its peer kept
+    /// acknowledging.
     fn wait(&self) -> Duration {
         (self.round_trip * 2)
             .max(self.round_trip + self.variation * 4)
-            .max(SHORTEST)
+            .clamp(SHORTEST, LONGEST)
     }
 
     /// Takes in one round trip measured.
