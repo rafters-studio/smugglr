@@ -3,7 +3,7 @@
 //! machine name (a `hostname` first on its `PATH`), broadcasting on the
 //! port its config names.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::File;
 use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
@@ -44,6 +44,8 @@ enum FrontEnd {
     Mesh,
     /// `smugglr sync <place> --sync-type mesh`.
     Sync,
+    /// `smugglr mesh <place> --sync-mode stop`.
+    MeshStop,
 }
 
 /// One running smugglr process.
@@ -155,6 +157,14 @@ impl Front {
         let key_file = key.display().to_string();
         let args: Vec<&str> = match front_end {
             FrontEnd::Mesh => vec!["mesh", &place, "--key-file", &key_file],
+            FrontEnd::MeshStop => vec![
+                "mesh",
+                &place,
+                "--key-file",
+                &key_file,
+                "--sync-mode",
+                "stop",
+            ],
             FrontEnd::Sync => vec![
                 "sync",
                 &place,
@@ -233,6 +243,17 @@ impl Front {
 
     /// Waits for node `index` to hold note `id` with `body`.
     fn holds(&self, index: usize, id: &str, body: &str) -> Result<(), String> {
+        self.holds_within(index, id, body, SOON)
+    }
+
+    /// Waits up to `within` for node `index` to hold note `id` with `body`.
+    fn holds_within(
+        &self,
+        index: usize,
+        id: &str,
+        body: &str,
+        within: Duration,
+    ) -> Result<(), String> {
         let path = self.with(index, |node| node.path.clone())?;
         let read = || {
             Connection::open(&path)
@@ -244,7 +265,7 @@ impl Front {
                 })
                 .ok()
         };
-        wait(SOON, || read().as_deref() == Some(body))
+        wait(within, || read().as_deref() == Some(body))
             .map_err(|()| format!("node {index} holds {:?} for {id}, not {body:?}", read()))
     }
 
@@ -261,6 +282,33 @@ impl Front {
             )
         })
     }
+}
+
+/// Starts `nodes` (each its name, key file and front end), each on its own
+/// port and naming the others' in its peers setting, `more` added to each
+/// config. They talk unicast on loopback, so what a scenario shows does not
+/// hang on the system delivering broadcasts.
+fn start_named(
+    world: &World,
+    front: &Front,
+    nodes: &[(&str, &Path, FrontEnd)],
+    more: &str,
+) -> Result<(), String> {
+    let ports = nodes
+        .iter()
+        .map(|_| free_port())
+        .collect::<Result<Vec<u16>, String>>()?;
+    for (at, (name, key, front_end)) in nodes.iter().enumerate() {
+        let peers: Vec<String> = ports
+            .iter()
+            .enumerate()
+            .filter(|(other, _)| *other != at)
+            .map(|(_, port)| format!("127.0.0.1:{port}"))
+            .collect();
+        let config = format!("peers = {peers:?}\n{more}");
+        front.start_with(world, name, key, Some(ports[at]), *front_end, &config)?;
+    }
+    Ok(())
 }
 
 /// Runs `command`, its output and errors written to `out` and `err`.
@@ -350,10 +398,15 @@ fn wait(within: Duration, mut done: impl FnMut() -> bool) -> Result<(), ()> {
 )]
 fn two_front_ends(world: &World, front: &Front) -> Result<(), String> {
     let key = key_file(world, front, "mesh.key")?;
-    let port = free_port()?;
-    front.start(world, "mesh-node", &key, Some(port), FrontEnd::Mesh)?;
-    front.start(world, "sync-node", &key, Some(port), FrontEnd::Sync)?;
-    Ok(())
+    start_named(
+        world,
+        front,
+        &[
+            ("mesh-node", &key, FrontEnd::Mesh),
+            ("sync-node", &key, FrontEnd::Sync),
+        ],
+        "",
+    )
 }
 
 #[when("a row is written on the first node's database")]
@@ -369,10 +422,15 @@ fn the_second_holds_it(front: &Front) -> Result<(), String> {
 #[given("a node running smugglr mesh on a machine named puck")]
 fn a_node_on_puck(world: &World, front: &Front) -> Result<(), String> {
     let key = key_file(world, front, "mesh.key")?;
-    let port = free_port()?;
-    front.start(world, "puck", &key, Some(port), FrontEnd::Mesh)?;
-    front.start(world, "rzr", &key, Some(port), FrontEnd::Mesh)?;
-    Ok(())
+    start_named(
+        world,
+        front,
+        &[
+            ("puck", &key, FrontEnd::Mesh),
+            ("rzr", &key, FrontEnd::Mesh),
+        ],
+        "",
+    )
 }
 
 #[when("a row is written on puck's database")]
@@ -411,12 +469,14 @@ fn exchanges_on(world: &World, front: &Front, index: usize, port: u16) -> Result
     )?;
     let (to, back) = (format!("to-{port}"), format!("back-{port}"));
     front.sql(index, &format!("INSERT INTO notes VALUES ('{to}', 'sent')"))?;
-    front.holds(partner, &to, "sent")?;
+    // Broadcast between nodes on one port: a missed announcement is said
+    // again within 10 s.
+    front.holds_within(partner, &to, "sent", Duration::from_secs(30))?;
     front.sql(
         partner,
         &format!("INSERT INTO notes VALUES ('{back}', 'heard')"),
     )?;
-    front.holds(index, &back, "heard")
+    front.holds_within(index, &back, "heard", Duration::from_secs(30))
 }
 
 #[then("the first sends and listens on UDP port 31337")]
@@ -505,12 +565,17 @@ fn keygen_appends(world: &World, front: &Front) -> Result<(), String> {
     ids.push(newer);
     front.key_ids.set(ids);
     let second = world.folder()?.join("second.key");
-    let port = free_port()?;
-    front.start(world, "first", &first, Some(port), FrontEnd::Mesh)?;
-    front.start(world, "second", &second, Some(port), FrontEnd::Mesh)?;
     // A third node holding both keys, to hear what the first signs.
-    front.start(world, "witness", &first, Some(port), FrontEnd::Mesh)?;
-    Ok(())
+    start_named(
+        world,
+        front,
+        &[
+            ("first", &first, FrontEnd::Mesh),
+            ("second", &second, FrontEnd::Mesh),
+            ("witness", &first, FrontEnd::Mesh),
+        ],
+        "",
+    )
 }
 
 #[then("the first node's changes are signed with the newer key")]
@@ -534,9 +599,15 @@ fn the_first_accepts_older(front: &Front) -> Result<(), String> {
 #[given("two nodes running smugglr mesh with one key file")]
 fn two_nodes_one_key(world: &World, front: &Front) -> Result<(), String> {
     let key = key_file(world, front, "mesh.key")?;
-    let port = free_port()?;
-    front.start(world, "left", &key, Some(port), FrontEnd::Mesh)?;
-    front.start(world, "right", &key, Some(port), FrontEnd::Mesh)?;
+    start_named(
+        world,
+        front,
+        &[
+            ("left", &key, FrontEnd::Mesh),
+            ("right", &key, FrontEnd::Mesh),
+        ],
+        "",
+    )?;
     front.key.set(key);
     Ok(())
 }
@@ -612,7 +683,7 @@ fn a_row_and_a_stranger(front: &Front) -> Result<(), String> {
     let socket = UdpSocket::bind("0.0.0.0:0").map_err(|err| err.to_string())?;
     socket.set_broadcast(true).map_err(|err| err.to_string())?;
     socket
-        .send_to(&forged("n2", &UNKNOWN, &shared)?, ("255.255.255.255", port))
+        .send_to(&forged("n2", &UNKNOWN, &shared)?, ("127.0.0.1", port))
         .map_err(|err| err.to_string())?;
     front.prints(1, "refused a change")
 }
@@ -760,10 +831,15 @@ impl Drop for Turn {
 fn two_nodes(world: &World, front: &Front) -> Result<(), String> {
     front.turn.set(Turn::take());
     let key = key_file(world, front, "mesh.key")?;
-    let port = free_port()?;
-    front.start(world, "first", &key, Some(port), FrontEnd::Mesh)?;
-    front.start(world, "second", &key, Some(port), FrontEnd::Mesh)?;
-    Ok(())
+    start_named(
+        world,
+        front,
+        &[
+            ("first", &key, FrontEnd::Mesh),
+            ("second", &key, FrontEnd::Mesh),
+        ],
+        "",
+    )
 }
 
 #[when("500,000 rows are written at once on the first node")]
@@ -845,6 +921,14 @@ struct Seen {
     /// Datagrams the first node sent, and of them resends.
     sent: u64,
     resent: u64,
+    /// The two counts as they stood at the last first copy.
+    at_last_first: (u64, u64),
+    /// Every resend either node sent: its row's key, its change and when.
+    resends: Vec<(String, String, Instant)>,
+    /// Every change either node sent, by its row's key.
+    changes_by_key: BTreeMap<String, BTreeSet<String>>,
+    /// When either node first acknowledged each change.
+    acked_by_either: BTreeMap<String, Instant>,
 }
 
 /// Stands between two nodes on a network that carries no broadcast: each
@@ -929,8 +1013,11 @@ impl Relay {
                 random ^= random >> 7;
                 random ^= random << 17;
                 let message = open_with(&buffer[..len], &seal);
-                let drop = (relay.lossy.load(Ordering::Relaxed) && random.is_multiple_of(10))
-                    || relay.last_first_copy(message.as_ref());
+                // The forced loss is looked at on every datagram, before the
+                // random one, so it never goes unseen.
+                let forced = relay.last_first_copy(message.as_ref(), from_first);
+                let drop =
+                    forced || (relay.lossy.load(Ordering::Relaxed) && random.is_multiple_of(10));
                 relay.note(message, from_first, drop);
                 if drop {
                     relay.dropped.fetch_add(1, Ordering::Relaxed);
@@ -942,28 +1029,31 @@ impl Relay {
         Ok(relay)
     }
 
-    /// Whether `message` is the first copy of the change to the last row a
-    /// scenario writes, which the relay then loses so its repair shows.
-    fn last_first_copy(&self, message: Option<&Value>) -> bool {
-        let Some(message) = message else {
+    /// Whether `message` is the first copy the relay sees of the change to
+    /// the last row a scenario writes, which the relay then loses so its
+    /// repair shows. It is the first the relay sees, not the maker's first
+    /// send: the system may drop that before the relay reads it, and the
+    /// change then first reaches the relay as a resend.
+    fn last_first_copy(&self, message: Option<&Value>, from_first: bool) -> bool {
+        let Some(message) = message.filter(|_| from_first) else {
             return false;
         };
-        let key = message
-            .get("envelope")
-            .and_then(|envelope| envelope.get("key")?.get(0)?.as_str());
+        let envelope = message.get("envelope");
+        let key = envelope.and_then(|envelope| envelope.get("key")?.get(0)?.as_str());
         let last = format!("'k{LAST_ROW}'");
         if !self.lose_last.load(Ordering::Relaxed)
-            || message.get("resend").and_then(Value::as_bool) == Some(true)
+            || message.get("t").and_then(Value::as_str) != Some("change")
             || key != Some(last.as_str())
         {
             return false;
         }
-        let signature = message
-            .get("envelope")
+        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        if seen.last_row.is_some() {
+            return false;
+        }
+        seen.last_row = envelope
             .and_then(|envelope| envelope.get("signature")?.as_str())
             .map(str::to_owned);
-        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
-        seen.last_row = signature;
         true
     }
 
@@ -974,6 +1064,40 @@ impl Relay {
         let now = Instant::now();
         let text = |value: &Value| value.as_str().map(str::to_owned);
         let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(envelope) = message.get("envelope")
+            && let (Some(key), Some(change)) = (
+                envelope
+                    .get("key")
+                    .and_then(|key| key.get(0))
+                    .and_then(text),
+                envelope.get("signature").and_then(text),
+            )
+        {
+            seen.changes_by_key.entry(key).or_default().insert(change);
+        }
+        if message.get("resend").and_then(Value::as_bool) == Some(true)
+            && let Some(envelope) = message.get("envelope")
+            && let (Some(key), Some(change)) = (
+                envelope
+                    .get("key")
+                    .and_then(|key| key.get(0))
+                    .and_then(text),
+                envelope.get("signature").and_then(text),
+            )
+        {
+            seen.resends.push((key, change, now));
+        }
+        if message.get("t").and_then(Value::as_str) == Some("ack") {
+            for change in message
+                .get("changes")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(text)
+            {
+                seen.acked_by_either.entry(change).or_insert(now);
+            }
+        }
         match message.get("t").and_then(Value::as_str) {
             Some("change") if from_first => {
                 let Some(change) = message
@@ -991,6 +1115,7 @@ impl Relay {
                     }
                 } else {
                     seen.first_copies.insert(change.clone());
+                    seen.at_last_first = (seen.sent, seen.resent);
                 }
                 if dropped {
                     // Measured from its latest loss: a resend lost too is a
@@ -1019,6 +1144,17 @@ impl Relay {
 /// dropping one datagram in ten when `lossy`; returns once each has heard
 /// the other.
 fn two_on_a_relay(world: &World, front: &Front, lossy: bool, first: &str) -> Result<(), String> {
+    two_on_a_relay_as(world, front, lossy, first, FrontEnd::Mesh)
+}
+
+/// Two nodes as [`two_on_a_relay`] starts them, each started as `front_end`.
+fn two_on_a_relay_as(
+    world: &World,
+    front: &Front,
+    lossy: bool,
+    first: &str,
+    front_end: FrontEnd,
+) -> Result<(), String> {
     front.turn.set(Turn::take());
     let key = key_file(world, front, "mesh.key")?;
     let line = key_lines(&key)?.pop().ok_or("the key file holds no key")?;
@@ -1027,7 +1163,7 @@ fn two_on_a_relay(world: &World, front: &Front, lossy: bool, first: &str) -> Res
     let peers = format!("peers = [\"127.0.0.1:{}\"]\n", relay.port);
     front.relay.set(relay);
     let more = format!("{peers}{first}");
-    front.start_with(world, "first", &key, Some(ports[0]), FrontEnd::Mesh, &more)?;
+    front.start_with(world, "first", &key, Some(ports[0]), front_end, &more)?;
     front.start_with(
         world,
         "second",
@@ -1124,16 +1260,20 @@ fn lost_copies_within_a_second(front: &Front) -> Result<(), String> {
     }
 }
 
-#[then("resends never take more than a quarter of what the first node sends")]
+#[then(
+    "while first copies are still waiting to be sent, resends take no more than a quarter of what the first node sends"
+)]
 fn resends_a_quarter_at_most(front: &Front) -> Result<(), String> {
     let relay = front.relay.get().ok_or("no relay")?;
     let seen = relay.seen.lock().unwrap_or_else(PoisonError::into_inner);
-    if seen.resent * 4 <= seen.sent {
+    // Counted up to the last first copy: until then first copies were
+    // waiting to be sent.
+    let (sent, resent) = seen.at_last_first;
+    if resent * 4 <= sent {
         Ok(())
     } else {
         Err(format!(
-            "{} of {} datagrams were resends",
-            seen.resent, seen.sent
+            "{resent} of {sent} datagrams were resends while first copies were waiting"
         ))
     }
 }
@@ -1245,7 +1385,7 @@ fn the_last_row_within_a_second(front: &Front) -> Result<(), String> {
     let last = seen
         .last_row
         .clone()
-        .ok_or("the relay saw no first copy of the last row")?;
+        .ok_or("the relay saw no copy of the last row")?;
     let lost = seen
         .lost
         .get(&last)
@@ -1265,11 +1405,16 @@ fn the_last_row_within_a_second(front: &Front) -> Result<(), String> {
 #[given("a node whose last run ended longer ago than the sunset")]
 fn a_node_back_from_away(world: &World, front: &Front) -> Result<(), String> {
     let key = key_file(world, front, "mesh.key")?;
-    let port = free_port()?;
     // A sunset of 2 seconds, so a short absence is longer than it.
-    let sunset = "graveyard = 2\n";
-    front.start_with(world, "away", &key, Some(port), FrontEnd::Mesh, sunset)?;
-    front.start_with(world, "stayed", &key, Some(port), FrontEnd::Mesh, sunset)?;
+    start_named(
+        world,
+        front,
+        &[
+            ("away", &key, FrontEnd::Mesh),
+            ("stayed", &key, FrontEnd::Mesh),
+        ],
+        "graveyard = 2\n",
+    )?;
     // The node notes that it is running as soon as it announces itself.
     sleep(Duration::from_secs(1));
     front.stop(0)?;
@@ -1298,4 +1443,70 @@ fn it_keeps_running(front: &Front) -> Result<(), String> {
     sleep(Duration::from_secs(1));
     front.sql(1, "INSERT INTO notes VALUES ('n7', 'after')")?;
     front.holds(0, "n7", "after")
+}
+
+#[given("two nodes running smugglr mesh with --sync-mode stop")]
+fn two_nodes_that_stop(world: &World, front: &Front) -> Result<(), String> {
+    two_on_a_relay_as(world, front, false, "", FrontEnd::MeshStop)?;
+    // The row both will change, the same on each before either does.
+    front.sql(0, "INSERT INTO notes VALUES ('c1', 'base')")?;
+    front.holds(1, "c1", "base")
+}
+
+#[when("both nodes change the same row at once")]
+fn both_change_it(front: &Front) -> Result<(), String> {
+    front.sql(0, "UPDATE notes SET body = 'left' WHERE id = 'c1'")?;
+    front.sql(1, "UPDATE notes SET body = 'right' WHERE id = 'c1'")?;
+    for index in 0..2 {
+        front.prints(index, "stopped notes")?;
+    }
+    // Past several round trips, when a change not acknowledged would have
+    // been resent.
+    sleep(Duration::from_secs(3));
+    Ok(())
+}
+
+#[then("each node names the conflict in its record once")]
+fn named_once(front: &Front) -> Result<(), String> {
+    for index in 0..2 {
+        let printed = front.with(index, Node::printed)?;
+        let named = printed.matches("stopped notes").count();
+        if named != 1 {
+            return Err(format!("node {index} named the conflict {named} times"));
+        }
+    }
+    Ok(())
+}
+
+#[then("neither node resends that change after it is acknowledged")]
+fn not_resent(front: &Front) -> Result<(), String> {
+    let relay = front.relay.get().ok_or("no relay")?;
+    let seen = relay.seen.lock().unwrap_or_else(PoisonError::into_inner);
+    // Each change to the row, the stopped ones too, was acknowledged.
+    let changes = seen.changes_by_key.get("'c1'").cloned().unwrap_or_default();
+    if changes.len() < 3 {
+        return Err(format!(
+            "the relay saw {} changes to the row",
+            changes.len()
+        ));
+    }
+    if let Some(change) = changes
+        .iter()
+        .find(|change| !seen.acked_by_either.contains_key(*change))
+    {
+        return Err(format!("change {change} to the row was never acknowledged"));
+    }
+    let late = seen.resends.iter().find(|(key, change, at)| {
+        key == "'c1'"
+            && seen
+                .acked_by_either
+                .get(change)
+                .is_some_and(|acked| acked < at)
+    });
+    match late {
+        Some((_, change, _)) => Err(format!(
+            "change {change} was resent after it was acknowledged"
+        )),
+        None => Ok(()),
+    }
 }

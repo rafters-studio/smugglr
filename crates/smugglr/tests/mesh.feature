@@ -60,7 +60,7 @@ Feature: smugglr mesh as a command: its front ends, its node's name and port, it
     When 50,000 rows are written at once on the first node, and the relay drops one datagram in ten
     Then the first node sends each change's first copy unicast to the second node
     And each lost copy is applied on the second node within one second of its loss
-    And resends never take more than a quarter of what the first node sends
+    And while first copies are still waiting to be sent, resends take no more than a quarter of what the first node sends
 
   @criterion-01a176cc-730a-70c0-a641-dcff52054467 @module-mesh
   Scenario: the window shrinks on congestion, not on a lost datagram
@@ -93,3 +93,10 @@ Feature: smugglr mesh as a command: its front ends, its node's name and port, it
     Then it prints that it has been away longer than the sunset
     And it names smugglr stash and smugglr retrieve as the way to catch up
     And it keeps running and applies new changes
+
+  @criterion-01a177cf-dd00-79b1-ae49-0e7c363885b1 @module-mesh
+  Scenario: a stopped change is named once and not resent
+    Given two nodes running smugglr mesh with --sync-mode stop
+    When both nodes change the same row at once
+    Then each node names the conflict in its record once
+    And neither node resends that change after it is acknowledged

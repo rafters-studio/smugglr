@@ -35,6 +35,8 @@ pub(crate) struct Applied {
     pub(crate) wrote: Vec<[u8; 32]>,
     /// The changes that wait for their `from` to appear.
     pub(crate) waiting: Vec<Envelope>,
+    /// The changes it stopped or dropped: decided, so acknowledged.
+    pub(crate) decided: Vec<[u8; 32]>,
 }
 
 /// The node's database and what it keeps per key.
@@ -47,6 +49,8 @@ pub(crate) struct Local {
     last_from: HashMap<Row, Option<[u8; 16]>>,
     tombstones: HashMap<Row, Envelope>,
     /// The waiting changes the record has named, so each is named once.
+    held: HashSet<[u8; 32]>,
+    /// The changes stopped or dropped the record has named, likewise.
     named: HashSet<[u8; 32]>,
 }
 
@@ -67,6 +71,7 @@ impl Local {
             baseline: BTreeMap::new(),
             last_from: HashMap::new(),
             tombstones: HashMap::new(),
+            held: HashSet::new(),
             named: HashSet::new(),
         };
         local.read_tables(place, settings)?;
@@ -172,10 +177,28 @@ impl Local {
         Ok(self.store.replace(&self.journal, &text)?)
     }
 
-    /// Keeps that the row now hashes to `to` and was brought there from
-    /// `from` (an applied change or the node's own), adding the lines to
-    /// `lines`.
-    fn moved(&mut self, envelope: &Envelope, lines: &mut String) {
+    /// The journal lines for a row brought from `from` to `to` (an applied
+    /// change or the node's own), and its tombstone for a delete.
+    fn moved_lines(envelope: &Envelope) -> String {
+        let change = &envelope.change;
+        let (table, key) = (&change.table, &change.key);
+        let mut lines = String::new();
+        lines.push_str(&json!({"b": [table, key, change.to.map(|t| hex(&t))]}).to_string());
+        lines.push('\n');
+        lines.push_str(&json!({"f": [table, key, change.from.map(|f| hex(&f))]}).to_string());
+        lines.push('\n');
+        if change.to.is_none() {
+            lines.push_str(&Self::tombstone_line(envelope));
+        }
+        lines
+    }
+
+    fn tombstone_line(envelope: &Envelope) -> String {
+        format!("{}\n", json!({"t": envelope.to_json()}))
+    }
+
+    /// Keeps in memory that the row now hashes to `to`, brought from `from`.
+    fn remember_move(&mut self, envelope: &Envelope) {
         let change = &envelope.change;
         let (table, key) = (&change.table, &change.key);
         let hashes = self.baseline.entry(table.clone()).or_default();
@@ -185,20 +208,26 @@ impl Local {
         }
         self.last_from
             .insert((table.clone(), key.clone()), change.from);
-        lines.push_str(&json!({"b": [table, key, change.to.map(|t| hex(&t))]}).to_string());
-        lines.push('\n');
-        lines.push_str(&json!({"f": [table, key, change.from.map(|f| hex(&f))]}).to_string());
-        lines.push('\n');
         if change.to.is_none() {
-            self.tombstone(envelope, lines);
+            self.remember_tombstone(envelope);
         }
     }
 
-    fn tombstone(&mut self, envelope: &Envelope, lines: &mut String) {
+    fn remember_tombstone(&mut self, envelope: &Envelope) {
         let row = (envelope.change.table.clone(), envelope.change.key.clone());
         self.tombstones.insert(row, envelope.clone());
-        lines.push_str(&json!({"t": envelope.to_json()}).to_string());
-        lines.push('\n');
+    }
+
+    /// Keeps `found`, the node's own changes now in its outbox, as the last
+    /// hash of each key: written to the journal first, and only then in
+    /// memory, so a change that could not be kept is found again.
+    pub(crate) fn keep(&mut self, found: &[Envelope]) -> Result<(), Error> {
+        let lines: String = found.iter().map(Self::moved_lines).collect();
+        self.append(&lines)?;
+        for envelope in found {
+            self.remember_move(envelope);
+        }
+        Ok(())
     }
 
     fn append(&self, lines: &str) -> Result<(), Error> {
@@ -211,9 +240,10 @@ impl Local {
     /// One envelope per row changed here since it was last noted, signed
     /// with `sign`, as many as fit in `budget` bytes as `weigh` weighs each;
     /// the rows left over are found again on a later look. Also whether the
-    /// budget left rows over.
+    /// budget left rows over. Nothing is kept until [`Local::keep`], so a
+    /// look that fails part way loses no row.
     pub(crate) fn changes(
-        &mut self,
+        &self,
         place: &mut dyn Place,
         settings: &Settings,
         sign: &[u8; 32],
@@ -221,7 +251,7 @@ impl Local {
         budget: u64,
         weigh: impl Fn(&Envelope) -> u64,
     ) -> Result<(Vec<Envelope>, bool), Error> {
-        let (mut found, mut spent, mut lines) = (Vec::new(), 0_u64, String::new());
+        let (mut found, mut spent) = (Vec::new(), 0_u64);
         let mut full = false;
         let tables: Vec<Table> = self.tables.values().cloned().collect();
         'tables: for table in &tables {
@@ -281,12 +311,10 @@ impl Local {
                         break 'tables;
                     }
                     spent += size;
-                    self.moved(&envelope, &mut lines);
                     found.push(envelope);
                 }
             }
         }
-        self.append(&lines)?;
         Ok((found, full))
     }
 
@@ -358,7 +386,8 @@ impl Local {
                 .cloned()
                 .unwrap_or_default()
         });
-        let (mut applied, mut lines) = (Applied::default(), String::new());
+        let mut applied = Applied::default();
+        let (mut moves, mut tombstones): (Vec<Envelope>, Vec<Envelope>) = (Vec::new(), Vec::new());
         let mut writing: BTreeMap<String, Vec<&Envelope>> = BTreeMap::new();
         for (envelope, arrival) in envelopes.iter().zip(arrivals) {
             let change = &envelope.change;
@@ -369,7 +398,7 @@ impl Local {
                     .push(envelope),
                 Arrival::Skip => {
                     if change.to.is_none() {
-                        self.tombstone(envelope, &mut lines);
+                        tombstones.push(envelope.clone());
                     }
                     applied.has.push(envelope.signature);
                 }
@@ -387,17 +416,31 @@ impl Local {
                     );
                     applied.waiting.push(envelope.clone());
                 }
-                Arrival::Stop => println!(
-                    "smugglr mesh: stopped {} {:?}: changed here and in a change from {}",
-                    change.table, change.key, envelope.node
-                ),
-                Arrival::Dropped(reason) => println!(
-                    "smugglr mesh: dropped a change to {} {:?} from {}: {}",
-                    change.table,
-                    change.key,
-                    envelope.node,
-                    reason.words()
-                ),
+                // Decided, so acknowledged, and named once however often
+                // a copy arrives (FR-SMUGGLR-078 rev 24).
+                Arrival::Stop => {
+                    self.name(
+                        envelope,
+                        &format!(
+                            "stopped {} {:?}: changed here and in a change from {}",
+                            change.table, change.key, envelope.node
+                        ),
+                    );
+                    applied.decided.push(envelope.signature);
+                }
+                Arrival::Dropped(reason) => {
+                    self.name(
+                        envelope,
+                        &format!(
+                            "dropped a change to {} {:?} from {}: {}",
+                            change.table,
+                            change.key,
+                            envelope.node,
+                            reason.words()
+                        ),
+                    );
+                    applied.decided.push(envelope.signature);
+                }
                 Arrival::Refused => eprintln!(
                     "smugglr mesh: refused a change to {} from {}: key {} is not one this node holds",
                     change.table, envelope.node, envelope.key_id
@@ -405,60 +448,94 @@ impl Local {
             }
         }
         for (name, envelopes) in writing {
-            let Some(table) = self.tables.get(&name).cloned() else {
-                continue;
-            };
-            let changes: Vec<Change> = envelopes.iter().map(|e| e.change.clone()).collect();
-            let landed: BTreeSet<Key> = place.write(&table, &changes)?.into_iter().collect();
-            let read_back = read_back(place, &table, &landed)?;
-            let (mut makers, mut keys, mut count) = (BTreeSet::new(), BTreeSet::new(), 0);
-            for envelope in envelopes {
-                if landed.contains(&envelope.change.key) {
-                    let now_here = read_back.get(&envelope.change.key).copied();
-                    if now_here != envelope.change.to {
-                        println!(
-                            "smugglr mesh: a change to {name} {:?} from {} reads back as {}, not {}",
-                            envelope.change.key,
-                            envelope.node,
-                            short(now_here),
-                            short(envelope.change.to)
-                        );
-                    }
-                    self.named.remove(&envelope.signature);
-                    self.moved(envelope, &mut lines);
-                    applied.has.push(envelope.signature);
-                    applied.wrote.push(envelope.signature);
-                    makers.insert(envelope.node.as_str());
-                    keys.insert(envelope.key_id.as_str());
-                    count += 1;
-                } else {
-                    self.hold(
-                        envelope,
-                        "the row moved here between the read and the write",
+            self.write(place, &name, &envelopes, &mut applied, &mut moves)?;
+        }
+        // The journal first, then memory, as for the node's own changes.
+        let lines: String = moves
+            .iter()
+            .map(Self::moved_lines)
+            .chain(tombstones.iter().map(Self::tombstone_line))
+            .collect();
+        self.append(&lines)?;
+        for envelope in &moves {
+            self.remember_move(envelope);
+        }
+        for envelope in &tombstones {
+            self.remember_tombstone(envelope);
+        }
+        Ok(applied)
+    }
+
+    /// Writes `envelopes`, all to the table `name`, in one transaction, and
+    /// notes in `applied` and `moves` what landed.
+    fn write(
+        &mut self,
+        place: &mut dyn Place,
+        name: &str,
+        envelopes: &[&Envelope],
+        applied: &mut Applied,
+        moves: &mut Vec<Envelope>,
+    ) -> Result<(), Error> {
+        let Some(table) = self.tables.get(name).cloned() else {
+            return Ok(());
+        };
+        let changes: Vec<Change> = envelopes.iter().map(|e| e.change.clone()).collect();
+        let landed: BTreeSet<Key> = place.write(&table, &changes)?.into_iter().collect();
+        let read_back = read_back(place, &table, &landed)?;
+        let (mut makers, mut keys, mut count) = (BTreeSet::new(), BTreeSet::new(), 0);
+        for &envelope in envelopes {
+            if landed.contains(&envelope.change.key) {
+                let now_here = read_back.get(&envelope.change.key).copied();
+                if now_here != envelope.change.to {
+                    println!(
+                        "smugglr mesh: a change to {name} {:?} from {} reads back as {}, not {}",
+                        envelope.change.key,
+                        envelope.node,
+                        short(now_here),
+                        short(envelope.change.to)
                     );
-                    applied.waiting.push(envelope.clone());
                 }
-            }
-            if count > 0 {
-                println!(
-                    "smugglr mesh: applied {count} {} to {name} from {}, key {}",
-                    if count == 1 { "change" } else { "changes" },
-                    makers.into_iter().collect::<Vec<_>>().join(", "),
-                    keys.into_iter().collect::<Vec<_>>().join(", "),
+                self.held.remove(&envelope.signature);
+                moves.push(envelope.clone());
+                applied.has.push(envelope.signature);
+                applied.wrote.push(envelope.signature);
+                makers.insert(envelope.node.as_str());
+                keys.insert(envelope.key_id.as_str());
+                count += 1;
+            } else {
+                self.hold(
+                    envelope,
+                    "the row moved here between the read and the write",
                 );
+                applied.waiting.push(envelope.clone());
             }
         }
-        self.append(&lines)?;
-        Ok(applied)
+        if count > 0 {
+            println!(
+                "smugglr mesh: applied {count} {} to {name} from {}, key {}",
+                if count == 1 { "change" } else { "changes" },
+                makers.into_iter().collect::<Vec<_>>().join(", "),
+                keys.into_iter().collect::<Vec<_>>().join(", "),
+            );
+        }
+        Ok(())
     }
 
     /// Names in the record, once, a change that waits, and why.
     fn hold(&mut self, envelope: &Envelope, why: &str) {
-        if self.named.insert(envelope.signature) {
+        if self.held.insert(envelope.signature) {
             println!(
                 "smugglr mesh: holding a change to {} {:?} from {}: {why}",
                 envelope.change.table, envelope.change.key, envelope.node
             );
+        }
+    }
+
+    /// Prints `line` for `envelope`, a change decided (stopped or dropped),
+    /// in the record, once however often a copy of it arrives.
+    fn name(&mut self, envelope: &Envelope, line: &str) {
+        if self.named.insert(envelope.signature) {
+            println!("smugglr mesh: {line}");
         }
     }
 

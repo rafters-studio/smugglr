@@ -346,6 +346,16 @@ impl Outbox {
         Ok(out)
     }
 
+    /// Lets `change` go without its acknowledgements: it can never be sent.
+    pub(crate) fn forget(&mut self, change: &[u8; 32]) {
+        if let Some(entry) = self.entries.remove(change)
+            && let Some((_, live)) = self.segments.get_mut(&entry.segment)
+        {
+            *live = live.saturating_sub(1);
+            self.settled = true;
+        }
+    }
+
     /// Puts `envelopes`, taken by [`Outbox::first_sends`] and not sent, back
     /// at the front.
     pub(crate) fn unsend(&mut self, envelopes: &[Envelope]) {

@@ -55,22 +55,29 @@ const PER_TICK: usize = 2_000;
 const FIRST_WINDOW: f64 = 32.0;
 
 /// The largest window. A larger one queues more first copies at a busy
-/// peer, and a resend waits behind them all: past about 2,000, a lost copy
+/// peer, and a resend waits behind them all: past about 1,000, a lost copy
 /// takes longer than a second to repair.
-const LARGEST: f64 = 2_000.0;
+const LARGEST: f64 = 1_000.0;
 
 /// How often a node announces itself again, so a peer that missed it, or
 /// started since, learns its address.
 const ANNOUNCE: Duration = Duration::from_secs(10);
 
-/// How often at most the record names datagrams that did not open.
-const SAY_UNOPENED: Duration = Duration::from_secs(60);
+/// How often at most the record names resends, or datagrams that did not
+/// open.
+const SAY_EVERY: Duration = Duration::from_secs(60);
 
 /// How often the outbox and what the node has heard are tidied.
 const TIDY: Duration = Duration::from_secs(1);
 
 /// Bytes kept free under the backpressure line for the outbox's index.
 const INDEX_ROOM: u64 = 1_024;
+
+/// The most applied changes waiting for their echo.
+const ECHOES: usize = 20_000;
+
+/// The most echoes a tick sends.
+const ECHOES_PER_TICK: usize = 200;
 
 /// The resends a tick may send when the node has nothing left to send
 /// first.
@@ -139,6 +146,8 @@ pub fn run(place: &mut dyn Place, settings: &Settings, stop: &AtomicBool) -> Res
         lost: 0,
         announced: None,
         ran,
+        resent_unsaid: 0,
+        said_resent: None,
         unopened: 0,
         said_unopened: None,
         tidied: Instant::now(),
@@ -158,8 +167,9 @@ pub fn run(place: &mut dyn Place, settings: &Settings, stop: &AtomicBool) -> Res
         });
         while !stop.load(Ordering::Relaxed) {
             // A busy database or a datagram that could not go out is a
-            // moment's trouble: the node says so and goes on, and resends
-            // cover the gap.
+            // moment's trouble: the node says so and goes on. A look that
+            // failed kept nothing, so its rows are found again, and a change
+            // that did not go out is resent.
             if let Err(err) = node.turn(place, &rx) {
                 eprintln!("smugglr mesh: {err}");
             }
@@ -295,6 +305,9 @@ struct Node<'a> {
     announced: Option<Instant>,
     /// Where it keeps when it last ran.
     ran: String,
+    /// Changes resent since the record last said so.
+    resent_unsaid: usize,
+    said_resent: Option<Instant>,
     /// Datagrams that opened under no key held, since the record last said.
     unopened: usize,
     said_unopened: Option<Instant>,
@@ -349,6 +362,45 @@ impl Node<'_> {
             // Room in the outbox as soon as acknowledgements make it.
             self.outbox.prune(now())?;
         }
+        self.look(place)?;
+        self.send_due()?;
+        if self.unopened > 0
+            && self
+                .said_unopened
+                .is_none_or(|at| at.elapsed() >= SAY_EVERY)
+        {
+            // Another mesh on the port, or a peer holding another key.
+            println!(
+                "smugglr mesh: {} on port {} did not open under a key this node holds",
+                if self.unopened == 1 {
+                    "1 datagram".to_owned()
+                } else {
+                    format!("{} datagrams", self.unopened)
+                },
+                self.settings.port
+            );
+            self.unopened = 0;
+            self.said_unopened = Some(Instant::now());
+        }
+        if self.announced.is_none_or(|at| at.elapsed() >= ANNOUNCE) {
+            self.announce();
+        }
+        if self.tidied.elapsed() >= TIDY {
+            self.tidied = Instant::now();
+            let epoch = now();
+            self.outbox.prune(epoch)?;
+            self.heard.retain(|_, heard| epoch <= heard.sunset);
+            if !self.waiting.is_empty() {
+                // A change waiting past its sunset is dropped.
+                self.apply(place, Vec::new())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Looks for its own changes when a look is due, and takes what fits
+    /// under the backpressure line into the outbox.
+    fn look(&mut self, place: &mut dyn Place) -> Result<(), Error> {
         // A look that stopped at the backpressure line looks again once
         // acknowledgements have emptied half the outbox, not for every
         // change they settle; any other look waits its turn.
@@ -384,42 +436,13 @@ impl Node<'_> {
             )?;
             self.scan_full = full;
             if !found.is_empty() {
+                // In the outbox first, then kept as each key's last hash:
+                // a step that fails leaves the rows to be found again.
                 self.outbox.add(&found, &self.peers)?;
+                self.local.keep(&found)?;
             }
             self.scanned = Some(Instant::now());
             self.scan_took = started.elapsed();
-        }
-        self.send_due()?;
-        if self.unopened > 0
-            && self
-                .said_unopened
-                .is_none_or(|at| at.elapsed() >= SAY_UNOPENED)
-        {
-            // Another mesh on the port, or a peer holding another key.
-            println!(
-                "smugglr mesh: {} on port {} did not open under a key this node holds",
-                if self.unopened == 1 {
-                    "1 datagram".to_owned()
-                } else {
-                    format!("{} datagrams", self.unopened)
-                },
-                self.settings.port
-            );
-            self.unopened = 0;
-            self.said_unopened = Some(Instant::now());
-        }
-        if self.announced.is_none_or(|at| at.elapsed() >= ANNOUNCE) {
-            self.announce();
-        }
-        if self.tidied.elapsed() >= TIDY {
-            self.tidied = Instant::now();
-            let epoch = now();
-            self.outbox.prune(epoch)?;
-            self.heard.retain(|_, heard| epoch <= heard.sunset);
-            if !self.waiting.is_empty() {
-                // A change waiting past its sunset is dropped.
-                self.apply(place, Vec::new())?;
-            }
         }
         Ok(())
     }
@@ -608,8 +631,24 @@ impl Node<'_> {
                 .apply(place, self.settings, &sign, &envelopes, epoch)?;
             let wrote: BTreeSet<[u8; 32]> = applied.wrote.iter().copied().collect();
             let has: BTreeSet<[u8; 32]> = applied.has.iter().copied().collect();
+            let decided: BTreeSet<[u8; 32]> = applied.decided.iter().copied().collect();
             for envelope in envelopes {
                 let change = envelope.signature;
+                if decided.contains(&change) {
+                    // Stopped or dropped and named: decided, so acknowledged,
+                    // and its maker stops resending it (FR-SMUGGLR-078 rev
+                    // 24).
+                    self.heard.insert(
+                        change,
+                        Heard {
+                            has: true,
+                            copies: 0,
+                            sunset: envelope.sunset,
+                        },
+                    );
+                    acks.entry(envelope.node.clone()).or_default().push(change);
+                    continue;
+                }
                 if !has.contains(&change) {
                     continue;
                 }
@@ -625,6 +664,12 @@ impl Node<'_> {
                     acks.entry(envelope.node.clone()).or_default().push(change);
                 }
                 if wrote.contains(&change) {
+                    // Echo is redundancy, not repair: past ECHOES waiting,
+                    // the oldest is let go rather than hold a flood's every
+                    // change in memory.
+                    if self.echoes.len() >= ECHOES {
+                        self.echoes.pop_front();
+                    }
                     self.echoes
                         .push_back((Instant::now() + echo_wait(), envelope));
                 }
@@ -659,6 +704,18 @@ impl Node<'_> {
                 self.window.congested("acknowledgements slowing");
             }
         }
+    }
+
+    /// Refuses, loudly, a change the system will not send as one datagram:
+    /// names its row and the catch-up, and lets it go from the outbox so it
+    /// never holds up the changes after it.
+    fn refuse_too_large(&mut self, envelope: &Envelope) {
+        println!(
+            "smugglr mesh: a change to {} {:?} is too large for one datagram and is not sent; \
+             catch it up with smugglr stash and smugglr retrieve",
+            envelope.change.table, envelope.change.key
+        );
+        self.outbox.forget(&envelope.signature);
     }
 
     /// Acknowledges each maker's changes, [`ACKS`] to a datagram.
@@ -697,14 +754,20 @@ impl Node<'_> {
         let to = self.destinations();
         let firsts = self.outbox.first_sends(room)?;
         let mut sent = 0;
-        for (at, envelope) in firsts.iter().enumerate() {
+        'firsts: for (at, envelope) in firsts.iter().enumerate() {
             for to in &to {
-                if self.change(envelope, false, *to).is_err() {
-                    self.window.congested(FULL);
-                    self.outbox.unsend(&firsts[at..]);
-                    return Ok(());
+                match self.change(envelope, false, *to) {
+                    Ok(()) => sent += 1,
+                    Err(err) if too_large(&err) => {
+                        self.refuse_too_large(envelope);
+                        continue 'firsts;
+                    }
+                    Err(_) => {
+                        self.window.congested(FULL);
+                        self.outbox.unsend(&firsts[at..]);
+                        return Ok(());
+                    }
                 }
-                sent += 1;
             }
         }
         // When no first send could go (none left, or the window is held by
@@ -734,9 +797,16 @@ impl Node<'_> {
                 if resent >= room {
                     break 'resends;
                 }
-                if self.change(envelope, true, to).is_err() {
-                    self.window.congested(FULL);
-                    return Ok(());
+                match self.change(envelope, true, to) {
+                    Ok(()) => {}
+                    Err(err) if too_large(&err) => {
+                        self.refuse_too_large(envelope);
+                        continue 'resends;
+                    }
+                    Err(_) => {
+                        self.window.congested(FULL);
+                        return Ok(());
+                    }
                 }
                 self.resent.set(self.resent.get() + 1);
                 resent += 1;
@@ -744,13 +814,39 @@ impl Node<'_> {
             changes += 1;
         }
         sent += resent;
-        if changes > 0 {
+        self.say_resent(changes, instant);
+        self.send_echoes(instant, sent);
+        Ok(())
+    }
+
+    /// Notes `changes` resent, and says so at most once a minute.
+    fn say_resent(&mut self, changes: usize, instant: Instant) {
+        self.resent_unsaid += changes;
+        if self.resent_unsaid > 0 && self.said_resent.is_none_or(|at| at.elapsed() >= SAY_EVERY) {
             println!(
-                "smugglr mesh: resent {changes} {} a peer has not acknowledged",
-                if changes == 1 { "change" } else { "changes" }
+                "smugglr mesh: resent {} {} a peer had not acknowledged",
+                self.resent_unsaid,
+                if self.resent_unsaid == 1 {
+                    "change"
+                } else {
+                    "changes"
+                }
             );
+            self.resent_unsaid = 0;
+            self.said_resent = Some(instant);
         }
-        while sent < PER_TICK && self.echoes.front().is_some_and(|(due, _)| instant >= *due) {
+    }
+
+    /// Sends the echoes due at `instant`, paced, `sent` datagrams already
+    /// gone this tick.
+    fn send_echoes(&mut self, instant: Instant, mut sent: usize) {
+        // Echoes are paced too: each loops back to this node's own socket
+        // as well, and a flood's echoes sent at once would fill it.
+        let mut echoed = 0;
+        while sent < PER_TICK
+            && echoed < ECHOES_PER_TICK
+            && self.echoes.front().is_some_and(|(due, _)| instant >= *due)
+        {
             let Some((_, envelope)) = self.echoes.pop_front() else {
                 break;
             };
@@ -759,14 +855,19 @@ impl Node<'_> {
                 .get(&envelope.signature)
                 .map_or(0, |heard| heard.copies);
             if copies < self.settings.k {
-                if self.change(&envelope, false, (self.to, 0)).is_err() {
-                    self.window.congested(FULL);
-                    return Ok(());
+                match self.change(&envelope, false, (self.to, 0)) {
+                    Ok(()) => {}
+                    // Its maker refuses it too; an echo just lets it go.
+                    Err(err) if too_large(&err) => continue,
+                    Err(_) => {
+                        self.window.congested(FULL);
+                        return;
+                    }
                 }
                 sent += 1;
+                echoed += 1;
             }
         }
-        Ok(())
     }
 }
 
@@ -776,6 +877,19 @@ impl std::fmt::Debug for Node<'_> {
             .field("node", &self.settings.node)
             .field("peers", &self.peers)
             .finish_non_exhaustive()
+    }
+}
+
+/// Whether the system refused a datagram for its size (EMSGSIZE): rows up
+/// to that size go by IP fragmentation; past it, a change cannot go as one.
+fn too_large(err: &std::io::Error) -> bool {
+    let code = err.raw_os_error();
+    if cfg!(any(target_os = "linux", target_os = "android")) {
+        code == Some(90)
+    } else if cfg!(windows) {
+        code == Some(10_040)
+    } else {
+        code == Some(40)
     }
 }
 
