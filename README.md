@@ -6,7 +6,7 @@ smugglr is not a database. It moves rows between databases and keeps its own mem
 
 ## Install
 
-The GitHub release for tag v0.6.0 (https://github.com/rafters-studio/smugglr/releases) carries one archive per target, named `smugglr-<target>`: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, `aarch64-apple-darwin` and `x86_64-pc-windows-msvc`. smugglr publishes no checksum file.
+The GitHub release for tag v0.6.0 (https://github.com/rafters-studio/smugglr/releases) carries one archive per target: `smugglr-<target>.tar.gz` for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin` and `aarch64-apple-darwin`, and `smugglr-x86_64-pc-windows-msvc.zip` for Windows. smugglr publishes no checksum file.
 
 From source:
 
