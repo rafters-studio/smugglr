@@ -93,8 +93,9 @@ impl fmt::Display for Weight {
 #[must_use]
 pub fn too_much(weight: &Weight, source: &str, target: &str) -> String {
     format!(
-        "Too much for one sync: {weight}.\nMove it with: smugglr stash {source} <store>, \
-         then smugglr retrieve {target} <store>"
+        "Too much for one sync: {weight}.\nMove it with: smugglr stash {source} <dir> \
+         --key-file <path> --node <name> --whole, then smugglr retrieve {target} <dir> \
+         --key-file <path> --node <name>"
     )
 }
 
@@ -112,7 +113,8 @@ mod tests {
         assert_eq!(
             too_much(&weight, "./shop.db", "d1://shop"),
             "Too much for one sync: 4,812,000 rows, 2.1 GB in 3 tables.\n\
-             Move it with: smugglr stash ./shop.db <store>, then smugglr retrieve d1://shop <store>"
+             Move it with: smugglr stash ./shop.db <dir> --key-file <path> --node <name> --whole, \
+             then smugglr retrieve d1://shop <dir> --key-file <path> --node <name>"
         );
     }
 
