@@ -1,17 +1,17 @@
 # smugglr
 
-smugglr keeps SQLite databases in step. One Rust binary, three kinds of place: a local file, a service that speaks HTTP-SQL, and Cloudflare D1. Each row is compared by a 16-byte BLAKE3 hash of its contents, so only rows that changed cross the wire. A row changed in both places stops and is named; nothing is overwritten unless you say so.
+smugglr keeps SQLite databases in step. One Rust binary, three kinds of place: a local file, a service that speaks HTTP-SQL, and Cloudflare D1. On a local network where nobody is in charge, `smugglr mesh` keeps the nodes in step as changes happen. Each row is compared by a 16-byte BLAKE3 hash of its contents, so only rows that changed cross the wire. A row changed in both places stops and is named; nothing is overwritten unless you say so.
 
 smugglr is not a database. It moves rows between databases and keeps its own memory in files in its config directory.
 
 ## Install
 
-The GitHub release for tag v0.6.0 (https://github.com/rafters-studio/smugglr/releases) carries one archive per target: `smugglr-<target>.tar.gz` for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin` and `aarch64-apple-darwin`, and `smugglr-x86_64-pc-windows-msvc.zip` for Windows. smugglr publishes no checksum file.
+The GitHub release for tag v0.6.1 (https://github.com/rafters-studio/smugglr/releases) carries one archive per target: `smugglr-<target>.tar.gz` for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin` and `aarch64-apple-darwin`, and `smugglr-x86_64-pc-windows-msvc.zip` for Windows. smugglr publishes no checksum file.
 
 From source:
 
 ```
-cargo install --git https://github.com/rafters-studio/smugglr --tag v0.6.0 smugglr
+cargo install --git https://github.com/rafters-studio/smugglr --tag v0.6.1 smugglr
 ```
 
 ## First sync
@@ -139,7 +139,7 @@ smugglr sync: too much
 
 ```
 $ smugglr stash a/shop.db blobs --key-file shop.key --node laptop --whole
-blobs/1792977241457-31250147751667d1c02b67c6ec99a5a6.blob
+blobs/1793024890191-9acad5a77fc6de0a037c7cfc8ca03112.blob
 ```
 
 ```
@@ -165,13 +165,117 @@ Every change smugglr carries between devices has a sunset, the graveyard setting
 | 4 | Wrote something and is not done. Run it again. |
 | 5 | Too much for the wire. Nothing was sent. |
 
-## Not in 0.6.0
+## Mesh
 
-`--sync-type` accepts only `direct`. `hub`, `multi` and `mesh` are refused as not built yet.
+`smugglr mesh <place> --key-file <path>` keeps one database in step with every other node on the local network that holds the same key. There is no server, no hub and no coordinator, and any node can leave while the rest go on. Each change goes out as it happens and is resent to each peer until that peer has decided it. `smugglr sync <place> --sync-type mesh --key-file <path>` is the same command. The protocol is in `docs/mesh-protocol.md`.
+
+A mesh is one shared key. `keygen` writes it with `chmod 600`; copy the file to every node.
 
 ```
-$ smugglr sync laptop/shop.db server/shop.db --sync-type mesh 2>&1 | head -1
---sync-type mesh is not built yet
+$ smugglr mesh keygen --key-file ./mesh.key
+smugglr mesh: wrote key 9b22c29fc58e8e87 to ./mesh.key
 ```
 
-Every output block above was pasted from a run of the release binary against local SQLite files.
+The key file holds one base64 key per line, newest last; a line starting with `#` is a note. A node signs and seals with the newest key and also accepts the one before it, so a key is rotated by appending a new one. On unix a node refuses a key file its group or others can read, and exits 2:
+
+```
+$ chmod 644 ./loose.key
+$ smugglr mesh ./puck/node.db --key-file ./loose.key
+./loose.key: the key file is readable by its group or others; chmod 600 ./loose.key fixes it
+$ echo $?
+2
+```
+
+Every datagram is sealed with XChaCha20-Poly1305 under a key derived from the shared key, and each envelope is signed under another, so a capture of the traffic holds no row value and no key. No key is ever printed; a key is named by its `key_id`.
+
+A node announces itself by broadcast and learns each peer's address from where its datagrams come from. After that it talks to peers by unicast. On a network that carries no broadcast (WireGuard, Tailscale, a cloud network) the `peers` setting names the addresses to announce to. A node is named by its machine's name, `hostname` or `COMPUTERNAME` on Windows, so every node needs its own name. The two nodes below share one machine, each with its own port and a one-line `hostname` script ahead of the real one on its `PATH`, and name each other in `peers`:
+
+```toml
+# puck's config.toml
+port = 31401
+peers = ["127.0.0.1:31402"]
+```
+
+```toml
+# rzr's config.toml
+port = 31402
+peers = ["127.0.0.1:31401"]
+graveyard = 3
+```
+
+`graveyard = 3` on rzr is for the sunset demonstration below; leave it out for a real mesh.
+
+Both tables exist before the nodes start. A node's first run notes the rows already in its database and sends none of them; use stash and retrieve to bring a new node up to date.
+
+```
+$ smugglr mesh ./node.db --key-file ../mesh.key   # on puck
+smugglr mesh: node puck on UDP port 31401, key 9b22c29fc58e8e87
+$ smugglr mesh ./node.db --key-file ../mesh.key   # on rzr
+smugglr mesh: node rzr on UDP port 31402, key 9b22c29fc58e8e87
+```
+
+A row written on puck reaches rzr with no sync run, whichever program wrote it. A delete crosses the same way.
+
+```
+$ sqlite3 ./node.db "insert into notes values('n1','first note');"   # on puck
+$ sqlite3 ./node.db "select * from notes"   # on rzr
+n1|first note
+# rzr, output so far
+smugglr mesh: node rzr on UDP port 31402, key 9b22c29fc58e8e87
+smugglr mesh: applied 1 change to notes from puck, key 9b22c29fc58e8e87
+```
+
+```
+$ sqlite3 ./node.db "delete from notes where id='n1'"   # on puck
+$ sqlite3 ./node.db "select count(*) from notes"   # on rzr
+0
+# rzr, output so far
+smugglr mesh: node rzr on UDP port 31402, key 9b22c29fc58e8e87
+smugglr mesh: applied 1 change to notes from puck, key 9b22c29fc58e8e87
+smugglr mesh: applied 1 change to notes from puck, key 9b22c29fc58e8e87
+```
+
+A node that starts after being away longer than the sunset (the `graveyard` setting, 12 hours by default; 3 seconds here) says so, and names the commands that catch it up. It keeps running for new changes.
+
+```
+$ smugglr mesh ./node.db --key-file ../mesh.key   # on rzr, restarted after being stopped longer than its graveyard (3 seconds); the scratch directory is shown as .
+smugglr mesh: node rzr on UDP port 31402, key 9b22c29fc58e8e87
+smugglr mesh: this node has been away 11 seconds, longer than the sunset (3 seconds); changes made meanwhile may not reach it. Catch up with: smugglr stash <a peer's place> <dir> --key-file <path> --node <name> --whole, then smugglr retrieve ./node.db <dir> --key-file <path> --node rzr
+```
+
+A change too large for one datagram is refused loudly and dropped from the outbox, so it does not hold up the changes after it. On macOS the limit is about 9 KB (`net.inet.udp.maxdgram`). Move the row with stash and retrieve.
+
+```
+$ sqlite3 ./node.db "insert into notes values('big', <30,000 characters>);"   # on puck
+# puck, output so far
+smugglr mesh: node puck on UDP port 31401, key 9b22c29fc58e8e87
+smugglr mesh: a change to notes ["'big'"] is too large for one datagram and is not sent; catch it up with smugglr stash and smugglr retrieve
+```
+
+| setting | default | what it does |
+| --- | --- | --- |
+| `port` | 31337 | the UDP port a node broadcasts and listens on |
+| `peers` | none | addresses to announce to, `host` or `host:port` |
+| `backpressure` | 6 MB | the most the outbox of unacknowledged changes holds; at the line the node takes no new changes in until acknowledgements bring it down |
+| `graveyard` | 12 hours | seconds a change is carried; sets each change's sunset |
+
+Designed and tested for up to 50 nodes. Clocks should agree to within one twelfth of the sunset.
+
+### Not in 0.6.1
+
+- Automatic catch-up past the sunset (#521). A node away longer than the sunset prints the commands above; the person runs `smugglr stash` and `smugglr retrieve`.
+- `smugglr mesh remove` (#521). A node gone for good stops being a target when the sunset passes.
+- Retiring the previous key. A node accepts the key before the newest with no end date.
+- A loud name clash (#521). Two machines with one name ignore each other and nothing says so.
+- The `mesh_wire` setting, which belongs to the automatic catch-up.
+
+## Not in 0.6.1
+
+`--sync-type` accepts `direct` and `mesh`. `hub` and `multi` are refused as not built yet.
+
+```
+$ smugglr sync laptop/shop.db server/shop.db --sync-type hub 2>&1 | head -1
+--sync-type hub is not built yet
+```
+
+Every output block above was pasted from a run of the binary against local SQLite files; the mesh blocks come from two nodes on one machine.
