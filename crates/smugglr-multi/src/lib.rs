@@ -79,10 +79,17 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// The id of the key that signs: the first 8 bytes of its hash, as hex.
+    /// The id of the key that signs.
     fn key_id(&self) -> String {
-        hex(&row_hash(&[&hex(&self.key)])[..8])
+        key_id(&self.key)
     }
+}
+
+/// The id an envelope signed with `key` carries: the first 8 bytes of the
+/// key's hash, as hex. It names the key without giving it away.
+#[must_use]
+pub fn key_id(key: &[u8; 32]) -> String {
+    hex(&row_hash(&[&hex(key)])[..8])
 }
 
 /// What stash makes and retrieve applies.

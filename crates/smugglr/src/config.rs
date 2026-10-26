@@ -11,7 +11,9 @@
 //! `--sync-mode last` reads (FR-SMUGGLR-068), once for all tables
 //! (`steering = "updated_at"`) or per table (`[tables.orders] steering =
 //! "modified"`); and `graveyard`, the seconds a change is carried and a
-//! delete's tombstone kept (FR-SMUGGLR-076). Other settings are left alone.
+//! delete's tombstone kept (FR-SMUGGLR-076); and `port`, the UDP port
+//! smugglr mesh broadcasts and listens on (FR-SMUGGLR-078). Other settings
+//! are left alone.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -36,6 +38,8 @@ pub struct Config {
     pub steering: Steering,
     /// The graveyard window in seconds; `None` when not set, 12 hours.
     pub graveyard: Option<u64>,
+    /// The mesh's UDP port; `None` when not set, 31337.
+    pub port: Option<u16>,
 }
 
 /// The config as the file holds it, before its settings are checked.
@@ -45,6 +49,7 @@ struct File {
     ignore: Vec<String>,
     max_wire: Option<toml::Value>,
     graveyard: Option<u64>,
+    port: Option<u16>,
     steering: Option<String>,
     #[serde(default)]
     tables: BTreeMap<String, TableFile>,
@@ -144,6 +149,7 @@ fn parse(text: &str) -> Result<Config, Problem> {
             tables,
         },
         graveyard: file.graveyard,
+        port: file.port,
     })
 }
 
@@ -221,6 +227,16 @@ mod tests {
         assert_eq!(max_wire("max_wire = 2048"), Some(Some(2048)));
         assert_eq!(max_wire("max_wire = \"250 MB\""), Some(Some(250_000_000)));
         assert_eq!(parse("").ok(), Some(Config::default()));
+    }
+
+    #[test]
+    fn the_mesh_port_is_read_and_a_port_out_of_range_is_an_error() {
+        assert_eq!(
+            parse("port = 40000").ok().map(|c| c.port),
+            Some(Some(40000))
+        );
+        assert_eq!(parse("").ok().map(|c| c.port), Some(None));
+        assert!(parse("port = 70000").is_err());
     }
 
     #[test]

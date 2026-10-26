@@ -1,0 +1,620 @@
+//! Steps for `smugglr mesh` as a command: smugglr processes on SQLite files
+//! in the scenario's folder, each with its own config directory and its own
+//! machine name (a `hostname` first on its `PATH`), broadcasting on the
+//! port its config names.
+
+use std::fs::File;
+use std::net::UdpSocket;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::thread::sleep;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use chacha20poly1305::XChaCha20Poly1305;
+use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng};
+use rstest::fixture;
+use rstest_bdd::Slot;
+use rstest_bdd_macros::{ScenarioState, given, then, when};
+use rusqlite::Connection;
+use serde_json::json;
+use smugglr_core::change::{Change, Op};
+use smugglr_core::envelope::{Envelope, VERSION};
+use smugglr_core::hex::hex;
+use smugglr_core::row_hash::row_hash;
+use smugglr_core::shape::{Column, Stamp};
+
+use crate::setup::World;
+
+/// The table every node's database holds.
+const NOTES: &str = "CREATE TABLE notes (id TEXT PRIMARY KEY, body TEXT)";
+
+/// How long a step waits for a change sent at once.
+const SOON: Duration = Duration::from_secs(10);
+
+/// A key no node of a scenario holds.
+const UNKNOWN: [u8; 32] = [9; 32];
+
+/// How a node is started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrontEnd {
+    /// `smugglr mesh <place>`.
+    Mesh,
+    /// `smugglr sync <place> --sync-type mesh`.
+    Sync,
+}
+
+/// One running smugglr process.
+#[derive(Debug)]
+struct Node {
+    path: PathBuf,
+    out: PathBuf,
+    err: PathBuf,
+    port: u16,
+    child: Child,
+}
+
+impl Node {
+    /// What the node has printed to its output and its errors.
+    fn printed(&self) -> String {
+        let read = |path: &Path| std::fs::read_to_string(path).unwrap_or_default();
+        format!("{}{}", read(&self.out), read(&self.err))
+    }
+}
+
+/// A scenario's nodes; dropping them stops them.
+#[derive(Debug, Default)]
+struct Nodes(Mutex<Vec<Node>>);
+
+impl Drop for Nodes {
+    fn drop(&mut self) {
+        for node in self.0.get_mut().unwrap_or_else(PoisonError::into_inner) {
+            let _ = node.child.kill();
+            let _ = node.child.wait();
+        }
+    }
+}
+
+/// A scenario's mesh nodes and key files.
+#[derive(Debug, Default, ScenarioState)]
+pub(crate) struct Front {
+    nodes: Slot<Arc<Nodes>>,
+    /// The key ids keygen printed, in the order it wrote them.
+    key_ids: Slot<Vec<String>>,
+    /// The output of a node that did not start.
+    refused: Slot<std::process::Output>,
+    /// A key file a scenario names.
+    key: Slot<PathBuf>,
+}
+
+#[fixture]
+pub(crate) fn front() -> Front {
+    Front::default()
+}
+
+impl Front {
+    fn nodes(&self) -> Arc<Nodes> {
+        if let Some(nodes) = self.nodes.get() {
+            return nodes;
+        }
+        let nodes = Arc::new(Nodes::default());
+        self.nodes.set(nodes.clone());
+        nodes
+    }
+
+    /// Starts node `name` on `port` (`None`: no port setting) with the key
+    /// file `key`, and waits for its first look at its rows.
+    fn start(
+        &self,
+        world: &World,
+        name: &str,
+        key: &Path,
+        port: Option<u16>,
+        front_end: FrontEnd,
+    ) -> Result<usize, String> {
+        let folder = world.folder()?.join(name);
+        std::fs::create_dir_all(&folder).map_err(|err| err.to_string())?;
+        let path = folder.join("node.db");
+        Connection::open(&path)
+            .and_then(|db| db.execute_batch(NOTES))
+            .map_err(|err| err.to_string())?;
+        let config = folder.join("config").join("smugglr");
+        std::fs::create_dir_all(&config).map_err(|err| err.to_string())?;
+        if let Some(port) = port {
+            std::fs::write(config.join("config.toml"), format!("port = {port}\n"))
+                .map_err(|err| err.to_string())?;
+        }
+        let bin = folder.join("bin");
+        std::fs::create_dir_all(&bin).map_err(|err| err.to_string())?;
+        machine_named(&bin, name)?;
+        let place = path.display().to_string();
+        let key_file = key.display().to_string();
+        let args: Vec<&str> = match front_end {
+            FrontEnd::Mesh => vec!["mesh", &place, "--key-file", &key_file],
+            FrontEnd::Sync => vec![
+                "sync",
+                &place,
+                "--sync-type",
+                "mesh",
+                "--key-file",
+                &key_file,
+            ],
+        };
+        let (out, err) = (folder.join("out.txt"), folder.join("err.txt"));
+        let file = |path: &Path| File::create(path).map_err(|err| err.to_string());
+        let child = Command::new(env!("CARGO_BIN_EXE_smugglr"))
+            .args(&args)
+            .env("XDG_CONFIG_HOME", folder.join("config"))
+            .env("PATH", search_path(&bin))
+            .stdout(Stdio::from(file(&out)?))
+            .stderr(Stdio::from(file(&err)?))
+            .spawn()
+            .map_err(|err| format!("failed to start smugglr: {err}"))?;
+        let nodes = self.nodes();
+        let mut nodes = nodes.0.lock().unwrap_or_else(PoisonError::into_inner);
+        nodes.push(Node {
+            path,
+            out,
+            err,
+            port: port.unwrap_or(31337),
+            child,
+        });
+        let index = nodes.len() - 1;
+        drop(nodes);
+        // A node's first look notes every row as it is and sends nothing;
+        // it is done once the node keeps what it saw.
+        wait(SOON, || {
+            std::fs::read_dir(&config).is_ok_and(|entries| {
+                entries
+                    .flatten()
+                    .any(|entry| entry.file_name() != "config.toml")
+            })
+        })
+        .map_err(|()| format!("{name} did not look at its rows"))?;
+        Ok(index)
+    }
+
+    fn with<T>(&self, index: usize, read: impl FnOnce(&Node) -> T) -> Result<T, String> {
+        let nodes = self.nodes();
+        let nodes = nodes.0.lock().unwrap_or_else(PoisonError::into_inner);
+        nodes.get(index).map(read).ok_or(format!("no node {index}"))
+    }
+
+    fn sql(&self, index: usize, sql: &str) -> Result<(), String> {
+        let path = self.with(index, |node| node.path.clone())?;
+        Connection::open(path)
+            .and_then(|db| {
+                db.busy_timeout(Duration::from_secs(5))?;
+                db.execute_batch(sql)
+            })
+            .map_err(|err| err.to_string())
+    }
+
+    /// Waits for node `index` to hold note `id` with `body`.
+    fn holds(&self, index: usize, id: &str, body: &str) -> Result<(), String> {
+        let path = self.with(index, |node| node.path.clone())?;
+        let read = || {
+            Connection::open(&path)
+                .and_then(|db| {
+                    db.busy_timeout(Duration::from_secs(5))?;
+                    db.query_row("SELECT body FROM notes WHERE id = ?1", [id], |row| {
+                        row.get::<_, String>(0)
+                    })
+                })
+                .ok()
+        };
+        wait(SOON, || read().as_deref() == Some(body))
+            .map_err(|()| format!("node {index} holds {:?} for {id}, not {body:?}", read()))
+    }
+
+    /// Waits for node `index` to print `text`.
+    fn prints(&self, index: usize, text: &str) -> Result<(), String> {
+        wait(SOON, || {
+            self.with(index, |node| node.printed().contains(text))
+                .unwrap_or(false)
+        })
+        .map_err(|()| {
+            format!(
+                "node {index} did not print {text:?}; it printed {:?}",
+                self.with(index, Node::printed).unwrap_or_default()
+            )
+        })
+    }
+}
+
+/// Puts a `hostname` in `bin` that names this machine `name`.
+fn machine_named(bin: &Path, name: &str) -> Result<(), String> {
+    let script = bin.join("hostname");
+    std::fs::write(&script, format!("#!/bin/sh\necho {name}\n")).map_err(|err| err.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+/// `bin`, then the search path this test runs with.
+fn search_path(bin: &Path) -> String {
+    let rest = std::env::var("PATH").unwrap_or_default();
+    format!("{}:{rest}", bin.display())
+}
+
+/// A UDP port no process holds now.
+fn free_port() -> Result<u16, String> {
+    UdpSocket::bind("0.0.0.0:0")
+        .and_then(|socket| socket.local_addr())
+        .map(|addr| addr.port())
+        .map_err(|err| err.to_string())
+}
+
+/// Runs `smugglr mesh keygen --key-file <path>` and returns the key id it
+/// printed.
+fn keygen(path: &Path) -> Result<String, String> {
+    let output = Command::new(env!("CARGO_BIN_EXE_smugglr"))
+        .args(["mesh", "keygen", "--key-file"])
+        .arg(path)
+        .output()
+        .map_err(|err| format!("failed to start smugglr: {err}"))?;
+    let printed = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() {
+        return Err(format!(
+            "keygen failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    printed
+        .split_whitespace()
+        .skip_while(|word| *word != "key")
+        .nth(1)
+        .map(str::to_owned)
+        .ok_or_else(|| format!("keygen printed no key id: {printed:?}"))
+}
+
+/// A key file made by keygen in the scenario's folder; returns its path.
+fn key_file(world: &World, front: &Front, name: &str) -> Result<PathBuf, String> {
+    let path = world.folder()?.join(name);
+    let id = keygen(&path)?;
+    let mut ids = front.key_ids.get().unwrap_or_default();
+    ids.push(id);
+    front.key_ids.set(ids);
+    Ok(path)
+}
+
+/// Waits up to `within` for `done` to hold.
+fn wait(within: Duration, mut done: impl FnMut() -> bool) -> Result<(), ()> {
+    let started = Instant::now();
+    while started.elapsed() < within {
+        if done() {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(100));
+    }
+    if done() { Ok(()) } else { Err(()) }
+}
+
+#[given(
+    "one node started with smugglr mesh and another with smugglr sync --sync-type mesh, with the same key file"
+)]
+fn two_front_ends(world: &World, front: &Front) -> Result<(), String> {
+    let key = key_file(world, front, "mesh.key")?;
+    let port = free_port()?;
+    front.start(world, "mesh-node", &key, Some(port), FrontEnd::Mesh)?;
+    front.start(world, "sync-node", &key, Some(port), FrontEnd::Sync)?;
+    Ok(())
+}
+
+#[when("a row is written on the first node's database")]
+fn a_row_on_the_first(front: &Front) -> Result<(), String> {
+    front.sql(0, "INSERT INTO notes VALUES ('n9', 'across')")
+}
+
+#[then("the second node holds that row")]
+fn the_second_holds_it(front: &Front) -> Result<(), String> {
+    front.holds(1, "n9", "across")
+}
+
+#[given("a node running smugglr mesh on a machine named puck")]
+fn a_node_on_puck(world: &World, front: &Front) -> Result<(), String> {
+    let key = key_file(world, front, "mesh.key")?;
+    let port = free_port()?;
+    front.start(world, "puck", &key, Some(port), FrontEnd::Mesh)?;
+    front.start(world, "rzr", &key, Some(port), FrontEnd::Mesh)?;
+    Ok(())
+}
+
+#[when("a row is written on puck's database")]
+fn a_row_on_puck(front: &Front) -> Result<(), String> {
+    front.sql(0, "INSERT INTO notes VALUES ('n9', 'from puck')")
+}
+
+#[then("the change the other nodes receive names puck as its node")]
+fn the_change_names_puck(front: &Front) -> Result<(), String> {
+    front.holds(1, "n9", "from puck")?;
+    front.prints(1, "applied a change to notes from puck,")
+}
+
+#[given("one node with no port setting and one node with port set to 40000")]
+fn two_ports(world: &World, front: &Front) -> Result<(), String> {
+    key_file(world, front, "mesh.key").map(|key| front.key.set(key))
+}
+
+#[when("each node starts smugglr mesh")]
+fn each_starts(world: &World, front: &Front) -> Result<(), String> {
+    let key = front.key.get().ok_or("no key file")?;
+    front.start(world, "unset", &key, None, FrontEnd::Mesh)?;
+    front.start(world, "set", &key, Some(40000), FrontEnd::Mesh)?;
+    Ok(())
+}
+
+/// A partner on `port` exchanges a row each way with node `index`.
+fn exchanges_on(world: &World, front: &Front, index: usize, port: u16) -> Result<(), String> {
+    let key = front.key.get().ok_or("no key file")?;
+    let partner = front.start(
+        world,
+        &format!("on-{port}"),
+        &key,
+        Some(port),
+        FrontEnd::Mesh,
+    )?;
+    let (to, back) = (format!("to-{port}"), format!("back-{port}"));
+    front.sql(index, &format!("INSERT INTO notes VALUES ('{to}', 'sent')"))?;
+    front.holds(partner, &to, "sent")?;
+    front.sql(
+        partner,
+        &format!("INSERT INTO notes VALUES ('{back}', 'heard')"),
+    )?;
+    front.holds(index, &back, "heard")
+}
+
+#[then("the first sends and listens on UDP port 31337")]
+fn the_first_on_31337(world: &World, front: &Front) -> Result<(), String> {
+    if front.with(0, |node| node.port)? != 31337 {
+        return Err("the first node was not started without a port".to_owned());
+    }
+    exchanges_on(world, front, 0, 31337)
+}
+
+#[then("the second sends and listens on UDP port 40000")]
+fn the_second_on_40000(world: &World, front: &Front) -> Result<(), String> {
+    exchanges_on(world, front, 1, 40000)
+}
+
+#[given("a key file readable by its group")]
+fn a_group_readable_key(world: &World, front: &Front) -> Result<(), String> {
+    let key = key_file(world, front, "mesh.key")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o640))
+            .map_err(|err| err.to_string())?;
+    }
+    front.key.set(key);
+    Ok(())
+}
+
+#[when("a node starts smugglr mesh with it")]
+fn a_node_starts_with_it(world: &World, front: &Front) -> Result<(), String> {
+    let key = front.key.get().ok_or("no key file")?;
+    let place = world.place("node.db", NOTES)?;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_smugglr"))
+        .args(["mesh", &place, "--key-file"])
+        .arg(&key)
+        .env("XDG_CONFIG_HOME", world.xdg()?)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("failed to start smugglr: {err}"))?;
+    // A node that started runs until stopped.
+    if wait(SOON, || child.try_wait().ok().flatten().is_some()).is_err() {
+        let _ = child.kill();
+    }
+    let output = child.wait_with_output().map_err(|err| err.to_string())?;
+    front.refused.set(output);
+    Ok(())
+}
+
+#[then("the node does not start")]
+fn the_node_does_not_start(front: &Front) -> Result<(), String> {
+    let output = front.refused.get().ok_or("no node was started")?;
+    if output.status.success() || output.status.code().is_none() {
+        return Err(format!("the node ran: {}", output.status));
+    }
+    Ok(())
+}
+
+#[then("it says chmod 600 on that key file fixes it")]
+fn it_says_chmod(front: &Front) -> Result<(), String> {
+    let output = front.refused.get().ok_or("no node was started")?;
+    let key = front.key.get().ok_or("no key file")?;
+    let said = String::from_utf8_lossy(&output.stderr);
+    let fix = format!("chmod 600 {}", key.display());
+    if said.contains(&fix) {
+        Ok(())
+    } else {
+        Err(format!("it said {said:?}, not {fix:?}"))
+    }
+}
+
+#[given("a key file written by smugglr mesh keygen and shared by two nodes")]
+fn a_shared_keygen_file(world: &World, front: &Front) -> Result<(), String> {
+    let first = key_file(world, front, "first.key")?;
+    let second = world.folder()?.join("second.key");
+    std::fs::copy(&first, &second).map_err(|err| err.to_string())?;
+    front.key.set(first);
+    Ok(())
+}
+
+#[when("smugglr mesh keygen appends a second key on the first node only")]
+fn keygen_appends(world: &World, front: &Front) -> Result<(), String> {
+    let first = front.key.get().ok_or("no key file")?;
+    let newer = keygen(&first)?;
+    let mut ids = front.key_ids.get().unwrap_or_default();
+    ids.push(newer);
+    front.key_ids.set(ids);
+    let second = world.folder()?.join("second.key");
+    let port = free_port()?;
+    front.start(world, "first", &first, Some(port), FrontEnd::Mesh)?;
+    front.start(world, "second", &second, Some(port), FrontEnd::Mesh)?;
+    // A third node holding both keys, to hear what the first signs.
+    front.start(world, "witness", &first, Some(port), FrontEnd::Mesh)?;
+    Ok(())
+}
+
+#[then("the first node's changes are signed with the newer key")]
+fn the_first_signs_newer(front: &Front) -> Result<(), String> {
+    let ids = front.key_ids.get().ok_or("keygen wrote no key")?;
+    let newer = ids.last().ok_or("keygen wrote no key")?;
+    front.sql(0, "INSERT INTO notes VALUES ('n1', 'newer')")?;
+    front.holds(2, "n1", "newer")?;
+    front.prints(2, &format!("from first, key {newer}"))
+}
+
+#[then("the first node still accepts a change the second node signs with the older key")]
+fn the_first_accepts_older(front: &Front) -> Result<(), String> {
+    let ids = front.key_ids.get().ok_or("keygen wrote no key")?;
+    let older = ids.first().ok_or("keygen wrote no key")?;
+    front.sql(1, "INSERT INTO notes VALUES ('n2', 'older')")?;
+    front.holds(0, "n2", "older")?;
+    front.prints(0, &format!("from second, key {older}"))
+}
+
+#[given("two nodes running smugglr mesh with one key file")]
+fn two_nodes_one_key(world: &World, front: &Front) -> Result<(), String> {
+    let key = key_file(world, front, "mesh.key")?;
+    let port = free_port()?;
+    front.start(world, "left", &key, Some(port), FrontEnd::Mesh)?;
+    front.start(world, "right", &key, Some(port), FrontEnd::Mesh)?;
+    front.key.set(key);
+    Ok(())
+}
+
+/// A change to note `id` signed with `key`, sealed with the mesh's shared
+/// key `shared`, as the wire carries it.
+fn forged(id: &str, signed: &[u8; 32], shared: &[u8; 32]) -> Result<Vec<u8>, String> {
+    let values = vec![format!("'{id}'"), "'forged'".to_owned()];
+    let refs: Vec<&str> = values.iter().map(String::as_str).collect();
+    let columns: Vec<Column> = ["id", "body"]
+        .iter()
+        .map(|name| Column {
+            name: (*name).to_owned(),
+            kind: "TEXT".to_owned(),
+        })
+        .collect();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let mut envelope = Envelope {
+        v: VERSION,
+        node: "stranger".to_owned(),
+        change: Change {
+            op: Op::Up,
+            table: "notes".to_owned(),
+            key: vec![format!("'{id}'")],
+            from: None,
+            to: Some(row_hash(&refs)),
+            values,
+        },
+        targets: Vec::new(),
+        sunset: now + 600,
+        txn: None,
+        key_id: smugglr_mesh::key_id(signed),
+        stamp: Stamp::of(&columns),
+        signature: [0; 32],
+    };
+    envelope.sign(&blake3::derive_key(
+        "smugglr mesh 0.6 envelope signature",
+        signed,
+    ));
+    let message = json!({"t": "change", "sender": "stranger", "envelope": envelope.to_json()});
+    let seal = blake3::derive_key("smugglr mesh 0.6 datagram seal", shared);
+    let cipher = XChaCha20Poly1305::new((&seal).into());
+    let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+    let sealed = cipher
+        .encrypt(&nonce, message.to_string().as_bytes())
+        .map_err(|err| err.to_string())?;
+    let mut datagram = nonce.to_vec();
+    datagram.extend(sealed);
+    Ok(datagram)
+}
+
+/// The keys a key file holds, as its lines give them.
+fn key_lines(path: &Path) -> Result<Vec<String>, String> {
+    Ok(std::fs::read_to_string(path)
+        .map_err(|err| err.to_string())?
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_owned)
+        .collect())
+}
+
+#[when("a row is written and a change signed with an unknown key arrives")]
+fn a_row_and_a_stranger(front: &Front) -> Result<(), String> {
+    front.sql(0, "INSERT INTO notes VALUES ('n1', 'written')")?;
+    front.holds(1, "n1", "written")?;
+    let key = front.key.get().ok_or("no key file")?;
+    let line = key_lines(&key)?.pop().ok_or("the key file holds no key")?;
+    let shared = decode(&line)?;
+    let port = front.with(1, |node| node.port)?;
+    let socket = UdpSocket::bind("0.0.0.0:0").map_err(|err| err.to_string())?;
+    socket.set_broadcast(true).map_err(|err| err.to_string())?;
+    socket
+        .send_to(&forged("n2", &UNKNOWN, &shared)?, ("255.255.255.255", port))
+        .map_err(|err| err.to_string())?;
+    front.prints(1, "refused a change")
+}
+
+#[then("neither node's output or errors contain the key")]
+fn no_key_in_output(front: &Front) -> Result<(), String> {
+    let key = front.key.get().ok_or("no key file")?;
+    let mut secrets = key_lines(&key)?;
+    secrets.push(hex(&UNKNOWN));
+    for index in 0..2 {
+        let printed = front.with(index, Node::printed)?;
+        if let Some(secret) = secrets
+            .iter()
+            .find(|secret| printed.contains(secret.as_str()))
+        {
+            return Err(format!("node {index} printed the key {secret}"));
+        }
+    }
+    Ok(())
+}
+
+#[then("the record names the key only by its key_id")]
+fn named_by_key_id(front: &Front) -> Result<(), String> {
+    let ids = front.key_ids.get().ok_or("keygen wrote no key")?;
+    let mesh = ids.first().ok_or("keygen wrote no key")?;
+    for index in 0..2 {
+        front.prints(index, &format!("key {mesh}"))?;
+    }
+    front.prints(
+        1,
+        &format!("key {} is not one", smugglr_mesh::key_id(&UNKNOWN)),
+    )
+}
+
+/// The 32 bytes a base64 key line holds.
+fn decode(line: &str) -> Result<[u8; 32], String> {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut bits = 0_u32;
+    let mut count = 0;
+    let mut bytes = Vec::new();
+    for c in line.bytes().filter(|c| *c != b'=') {
+        let value = ALPHABET
+            .iter()
+            .position(|a| *a == c)
+            .ok_or("the key is not base64")?;
+        bits = bits << 6 | u32::try_from(value).map_err(|err| err.to_string())?;
+        count += 6;
+        if count >= 8 {
+            count -= 8;
+            bytes.push(u8::try_from(bits >> count & 0xff).map_err(|err| err.to_string())?);
+        }
+    }
+    bytes
+        .try_into()
+        .map_err(|_| "the key is not 32 bytes".to_owned())
+}

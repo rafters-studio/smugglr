@@ -26,14 +26,16 @@ const TOO_MUCH: u8 = 5;
 const WATCH_SECONDS: u64 = 60;
 
 const HELP: &str = "usage: smugglr sync <source> <target> [--dryrun] [--json] \
-     [--sync-type direct] [--sync-mode stop|source|target|last] [--table <name>]... \
+     [--sync-type direct|mesh] [--sync-mode stop|source|target|last] [--table <name>]... \
      [--watch [seconds]]
 
 The first place named is the source, the second the target.
   --dryrun                 show what the sync would do; write nothing
   --json                   print the record as JSON
-  --sync-type direct       how the places connect; direct is the default
-                           (hub, multi and mesh are not built yet)
+  --sync-type direct|mesh  how the places connect; direct is the default.
+                           mesh takes one place and is smugglr mesh
+                           (smugglr mesh --help); hub and multi are not
+                           built yet
   --sync-mode stop|source|target|last
                            what happens to a row changed in both places: stop
                            (the default) names it, source keeps the source's
@@ -59,6 +61,14 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Some((command, rest)) if command == "sync" => {
+            if let Some(at) = rest
+                .windows(2)
+                .position(|pair| pair[0] == "--sync-type" && pair[1] == "mesh")
+            {
+                let mut args = rest.to_vec();
+                args.drain(at..at + 2);
+                return crate::mesh::run(&args);
+            }
             if rest.iter().any(|arg| arg == "--help") {
                 println!("{HELP}");
                 return ExitCode::SUCCESS;
@@ -71,7 +81,8 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
         Some((command, rest)) if command == "stash" || command == "retrieve" => {
             crate::multi::run(command == "stash", rest)
         }
-        Some(_) => usage("smugglr knows sync, stash and retrieve"),
+        Some((command, rest)) if command == "mesh" => crate::mesh::run(rest),
+        Some(_) => usage("smugglr knows sync, stash, retrieve and mesh"),
     }
 }
 
@@ -95,10 +106,10 @@ fn parse(args: &[String]) -> Result<Sync, String> {
             "--table" => command.options.tables.push(value("--table")?),
             "--sync-type" => match value("--sync-type")?.as_str() {
                 "direct" => command.options.sync_type = SyncType::Direct,
-                kind @ ("hub" | "multi" | "mesh") => {
+                kind @ ("hub" | "multi") => {
                     return Err(format!("--sync-type {kind} is not built yet"));
                 }
-                other => return Err(format!("--sync-type {other}: use direct")),
+                other => return Err(format!("--sync-type {other}: use direct or mesh")),
             },
             "--sync-mode" => {
                 command.options.sync_mode = match value("--sync-mode")?.as_str() {
