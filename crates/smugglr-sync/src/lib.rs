@@ -193,10 +193,7 @@ pub fn sync(
         let why = too_much(&weight, source.address(), target.address());
         return Ok(Record::too_much(weight, why, ignored));
     }
-    let mut wrote = Wrote {
-        max_value: options.max_value.unwrap_or(DEFAULT_MAX_VALUE),
-        ..Wrote::default()
-    };
+    let mut wrote = Wrote::new(options.max_value.unwrap_or(DEFAULT_MAX_VALUE));
     let unmatched = match write_all(
         plans,
         &mut *source,
@@ -213,16 +210,12 @@ pub fn sync(
             if let Some(name) = wrote.writing.take() {
                 done.insert(name, record::lost(wrote.written_keys(), &cause.to_string()));
             }
-            let mut record = Record::new(done, ignored, false, weight);
-            record.deletes_seen = !unknown;
-            record.refused = wrote.refused;
+            let record = finished((done, ignored, false, weight), unknown, wrote);
             return Err(cut_off(record, cause));
         }
         Err(cause) => return Err(cause),
     };
-    let mut record = Record::new(done, ignored, options.dryrun, weight);
-    record.deletes_seen = !unknown;
-    record.refused = std::mem::take(&mut wrote.refused);
+    let record = finished((done, ignored, options.dryrun, weight), unknown, wrote);
     if !options.dryrun {
         let kept = memory.save().and_then(|()| {
             // Kept after a run whose rows read back different (exit 4), so
@@ -243,6 +236,25 @@ pub fn sync(
         }
     }
     Ok(record)
+}
+
+/// The record of a run whose tables did `done`, as [`Record::new`] makes
+/// it, that could tell a delete unless `unknown`, with the rows `wrote`
+/// refused.
+fn finished(
+    (done, ignored, dryrun, weight): (
+        BTreeMap<String, record::Table>,
+        std::collections::BTreeSet<String>,
+        bool,
+        Option<Weight>,
+    ),
+    unknown: bool,
+    wrote: Wrote,
+) -> Record {
+    let mut record = Record::new(done, ignored, dryrun, weight);
+    record.deletes_seen = !unknown;
+    record.refused = wrote.refused;
+    record
 }
 
 /// The error for a run that wrote rows and then stopped on `cause`,
@@ -274,6 +286,14 @@ struct Wrote {
 }
 
 impl Wrote {
+    /// Nothing written yet, a value over `max_value` refused.
+    fn new(max_value: u64) -> Self {
+        Self {
+            max_value,
+            ..Self::default()
+        }
+    }
+
     /// The writes the places answered as made, leaving none.
     fn take_written(&mut self) -> Vec<Write> {
         let made = std::mem::take(&mut self.made);
@@ -743,7 +763,11 @@ fn key_of(table: &Table, row: &[String]) -> Option<Vec<String>> {
 /// their limits, lowered by `max_value`, and the place whose limit it is,
 /// `to` when `max_value` is the lower.
 fn limit<'a>(from: &'a dyn Place, to: &'a dyn Place, max_value: u64) -> (u64, &'a str) {
-    let smaller = if from.value_limit() < to.value_limit() { from } else { to };
+    let smaller = if from.value_limit() < to.value_limit() {
+        from
+    } else {
+        to
+    };
     if smaller.value_limit() <= max_value {
         (smaller.value_limit(), smaller.address())
     } else {

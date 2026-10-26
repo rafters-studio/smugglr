@@ -42,8 +42,8 @@ use serde_json::{Value as Json, json};
 
 use crate::http_sql::Transport;
 use crate::queries::d1::{Kind, MAX_PARAMS, returning, typed_params, writes};
-use smugglr_core::hex::{base64, unbase64};
 use crate::{Error, HttpSql};
+use smugglr_core::hex::{base64, unbase64};
 
 /// The variable holding the Cloudflare account id.
 pub const ACCOUNT_ID: &str = "CLOUDFLARE_ACCOUNT_ID";

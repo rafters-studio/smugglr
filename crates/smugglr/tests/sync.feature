@@ -212,3 +212,10 @@ Feature: one sync between two places, with places and memory as they are
     Given two places never synced, holding orders alike except one row changed in both places
     When the agent runs smugglr sync on them and orders stops
     Then memory holds the hash of every orders key whose rows were alike
+
+  @criterion-01a179b5-c8dd-7110-af7d-dd0fec9fde43 @module-sync
+  Scenario: a value over a place's limit is refused and named
+    Given two places with the same table, max_value set to 1 MB, and the source holding a row with a 2 MB value and a small row
+    When the agent runs smugglr sync on them
+    Then the record names the 2 MB value as over the limit, with the place
+    And the target holds the small row

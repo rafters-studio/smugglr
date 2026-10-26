@@ -12,6 +12,7 @@ use smugglr_core::envelope::GRAVEYARD;
 use smugglr_core::hex::{hex, unhex};
 use smugglr_core::plan::SyncMode;
 use smugglr_core::row_hash::row_hash;
+use smugglr_core::weight::DEFAULT_MAX_VALUE;
 use smugglr_multi::{Blob, Settings, replay, retrieve};
 
 use crate::cli::{NOT_DONE, STOPPED, USAGE, exit, print_record};
@@ -105,11 +106,13 @@ pub(crate) fn run(stash: bool, args: &[String]) -> ExitCode {
             kept = keep(blob, Path::new(path))?;
             Ok(())
         };
-        return match smugglr_multi::stash(place.as_mut(), &settings, command.whole, keep_it)
-            .map(|_| &kept)
-        {
-            Ok(file) => {
-                println!("{}", file.display());
+        return match smugglr_multi::stash(place.as_mut(), &settings, command.whole, keep_it) {
+            Ok(blob) => {
+                println!("{}", kept.display());
+                // A row left out for a value over the value limit, named.
+                for refused in &blob.refused {
+                    println!("  {refused}");
+                }
                 ExitCode::SUCCESS
             }
             Err(err) => {
@@ -199,6 +202,7 @@ fn settings(command: &Multi) -> Result<Settings, String> {
         sync_mode: command.sync_mode,
         steering: config.steering,
         ignore: config.ignore,
+        max_value: config.max_value.unwrap_or(DEFAULT_MAX_VALUE),
     })
 }
 

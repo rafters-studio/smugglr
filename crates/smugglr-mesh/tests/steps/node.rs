@@ -358,6 +358,7 @@ impl Net {
             k: K,
             backpressure,
             peers: vec![self.relay.address()?],
+            max_value: smugglr_core::weight::DEFAULT_MAX_VALUE,
         };
         let mut node = Node {
             path,
@@ -1046,10 +1047,10 @@ fn a_delete_crosses_after_its_insert() -> Result<(), String> {
     .map_err(|()| format!("node 1 still holds p2: {:?}", net.body(1, "p2")))
 }
 
-/// A row too large for one datagram is refused, and the changes after it
-/// still go: it never holds up the outbox.
+/// A row too large for one datagram crosses in parts, and the changes
+/// after it still go: it never holds up the outbox.
 #[test]
-fn a_row_too_large_for_a_datagram_holds_up_nothing() -> Result<(), String> {
+fn a_row_too_large_for_a_datagram_crosses_in_parts() -> Result<(), String> {
     let net = Net::new()?;
     net.start_many(2, "")?;
     net.sql(
@@ -1058,8 +1059,5 @@ fn a_row_too_large_for_a_datagram_holds_up_nothing() -> Result<(), String> {
          INSERT INTO notes VALUES ('after', 'small')",
     )?;
     net.holds(1, "after", "small", SOON)?;
-    match net.body(1, "big")? {
-        None => Ok(()),
-        Some(_) => Err("a row too large for one datagram arrived".to_owned()),
-    }
+    net.holds(1, "big", &"x".repeat(100_000), SOON)
 }

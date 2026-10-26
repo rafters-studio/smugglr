@@ -7,11 +7,11 @@ use smugglr_core::change::{Change, op};
 use smugglr_core::envelope::{self, Arrival, Envelope, Here, receive, receive_replayed};
 use smugglr_core::hex::{hex, unhex};
 use smugglr_core::plan::{Hashes, Side, SyncMode};
+use smugglr_core::record::Refused;
 use smugglr_core::record::{
     self, CHANGED_HERE_AND_IN_BLOB, Dropped, EDIT_VERSUS_DELETE, Key as Named, Moves, PAST_SUNSET,
     REFUSED, Record, WAITING,
 };
-use smugglr_core::record::Refused;
 use smugglr_core::shape::Mismatch;
 use smugglr_core::weight::over_limit;
 use smugglr_memory::{Device, Row};
@@ -53,23 +53,21 @@ pub fn retrieve(
     // A change with a value over the value limit is named and not taken
     // (FR-SMUGGLR-071).
     let (limit, address) = settings.limit(place);
-    let address = address.to_owned();
     let mut over = Vec::new();
     for blob in blobs {
-        match refusal(blob, settings) {
-            Some(why) => refused.push((blob, why)),
-            None => {
-                let mut blob = blob.clone();
-                blob.changes.retain(|envelope| {
-                    let change = &envelope.change;
-                    let Some((column, bytes)) = over_limit(&change.values, limit) else {
-                        return true;
-                    };
-                    over.push((change.table.clone(), change.key.clone(), column, bytes));
-                    false
-                });
-                accepted.push(blob);
-            }
+        if let Some(why) = refusal(blob, settings) {
+            refused.push((blob, why));
+        } else {
+            let mut blob = blob.clone();
+            blob.changes.retain(|envelope| {
+                let change = &envelope.change;
+                let Some((column, bytes)) = over_limit(&change.values, limit) else {
+                    return true;
+                };
+                over.push((change.table.clone(), change.key.clone(), column, bytes));
+                false
+            });
+            accepted.push(blob);
         }
     }
     let blobs = accepted.as_slice();

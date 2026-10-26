@@ -16,9 +16,9 @@ const NONCE: usize = 24;
 /// well under the 1,200 bytes that are never fragmented.
 pub(crate) const ACKS: usize = 14;
 
-/// The most bytes a sealed change takes before its large values go apart,
-/// in parts, and about the most a part takes: under IPv6's 1,280-byte
-/// minimum, so no path fragments it (FR-SMUGGLR-078 rev 28, RFC 8085).
+/// The most bytes a sealed change takes before it goes in parts, and about
+/// the most a part takes: under IPv6's 1,280-byte minimum, so no path
+/// fragments it (FR-SMUGGLR-078 rev 31, RFC 8085).
 pub(crate) const DATAGRAM: usize = 1_200;
 
 /// The most ranges of part numbers one part acknowledgement names, of what
@@ -55,31 +55,29 @@ pub(crate) enum Message {
         /// The change hashes, at most [`ACKS`].
         changes: Vec<[u8; 32]>,
     },
-    /// One part of a large value, from the maker of a change that holds it.
+    /// One part of a change too large for one datagram, from its maker:
+    /// a piece of the change's message, its `quote()` text and all.
     Part {
         /// The maker.
         sender: String,
-        /// The value's hash.
-        value: [u8; 32],
+        /// The change's row hash, its `to`, which keys its parts.
+        row: [u8; 16],
         /// The part's number, from 0.
         n: u64,
-        /// How many parts the value has.
+        /// How many parts the change has.
         count: u64,
-        /// The sunset of the change that holds the value: past it, the
-        /// part is let go.
-        sunset: u64,
-        /// The part's bytes, as [`crate::parts`] carries them.
+        /// The part's bytes.
         data: Vec<u8>,
     },
-    /// A node has these parts of a large value made by `maker`, and misses
-    /// those (a NACK), so only those are resent.
+    /// A node has these parts of a change made by `maker`, and misses those
+    /// (a NACK), so only those are resent.
     Parts {
         /// The node.
         sender: String,
-        /// The value's maker.
+        /// The change's maker.
         maker: String,
-        /// The value's hash.
-        value: [u8; 32],
+        /// The change's row hash.
+        row: [u8; 16],
         /// Parts that arrived, at most [`RANGES`].
         have: Vec<Range>,
         /// Parts missing, at most [`RANGES`].
@@ -122,31 +120,29 @@ impl Message {
             }
             Self::Part {
                 sender,
-                value,
+                row,
                 n,
                 count,
-                sunset,
                 data,
             } => json!({
                 "t": "part",
                 "sender": sender,
-                "value": hex(value),
+                "row": hex(row),
                 "n": n,
                 "count": count,
-                "sunset": sunset,
                 "data": base64(data),
             }),
             Self::Parts {
                 sender,
                 maker,
-                value,
+                row,
                 have,
                 missing,
             } => json!({
                 "t": "parts",
                 "sender": sender,
                 "maker": maker,
-                "value": hex(value),
+                "row": hex(row),
                 "have": have,
                 "missing": missing,
             }),
@@ -175,10 +171,9 @@ impl Message {
             }),
             "part" => Some(Self::Part {
                 sender,
-                value: unhex(json.get("value")?.as_str()?)?.try_into().ok()?,
+                row: unhex(json.get("row")?.as_str()?)?.try_into().ok()?,
                 n: json.get("n")?.as_u64()?,
                 count: json.get("count")?.as_u64()?,
-                sunset: json.get("sunset")?.as_u64()?,
                 data: unbase64(json.get("data")?.as_str()?)?,
             }),
             "parts" => {
@@ -192,7 +187,7 @@ impl Message {
                 Some(Self::Parts {
                     sender,
                     maker: text("maker")?,
-                    value: unhex(json.get("value")?.as_str()?)?.try_into().ok()?,
+                    row: unhex(json.get("row")?.as_str()?)?.try_into().ok()?,
                     have: ranges("have")?,
                     missing: ranges("missing")?,
                 })
@@ -202,10 +197,21 @@ impl Message {
     }
 }
 
-/// The bytes `message` takes sealed.
-pub(crate) fn sealed_len(message: &Message) -> usize {
-    // The nonce, the text, and the cipher's 16-byte tag.
-    NONCE + message.to_json().to_string().len() + 16
+/// `message` as the text a datagram seals, the parts of a large change
+/// carry, and [`decode`] reads.
+pub(crate) fn encode(message: &Message) -> Vec<u8> {
+    message.to_json().to_string().into_bytes()
+}
+
+/// The message [`encode`] wrote; `None` when `bytes` hold none.
+pub(crate) fn decode(bytes: &[u8]) -> Option<Message> {
+    Message::from_json(&serde_json::from_slice(bytes).ok()?)
+}
+
+/// The bytes a message whose text is `len` bytes takes sealed: the nonce,
+/// the text, and the cipher's 16-byte tag.
+pub(crate) fn sealed_len(len: usize) -> usize {
+    NONCE + len + 16
 }
 
 /// `message` sealed under the sealing key `key`: the nonce, then the
@@ -213,9 +219,9 @@ pub(crate) fn sealed_len(message: &Message) -> usize {
 pub(crate) fn seal(message: &Message, key: &[u8; 32]) -> Vec<u8> {
     let cipher = XChaCha20Poly1305::new(key.into());
     let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-    let plain = message.to_json().to_string();
+    let plain = encode(message);
     // Sealing fails only for a message longer than the cipher can count.
-    let sealed = cipher.encrypt(&nonce, plain.as_bytes()).unwrap_or_default();
+    let sealed = cipher.encrypt(&nonce, plain.as_slice()).unwrap_or_default();
     let mut datagram = nonce.to_vec();
     datagram.extend(sealed);
     datagram
@@ -235,10 +241,7 @@ pub(crate) fn open(datagram: &[u8], keys: &[[u8; 32]]) -> Option<(Message, usize
             .ok()
             .map(|plain| (plain, at))
     })?;
-    Some((
-        Message::from_json(&serde_json::from_slice(&plain).ok()?)?,
-        at,
-    ))
+    Some((decode(&plain)?, at))
 }
 
 #[cfg(test)]
@@ -264,23 +267,25 @@ mod tests {
     fn a_part_and_its_acknowledgement_fit_one_datagram_and_open() {
         let part = Message::Part {
             sender: "a-machine-with-a-long-name.local".to_owned(),
-            value: [9; 32],
+            row: [9; 16],
             n: 999_999_999,
             count: 999_999_999,
-            sunset: 99_999_999_999,
             data: vec![0xff; crate::parts::PART],
         };
         let parts = Message::Parts {
             sender: "a-machine-with-a-long-name.local".to_owned(),
             maker: "another-machine-with-a-long-name".to_owned(),
-            value: [9; 32],
+            row: [9; 16],
             have: vec![(999_999_990, 999_999_999); super::RANGES],
             missing: vec![(999_999_990, 999_999_999); super::RANGES],
         };
         for message in [part, parts] {
             let datagram = seal(&message, &[1; 32]);
             assert!(datagram.len() <= super::DATAGRAM, "{}", datagram.len());
-            assert_eq!(super::sealed_len(&message), datagram.len());
+            assert_eq!(
+                super::sealed_len(super::encode(&message).len()),
+                datagram.len()
+            );
             assert_eq!(open(&datagram, &[[1; 32]]), Some((message, 0)));
         }
     }

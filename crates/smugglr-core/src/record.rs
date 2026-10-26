@@ -150,7 +150,13 @@ impl Refused {
     /// The row `key` of `table`, refused for its value of `bytes` in
     /// `column`, over `place`'s `limit`.
     #[must_use]
-    pub fn new(table: &str, key: &[String], column: &str, bytes: u64, (limit, place): (u64, &str)) -> Self {
+    pub fn new(
+        table: &str,
+        key: &[String],
+        column: &str,
+        bytes: u64,
+        (limit, place): (u64, &str),
+    ) -> Self {
         Self {
             table: table.to_owned(),
             key: Key(key.to_vec()),

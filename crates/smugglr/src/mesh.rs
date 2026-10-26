@@ -18,6 +18,7 @@ use std::sync::atomic::AtomicBool;
 use smugglr::Config;
 use smugglr_core::envelope::GRAVEYARD;
 use smugglr_core::plan::SyncMode;
+use smugglr_core::weight::DEFAULT_MAX_VALUE;
 use smugglr_mesh::{BACKPRESSURE, K, PORT, Settings, key_id, new_key};
 
 use crate::cli::{STOPPED, USAGE};
@@ -166,6 +167,7 @@ fn parse(args: &[String]) -> Result<(String, Settings, Option<String>), Refusal>
             ignore: config.ignore,
             k: K,
             backpressure: config.backpressure.unwrap_or(BACKPRESSURE),
+            max_value: config.max_value.unwrap_or(DEFAULT_MAX_VALUE),
             peers: peers(&config.peers, config.port.unwrap_or(PORT)).map_err(Refusal::Usage)?,
         },
         replay,

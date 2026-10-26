@@ -153,7 +153,7 @@ impl Place for LocalFile {
             .prepare(&queries::hashed(table, STREAMED))
             .map_err(sqlite)?;
         let mut rows = statement.query([]).map_err(sqlite)?;
-        let mut hashes = Vec::new();
+        let mut found = Vec::new();
         while let Some(row) = rows.next().map_err(sqlite)? {
             let key = (0..width)
                 .map(|i| row.get::<_, String>(i))
@@ -161,28 +161,29 @@ impl Place for LocalFile {
                 .map_err(sqlite)?;
             let mut hasher = RowHasher::new();
             for (i, column) in table.columns.iter().enumerate() {
-                let quoted = match row.get::<_, Option<String>>(width + i).map_err(sqlite)? {
-                    Some(quoted) => quoted,
-                    None => {
-                        let params = key
-                            .iter()
-                            .map(|text| unquote(text))
-                            .collect::<Result<Vec<_>, Error>>()?;
-                        self.connection
-                            .query_row(
-                                &queries::value(table, column, LOCAL_LIMIT),
-                                params_from_iter(params),
-                                |row| row.get::<_, String>(0),
-                            )
-                            .map_err(sqlite)?
-                    }
+                let quoted = if let Some(quoted) =
+                    row.get::<_, Option<String>>(width + i).map_err(sqlite)?
+                {
+                    quoted
+                } else {
+                    let params = key
+                        .iter()
+                        .map(|text| unquote(text))
+                        .collect::<Result<Vec<_>, Error>>()?;
+                    self.connection
+                        .query_row(
+                            &queries::value(table, column, LOCAL_LIMIT),
+                            params_from_iter(params),
+                            |row| row.get::<_, String>(0),
+                        )
+                        .map_err(sqlite)?
                 };
                 hasher.length(quoted.len() as u64);
                 hasher.piece(quoted.as_bytes());
             }
-            hashes.push((key, hasher.finish()));
+            found.push((key, hasher.finish()));
         }
-        Ok(hashes)
+        Ok(found)
     }
 
     fn weights(&mut self, table: &Table) -> Result<Vec<(Key, u64)>, Error> {

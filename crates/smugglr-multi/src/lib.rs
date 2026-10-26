@@ -85,8 +85,11 @@ pub struct Settings {
 impl Settings {
     /// The value limit for `place` (FR-SMUGGLR-071): its own, lowered by
     /// `max_value`, and the place it is named by.
-    fn limit<'a>(&self, place: &'a dyn Place) -> (u64, &'a str) {
-        (place.value_limit().min(self.max_value), place.address())
+    fn limit(&self, place: &dyn Place) -> (u64, String) {
+        (
+            place.value_limit().min(self.max_value),
+            place.address().to_owned(),
+        )
     }
 
     /// The id of the key that signs.

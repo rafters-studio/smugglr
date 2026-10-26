@@ -10,7 +10,9 @@
 //! It finds its own changes by comparing each row's hash with its last hash
 //! per key, and sends each change as it happens: one envelope
 //! (FR-SMUGGLR-075), signed and sealed under the shared key, unicast over
-//! UDP to every peer it knows. It applies the changes it hears in batches,
+//! UDP to every peer it knows; a change too large for one datagram goes in
+//! numbered parts (FR-SMUGGLR-078 rev 31). A value over the value limit is
+//! refused and named, and every other change still crosses. It applies the changes it hears in batches,
 //! through smugglr-core's one decision path and the place, one transaction
 //! of at most 20,000 changes per table, acknowledges each to its maker,
 //! and echoes it by broadcast once, 2 to 4 seconds later, unless it heard it
@@ -35,6 +37,7 @@
 mod local;
 mod node;
 mod outbox;
+mod parts;
 mod wire;
 
 use std::net::SocketAddr;
@@ -115,6 +118,9 @@ pub struct Settings {
     /// Addresses to announce to besides the broadcast, for a network that
     /// carries no broadcast.
     pub peers: Vec<SocketAddr>,
+    /// The largest value a row may hold to cross, below the place's own
+    /// value limit (FR-SMUGGLR-071).
+    pub max_value: u64,
 }
 
 impl std::fmt::Debug for Settings {
@@ -129,6 +135,7 @@ impl std::fmt::Debug for Settings {
             .field("sync_mode", &self.sync_mode)
             .field("k", &self.k)
             .field("backpressure", &self.backpressure)
+            .field("max_value", &self.max_value)
             .field("peers", &self.peers)
             .finish_non_exhaustive()
     }

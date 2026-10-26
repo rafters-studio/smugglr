@@ -222,6 +222,7 @@ pub(crate) fn settings(
         sync_mode: smugglr_core::plan::SyncMode::Stop,
         steering: smugglr_core::steering::Steering::default(),
         ignore,
+        max_value: smugglr_core::weight::DEFAULT_MAX_VALUE,
     })
 }
 

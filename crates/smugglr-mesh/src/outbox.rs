@@ -107,7 +107,7 @@ pub(crate) struct Timing {
 }
 
 impl Timing {
-    fn acknowledging(&self, now: Instant) -> bool {
+    pub(crate) fn acknowledging(&self, now: Instant) -> bool {
         now.duration_since(self.last_ack) < SILENT
     }
 
@@ -116,7 +116,7 @@ impl Timing {
     /// the measured round trips swell with queueing, and an unbounded wait
     /// left a lost copy unrepaired for seconds while its peer kept
     /// acknowledging.
-    fn wait(&self) -> Duration {
+    pub(crate) fn wait(&self) -> Duration {
         (self.round_trip * 2)
             .max(self.round_trip + self.variation * 4)
             .clamp(SHORTEST, LONGEST)
@@ -231,6 +231,13 @@ impl Outbox {
 
     fn segment(&self, segment: u64) -> String {
         format!("{}/{segment:020}.jsonl", self.folder)
+    }
+
+    /// Whether `change` is still owed to `peer`.
+    pub(crate) fn owes(&self, change: &[u8; 32], peer: &str) -> bool {
+        self.entries
+            .get(change)
+            .is_some_and(|entry| entry.targets.contains(peer) && !entry.acked.contains(peer))
     }
 
     fn acks_file(&self) -> String {
@@ -390,11 +397,14 @@ impl Outbox {
     /// acknowledged changes sent after it; to a peer that is acknowledging,
     /// after about two of its round trips, doubling with each try; and to a
     /// peer that has stopped acknowledging, on the 10 s to 160 s doubling.
+    /// A peer that `busy` says is taking in a change's parts is not due
+    /// that change.
     pub(crate) fn resends(
         &mut self,
         now: Instant,
         timing: &HashMap<String, Timing>,
         limit: usize,
+        busy: impl Fn(&[u8; 32], &str) -> bool,
     ) -> Result<Vec<Owed>, Error> {
         // Which peers each change is due to, and how; the oldest first, so
         // none waits behind newer ones.
@@ -405,6 +415,9 @@ impl Outbox {
             }
             let (mut to, mut silent, mut sure) = (Vec::new(), false, false);
             for peer in entry.targets.difference(&entry.acked) {
+                if busy(change, peer) {
+                    continue;
+                }
                 if entry.unsent_to.contains(peer) {
                     // Its first copy to a peer heard since the first send.
                     to.push(peer.clone());

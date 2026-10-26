@@ -47,7 +47,10 @@ pub fn value_bytes(quoted: &str) -> u64 {
     if let Some(hex) = quoted.strip_prefix("X'") {
         return (hex.len().saturating_sub(1) / 2) as u64;
     }
-    match quoted.strip_prefix('\'').and_then(|inner| inner.strip_suffix('\'')) {
+    match quoted
+        .strip_prefix('\'')
+        .and_then(|inner| inner.strip_suffix('\''))
+    {
         Some(inner) => (inner.len() - inner.matches("''").count()) as u64,
         None => quoted.len() as u64,
     }
@@ -153,7 +156,11 @@ mod tests {
         assert_eq!(value_bytes("X'00FF'"), 2);
         assert_eq!(value_bytes("12345"), 5);
         assert_eq!(value_bytes(&unquotable(600_000_000)), 600_000_000);
-        let row = ["'a'".to_owned(), "X'000000'".to_owned(), "'abcd'".to_owned()];
+        let row = [
+            "'a'".to_owned(),
+            "X'000000'".to_owned(),
+            "'abcd'".to_owned(),
+        ];
         assert_eq!(over_limit(&row, 3), Some((2, 4)));
         assert_eq!(over_limit(&row, 4), None);
     }

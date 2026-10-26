@@ -107,3 +107,23 @@ Feature: smugglr mesh as a command: its front ends, its node's name and port, it
     When the agent runs smugglr mesh with --replay and that change's hash
     Then the change is sent again with a fresh sunset
     And running smugglr mesh with --replay and a change hash not in the dropped log exits 2
+
+  @criterion-01a17995-a5f3-7fb0-98e5-9be9f88771d5 @module-mesh
+  Scenario: a large row crosses whole
+    Given two nodes running smugglr mesh
+    When a row holding a 400 KB text value and a 1.5 KB blob, both under both nodes' value limits is written on the first node
+    Then the second node holds the row, byte for byte the same
+
+  @criterion-01a17995-a5f3-7fb0-98e5-9c1ae6a7bd54 @module-mesh
+  Scenario: only missing parts are resent
+    Given two nodes running smugglr mesh, and a relay that drops one datagram in ten
+    When a row holding a 2 MB value is written on the first node
+    Then the second node holds the row whole
+    And the first node resent only the parts the second node had not acknowledged
+
+  @criterion-01a179b5-5e77-78f2-a89d-f9a5c5aa4cdf @module-mesh
+  Scenario: a value over the limit is refused and named
+    Given two nodes running smugglr mesh, the second with max_value set to 1 MB
+    When a row holding a 2 MB value and then a small row are written on the first node
+    Then the record names the 2 MB value as over the second node's limit
+    And the second node holds the small row
