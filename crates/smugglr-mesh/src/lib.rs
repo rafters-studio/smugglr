@@ -12,11 +12,11 @@
 //! (FR-SMUGGLR-075), signed and sealed under the shared key, unicast over
 //! UDP to every peer it knows; a change too large for one datagram goes in
 //! numbered parts (FR-SMUGGLR-078 rev 31). A value over the value limit is
-//! refused and named, and every other change still crosses. It applies the changes it hears in batches,
-//! through smugglr-core's one decision path and the place, one transaction
-//! of at most 20,000 changes per table, acknowledges each to its maker,
-//! and echoes it by broadcast once, 2 to 4 seconds later, unless it heard it
-//! `k` more times in that wait (RFC 6206's suppression). Multi's stash and
+//! refused and named, and every other change still crosses. It applies the
+//! changes it hears in batches, through smugglr-core's one decision path and
+//! the place, one transaction of at most 20,000 changes per table,
+//! acknowledges each to its maker, and echoes it by broadcast once, 2 to 4
+//! seconds later, unless it heard it `k` more times in that wait (RFC 6206's suppression). Multi's stash and
 //! retrieve are the slow, offline path; the mesh's live path does not use
 //! them.
 //!

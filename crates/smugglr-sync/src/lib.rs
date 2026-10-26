@@ -19,7 +19,7 @@ use smugglr_core::plan::{
 use smugglr_core::record::{self, Record, Refused};
 use smugglr_core::row_hash::row_hash;
 use smugglr_core::steering::{Steering, needs_steering};
-use smugglr_core::weight::{DEFAULT_MAX_VALUE, DEFAULT_MAX_WIRE, Weight, over_limit, too_much};
+use smugglr_core::weight::{DEFAULT_MAX_VALUE, DEFAULT_MAX_WIRE, Weight, too_much};
 use smugglr_memory::{Files, Memory, Store};
 use smugglr_place::{Place, Table};
 
@@ -795,14 +795,8 @@ fn changes(
         let Some(key) = key_of(table, &row) else {
             continue;
         };
-        match over_limit(&row, limit) {
-            Some((column, bytes)) => refused.push(Refused::new(
-                &table.name,
-                &key,
-                table.columns.get(column).map_or("", String::as_str),
-                bytes,
-                (limit, place),
-            )),
+        match Refused::find(&table.name, &table.columns, &key, &row, (limit, place)) {
+            Some(over) => refused.push(over),
             None => drop(rows.insert(key, row)),
         }
     }

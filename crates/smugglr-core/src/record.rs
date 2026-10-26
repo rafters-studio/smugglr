@@ -15,7 +15,7 @@ use crate::change::Op;
 use crate::envelope::Envelope;
 use crate::plan::{Plan, Side};
 use crate::shape::Mismatch;
-use crate::weight::Weight;
+use crate::weight::{Weight, over_limit};
 
 /// Why a table stops when rows changed in both places.
 pub const CHANGED_IN_BOTH: &str = "These rows changed in both places since the last sync. \
@@ -165,6 +165,22 @@ impl Refused {
             limit,
             place: place.to_owned(),
         }
+    }
+
+    /// The row `key` of `table`, whose columns are `columns` and whose
+    /// values' `quote()` text is `row`, refused for its first value over
+    /// `place`'s `limit`; `None` when every value fits.
+    #[must_use]
+    pub fn find(
+        table: &str,
+        columns: &[String],
+        key: &[String],
+        row: &[String],
+        (limit, place): (u64, &str),
+    ) -> Option<Self> {
+        let (column, bytes) = over_limit(row, limit)?;
+        let column = columns.get(column).map_or("", String::as_str);
+        Some(Self::new(table, key, column, bytes, (limit, place)))
     }
 }
 

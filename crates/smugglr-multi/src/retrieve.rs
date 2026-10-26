@@ -13,7 +13,6 @@ use smugglr_core::record::{
     REFUSED, Record, WAITING,
 };
 use smugglr_core::shape::Mismatch;
-use smugglr_core::weight::over_limit;
 use smugglr_memory::{Device, Row};
 use smugglr_place::{Key, Place, Table};
 
@@ -49,6 +48,7 @@ pub fn retrieve(
         ),
         _ => None,
     };
+    let (tables, ignored) = tables(place, settings)?;
     let (mut accepted, mut refused) = (Vec::new(), Vec::new());
     // A change with a value over the value limit is named and not taken
     // (FR-SMUGGLR-071).
@@ -61,29 +61,28 @@ pub fn retrieve(
             let mut blob = blob.clone();
             blob.changes.retain(|envelope| {
                 let change = &envelope.change;
-                let Some((column, bytes)) = over_limit(&change.values, limit) else {
-                    return true;
-                };
-                over.push((change.table.clone(), change.key.clone(), column, bytes));
-                false
+                let columns = tables
+                    .iter()
+                    .find(|table| table.name == change.table)
+                    .map_or(&[][..], |table| table.columns.as_slice());
+                match Refused::find(
+                    &change.table,
+                    columns,
+                    &change.key,
+                    &change.values,
+                    (limit, &address),
+                ) {
+                    Some(refused) => {
+                        over.push(refused);
+                        false
+                    }
+                    None => true,
+                }
             });
             accepted.push(blob);
         }
     }
     let blobs = accepted.as_slice();
-    let (tables, ignored) = tables(place, settings)?;
-    let over: Vec<Refused> = over
-        .into_iter()
-        .map(|(table, key, column, bytes)| {
-            let name = tables
-                .iter()
-                .find(|t| t.name == table)
-                .and_then(|t| t.columns.get(column))
-                .cloned()
-                .unwrap_or_else(|| column.to_string());
-            Refused::new(&table, &key, &name, bytes, (limit, &address))
-        })
-        .collect();
     if let Some(mismatch) = mismatch(blobs, &tables, &ignored) {
         let mut record = Record::shape_mismatch(mismatch, ignored, false);
         record.targets_remaining = remaining;

@@ -21,7 +21,6 @@ use smugglr_core::plan::Hashes;
 use smugglr_core::record::Refused;
 use smugglr_core::row_hash::row_hash;
 use smugglr_core::shape::{Column, Stamp};
-use smugglr_core::weight::over_limit;
 use smugglr_memory::Store;
 use smugglr_place::{Key, Place, Table};
 
@@ -54,16 +53,16 @@ pub(crate) fn limit(place: &dyn Place, settings: &Settings) -> (u64, String) {
 /// Whether `envelope`, a change to `table`, holds a value over `limit`, the
 /// value limit of the place it names; the record names it when it does.
 pub(crate) fn refuse(envelope: &Envelope, table: &Table, (limit, place): (u64, &str)) -> bool {
-    let Some((column, bytes)) = over_limit(&envelope.change.values, limit) else {
+    let change = &envelope.change;
+    let Some(refused) = Refused::find(
+        &change.table,
+        &table.columns,
+        &change.key,
+        &change.values,
+        (limit, place),
+    ) else {
         return false;
     };
-    let refused = Refused::new(
-        &envelope.change.table,
-        &envelope.change.key,
-        table.columns.get(column).map_or("", String::as_str),
-        bytes,
-        (limit, place),
-    );
     println!("smugglr mesh: {refused}, from {}", envelope.node);
     true
 }
