@@ -175,9 +175,6 @@ impl Node<'_> {
                 sender: self.settings.node.clone(),
                 envelope: Box::new(envelope.clone()),
             })?;
-            if self.peers.is_empty() {
-                continue;
-            }
             self.outbox.insert(
                 envelope.signature,
                 Outgoing {
@@ -197,7 +194,13 @@ impl Node<'_> {
         if sender == self.settings.node {
             return Ok(());
         }
-        self.peers.insert(sender);
+        // Every other node is a target: one heard for the first time is a
+        // target of each change this node is still resending.
+        if self.peers.insert(sender.clone()) {
+            for outgoing in self.outbox.values_mut() {
+                outgoing.targets.insert(sender.clone());
+            }
+        }
         match message {
             Message::Ack {
                 sender,
@@ -322,7 +325,7 @@ impl Node<'_> {
             .retain(|_, outgoing| epoch <= outgoing.envelope.sunset);
         let mut resends = Vec::new();
         for outgoing in self.outbox.values_mut() {
-            if instant >= outgoing.resend_at {
+            if instant >= outgoing.resend_at && !outgoing.targets.is_empty() {
                 outgoing.interval = (outgoing.interval * 2).min(LAST_RESEND);
                 outgoing.resend_at = instant + outgoing.interval;
                 resends.push(outgoing.envelope.clone());
