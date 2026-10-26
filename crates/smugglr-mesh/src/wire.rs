@@ -12,6 +12,10 @@ use smugglr_core::hex::{hex, unhex};
 /// The nonce's length, in bytes.
 const NONCE: usize = 24;
 
+/// The most changes one acknowledgement names, so it stays one datagram
+/// well under the 1,200 bytes that are never fragmented.
+pub(crate) const ACKS: usize = 14;
+
 /// One message between nodes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Message {
@@ -21,15 +25,18 @@ pub(crate) enum Message {
         sender: String,
         /// The change, signed by its maker.
         envelope: Box<Envelope>,
+        /// The maker sends it again because a peer has not acknowledged it.
+        resend: bool,
     },
-    /// A node has the change whose change hash is `change`.
+    /// A node has the changes whose change hashes are `changes`, all made
+    /// by `maker`.
     Ack {
-        /// The node that has it.
+        /// The node that has them.
         sender: String,
-        /// The change's maker.
+        /// The changes' maker.
         maker: String,
-        /// The change hash.
-        change: [u8; 32],
+        /// The change hashes, at most [`ACKS`].
+        changes: Vec<[u8; 32]>,
     },
 }
 
@@ -43,14 +50,24 @@ impl Message {
 
     fn to_json(&self) -> Value {
         match self {
-            Self::Change { sender, envelope } => {
-                json!({"t": "change", "sender": sender, "envelope": envelope.to_json()})
-            }
+            Self::Change {
+                sender,
+                envelope,
+                resend,
+            } => json!({
+                "t": "change",
+                "sender": sender,
+                "envelope": envelope.to_json(),
+                "resend": resend,
+            }),
             Self::Ack {
                 sender,
                 maker,
-                change,
-            } => json!({"t": "ack", "sender": sender, "maker": maker, "change": hex(change)}),
+                changes,
+            } => {
+                let changes: Vec<String> = changes.iter().map(|change| hex(change)).collect();
+                json!({"t": "ack", "sender": sender, "maker": maker, "changes": changes})
+            }
         }
     }
 
@@ -61,11 +78,17 @@ impl Message {
             "change" => Some(Self::Change {
                 sender,
                 envelope: Box::new(Envelope::from_json(json.get("envelope")?)?),
+                resend: json.get("resend").and_then(Value::as_bool).unwrap_or(false),
             }),
             "ack" => Some(Self::Ack {
                 sender,
                 maker: text("maker")?,
-                change: unhex(&text("change")?)?.try_into().ok()?,
+                changes: json
+                    .get("changes")?
+                    .as_array()?
+                    .iter()
+                    .map(|change| unhex(change.as_str()?)?.try_into().ok())
+                    .collect::<Option<_>>()?,
             }),
             _ => None,
         }
@@ -110,7 +133,7 @@ mod tests {
         Message::Ack {
             sender: "rzr".to_owned(),
             maker: "puck".to_owned(),
-            change: [3; 32],
+            changes: vec![[3; 32]; super::ACKS],
         }
     }
 

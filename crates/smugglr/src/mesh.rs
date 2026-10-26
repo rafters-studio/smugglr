@@ -16,7 +16,7 @@ use std::sync::atomic::AtomicBool;
 use smugglr::Config;
 use smugglr_core::envelope::GRAVEYARD;
 use smugglr_core::plan::SyncMode;
-use smugglr_mesh::{K, PORT, Settings, key_id, new_key};
+use smugglr_mesh::{BACKPRESSURE, K, PORT, Settings, key_id, new_key};
 
 use crate::cli::{STOPPED, USAGE};
 
@@ -27,7 +27,8 @@ const HELP: &str = "usage: smugglr mesh <place> --key-file <path> [--sync-mode s
 Keeps <place> in step with every node on the local network that holds the
 same key, until stopped. A node is named by its machine's name, and
 broadcasts and listens on the UDP port the config's port setting names,
-31337 when not set.
+31337 when not set. Changes not yet acknowledged wait in an outbox of at
+most the config's backpressure setting, 6 MB when not set.
   --key-file <path>        the shared key: one base64 key per line, newest
                            last; a line starting with # is a note. Only its
                            owner may read it (chmod 600)
@@ -140,6 +141,7 @@ fn parse(args: &[String]) -> Result<(String, Settings), Refusal> {
             steering: config.steering,
             ignore: config.ignore,
             k: K,
+            backpressure: config.backpressure.unwrap_or(BACKPRESSURE),
         },
     ))
 }
