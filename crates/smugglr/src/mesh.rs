@@ -170,8 +170,16 @@ fn peers(written: &[String], port: u16) -> Result<Vec<SocketAddr>, String> {
         .collect()
 }
 
-/// This machine's name, as the `hostname` command gives it.
+/// This machine's name: `COMPUTERNAME` on Windows, else what the `hostname`
+/// command gives.
 fn machine() -> Result<String, String> {
+    // Windows names the machine in COMPUTERNAME; elsewhere `hostname` does.
+    if cfg!(windows)
+        && let Ok(name) = std::env::var("COMPUTERNAME")
+        && !name.trim().is_empty()
+    {
+        return Ok(name.trim().to_owned());
+    }
     let output = Command::new("hostname")
         .output()
         .map_err(|err| format!("smugglr mesh names a node by its machine: hostname: {err}"))?;

@@ -165,11 +165,10 @@ struct Node {
 impl Node {
     fn start(&mut self, key: &Path) -> Result<(), String> {
         let bin = self.config.join("bin");
-        let path = format!(
-            "{}:{}",
-            bin.display(),
-            std::env::var("PATH").unwrap_or_default()
-        );
+        let rest = std::env::var_os("PATH").unwrap_or_default();
+        let path =
+            std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(&rest)))
+                .unwrap_or(rest);
         let child = Command::new(env!("CARGO_BIN_EXE_smugglr"))
             .arg("mesh")
             .arg(&self.path)
@@ -177,6 +176,14 @@ impl Node {
             .arg(key)
             .env("XDG_CONFIG_HOME", &self.config)
             .env("PATH", path)
+            // Windows names the machine in COMPUTERNAME, not `hostname`.
+            .env(
+                "COMPUTERNAME",
+                self.config
+                    .file_name()
+                    .map(|name| name.to_string_lossy().replace("config", "node"))
+                    .unwrap_or_default(),
+            )
             .stdout(Stdio::null())
             .spawn()
             .map_err(|err| err.to_string())?;
