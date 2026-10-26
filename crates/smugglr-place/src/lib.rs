@@ -21,11 +21,7 @@ pub mod local_file;
 mod queries;
 mod value;
 
-use std::path::Path;
-
 use smugglr_core::change::Change;
-use smugglr_core::large::Large;
-use smugglr_core::row_hash::row_hash;
 
 #[cfg(feature = "native")]
 pub use d1::D1;
@@ -67,6 +63,11 @@ pub enum Error {
     #[error("{0}")]
     Adapter(String),
 }
+
+/// A local SQLite file's value limit, the largest value whose `quote()`
+/// text it can build: SQLite's `SQLITE_MAX_LENGTH` of 1,000,000,000 bytes
+/// halved for a blob's hex, less 5% headroom (FR-SMUGGLR-071 rev 11).
+pub const LOCAL_LIMIT: u64 = 475_000_000;
 
 /// A row's key: SQLite's `quote()` text of each primary-key column, in key
 /// order.
@@ -116,6 +117,13 @@ pub trait Place {
     /// them (FR-SMUGGLR-066). None by default.
     fn own_tables(&self) -> &[&str] {
         &[]
+    }
+
+    /// The place's value limit: the largest value, in bytes, whose
+    /// `quote()` text it can build (FR-SMUGGLR-071 rev 11). A local file's,
+    /// [`LOCAL_LIMIT`], by default.
+    fn value_limit(&self) -> u64 {
+        LOCAL_LIMIT
     }
 
     /// Every table the place holds, except SQLite's own. A table of the
@@ -172,115 +180,6 @@ pub trait Place {
     /// # Errors
     /// When the place cannot be written; nothing is then written.
     fn write(&mut self, table: &Table, changes: &[Change]) -> Result<Vec<Key>, Error>;
-
-    /// The rows of `keys` as [`Place::rows`] reads them, and each row's
-    /// hash, except that a text or blob value of more than `large` bytes is
-    /// its [`Large::placeholder`], hashed where it lives and never held
-    /// whole (FR-SMUGGLR-078 rev 28).
-    ///
-    /// The default reads every row whole through [`Place::rows`].
-    ///
-    /// # Errors
-    /// When the place cannot be read.
-    fn rows_apart(
-        &mut self,
-        table: &Table,
-        keys: &[Key],
-        large: u64,
-    ) -> Result<Vec<(Vec<String>, [u8; 16])>, Error> {
-        let rows = self.rows(table, keys)?;
-        Ok(apart(table, rows, large))
-    }
-
-    /// Up to `len` bytes of the value in column `column` (its position) of
-    /// the row `key`, from `offset`: the value's own bytes, a text's UTF-8
-    /// or a blob's. Fewer at the value's end; none past it or for a row not
-    /// there.
-    ///
-    /// The default reads the row whole through [`Place::rows`].
-    ///
-    /// # Errors
-    /// When the place cannot be read.
-    fn read_value(
-        &mut self,
-        table: &Table,
-        key: &Key,
-        column: usize,
-        offset: u64,
-        len: usize,
-    ) -> Result<Vec<u8>, Error> {
-        let rows = self.rows(table, std::slice::from_ref(key))?;
-        let bytes = rows
-            .first()
-            .and_then(|row| row.get(column))
-            .and_then(|quoted| Large::of(quoted))
-            .map(|(_, bytes)| bytes)
-            .unwrap_or_default();
-        let start = usize::try_from(offset).unwrap_or(usize::MAX).min(bytes.len());
-        Ok(bytes[start..bytes.len().min(start.saturating_add(len))].to_vec())
-    }
-
-    /// Writes the changes as [`Place::write`] does, where a value may be a
-    /// [`Large::placeholder`] whose own bytes are in the file `file` names
-    /// for it.
-    ///
-    /// The default reads each such value whole from its file.
-    ///
-    /// # Errors
-    /// When a value's file cannot be read, or the place cannot be written;
-    /// nothing is then written.
-    fn write_apart(
-        &mut self,
-        table: &Table,
-        changes: &[Change],
-        file: &dyn Fn(&Large) -> Option<std::path::PathBuf>,
-    ) -> Result<Vec<Key>, Error> {
-        let mut whole = changes.to_vec();
-        for change in &mut whole {
-            for value in &mut change.values {
-                if let Some(large) = Large::parse(value) {
-                    *value = quoted_from(&large, &file(&large).unwrap_or_default())?;
-                }
-            }
-        }
-        self.write(table, &whole)
-    }
-}
-
-/// `rows`, read whole, with each row's hash, and each text or blob value of
-/// more than `large` bytes outside the key as its placeholder.
-#[cfg_attr(not(feature = "native"), allow(dead_code))]
-fn apart(table: &Table, rows: Vec<Vec<String>>, large: u64) -> Vec<(Vec<String>, [u8; 16])> {
-    rows.into_iter()
-        .map(|row| {
-            let columns: Vec<&str> = row.iter().map(String::as_str).collect();
-            let hash = row_hash(&columns);
-            let row = row
-                .into_iter()
-                .enumerate()
-                .map(|(i, quoted)| {
-                    let in_key = table.columns.get(i).is_some_and(|c| table.key.contains(c));
-                    match Large::of(&quoted) {
-                        Some((value, _)) if !in_key && value.size > large => value.placeholder(),
-                        _ => quoted,
-                    }
-                })
-                .collect();
-            (row, hash)
-        })
-        .collect()
-}
-
-/// The `quote()` text of the large value whose own bytes are in the file at
-/// `path`, read whole.
-fn quoted_from(large: &Large, path: &Path) -> Result<String, Error> {
-    let bytes = std::fs::read(path)
-        .map_err(|err| Error::Adapter(format!("{}: {err}", path.display())))?;
-    let mut quoted = smugglr_core::large::opening(large.blob).to_vec();
-    smugglr_core::large::quote(large.blob, &bytes, &mut quoted);
-    quoted.push(b'\'');
-    String::from_utf8(quoted)
-        .map_err(|_| Error::Adapter(format!("{} is not UTF-8 text", path.display())))
 }
 
 /// Database addresses that name another engine.

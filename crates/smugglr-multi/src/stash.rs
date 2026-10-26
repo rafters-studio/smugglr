@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 
 use smugglr_core::change::{Change, op};
 use smugglr_core::envelope::{Envelope, VERSION};
+use smugglr_core::record::Refused;
 use smugglr_core::row_hash::row_hash;
+use smugglr_core::weight::over_limit;
 use smugglr_memory::Device;
 use smugglr_place::{Key, Place};
 
@@ -40,7 +42,10 @@ pub fn stash(
         graveyard: Vec::new(),
         signature: [0; 32],
         sunset,
+        refused: Vec::new(),
     };
+    let (limit, address) = settings.limit(place);
+    let address = address.to_owned();
     for table in &tables {
         let stamp = stamp(table);
         blob.stamps.insert(table.name.clone(), stamp);
@@ -64,6 +69,21 @@ pub fn stash(
         let mut changes = Vec::new();
         for key in keys {
             match values.get(&key) {
+                // Over the value limit: named, left out, and its last hash
+                // kept, so a later stash carries it once it fits.
+                Some(values) if let Some((column, bytes)) = over_limit(values, limit) => {
+                    blob.refused.push(Refused::new(
+                        &table.name,
+                        &key,
+                        table.columns.get(column).map_or("", String::as_str),
+                        bytes,
+                        (limit, &address),
+                    ));
+                    match before.get(&key) {
+                        Some(hash) => drop(baseline.insert(key, *hash)),
+                        None => drop(baseline.remove(&key)),
+                    }
+                }
                 Some(values) => {
                     let columns: Vec<&str> = values.iter().map(String::as_str).collect();
                     changes.push((key.clone(), from(&key), Some(row_hash(&columns)), values));

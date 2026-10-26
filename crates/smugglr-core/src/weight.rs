@@ -6,6 +6,10 @@
 //! bytes and the tables they are in. Over `max_wire` it writes nothing and
 //! says how to move the data instead. `max_wire` is also the limit of the
 //! mesh's too-much answer (FR-SMUGGLR-079).
+//!
+//! Each value has a limit too (FR-SMUGGLR-071 rev 11): the smaller of the
+//! two places' value limits, lowered by `max_value`. A value over it is
+//! refused and named in the record, and every other row moves.
 
 use std::fmt;
 
@@ -17,6 +21,47 @@ use serde::Serialize;
 /// 100,000,000 bytes, because the record writes sizes in the same decimal
 /// units (`2.1 GB`); revisable.
 pub const DEFAULT_MAX_WIRE: u64 = 100_000_000;
+
+/// `max_value` when the config does not set it: 2 MB, 2,000,000 bytes.
+///
+/// Current choice (2026-10-26, Sean): sane hosted services keep rows that
+/// size, and it sits well inside the backpressure and wire lines; it may be
+/// raised up to a place's own limit.
+pub const DEFAULT_MAX_VALUE: u64 = 2_000_000;
+
+/// What a place gives, in place of its `quote()` text, for a value too
+/// large for it to quote: the value's bytes.
+#[must_use]
+pub fn unquotable(bytes: u64) -> String {
+    format!("@over {bytes}")
+}
+
+/// The bytes of the value whose `quote()` text is `quoted`: a text's own
+/// bytes, a blob's, and any other value's text; for a value its place could
+/// not quote ([`unquotable`]), the bytes it names.
+#[must_use]
+pub fn value_bytes(quoted: &str) -> u64 {
+    if let Some(bytes) = quoted.strip_prefix("@over ") {
+        return bytes.parse().unwrap_or(u64::MAX);
+    }
+    if let Some(hex) = quoted.strip_prefix("X'") {
+        return (hex.len().saturating_sub(1) / 2) as u64;
+    }
+    match quoted.strip_prefix('\'').and_then(|inner| inner.strip_suffix('\'')) {
+        Some(inner) => (inner.len() - inner.matches("''").count()) as u64,
+        None => quoted.len() as u64,
+    }
+}
+
+/// The first value of `row` (its columns' `quote()` text) over `limit`
+/// bytes: its column's place and its bytes.
+#[must_use]
+pub fn over_limit(row: &[String], limit: u64) -> Option<(usize, u64)> {
+    row.iter()
+        .map(|quoted| value_bytes(quoted))
+        .enumerate()
+        .find(|(_, bytes)| *bytes > limit)
+}
 
 /// What a sync would move.
 ///
@@ -101,6 +146,18 @@ pub fn too_much(weight: &Weight, source: &str, target: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_value_weighs_its_own_bytes_and_one_over_the_limit_is_found() {
+        use super::{over_limit, unquotable, value_bytes};
+        assert_eq!(value_bytes("'it''s'"), 4);
+        assert_eq!(value_bytes("X'00FF'"), 2);
+        assert_eq!(value_bytes("12345"), 5);
+        assert_eq!(value_bytes(&unquotable(600_000_000)), 600_000_000);
+        let row = ["'a'".to_owned(), "X'000000'".to_owned(), "'abcd'".to_owned()];
+        assert_eq!(over_limit(&row, 3), Some((2, 4)));
+        assert_eq!(over_limit(&row, 4), None);
+    }
+
     use super::{Weight, too_much};
 
     #[test]

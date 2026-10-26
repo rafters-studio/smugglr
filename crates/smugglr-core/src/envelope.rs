@@ -98,17 +98,8 @@ impl Envelope {
             Some(to) => row_hash(&values) == to,
             None => values.is_empty(),
         };
-        values_match && self.signed_by(key)
-    }
-
-    /// Whether the signature matches the envelope under `key`, its values
-    /// aside: for a change whose large values ([`crate::large::Large`])
-    /// travel apart, and whose row hash the receiver checks once they have
-    /// arrived.
-    #[must_use]
-    pub fn signed_by(&self, key: &[u8; 32]) -> bool {
         // blake3::Hash compares in constant time.
-        self.signed(key) == blake3::Hash::from(self.signature)
+        values_match && self.signed(key) == blake3::Hash::from(self.signature)
     }
 
     /// BLAKE3 keyed with `key` over each field, each prefixed with its byte
@@ -312,22 +303,7 @@ pub fn receive(
     now: u64,
     here: impl Fn(&Change) -> Here,
 ) -> Vec<Arrival> {
-    decide_all(envelopes, &|envelope| envelope.verify(key), mode, now, here, false)
-}
-
-/// Decides `envelopes` as [`receive`] does (as [`receive_replayed`] does
-/// when `replayed`), except that `verified` says whether each is signed and
-/// its values bound by its `to`: for changes whose large values travel
-/// apart, which the caller checks once they have arrived.
-pub fn receive_checked(
-    envelopes: &[Envelope],
-    verified: impl Fn(&Envelope) -> bool,
-    mode: SyncMode,
-    now: u64,
-    here: impl Fn(&Change) -> Here,
-    replayed: bool,
-) -> Vec<Arrival> {
-    decide_all(envelopes, &verified, mode, now, here, replayed)
+    decide_all(envelopes, key, mode, now, here, false)
 }
 
 /// Decides `envelopes` the place replays ([`replay`]) as [`receive`] does,
@@ -340,12 +316,12 @@ pub fn receive_replayed(
     now: u64,
     here: impl Fn(&Change) -> Here,
 ) -> Vec<Arrival> {
-    decide_all(envelopes, &|envelope| envelope.verify(key), mode, now, here, true)
+    decide_all(envelopes, key, mode, now, here, true)
 }
 
 fn decide_all(
     envelopes: &[Envelope],
-    verified: &dyn Fn(&Envelope) -> bool,
+    key: &[u8; 32],
     mode: SyncMode,
     now: u64,
     here: impl Fn(&Change) -> Here,
@@ -355,7 +331,7 @@ fn decide_all(
     // further member is held.
     let mut held = BTreeSet::new();
     loop {
-        let arrivals = in_order(envelopes, verified, (mode, now, replayed), &here, &held);
+        let arrivals = in_order(envelopes, key, (mode, now, replayed), &here, &held);
         let broken = broken(envelopes, &arrivals);
         let before = held.len();
         for (index, (envelope, arrival)) in envelopes.iter().zip(&arrivals).enumerate() {
@@ -377,7 +353,7 @@ fn decide_all(
 /// it; an envelope in `held` that would apply is held instead.
 fn in_order(
     envelopes: &[Envelope],
-    verified: &dyn Fn(&Envelope) -> bool,
+    key: &[u8; 32],
     (mode, now, replayed): (SyncMode, u64, bool),
     here: impl Fn(&Change) -> Here,
     held: &BTreeSet<usize>,
@@ -389,7 +365,7 @@ fn in_order(
         let row = rows
             .entry((change.table.as_str(), change.key.as_slice()))
             .or_insert_with(|| here(change));
-        let mut arrival = arrive(envelope, verified(envelope), mode, now, row, replayed);
+        let mut arrival = arrive(envelope, key, mode, now, row, replayed);
         if arrival == Arrival::Apply && held.contains(&index) {
             arrival = Arrival::Hold;
         }
@@ -440,13 +416,13 @@ fn broken<'a>(envelopes: &'a [Envelope], arrivals: &[Arrival]) -> BTreeSet<(&'a 
 
 fn arrive(
     envelope: &Envelope,
-    verified: bool,
+    key: &[u8; 32],
     mode: SyncMode,
     now: u64,
     here: &Here,
     replayed: bool,
 ) -> Arrival {
-    if !verified {
+    if !envelope.verify(key) {
         return Arrival::Refused;
     }
     if now > envelope.sunset {

@@ -7,9 +7,8 @@
 //! an acknowledgement is one line appended to the acks file. A peer heard
 //! later becomes a target of every change still owed.
 //! A segment is removed once none of its changes is still owed, and the
-//! acks file once the outbox is empty. A change's large values are kept
-//! beside it, one file each of the value's own bytes, until it is no longer
-//! owed. What the outbox weighs is the bytes of its files.
+//! acks file once the outbox is empty. What the outbox weighs is the bytes
+//! of its files.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
@@ -21,7 +20,6 @@ use smugglr_core::hex::{hex, unhex};
 use smugglr_memory::Store;
 
 use crate::Error;
-use crate::parts::large_values;
 
 /// The most envelopes one segment file holds.
 const SEGMENT: usize = 1_000;
@@ -94,10 +92,6 @@ struct Entry {
     /// When it is next resent to a peer that has stopped acknowledging.
     resend_at: Instant,
     interval: Duration,
-    /// The columns that hold its large values, each kept in a file.
-    large: Vec<usize>,
-    /// The bytes of those files.
-    values: u64,
 }
 
 /// How a peer has been acknowledging this node's changes.
@@ -198,11 +192,6 @@ impl Outbox {
                     continue;
                 };
                 if now > envelope.sunset {
-                    for (column, _) in large_values(&envelope) {
-                        let _ = outbox
-                            .store
-                            .remove(&outbox.value_path(&envelope.signature, column));
-                    }
                     continue;
                 }
                 live += 1;
@@ -244,31 +233,6 @@ impl Outbox {
         format!("{}/{segment:020}.jsonl", self.folder)
     }
 
-    /// Where the outbox keeps the own bytes of the large value in column
-    /// `column` of the change `change`.
-    pub(crate) fn value_path(&self, change: &[u8; 32], column: usize) -> String {
-        format!("{}/values/{}-{column}", self.folder, hex(change))
-    }
-
-    fn remove_values(&self, change: &[u8; 32], entry: &Entry) {
-        for column in &entry.large {
-            // A file that cannot go now is only room not yet made.
-            let _ = self.store.remove(&self.value_path(change, *column));
-        }
-    }
-
-    /// Whether `change` is still owed to `peer`.
-    pub(crate) fn owes(&self, change: &[u8; 32], peer: &str) -> bool {
-        self.entries
-            .get(change)
-            .is_some_and(|entry| entry.targets.contains(peer) && !entry.acked.contains(peer))
-    }
-
-    /// Whether no change is owed.
-    pub(crate) fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
     fn acks_file(&self) -> String {
         format!("{}/acks.jsonl", self.folder)
     }
@@ -283,16 +247,11 @@ impl Outbox {
     /// What `envelope`, owed to `targets`, adds to the outbox's weight.
     pub(crate) fn weigh(envelope: &Envelope, targets: &BTreeSet<String>) -> u64 {
         line(envelope, targets).len() as u64
-            + large_values(envelope)
-                .iter()
-                .map(|(_, large)| large.size)
-                .sum::<u64>()
     }
 
     /// What the outbox weighs: the bytes of its files.
     pub(crate) fn bytes(&self) -> u64 {
         self.segments.values().map(|(bytes, _)| bytes).sum::<u64>()
-            + self.entries.values().map(|entry| entry.values).sum::<u64>()
             + self.acks_bytes
             + self.acks.len() as u64
             + self.index_bytes
@@ -398,12 +357,11 @@ impl Outbox {
 
     /// Lets `change` go without its acknowledgements: it can never be sent.
     pub(crate) fn forget(&mut self, change: &[u8; 32]) {
-        if let Some(entry) = self.entries.remove(change) {
-            self.remove_values(change, &entry);
-            if let Some((_, live)) = self.segments.get_mut(&entry.segment) {
-                *live = live.saturating_sub(1);
-                self.settled = true;
-            }
+        if let Some(entry) = self.entries.remove(change)
+            && let Some((_, live)) = self.segments.get_mut(&entry.segment)
+        {
+            *live = live.saturating_sub(1);
+            self.settled = true;
         }
     }
 
@@ -432,14 +390,11 @@ impl Outbox {
     /// acknowledged changes sent after it; to a peer that is acknowledging,
     /// after about two of its round trips, doubling with each try; and to a
     /// peer that has stopped acknowledging, on the 10 s to 160 s doubling.
-    /// A peer that `busy` says is taking in a change's parts is not resent
-    /// its envelope.
     pub(crate) fn resends(
         &mut self,
         now: Instant,
         timing: &HashMap<String, Timing>,
         limit: usize,
-        busy: impl Fn(&[u8; 32], &str) -> bool,
     ) -> Result<Vec<Owed>, Error> {
         // Which peers each change is due to, and how; the oldest first, so
         // none waits behind newer ones.
@@ -450,9 +405,6 @@ impl Outbox {
             }
             let (mut to, mut silent, mut sure) = (Vec::new(), false, false);
             for peer in entry.targets.difference(&entry.acked) {
-                if !entry.large.is_empty() && busy(change, peer) {
-                    continue;
-                }
                 if entry.unsent_to.contains(peer) {
                     // Its first copy to a peer heard since the first send.
                     to.push(peer.clone());
@@ -568,11 +520,10 @@ impl Outbox {
             .map(|(change, _)| *change)
             .collect();
         for change in done {
-            if let Some(entry) = self.entries.remove(&change) {
-                self.remove_values(&change, &entry);
-                if let Some((_, live)) = self.segments.get_mut(&entry.segment) {
-                    *live = live.saturating_sub(1);
-                }
+            if let Some(entry) = self.entries.remove(&change)
+                && let Some((_, live)) = self.segments.get_mut(&entry.segment)
+            {
+                *live = live.saturating_sub(1);
             }
         }
         let empty: Vec<u64> = self
@@ -648,10 +599,7 @@ fn read_line(line: &str) -> Option<(Envelope, BTreeSet<String>)> {
 }
 
 fn entry(segment: u64, envelope: &Envelope, targets: BTreeSet<String>) -> Entry {
-    let large = large_values(envelope);
     Entry {
-        large: large.iter().map(|(column, _)| *column).collect(),
-        values: large.iter().map(|(_, value)| value.size).sum(),
         segment,
         sunset: envelope.sunset,
         targets,

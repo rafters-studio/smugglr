@@ -16,10 +16,10 @@ use smugglr_core::plan::{
     Hashes, Plan, Side, Steered, SyncMode, Write, changed_in_both, not_read_back, plan_steered,
     recover,
 };
-use smugglr_core::record::{self, Record};
+use smugglr_core::record::{self, Record, Refused};
 use smugglr_core::row_hash::row_hash;
 use smugglr_core::steering::{Steering, needs_steering};
-use smugglr_core::weight::{DEFAULT_MAX_WIRE, Weight, too_much};
+use smugglr_core::weight::{DEFAULT_MAX_VALUE, DEFAULT_MAX_WIRE, Weight, over_limit, too_much};
 use smugglr_memory::{Files, Memory, Store};
 use smugglr_place::{Place, Table};
 
@@ -62,6 +62,9 @@ pub struct Options {
     /// The most bytes a first sync moves; `None` is
     /// [`DEFAULT_MAX_WIRE`], 100 MB.
     pub max_wire: Option<u64>,
+    /// The largest value a row may hold to move, below the places' own
+    /// value limits; `None` is [`DEFAULT_MAX_VALUE`], 2 MB.
+    pub max_value: Option<u64>,
     /// The steering columns the config names; only `--sync-mode last` reads
     /// them.
     pub steering: Steering,
@@ -190,7 +193,10 @@ pub fn sync(
         let why = too_much(&weight, source.address(), target.address());
         return Ok(Record::too_much(weight, why, ignored));
     }
-    let mut wrote = Wrote::default();
+    let mut wrote = Wrote {
+        max_value: options.max_value.unwrap_or(DEFAULT_MAX_VALUE),
+        ..Wrote::default()
+    };
     let unmatched = match write_all(
         plans,
         &mut *source,
@@ -209,12 +215,14 @@ pub fn sync(
             }
             let mut record = Record::new(done, ignored, false, weight);
             record.deletes_seen = !unknown;
+            record.refused = wrote.refused;
             return Err(cut_off(record, cause));
         }
         Err(cause) => return Err(cause),
     };
     let mut record = Record::new(done, ignored, options.dryrun, weight);
     record.deletes_seen = !unknown;
+    record.refused = std::mem::take(&mut wrote.refused);
     if !options.dryrun {
         let kept = memory.save().and_then(|()| {
             // Kept after a run whose rows read back different (exit 4), so
@@ -259,6 +267,10 @@ struct Wrote {
     writes: Vec<Write>,
     /// Whether the place answered each of `writes` as made.
     made: Vec<bool>,
+    /// The largest value a row may hold to move, below the places' limits.
+    max_value: u64,
+    /// The rows not moved for a value over the value limit.
+    refused: Vec<Refused>,
 }
 
 impl Wrote {
@@ -675,7 +687,10 @@ fn carry(
     for start in range.clone().step_by(CHUNK) {
         let end = (start + CHUNK).min(range.end);
         let writes = &wrote.writes[start..end];
-        let changes = changes(table, from, writes)?;
+        let (limit, place) = limit(from, to, wrote.max_value);
+        let place = place.to_owned();
+        let (changes, refused) = changes(table, from, writes, (limit, &place))?;
+        wrote.refused.extend(refused);
         let to_change: HashSet<&Vec<String>> = changes.iter().map(|change| &change.key).collect();
         let journaled: Vec<Write> = writes
             .iter()
@@ -724,20 +739,50 @@ fn key_of(table: &Table, row: &[String]) -> Option<Vec<String>> {
         .collect()
 }
 
+/// The value limit between `from` and `to` (FR-SMUGGLR-071): the smaller of
+/// their limits, lowered by `max_value`, and the place whose limit it is,
+/// `to` when `max_value` is the lower.
+fn limit<'a>(from: &'a dyn Place, to: &'a dyn Place, max_value: u64) -> (u64, &'a str) {
+    let smaller = if from.value_limit() < to.value_limit() { from } else { to };
+    if smaller.value_limit() <= max_value {
+        (smaller.value_limit(), smaller.address())
+    } else {
+        (max_value, to.address())
+    }
+}
+
 /// The Changes for `writes`, with values read from `from`, the other side;
-/// a write whose row `from` no longer holds is left out.
-fn changes(table: &Table, from: &mut dyn Place, writes: &[Write]) -> Result<Vec<Change>, Error> {
+/// a write whose row `from` no longer holds is left out, and so is one with
+/// a value over `limit`, which is named among the rows refused.
+fn changes(
+    table: &Table,
+    from: &mut dyn Place,
+    writes: &[Write],
+    (limit, place): (u64, &str),
+) -> Result<(Vec<Change>, Vec<Refused>), Error> {
     let wanted: Vec<Vec<String>> = writes
         .iter()
         .filter(|write| write.op != Op::Down)
         .map(|write| write.key.clone())
         .collect();
-    let mut rows: BTreeMap<Vec<String>, Vec<String>> = from
-        .rows(table, &wanted)?
-        .into_iter()
-        .filter_map(|row| Some((key_of(table, &row)?, row)))
-        .collect();
-    Ok(writes
+    let mut refused = Vec::new();
+    let mut rows: BTreeMap<Vec<String>, Vec<String>> = BTreeMap::new();
+    for row in from.rows(table, &wanted)? {
+        let Some(key) = key_of(table, &row) else {
+            continue;
+        };
+        match over_limit(&row, limit) {
+            Some((column, bytes)) => refused.push(Refused::new(
+                &table.name,
+                &key,
+                table.columns.get(column).map_or("", String::as_str),
+                bytes,
+                (limit, place),
+            )),
+            None => drop(rows.insert(key, row)),
+        }
+    }
+    let changes = writes
         .iter()
         .filter_map(|write| {
             let values = match write.op {
@@ -753,7 +798,8 @@ fn changes(table: &Table, from: &mut dyn Place, writes: &[Write]) -> Result<Vec<
                 values,
             })
         })
-        .collect())
+        .collect();
+    Ok((changes, refused))
 }
 
 #[cfg(test)]

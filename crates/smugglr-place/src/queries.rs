@@ -56,24 +56,34 @@ fn by_key(key: &[String], first: usize) -> String {
         .join(" AND ")
 }
 
-/// Each row's key columns' `quote()` text, then its row hash.
-pub(crate) fn hashes(table: &Table) -> String {
-    format!(
-        "SELECT {}, {ROW_HASH}({}) FROM {}",
-        quoted(&table.key),
-        quoted(&table.columns),
-        ident(&table.name)
-    )
+/// Each column's `quote()` text, the key's first, as [`unquotable`] text
+/// for a value over `limit` bytes outside the key, which is never quoted.
+///
+/// [`unquotable`]: smugglr_core::weight::unquotable
+fn quoted_within(table: &Table, limit: u64) -> String {
+    table
+        .columns
+        .iter()
+        .map(|column| {
+            if table.key.contains(column) {
+                format!("quote({})", ident(column))
+            } else {
+                format!(
+                    "CASE WHEN octet_length({0}) > {limit} THEN '@over ' || octet_length({0}) \
+                     ELSE quote({0}) END",
+                    ident(column)
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
-/// Each row's key columns' `quote()` text and its rowid (`rowid`, the name
-/// it answers to); then each column's `quote()` text, NULL for a text or
-/// blob of more than `large` bytes outside the key, read only by its
-/// length; then for each column whether it is such a blob, NULL when it is
-/// not such a value. Only the rows of one key, the key's parameters first,
-/// when `by_key`.
-pub(crate) fn apart(table: &Table, rowid: &str, large: u64, one_key: bool) -> String {
-    let big = |column: &String| format!("octet_length({}) > {large}", ident(column));
+/// Each row's key columns' `quote()` text, then each column's, except that
+/// a value of more than `streamed` bytes outside the key is NULL: read
+/// alone, by [`value`], so a row's hash holds no more than one large value
+/// in memory at once.
+pub(crate) fn hashed(table: &Table, streamed: u64) -> String {
     let values: Vec<String> = table
         .columns
         .iter()
@@ -82,64 +92,30 @@ pub(crate) fn apart(table: &Table, rowid: &str, large: u64, one_key: bool) -> St
                 format!("quote({})", ident(column))
             } else {
                 format!(
-                    "CASE WHEN {} THEN NULL ELSE quote({}) END",
-                    big(column),
+                    "CASE WHEN octet_length({0}) > {streamed} THEN NULL ELSE quote({0}) END",
                     ident(column)
                 )
             }
         })
         .collect();
-    let blobs: Vec<String> = table
-        .columns
-        .iter()
-        .map(|column| {
-            if table.key.contains(column) {
-                "NULL".to_owned()
-            } else {
-                format!(
-                    "CASE WHEN {} THEN typeof({}) = 'blob' END",
-                    big(column),
-                    ident(column)
-                )
-            }
-        })
-        .collect();
-    let mut sql = format!(
-        "SELECT {}, {}, {}, {} FROM {}",
-        quoted(&table.key),
-        ident(rowid),
-        values.join(", "),
-        blobs.join(", "),
-        ident(&table.name)
-    );
-    if one_key {
-        sql.push_str(" WHERE ");
-        sql.push_str(&by_key(&table.key, 1));
-    }
-    sql
-}
-
-/// The rowid (`rowid`, the name it answers to) of one row, by key.
-pub(crate) fn rowid(table: &Table, rowid: &str) -> String {
     format!(
-        "SELECT {} FROM {} WHERE {}",
-        ident(rowid),
-        ident(&table.name),
-        by_key(&table.key, 1)
+        "SELECT {}, {} FROM {}",
+        quoted(&table.key),
+        values.join(", "),
+        ident(&table.name)
     )
 }
 
-/// Whether a table is `WITHOUT ROWID`.
-pub(crate) const WITHOUT_ROWID: &str =
-    "SELECT wr FROM pragma_table_list WHERE schema = 'main' AND name = ?1";
-
-/// One column's value, by key, as its bytes (`whole`) or only its length in
-/// bytes, for a table with no rowid, whose value is read whole.
-pub(crate) fn value(table: &Table, column: &str, whole: bool) -> String {
-    let read = if whole { "CAST({} AS BLOB)" } else { "octet_length({})" };
+/// One column's `quote()` text, by key, as [`quoted_within`] gives it.
+pub(crate) fn value(table: &Table, column: &str, limit: u64) -> String {
+    let one = Table {
+        columns: vec![column.to_owned()],
+        key: Vec::new(),
+        ..table.clone()
+    };
     format!(
         "SELECT {} FROM {} WHERE {}",
-        read.replace("{}", &ident(column)),
+        quoted_within(&one, limit),
         ident(&table.name),
         by_key(&table.key, 1)
     )
@@ -188,6 +164,17 @@ pub(crate) fn row(table: &Table) -> String {
     format!(
         "SELECT {} FROM {} WHERE {}",
         quoted(&table.columns),
+        ident(&table.name),
+        by_key(&table.key, 1)
+    )
+}
+
+/// One row's columns' `quote()` text, by key, as [`quoted_within`] gives
+/// it: a value over `limit` bytes is never quoted.
+pub(crate) fn row_within(table: &Table, limit: u64) -> String {
+    format!(
+        "SELECT {} FROM {} WHERE {}",
+        quoted_within(table, limit),
         ident(&table.name),
         by_key(&table.key, 1)
     )

@@ -45,6 +45,12 @@ pub trait Transport: std::fmt::Debug {
         &[]
     }
 
+    /// The service's value limit ([`Place::value_limit`]); a local
+    /// SQLite file's by default.
+    fn value_limit(&self) -> u64 {
+        crate::LOCAL_LIMIT
+    }
+
     /// The service runs the engine's row hash as `smugglr_row_hash`, a
     /// function registered on its connection, as the browser's SQLite does:
     /// each row is then hashed where it lives. False by default.
@@ -244,6 +250,10 @@ impl Place for HttpSql {
 
     fn own_tables(&self) -> &[&str] {
         self.transport.own_tables()
+    }
+
+    fn value_limit(&self) -> u64 {
+        self.transport.value_limit()
     }
 
     fn tables(&mut self) -> Result<Vec<Table>, Error> {
