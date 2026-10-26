@@ -922,8 +922,16 @@ impl Node<'_> {
         let Some((firsts, mut sent)) = self.send_firsts()? else {
             return Ok(());
         };
-        // Parts take what the window has left.
-        let parts = self.sending.firsts(self.room(sent), instant);
+        // Parts take turns with first sends under the same window: a change
+        // in parts already holds one place in it, waiting on its parts, so
+        // its parts are held to the window on their own and never wait on
+        // it.
+        let room = self
+            .window
+            .whole()
+            .saturating_sub(self.sending.in_flight())
+            .min(PER_TICK.saturating_sub(sent));
+        let parts = self.sending.firsts(room, instant);
         let first_parts = parts.len();
         let (went, full) = self.send_pieces(parts);
         sent += went;
