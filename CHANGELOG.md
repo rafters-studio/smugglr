@@ -56,8 +56,9 @@ the key file is readable only by its owner runs on unix only.
 - **`smugglr mesh keygen`** (PR #593, #520): `smugglr mesh keygen --key-file
   <path>` writes a new key at the end of the key file, creating the file when
   there is none. The file holds one base64 key per line, newest last; a node
-  sends under the newest, opens datagrams under any key the file holds, and
-  answers a peer in the key it speaks, so appending a key rotates to it. A
+  sends under the newest, opens datagrams under the newest key and the one
+  before it (older keys in the file do not open), and answers a peer in the key
+  it speaks, so appending a key rotates to it. A
   key is never written to output or errors, only its id. A key file that its
   group or others can read is refused, on unix.
 - **`--replay <change hash>` on `smugglr mesh` and `smugglr retrieve`** (PR
