@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-25
+
 The greenfield release. smugglr 0.6.0 is a new engine, rebuilt from service
 design and specification rather than from the 0.5 code (#529), so this entry
 describes what 0.6.0 does, not how it differs from 0.5. It keeps two SQLite
