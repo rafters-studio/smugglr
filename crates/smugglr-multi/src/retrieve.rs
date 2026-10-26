@@ -1,6 +1,7 @@
 //! Retrieve: verify blobs and apply them by the envelope rules, in any
 //! order.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use smugglr_core::change::{Change, op};
@@ -12,6 +13,7 @@ use smugglr_core::record::{
     REFUSED, Record, WAITING,
 };
 use smugglr_core::shape::Mismatch;
+use smugglr_core::steering::further_on;
 use smugglr_memory::{Device, Row};
 use smugglr_place::{Key, Place, Table};
 
@@ -66,7 +68,7 @@ pub fn retrieve(
         run.refuse(blob, why);
     }
     for blob in blobs.iter().filter(|blob| blob.whole) {
-        run.take_whole(place, blob, settings.now)?;
+        run.take_whole(place, blob, settings)?;
     }
     let envelopes = blobs
         .iter()
@@ -323,10 +325,19 @@ impl Run {
 
     /// Takes a whole blob: every row not changed here since the last stash
     /// becomes the blob's, and its graveyard joins the device's. This
-    /// device's own changes since its last stash stay, for its next stash.
+    /// device's own changes since its last stash stay, for its next stash,
+    /// unless the blob's copy also differs from the row at that stash (on a
+    /// first retrieve, any row held here that differs): that row is decided
+    /// by `--sync-mode` and named, overwritten or stopped (FR-SMUGGLR-071).
     /// An envelope past its own sunset is dead (FR-SMUGGLR-076): its row is
     /// left as it is here, and a dead tombstone is not kept.
-    fn take_whole(&mut self, place: &mut dyn Place, blob: &Blob, now: u64) -> Result<(), Error> {
+    fn take_whole(
+        &mut self,
+        place: &mut dyn Place,
+        blob: &Blob,
+        settings: &Settings,
+    ) -> Result<(), Error> {
+        let now = settings.now;
         let mut rows: BTreeMap<&str, BTreeMap<&Key, &Envelope>> = BTreeMap::new();
         let mut dead: BTreeMap<&str, BTreeSet<&Key>> = BTreeMap::new();
         for envelope in &blob.changes {
@@ -360,9 +371,23 @@ impl Run {
             let own = |key: &Key| here.get(key) != at_stash.get(key) || dead.contains(key);
             let theirs = rows.remove(name.as_str()).unwrap_or_default();
             let mut changes = Vec::new();
+            // Changed here and in the blob since the last stash, each to a
+            // different copy: `--sync-mode` decides.
+            let conflicts: Vec<Envelope> = theirs
+                .iter()
+                .filter(|(key, envelope)| {
+                    let to = envelope.change.to;
+                    own(key)
+                        && !dead.contains(**key)
+                        && to != at_stash.get(**key).copied()
+                        && to != here.get(**key).copied()
+                })
+                .map(|(_, envelope)| (*envelope).clone())
+                .collect();
+            let overwriting = self.overwrites(place, &name, &conflicts, &here, settings)?;
             for (key, envelope) in &theirs {
                 let (from, to) = (here.get(*key).copied(), envelope.change.to);
-                if !own(key) && from != to {
+                if (!own(key) || overwriting.contains(*key)) && from != to {
                     changes.push(Change {
                         op: op(from, to),
                         from,
@@ -387,6 +412,10 @@ impl Run {
                 .into_iter()
                 .map(|change| change.key)
                 .collect();
+            for key in overwriting.into_iter().filter(|key| landed.contains(key)) {
+                let moves = self.moves.entry(name.clone()).or_default();
+                moves.overwritten_in_target.push(Named(key));
+            }
             for key in here.keys().chain(theirs.keys().copied()) {
                 if own(key) {
                     continue;
@@ -414,6 +443,39 @@ impl Run {
         }
         self.device.stashed = true;
         Ok(())
+    }
+
+    /// Decides each of `conflicts`, a whole blob's copies of rows of `name`
+    /// changed here and in the blob, by `--sync-mode`, and returns the keys
+    /// whose copy in the blob overwrites the row here. Under `last` the copy
+    /// whose steering value is further on is kept; every other row is named
+    /// stopped.
+    fn overwrites(
+        &mut self,
+        place: &mut dyn Place,
+        name: &str,
+        conflicts: &[Envelope],
+        here: &Hashes,
+        settings: &Settings,
+    ) -> Result<BTreeSet<Key>, Error> {
+        let steering = self.steering(place, conflicts, settings)?;
+        let mut overwriting = BTreeSet::new();
+        for envelope in conflicts {
+            let change = &envelope.change;
+            let row: Row = (name.to_owned(), change.key.clone());
+            let further = steering
+                .get(&row)
+                .and_then(|(at, mine)| Some(further_on(change.values.get(*at)?, mine)));
+            match further {
+                Some(Ordering::Greater) => drop(overwriting.insert(change.key.clone())),
+                Some(Ordering::Less) => {}
+                _ if here.contains_key(&change.key) => {
+                    self.name(name, &change.key, CHANGED_HERE_AND_IN_BLOB);
+                }
+                _ => self.name(name, &change.key, EDIT_VERSUS_DELETE),
+            }
+        }
+        Ok(overwriting)
     }
 
     /// Receives `pending` together, writes what applies, and receives what
