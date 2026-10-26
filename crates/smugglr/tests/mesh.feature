@@ -53,3 +53,23 @@ Feature: smugglr mesh as a command: its front ends, its node's name and port, it
     Given two nodes running smugglr mesh
     When 50,000 rows are written at once on the first node
     Then the second node applies them in transactions of at most 20,000 changes, not one per change
+
+  @criterion-01a176cc-730a-70c0-a641-dce0f9d2d785 @module-mesh
+  Scenario: first sends are unicast and a lost copy is resent at once
+    Given two nodes running smugglr mesh that have heard each other
+    When 50,000 rows are written at once on the first node, and the relay drops one datagram in ten
+    Then the first node sends each change's first copy unicast to the second node
+    And each lost copy is applied on the second node within one second of its loss
+    And resends never take more than a quarter of what the first node sends
+
+  @criterion-01a176cc-730a-70c0-a641-dcff52054467 @module-mesh
+  Scenario: the window shrinks on congestion, not on a lost datagram
+    Given two nodes running smugglr mesh, and a relay that drops one datagram in ten
+    When 50,000 rows are written at once on the first node
+    Then the first node's send window never halves for a lost datagram
+
+  @criterion-01a176d8-f51b-73b0-b21e-f433d87c812f @module-mesh
+  Scenario: peers named in config keep in step without broadcast
+    Given two nodes running smugglr mesh on a relay that passes no broadcast, each naming the other in its peers setting
+    When a row is written on the first node
+    Then the second node holds that row

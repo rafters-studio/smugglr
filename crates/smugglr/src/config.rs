@@ -13,8 +13,9 @@
 //! "modified"`); and `graveyard`, the seconds a change is carried and a
 //! delete's tombstone kept (FR-SMUGGLR-076); and `port`, the UDP port
 //! smugglr mesh broadcasts and listens on, and `backpressure`, the most its
-//! outbox holds, in bytes or text like `max_wire` (FR-SMUGGLR-078). Other
-//! settings are left alone.
+//! outbox holds, in bytes or text like `max_wire`, and `peers`, addresses a
+//! mesh node announces itself to on a network that carries no broadcast
+//! (FR-SMUGGLR-078). Other settings are left alone.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -43,6 +44,8 @@ pub struct Config {
     pub port: Option<u16>,
     /// The most bytes the mesh's outbox holds; `None` when not set, 6 MB.
     pub backpressure: Option<u64>,
+    /// Peer addresses for the mesh, as written: `host` or `host:port`.
+    pub peers: Vec<String>,
 }
 
 /// The config as the file holds it, before its settings are checked.
@@ -52,6 +55,8 @@ struct File {
     ignore: Vec<String>,
     max_wire: Option<toml::Value>,
     backpressure: Option<toml::Value>,
+    #[serde(default)]
+    peers: Vec<String>,
     graveyard: Option<u64>,
     port: Option<u16>,
     steering: Option<String>,
@@ -144,6 +149,7 @@ fn parse(text: &str) -> Result<Config, Problem> {
         graveyard: file.graveyard,
         port: file.port,
         backpressure,
+        peers: file.peers,
     })
 }
 
@@ -235,6 +241,17 @@ mod tests {
         assert_eq!(max_wire("max_wire = 2048"), Some(Some(2048)));
         assert_eq!(max_wire("max_wire = \"250 MB\""), Some(Some(250_000_000)));
         assert_eq!(parse("").ok(), Some(Config::default()));
+    }
+
+    #[test]
+    fn peers_are_read_as_written() {
+        let peers = parse("peers = [\"10.0.0.2\", \"rzr.local:40000\"]")
+            .ok()
+            .map(|c| c.peers);
+        assert_eq!(
+            peers,
+            Some(vec!["10.0.0.2".to_owned(), "rzr.local:40000".to_owned()])
+        );
     }
 
     #[test]

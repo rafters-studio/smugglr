@@ -27,13 +27,39 @@ const SEGMENT: usize = 1_000;
 /// How many segments are kept read into memory at once.
 const CACHED: usize = 8;
 
-/// The first resend's wait; each later one doubles, up to [`LAST_RESEND`].
+/// The first resend's wait to a peer that has stopped acknowledging; each
+/// later one doubles, up to [`LAST_RESEND`] (toy Z, for sleepers).
 const FIRST_RESEND: Duration = Duration::from_secs(10);
+
+/// A peer that has acknowledged nothing for this long has stopped
+/// acknowledging.
+const SILENT: Duration = Duration::from_secs(10);
+
+/// How many changes sent after one a peer must acknowledge before the one
+/// it skipped is resent at once, so a change merely reordered is not.
+const SKIPPED: u64 = 3;
+
+/// The shortest wait for a resend to an acknowledging peer.
+const SHORTEST: Duration = Duration::from_millis(50);
+
+/// The acks file is rewritten only once it holds at least this many bytes.
+const COMPACT: u64 = 64 * 1024;
 
 /// The longest wait between two resends.
 const LAST_RESEND: Duration = Duration::from_secs(160);
 
-/// A change due a resend, and the targets that have not acknowledged it.
+/// A change due a resend: to which peers, and whether to a silent peer (on
+/// the doubling) or to an acknowledging one after its round trips.
+#[derive(Debug)]
+struct Due {
+    seq: u64,
+    change: [u8; 32],
+    to: Vec<String>,
+    silent: bool,
+    paced: bool,
+}
+
+/// A change due a resend, and the targets it is due to.
 pub(crate) type Owed = (Envelope, Vec<String>);
 
 #[derive(Debug)]
@@ -42,11 +68,69 @@ struct Entry {
     sunset: u64,
     /// The peers it is owed to.
     targets: BTreeSet<String>,
+    /// Targets heard after its first send, which have had no copy yet.
+    unsent_to: BTreeSet<String>,
     /// The peers that have acknowledged it.
     acked: BTreeSet<String>,
     sent: bool,
+    /// The change's place in the order of first sends.
+    seq: u64,
+    sent_at: Instant,
+    /// When it last went out, first send or resend.
+    last_sent: Instant,
+    /// Resends to acknowledging peers so far: each waits twice the last.
+    tries: u32,
+    /// For each peer it has been resent to, the last first send by then: a
+    /// peer that acknowledges changes sent after that has skipped the resend
+    /// too, so it is resent at once again.
+    resent_by: HashMap<String, u64>,
+    /// It has been resent, so an acknowledgement times no round trip.
+    resent: bool,
+    /// When it is next resent to a peer that has stopped acknowledging.
     resend_at: Instant,
     interval: Duration,
+}
+
+/// How a peer has been acknowledging this node's changes.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Timing {
+    /// Its smoothed round trip.
+    pub(crate) round_trip: Duration,
+    /// How far its round trips stray from the smoothed one (RFC 6298).
+    pub(crate) variation: Duration,
+    pub(crate) last_ack: Instant,
+    /// The latest change, in the order of first sends, it has acknowledged.
+    pub(crate) highest: u64,
+}
+
+impl Timing {
+    fn acknowledging(&self, now: Instant) -> bool {
+        now.duration_since(self.last_ack) < SILENT
+    }
+
+    /// The wait before a first resend: about two round trips, longer when
+    /// round trips vary (RFC 6298).
+    fn wait(&self) -> Duration {
+        (self.round_trip * 2).max(SHORTEST)
+    }
+
+    /// Takes in one round trip measured.
+    pub(crate) fn measure(&mut self, sample: Duration) {
+        let gap = self.round_trip.abs_diff(sample);
+        self.variation = (self.variation * 3 + gap) / 4;
+        self.round_trip = (self.round_trip * 7 + sample) / 8;
+    }
+}
+
+/// What an acknowledgement tells the node.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Acked {
+    /// The peer is the first to acknowledge the change.
+    pub(crate) first: bool,
+    /// The change's place in the order of first sends.
+    pub(crate) seq: u64,
+    /// The round trip, from its one send to now; `None` once resent.
+    pub(crate) round_trip: Option<Duration>,
 }
 
 #[derive(Debug)]
@@ -56,6 +140,8 @@ pub(crate) struct Outbox {
     next: u64,
     entries: HashMap<[u8; 32], Entry>,
     unsent: VecDeque<[u8; 32]>,
+    /// The last first send's place in the order.
+    seq: u64,
     /// Each live segment's bytes and how many of its changes are still owed.
     segments: BTreeMap<u64, (u64, usize)>,
     cache: HashMap<u64, HashMap<[u8; 32], Envelope>>,
@@ -75,6 +161,7 @@ impl Outbox {
             next: 0,
             entries: HashMap::new(),
             unsent: VecDeque::new(),
+            seq: 0,
             segments: BTreeMap::new(),
             cache: HashMap::new(),
             acks_bytes: 0,
@@ -242,8 +329,13 @@ impl Outbox {
                 continue;
             };
             if let Some(entry) = self.entries.get_mut(&change) {
+                let now = Instant::now();
+                self.seq += 1;
                 entry.sent = true;
-                entry.resend_at = Instant::now() + entry.interval;
+                entry.seq = self.seq;
+                entry.sent_at = now;
+                entry.last_sent = now;
+                entry.resend_at = now + entry.interval;
             }
             out.push(envelope);
         }
@@ -264,58 +356,124 @@ impl Outbox {
     /// A peer heard for the first time: a target of every change still owed.
     pub(crate) fn heard(&mut self, peer: &str) {
         for entry in self.entries.values_mut() {
-            entry.targets.insert(peer.to_owned());
+            if entry.targets.insert(peer.to_owned()) && entry.sent {
+                entry.unsent_to.insert(peer.to_owned());
+            }
         }
     }
 
     /// Up to `limit` changes due a resend at `now`, each with the targets
-    /// that have not acknowledged it, each next due after twice its last
-    /// wait; and whether one of them no peer has acknowledged, a sign of
-    /// loss.
+    /// it is due to (FR-SMUGGLR-078 rev 20): at once to a peer that has
+    /// acknowledged changes sent after it; to a peer that is acknowledging,
+    /// after about two of its round trips, doubling with each try; and to a
+    /// peer that has stopped acknowledging, on the 10 s to 160 s doubling.
     pub(crate) fn resends(
         &mut self,
         now: Instant,
+        timing: &HashMap<String, Timing>,
         limit: usize,
-    ) -> Result<(Vec<Owed>, bool), Error> {
-        let mut due: Vec<([u8; 32], bool)> = self
-            .entries
-            .iter()
-            .filter(|(_, entry)| {
-                entry.sent && now >= entry.resend_at && !entry.targets.is_subset(&entry.acked)
-            })
-            .map(|(change, entry)| (*change, entry.acked.is_empty()))
-            .collect();
-        due.truncate(limit);
-        let lost = due.iter().any(|(_, none)| *none);
-        let mut out = Vec::new();
-        for (change, _) in due {
-            let mut owed = Vec::new();
-            if let Some(entry) = self.entries.get_mut(&change) {
-                entry.interval = (entry.interval * 2).min(LAST_RESEND);
-                entry.resend_at = now + entry.interval;
-                owed = entry.targets.difference(&entry.acked).cloned().collect();
+    ) -> Result<Vec<Owed>, Error> {
+        // Which peers each change is due to, and how; the oldest first, so
+        // none waits behind newer ones.
+        let mut due: Vec<Due> = Vec::new();
+        for (change, entry) in &self.entries {
+            if !entry.sent {
+                continue;
             }
-            if let Some(envelope) = self.envelope(&change)? {
-                out.push((envelope, owed));
+            let (mut to, mut silent, mut paced) = (Vec::new(), false, false);
+            for peer in entry.targets.difference(&entry.acked) {
+                if entry.unsent_to.contains(peer) {
+                    // Its first copy to a peer heard since the first send.
+                    to.push(peer.clone());
+                    continue;
+                }
+                match timing.get(peer).filter(|timing| timing.acknowledging(now)) {
+                    Some(timing)
+                        if timing.highest
+                            > entry.resent_by.get(peer).copied().unwrap_or(entry.seq) + SKIPPED =>
+                    {
+                        to.push(peer.clone());
+                    }
+                    Some(timing) => {
+                        let wait = timing.wait() * 2_u32.pow(entry.tries.min(8));
+                        if now >= entry.last_sent + wait.min(LAST_RESEND) {
+                            paced = true;
+                            to.push(peer.clone());
+                        }
+                    }
+                    None => {
+                        if now >= entry.resend_at {
+                            silent = true;
+                            to.push(peer.clone());
+                        }
+                    }
+                }
+            }
+            if !to.is_empty() {
+                due.push(Due {
+                    seq: entry.seq,
+                    change: *change,
+                    to,
+                    silent,
+                    paced,
+                });
             }
         }
-        Ok((out, lost))
+        due.sort_unstable_by_key(|due| due.seq);
+        due.truncate(limit);
+        let latest = self.seq;
+        for Due {
+            change,
+            to,
+            silent,
+            paced,
+            ..
+        } in &due
+        {
+            let Some(entry) = self.entries.get_mut(change) else {
+                continue;
+            };
+            if *silent {
+                entry.interval = (entry.interval * 2).min(LAST_RESEND);
+                entry.resend_at = now + entry.interval;
+            }
+            if *paced {
+                entry.tries += 1;
+            }
+            entry.last_sent = now;
+            entry.resent = true;
+            for peer in to {
+                entry.unsent_to.remove(peer);
+                entry.resent_by.insert(peer.clone(), latest);
+            }
+        }
+        let due: Vec<([u8; 32], Vec<String>)> =
+            due.into_iter().map(|due| (due.change, due.to)).collect();
+        let mut out = Vec::new();
+        for (change, to) in due {
+            if let Some(envelope) = self.envelope(&change)? {
+                out.push((envelope, to));
+            }
+        }
+        Ok(out)
     }
 
-    /// Notes that `peer` acknowledged `change`; true when it is the first
-    /// peer to.
-    pub(crate) fn ack(&mut self, change: &[u8; 32], peer: &str) -> bool {
-        let Some(entry) = self.entries.get_mut(change) else {
-            return false;
-        };
+    /// Notes that `peer` acknowledged `change`, and what that tells; `None`
+    /// for a change not owed or acknowledged already.
+    pub(crate) fn ack(&mut self, change: &[u8; 32], peer: &str) -> Option<Acked> {
+        let entry = self.entries.get_mut(change)?;
         if !entry.acked.insert(peer.to_owned()) {
-            return false;
+            return None;
         }
         self.acks
             .push_str(&json!({"c": hex(change), "n": peer}).to_string());
         self.acks.push('\n');
         self.settled |= entry.targets.is_subset(&entry.acked);
-        entry.acked.len() == 1
+        Some(Acked {
+            first: entry.acked.len() == 1,
+            seq: entry.seq,
+            round_trip: (!entry.resent).then(|| entry.sent_at.elapsed()),
+        })
     }
 
     /// Whether a change has been acknowledged by every target since the last
@@ -370,7 +528,29 @@ impl Outbox {
             self.store.append(&self.acks_file(), &self.acks)?;
             self.acks_bytes += self.acks.len() as u64;
             self.acks.clear();
+            self.compact_acks()?;
         }
+        Ok(())
+    }
+
+    /// Rewrites the acks file with only the acknowledgements of changes
+    /// still owed, once most of it names changes already gone, so a steady
+    /// flow never grows it past the backpressure line.
+    fn compact_acks(&mut self) -> Result<(), Error> {
+        let live: usize = self.entries.values().map(|entry| entry.acked.len()).sum();
+        // An acknowledgement line is about 90 bytes.
+        if self.acks_bytes < COMPACT || self.acks_bytes < (live as u64) * 90 * 2 {
+            return Ok(());
+        }
+        let mut text = String::new();
+        for (change, entry) in &self.entries {
+            for peer in &entry.acked {
+                text.push_str(&json!({"c": hex(change), "n": peer}).to_string());
+                text.push('\n');
+            }
+        }
+        self.store.replace(&self.acks_file(), &text)?;
+        self.acks_bytes = text.len() as u64;
         Ok(())
     }
 }
@@ -400,8 +580,15 @@ fn entry(segment: u64, envelope: &Envelope, targets: BTreeSet<String>) -> Entry 
         segment,
         sunset: envelope.sunset,
         targets,
+        unsent_to: BTreeSet::new(),
         acked: BTreeSet::new(),
         sent: false,
+        seq: 0,
+        sent_at: Instant::now(),
+        last_sent: Instant::now(),
+        tries: 0,
+        resent_by: HashMap::new(),
+        resent: false,
         resend_at: Instant::now(),
         interval: FIRST_RESEND,
     }

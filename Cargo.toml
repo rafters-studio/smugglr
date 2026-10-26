@@ -73,3 +73,16 @@ panic = "warn"
 [profile.release]
 lto = "thin"
 strip = true
+
+# The mesh scenarios measure timing (a lost copy repaired within a second,
+# resends within a quarter of what a node sends); unoptimized, the cipher,
+# the hash and the JSON make a debug build too slow to show it. Current
+# choice 2026-10-26 (#520); revisable.
+[profile.dev.package."*"]
+opt-level = 2
+[profile.dev.package.smugglr-mesh]
+opt-level = 2
+[profile.dev.package.smugglr-core]
+opt-level = 2
+[profile.dev.package.smugglr-place]
+opt-level = 2
