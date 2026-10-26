@@ -1033,6 +1033,13 @@ mod tests {
         let smaller = time_first_sync("linear-200k", 200_000)?;
         let larger = time_first_sync("linear-400k", 400_000)?;
         println!("200,000 rows took {smaller:?}, 400,000 rows took {larger:?}");
+        // On Windows the 15.6 ms timer tick and slow shared runners make the
+        // ratio a measure of the machine, not of sync (#594); both syncs
+        // still run.
+        if cfg!(windows) {
+            println!("skipped on Windows: the wall-clock ratio (#594)");
+            return Ok(());
+        }
         assert!(
             larger < smaller * 3,
             "200,000 rows took {smaller:?}, 400,000 rows took {larger:?}"

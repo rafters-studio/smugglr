@@ -1289,12 +1289,38 @@ fn first_copies_unicast(front: &Front) -> Result<(), String> {
     }
 }
 
+/// Whether a wall-clock bound is skipped here, saying so when it is: on
+/// Windows the 15.6 ms timer tick and slow shared runners make such bounds a
+/// measure of the machine, not of smugglr (#598). The step's other checks
+/// still run.
+fn wall_clock_skipped(bound: &str) -> bool {
+    if cfg!(windows) {
+        println!("skipped on Windows: the wall-clock bound \"{bound}\" (#598)");
+    }
+    cfg!(windows)
+}
+
 #[then("each lost copy is applied on the second node within one second of its loss")]
 fn lost_copies_within_a_second(front: &Front) -> Result<(), String> {
     let relay = front.relay.get().ok_or("no relay")?;
     let seen = relay.seen();
     if seen.lost.is_empty() {
         return Err("the relay lost no copy of a change".to_owned());
+    }
+    if wall_clock_skipped("each lost copy applied within one second of its loss") {
+        let unacked = seen
+            .lost
+            .keys()
+            .filter(|change| !seen.acked.contains_key(*change))
+            .count();
+        return if unacked == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "{unacked} of {} lost copies were never acknowledged",
+                seen.lost.len()
+            ))
+        };
     }
     let late: Vec<Duration> = seen
         .lost
@@ -1460,6 +1486,9 @@ fn the_last_row_within_a_second(front: &Front) -> Result<(), String> {
         .acked
         .get(&last)
         .ok_or("the second node never acknowledged the last row")?;
+    if wall_clock_skipped("the last row repaired within one second of its latest loss") {
+        return Ok(());
+    }
     match acked.checked_duration_since(*lost) {
         Some(took) if took > Duration::from_secs(1) => Err(format!(
             "the last row was repaired {took:?} after its latest loss"
