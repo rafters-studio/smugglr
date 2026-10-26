@@ -16,10 +16,10 @@ use smugglr_core::plan::{
     Hashes, Plan, Side, Steered, SyncMode, Write, changed_in_both, not_read_back, plan_steered,
     recover,
 };
-use smugglr_core::record::{self, Record};
+use smugglr_core::record::{self, Record, Refused};
 use smugglr_core::row_hash::row_hash;
 use smugglr_core::steering::{Steering, needs_steering};
-use smugglr_core::weight::{DEFAULT_MAX_WIRE, Weight, too_much};
+use smugglr_core::weight::{DEFAULT_MAX_VALUE, DEFAULT_MAX_WIRE, Weight, too_much};
 use smugglr_memory::{Files, Memory, Store};
 use smugglr_place::{Place, Table};
 
@@ -62,6 +62,9 @@ pub struct Options {
     /// The most bytes a first sync moves; `None` is
     /// [`DEFAULT_MAX_WIRE`], 100 MB.
     pub max_wire: Option<u64>,
+    /// The largest value a row may hold to move, below the places' own
+    /// value limits; `None` is [`DEFAULT_MAX_VALUE`], 2 MB.
+    pub max_value: Option<u64>,
     /// The steering columns the config names; only `--sync-mode last` reads
     /// them.
     pub steering: Steering,
@@ -190,7 +193,7 @@ pub fn sync(
         let why = too_much(&weight, source.address(), target.address());
         return Ok(Record::too_much(weight, why, ignored));
     }
-    let mut wrote = Wrote::default();
+    let mut wrote = Wrote::new(options.max_value.unwrap_or(DEFAULT_MAX_VALUE));
     let unmatched = match write_all(
         plans,
         &mut *source,
@@ -207,14 +210,12 @@ pub fn sync(
             if let Some(name) = wrote.writing.take() {
                 done.insert(name, record::lost(wrote.written_keys(), &cause.to_string()));
             }
-            let mut record = Record::new(done, ignored, false, weight);
-            record.deletes_seen = !unknown;
+            let record = finished((done, ignored, false, weight), unknown, wrote);
             return Err(cut_off(record, cause));
         }
         Err(cause) => return Err(cause),
     };
-    let mut record = Record::new(done, ignored, options.dryrun, weight);
-    record.deletes_seen = !unknown;
+    let record = finished((done, ignored, options.dryrun, weight), unknown, wrote);
     if !options.dryrun {
         let kept = memory.save().and_then(|()| {
             // Kept after a run whose rows read back different (exit 4), so
@@ -235,6 +236,25 @@ pub fn sync(
         }
     }
     Ok(record)
+}
+
+/// The record of a run whose tables did `done`, as [`Record::new`] makes
+/// it, that could tell a delete unless `unknown`, with the rows `wrote`
+/// refused.
+fn finished(
+    (done, ignored, dryrun, weight): (
+        BTreeMap<String, record::Table>,
+        std::collections::BTreeSet<String>,
+        bool,
+        Option<Weight>,
+    ),
+    unknown: bool,
+    wrote: Wrote,
+) -> Record {
+    let mut record = Record::new(done, ignored, dryrun, weight);
+    record.deletes_seen = !unknown;
+    record.refused = wrote.refused;
+    record
 }
 
 /// The error for a run that wrote rows and then stopped on `cause`,
@@ -259,9 +279,21 @@ struct Wrote {
     writes: Vec<Write>,
     /// Whether the place answered each of `writes` as made.
     made: Vec<bool>,
+    /// The largest value a row may hold to move, below the places' limits.
+    max_value: u64,
+    /// The rows not moved for a value over the value limit.
+    refused: Vec<Refused>,
 }
 
 impl Wrote {
+    /// Nothing written yet, a value over `max_value` refused.
+    fn new(max_value: u64) -> Self {
+        Self {
+            max_value,
+            ..Self::default()
+        }
+    }
+
     /// The writes the places answered as made, leaving none.
     fn take_written(&mut self) -> Vec<Write> {
         let made = std::mem::take(&mut self.made);
@@ -305,6 +337,9 @@ fn write_all(
             continue;
         };
         if dryrun {
+            // A dry run writes nothing and names what it would refuse.
+            let refused = refused(&table, &mut *source, &mut *target, &writes, wrote.max_value)?;
+            wrote.refused.extend(refused);
             continue;
         }
         wrote.writing = Some(table.name.clone());
@@ -675,7 +710,10 @@ fn carry(
     for start in range.clone().step_by(CHUNK) {
         let end = (start + CHUNK).min(range.end);
         let writes = &wrote.writes[start..end];
-        let changes = changes(table, from, writes)?;
+        let (limit, place) = limit(from, to, wrote.max_value);
+        let place = place.to_owned();
+        let (changes, refused) = changes(table, from, writes, (limit, &place))?;
+        wrote.refused.extend(refused);
         let to_change: HashSet<&Vec<String>> = changes.iter().map(|change| &change.key).collect();
         let journaled: Vec<Write> = writes
             .iter()
@@ -724,20 +762,89 @@ fn key_of(table: &Table, row: &[String]) -> Option<Vec<String>> {
         .collect()
 }
 
+/// The rows of `writes` a run would refuse for a value over the value
+/// limit, each read from the place it is copied from, `CHUNK` at a time.
+fn refused(
+    table: &Table,
+    source: &mut dyn Place,
+    target: &mut dyn Place,
+    writes: &[Write],
+    max_value: u64,
+) -> Result<Vec<Refused>, Error> {
+    let mut refused = side_refused(table, source, target, writes, Side::Target, max_value)?;
+    refused.extend(side_refused(
+        table,
+        target,
+        source,
+        writes,
+        Side::Source,
+        max_value,
+    )?);
+    Ok(refused)
+}
+
+/// The rows of `writes` for `side`, whose place is `to`, that a run would
+/// refuse, read from `from`.
+fn side_refused(
+    table: &Table,
+    from: &mut dyn Place,
+    to: &dyn Place,
+    writes: &[Write],
+    side: Side,
+    max_value: u64,
+) -> Result<Vec<Refused>, Error> {
+    let (limit, place) = limit(from, to, max_value);
+    let place = place.to_owned();
+    let side: Vec<Write> = writes.iter().filter(|w| w.side == side).cloned().collect();
+    let mut refused = Vec::new();
+    for writes in side.chunks(CHUNK) {
+        refused.extend(changes(table, from, writes, (limit, &place))?.1);
+    }
+    Ok(refused)
+}
+
+/// The value limit between `from` and `to` (FR-SMUGGLR-071): the smaller of
+/// their limits, lowered by `max_value`, and the place whose limit it is,
+/// `to` when `max_value` is the lower.
+fn limit<'a>(from: &'a dyn Place, to: &'a dyn Place, max_value: u64) -> (u64, &'a str) {
+    let smaller = if from.value_limit() < to.value_limit() {
+        from
+    } else {
+        to
+    };
+    if smaller.value_limit() <= max_value {
+        (smaller.value_limit(), smaller.address())
+    } else {
+        (max_value, to.address())
+    }
+}
+
 /// The Changes for `writes`, with values read from `from`, the other side;
-/// a write whose row `from` no longer holds is left out.
-fn changes(table: &Table, from: &mut dyn Place, writes: &[Write]) -> Result<Vec<Change>, Error> {
+/// a write whose row `from` no longer holds is left out, and so is one with
+/// a value over `limit`, which is named among the rows refused.
+fn changes(
+    table: &Table,
+    from: &mut dyn Place,
+    writes: &[Write],
+    (limit, place): (u64, &str),
+) -> Result<(Vec<Change>, Vec<Refused>), Error> {
     let wanted: Vec<Vec<String>> = writes
         .iter()
         .filter(|write| write.op != Op::Down)
         .map(|write| write.key.clone())
         .collect();
-    let mut rows: BTreeMap<Vec<String>, Vec<String>> = from
-        .rows(table, &wanted)?
-        .into_iter()
-        .filter_map(|row| Some((key_of(table, &row)?, row)))
-        .collect();
-    Ok(writes
+    let mut refused = Vec::new();
+    let mut rows: BTreeMap<Vec<String>, Vec<String>> = BTreeMap::new();
+    for row in from.rows(table, &wanted)? {
+        let Some(key) = key_of(table, &row) else {
+            continue;
+        };
+        match Refused::find(&table.name, &table.columns, &key, &row, (limit, place)) {
+            Some(over) => refused.push(over),
+            None => drop(rows.insert(key, row)),
+        }
+    }
+    let changes = writes
         .iter()
         .filter_map(|write| {
             let values = match write.op {
@@ -753,7 +860,8 @@ fn changes(table: &Table, from: &mut dyn Place, writes: &[Write]) -> Result<Vec<
                 values,
             })
         })
-        .collect())
+        .collect();
+    Ok((changes, refused))
 }
 
 #[cfg(test)]

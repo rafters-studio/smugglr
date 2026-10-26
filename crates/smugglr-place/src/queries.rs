@@ -56,45 +56,120 @@ fn by_key(key: &[String], first: usize) -> String {
         .join(" AND ")
 }
 
-/// Each row's key columns' `quote()` text, then its row hash.
-pub(crate) fn hashes(table: &Table) -> String {
+/// Each column's `quote()` text, the key's first, as [`unquotable`] text
+/// for a value over `limit` bytes outside the key, which is never quoted.
+///
+/// [`unquotable`]: smugglr_core::weight::unquotable
+fn quoted_within(table: &Table, limit: u64) -> String {
+    table
+        .columns
+        .iter()
+        .map(|column| {
+            if table.key.contains(column) {
+                format!("quote({})", ident(column))
+            } else {
+                // The value's own bytes, read without building its quote()
+                // text, which a service that cannot build it fails on.
+                format!(
+                    "CASE WHEN length(CAST({0} AS BLOB)) > {limit} \
+                     THEN '@over ' || length(CAST({0} AS BLOB)) ELSE quote({0}) END",
+                    ident(column)
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Each row's key columns' `quote()` text, then each column's, except that
+/// a value of more than `streamed` bytes outside the key is NULL: read
+/// alone, by [`value`], so a row's hash holds no more than one large value
+/// in memory at once.
+pub(crate) fn hashed(table: &Table, streamed: u64) -> String {
+    let values: Vec<String> = table
+        .columns
+        .iter()
+        .map(|column| {
+            if table.key.contains(column) {
+                format!("quote({})", ident(column))
+            } else {
+                format!(
+                    "CASE WHEN octet_length({0}) > {streamed} THEN NULL ELSE quote({0}) END",
+                    ident(column)
+                )
+            }
+        })
+        .collect();
     format!(
-        "SELECT {}, {ROW_HASH}({}) FROM {}",
+        "SELECT {}, {} FROM {}",
         quoted(&table.key),
-        quoted(&table.columns),
+        values.join(", "),
         ident(&table.name)
+    )
+}
+
+/// One column's `quote()` text, by key, as [`quoted_within`] gives it.
+pub(crate) fn value(table: &Table, column: &str, limit: u64) -> String {
+    let one = Table {
+        columns: vec![column.to_owned()],
+        key: Vec::new(),
+        ..table.clone()
+    };
+    format!(
+        "SELECT {} FROM {} WHERE {}",
+        quoted_within(&one, limit),
+        ident(&table.name),
+        by_key(&table.key, 1)
     )
 }
 
 /// Each row's key columns' `quote()` text, then its row hash as hex, for an
-/// HTTP-SQL place whose connection runs the row hash.
-pub(crate) fn hex_hashes(table: &Table) -> String {
+/// HTTP-SQL place whose connection runs the row hash; a value over `limit`
+/// bytes is hashed as [`quoted_within`] gives it, never quoted.
+pub(crate) fn hex_hashes(table: &Table, limit: u64) -> String {
     format!(
         "SELECT {}, hex({ROW_HASH}({})) FROM {}",
         quoted(&table.key),
-        quoted(&table.columns),
+        quoted_within(table, limit),
         ident(&table.name)
     )
 }
 
-/// Each row's key columns' `quote()` text, then every column's, for a place
-/// that cannot run the row hash where the rows live.
-pub(crate) fn quoted_rows(table: &Table) -> String {
+/// Each row's key columns' `quote()` text, then every column's as
+/// [`quoted_within`] gives it, for a place that cannot run the row hash
+/// where the rows live.
+pub(crate) fn quoted_rows(table: &Table, limit: u64) -> String {
     format!(
         "SELECT {}, {} FROM {}",
         quoted(&table.key),
-        quoted(&table.columns),
+        quoted_within(table, limit),
         ident(&table.name)
     )
 }
 
 /// Each row's key columns' `quote()` text, then the bytes of all its
-/// columns' `quote()` text.
-pub(crate) fn weights(table: &Table) -> String {
+/// columns' `quote()` text, a value over `limit` bytes outside the key
+/// weighed as its unquotable mark, never quoted: it is named when the row is
+/// read to move.
+pub(crate) fn weights(table: &Table, limit: u64) -> String {
+    let one = |column: &String| Table {
+        columns: vec![column.clone()],
+        key: if table.key.contains(column) {
+            vec![column.clone()]
+        } else {
+            Vec::new()
+        },
+        ..table.clone()
+    };
     let bytes: Vec<String> = table
         .columns
         .iter()
-        .map(|column| format!("length(CAST(quote({}) AS BLOB))", ident(column)))
+        .map(|column| {
+            format!(
+                "length(CAST({} AS BLOB))",
+                quoted_within(&one(column), limit)
+            )
+        })
         .collect();
     format!(
         "SELECT {}, {} FROM {}",
@@ -104,11 +179,12 @@ pub(crate) fn weights(table: &Table) -> String {
     )
 }
 
-/// One row's columns' `quote()` text, by key.
-pub(crate) fn row(table: &Table) -> String {
+/// One row's columns' `quote()` text, by key, as [`quoted_within`] gives
+/// it: a value over `limit` bytes is never quoted.
+pub(crate) fn row_within(table: &Table, limit: u64) -> String {
     format!(
         "SELECT {} FROM {} WHERE {}",
-        quoted(&table.columns),
+        quoted_within(table, limit),
         ident(&table.name),
         by_key(&table.key, 1)
     )
@@ -319,8 +395,10 @@ mod tests {
     fn http_sql_statements_read_and_write_by_quote_text() {
         let table = notes();
         assert_eq!(
-            quoted_rows(&table),
-            "SELECT quote(\"id\"), quote(\"id\"), quote(\"body\") FROM \"notes\""
+            quoted_rows(&table, 9),
+            "SELECT quote(\"id\"), quote(\"id\"), CASE WHEN length(CAST(\"body\" AS BLOB)) > 9 \
+             THEN '@over ' || length(CAST(\"body\" AS BLOB)) ELSE quote(\"body\") END \
+             FROM \"notes\""
         );
         assert_eq!(
             update_at_quoted(&table),

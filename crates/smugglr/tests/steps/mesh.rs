@@ -31,6 +31,9 @@ use crate::setup::World;
 /// The table every node's database holds.
 const NOTES: &str = "CREATE TABLE notes (id TEXT PRIMARY KEY, body TEXT)";
 
+/// The table of large rows every node's database holds beside it.
+const FILES: &str = "CREATE TABLE files (id TEXT PRIMARY KEY, body TEXT, data BLOB)";
+
 /// How long a step waits for a change sent at once.
 const SOON: Duration = Duration::from_secs(10);
 
@@ -139,7 +142,7 @@ impl Front {
         std::fs::create_dir_all(&folder).map_err(|err| err.to_string())?;
         let path = folder.join("node.db");
         Connection::open(&path)
-            .and_then(|db| db.execute_batch(NOTES))
+            .and_then(|db| db.execute_batch(&format!("{NOTES}; {FILES}")))
             .map_err(|err| err.to_string())?;
         let config = folder.join("config").join("smugglr");
         std::fs::create_dir_all(&config).map_err(|err| err.to_string())?;
@@ -958,6 +961,11 @@ struct Seen {
     changes_by_key: BTreeMap<String, BTreeSet<String>>,
     /// When either node first acknowledged each change.
     acked_by_either: BTreeMap<String, Instant>,
+    /// Every part the first node sent, by number, and when.
+    parts: Vec<(u64, Instant)>,
+    /// When the second node's acknowledgement of each part first passed the
+    /// relay.
+    parts_acked: BTreeMap<u64, Instant>,
 }
 
 /// Stands between two nodes on a network that carries no broadcast: each
@@ -1173,6 +1181,7 @@ impl Relay {
             }
         }
         match message.get("t").and_then(Value::as_str) {
+            Some("part" | "parts") => note_part(&mut seen, &message, from_first, dropped, now),
             Some("change") if from_first => {
                 let Some(change) = message
                     .get("envelope")
@@ -1215,6 +1224,37 @@ impl Relay {
     }
 }
 
+/// Notes a part the first node sent, or an acknowledgement of parts from
+/// the second that the relay passed on.
+fn note_part(seen: &mut Seen, message: &Value, from_first: bool, dropped: bool, now: Instant) {
+    if from_first {
+        seen.sent += 1;
+        if let Some(n) = message.get("n").and_then(Value::as_u64) {
+            seen.parts.push((n, now));
+        }
+        return;
+    }
+    if dropped {
+        return;
+    }
+    for range in message
+        .get("have")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let (Some(start), Some(end)) = (
+            range.get(0).and_then(Value::as_u64),
+            range.get(1).and_then(Value::as_u64),
+        ) else {
+            continue;
+        };
+        for n in start..end {
+            seen.parts_acked.entry(n).or_insert(now);
+        }
+    }
+}
+
 /// Two nodes, each naming the relay in its peers setting, the relay
 /// dropping one datagram in ten when `lossy`; returns once each has heard
 /// the other.
@@ -1228,6 +1268,18 @@ fn two_on_a_relay_as(
     front: &Front,
     lossy: bool,
     first: &str,
+    front_end: FrontEnd,
+) -> Result<(), String> {
+    two_on_a_relay_with(world, front, lossy, [first, ""], front_end)
+}
+
+/// Two nodes as [`two_on_a_relay`] starts them, `more` added to each one's
+/// config, the first started as `front_end`.
+fn two_on_a_relay_with(
+    world: &World,
+    front: &Front,
+    lossy: bool,
+    [first, second]: [&str; 2],
     front_end: FrontEnd,
 ) -> Result<(), String> {
     front.turn.set(Turn::take());
@@ -1245,7 +1297,7 @@ fn two_on_a_relay_as(
         &key,
         Some(ports[1]),
         FrontEnd::Mesh,
-        &peers,
+        &format!("{peers}{second}"),
     )?;
     front.sql(0, "INSERT INTO notes VALUES ('w0', 'heard')")?;
     front.holds(1, "w0", "heard")?;
@@ -1724,5 +1776,213 @@ fn unknown_hash_exits_2(front: &Front) -> Result<(), String> {
             "an unknown hash exited {:?}, saying {said:?}",
             output.status.code()
         ))
+    }
+}
+
+/// A 400 KB text value.
+const FOUR_HUNDRED_KB: &str = "printf('%.400000c', 'd')";
+
+/// A 2 MB value: 2,000,000 bytes of text, at the default `max_value`.
+const TWO_MB: &str = "printf('%.2000000c', 'v')";
+
+/// The `quote()` text of each of the row `id`'s values in node `index`'s
+/// files table; `None` when it holds no such row.
+fn file_row(front: &Front, index: usize, id: &str) -> Result<Option<Vec<String>>, String> {
+    let path = front.with(index, |node| node.path.clone())?;
+    let db = Connection::open(path).map_err(|err| err.to_string())?;
+    db.busy_timeout(Duration::from_secs(5))
+        .map_err(|err| err.to_string())?;
+    let mut statement = db
+        .prepare("SELECT quote(id), quote(body), quote(data) FROM files WHERE id = ?1")
+        .map_err(|err| err.to_string())?;
+    let mut rows = statement
+        .query_map([id], |row| Ok(vec![row.get(0)?, row.get(1)?, row.get(2)?]))
+        .map_err(|err| err.to_string())?;
+    rows.next().transpose().map_err(|err| err.to_string())
+}
+
+/// Waits up to `within` for node 1 to hold the files row `id` byte for byte
+/// as node 0 holds it.
+fn crossed_whole(front: &Front, id: &str, within: Duration) -> Result<(), String> {
+    let made = file_row(front, 0, id)?.ok_or_else(|| format!("the first node holds no {id}"))?;
+    wait(within, || {
+        file_row(front, 1, id).ok().flatten().as_ref() == Some(&made)
+    })
+    .map_err(|()| {
+        let held = file_row(front, 1, id).ok().flatten();
+        format!(
+            "the second node holds {:?} bytes of {id}, not the {} the first holds",
+            held.map(|row| row.iter().map(String::len).sum::<usize>()),
+            made.iter().map(String::len).sum::<usize>()
+        )
+    })
+}
+
+#[when(
+    "a row holding a 400 KB text value and a 1.5 KB blob, both under both nodes' value limits is written on the first node"
+)]
+fn a_large_row(front: &Front) -> Result<(), String> {
+    front.sql(
+        0,
+        &format!("INSERT INTO files VALUES ('large', {FOUR_HUNDRED_KB}, randomblob(1500))"),
+    )
+}
+
+#[then("the second node holds the row, byte for byte the same")]
+fn the_large_row_crossed(front: &Front) -> Result<(), String> {
+    crossed_whole(front, "large", Duration::from_secs(30))
+}
+
+#[when("a row holding a 2 MB value is written on the first node")]
+fn a_two_mb_row(front: &Front) -> Result<(), String> {
+    front.sql(
+        0,
+        &format!("INSERT INTO files VALUES ('two', {TWO_MB}, NULL)"),
+    )
+}
+
+#[then("the second node holds the row whole")]
+fn the_two_mb_row_crossed(front: &Front) -> Result<(), String> {
+    crossed_whole(front, "two", Duration::from_secs(60))
+}
+
+/// How long an acknowledgement may take, from passing the relay to its
+/// maker acting on it, before a resend after it counts as a resend of a
+/// part already acknowledged.
+const ACTED_ON: Duration = Duration::from_millis(500);
+
+#[then("the first node resent only the parts the second node had not acknowledged")]
+fn only_missing_parts_resent(front: &Front) -> Result<(), String> {
+    let relay = front.relay.get().ok_or("no relay")?;
+    let seen = relay.seen();
+    let mut sent: BTreeSet<u64> = BTreeSet::new();
+    let mut resent = 0;
+    for &(n, at) in &seen.parts {
+        if sent.insert(n) {
+            continue;
+        }
+        resent += 1;
+        if let Some(&acked) = seen.parts_acked.get(&n)
+            && acked + ACTED_ON < at
+        {
+            return Err(format!(
+                "the first node resent part {n} {:?} after the second acknowledged it",
+                at.duration_since(acked)
+            ));
+        }
+    }
+    if sent.is_empty() {
+        return Err("the first node sent no part".to_owned());
+    }
+    if resent == 0 {
+        return Err("the relay dropped parts, and none was resent".to_owned());
+    }
+    Ok(())
+}
+
+#[given("two nodes running smugglr mesh, the second with max_value set to 1 MB")]
+fn the_second_with_a_lower_limit(world: &World, front: &Front) -> Result<(), String> {
+    two_on_a_relay_with(
+        world,
+        front,
+        false,
+        ["", "max_value = \"1 MB\"\n"],
+        FrontEnd::Mesh,
+    )
+}
+
+#[when("a row holding a 2 MB value and then a small row are written on the first node")]
+fn a_two_mb_row_then_a_small_one(front: &Front) -> Result<(), String> {
+    a_two_mb_row(front)?;
+    front.sql(0, "INSERT INTO notes VALUES ('after', 'small')")
+}
+
+#[then("the record names the 2 MB value as over the second node's limit")]
+fn the_second_names_the_value(front: &Front) -> Result<(), String> {
+    front.prints(1, "refused: files two: a value of 2000000 bytes in body is over the value limit of 1000000 bytes")?;
+    if file_row(front, 1, "two")?.is_some() {
+        return Err("the second node holds the 2 MB row".to_owned());
+    }
+    Ok(())
+}
+
+#[then("the second node holds the small row")]
+fn the_second_holds_the_small_row(front: &Front) -> Result<(), String> {
+    front.holds(1, "after", "small")
+}
+
+/// A change its own maker refuses for a value over its limit leaves the
+/// key's last hash where its peers hold it, so the next edit that fits
+/// crosses; the maker names the refusal once, not on every look.
+#[test]
+fn a_change_its_maker_refuses_leaves_the_next_edit_free_to_cross() -> Result<(), String> {
+    let (world, front) = (World::default(), Front::default());
+    two_on_a_relay_with(
+        &world,
+        &front,
+        false,
+        ["max_value = \"1 MB\"\n", ""],
+        FrontEnd::Mesh,
+    )?;
+    front.sql(0, "INSERT INTO notes VALUES ('k', 'first')")?;
+    front.holds(1, "k", "first")?;
+    front.sql(
+        0,
+        &format!("UPDATE notes SET body = {TWO_MB} WHERE id = 'k'"),
+    )?;
+    front.prints(0, "refused: notes k")?;
+    // Several looks at the row while it is over the limit.
+    sleep(Duration::from_secs(3));
+    front.sql(0, "UPDATE notes SET body = 'fits' WHERE id = 'k'")?;
+    front.holds(1, "k", "fits")?;
+    let named = front
+        .with(0, Node::printed)?
+        .matches("refused: notes k")
+        .count();
+    if named == 1 {
+        Ok(())
+    } else {
+        Err(format!("the first node named the refusal {named} times"))
+    }
+}
+
+/// A change over a receiver's part cap is refused from its part count, and
+/// its maker is told: its parts no longer hold the maker's window, and a
+/// small change after it crosses within a second.
+#[test]
+fn a_change_over_a_receivers_part_cap_releases_its_maker() -> Result<(), String> {
+    let (world, front) = (World::default(), Front::default());
+    two_on_a_relay_with(
+        &world,
+        &front,
+        false,
+        ["", "max_value = \"500 kB\"\n"],
+        FrontEnd::Mesh,
+    )?;
+    // 2 MB of blob is 4 MB of hex: past the receiver's cap of four times
+    // its 500 kB limit and a mebibyte.
+    front.sql(
+        0,
+        "INSERT INTO files VALUES ('blob', NULL, randomblob(2000000))",
+    )?;
+    front.prints(1, "refused a change from")?;
+    let relay = front.relay.get().ok_or("no relay")?;
+    let parts = || relay.seen().parts.len();
+    // Released: the maker sends no more of its parts.
+    sleep(Duration::from_secs(1));
+    let released = parts();
+    let written = Instant::now();
+    front.sql(0, "INSERT INTO notes VALUES ('after', 'small')")?;
+    front.holds_within(1, "after", "small", Duration::from_secs(1))?;
+    if written.elapsed() > Duration::from_millis(1_100) {
+        return Err(format!("the small change took {:?}", written.elapsed()));
+    }
+    sleep(Duration::from_secs(2));
+    match parts() {
+        now if now == released => Ok(()),
+        now => Err(format!(
+            "the maker sent {} more parts after it was told",
+            now - released
+        )),
     }
 }

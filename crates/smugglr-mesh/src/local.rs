@@ -18,6 +18,7 @@ use smugglr_core::envelope::{self, Arrival, Envelope, Here, VERSION, receive, re
 use smugglr_core::hex::{hex, unhex};
 use smugglr_core::ignore::Ignore;
 use smugglr_core::plan::Hashes;
+use smugglr_core::record::Refused;
 use smugglr_core::row_hash::row_hash;
 use smugglr_core::shape::{Column, Stamp};
 use smugglr_memory::Store;
@@ -27,6 +28,48 @@ use crate::{Error, Settings};
 
 /// A table's row, by its table and key.
 type Row = (String, Key);
+
+/// What a look for the node's own changes found.
+#[derive(Debug, Default)]
+pub(crate) struct Changes {
+    /// The changes to send, as many as fit the budget.
+    pub(crate) found: Vec<Envelope>,
+    /// The budget left rows over.
+    pub(crate) full: bool,
+}
+
+/// The value limit of the node whose database is `place` (FR-SMUGGLR-071):
+/// the place's own, lowered by the `max_value` setting, and the place's
+/// address.
+pub(crate) fn limit(place: &dyn Place, settings: &Settings) -> (u64, String) {
+    (
+        place.value_limit().min(settings.max_value),
+        place.address().to_owned(),
+    )
+}
+
+/// Whether `envelope`, a change to `table`, holds a value over `limit`, the
+/// value limit of the place it names; the record names it when it does.
+pub(crate) fn refuse(envelope: &Envelope, table: &Table, limit: (u64, &str)) -> bool {
+    let Some(refused) = oversized(envelope, table, limit) else {
+        return false;
+    };
+    println!("smugglr mesh: {refused}, from {}", envelope.node);
+    true
+}
+
+/// The refusal of `envelope`, a change to `table`, when it holds a value
+/// over `limit`, the value limit of the place it names.
+fn oversized(envelope: &Envelope, table: &Table, (limit, place): (u64, &str)) -> Option<Refused> {
+    let change = &envelope.change;
+    Refused::find(
+        &change.table,
+        &table.columns,
+        &change.key,
+        &change.values,
+        (limit, place),
+    )
+}
 
 /// What one batch of received changes came to, in the batch's order.
 #[derive(Debug, Default)]
@@ -54,6 +97,9 @@ pub(crate) struct Local {
     held: HashSet<[u8; 32]>,
     /// The changes stopped or dropped the record has named, likewise.
     named: HashSet<[u8; 32]>,
+    /// The node's own rows refused for a value over the value limit, at the
+    /// hash the record named each at, so each is named once.
+    oversized: HashSet<(Row, Option<[u8; 16]>)>,
     /// The dropped log: every change the node dropped, until it is replayed.
     dropped: Vec<Envelope>,
 }
@@ -77,6 +123,7 @@ impl Local {
             tombstones: HashMap::new(),
             held: HashSet::new(),
             named: HashSet::new(),
+            oversized: HashSet::new(),
             dropped: Vec::new(),
         };
         local.read_tables(place, settings)?;
@@ -253,15 +300,20 @@ impl Local {
     /// the rows left over are found again on a later look. Also whether the
     /// budget left rows over. Nothing is kept until [`Local::keep`], so a
     /// look that fails part way loses no row.
+    /// A change with a value over the value limit (FR-SMUGGLR-071) is
+    /// named in the record once and not sent, and its key's last hash stays
+    /// as it was, so the next edit that fits starts from a hash its peers
+    /// hold.
     pub(crate) fn changes(
-        &self,
+        &mut self,
         place: &mut dyn Place,
         settings: &Settings,
         sign: &[u8; 32],
         now: u64,
         budget: u64,
         weigh: impl Fn(&Envelope) -> u64,
-    ) -> Result<(Vec<Envelope>, bool), Error> {
+    ) -> Result<Changes, Error> {
+        let (most, address) = limit(place, settings);
         let (mut found, mut spent) = (Vec::new(), 0_u64);
         let mut full = false;
         let tables: Vec<Table> = self.tables.values().cloned().collect();
@@ -316,6 +368,13 @@ impl Local {
                         signature: [0; 32],
                     };
                     envelope.sign(sign);
+                    if let Some(refused) = oversized(&envelope, table, (most, &address)) {
+                        let row = (table.name.clone(), key.clone());
+                        if self.oversized.insert((row, to)) {
+                            println!("smugglr mesh: {refused}, from {}", envelope.node);
+                        }
+                        continue;
+                    }
                     let size = weigh(&envelope);
                     if spent + size > budget {
                         full = true;
@@ -326,7 +385,7 @@ impl Local {
                 }
             }
         }
-        Ok((found, full))
+        Ok(Changes { found, full })
     }
 
     /// The row each change's key holds here, as the decision path reads it.
@@ -628,6 +687,11 @@ impl Local {
             self.dropped.push(envelope);
         }
         new
+    }
+
+    /// The table `name` as this node keeps it.
+    pub(crate) fn table(&self, name: &str) -> Option<&Table> {
+        self.tables.get(name)
     }
 
     /// Whether `envelope`'s table is one this node keeps, with the same

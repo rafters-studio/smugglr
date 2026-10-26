@@ -11,16 +11,21 @@ use std::time::Duration;
 use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, OpenFlags, params_from_iter};
 use smugglr_core::change::{Change, Op};
-use smugglr_core::row_hash::row_hash;
+use smugglr_core::row_hash::{RowHasher, row_hash};
 
 use crate::queries::{self, ROW_HASH};
 use crate::value::{Value, unquote};
-use crate::{Error, Key, Place, Table};
+use crate::{Error, Key, LOCAL_LIMIT, Place, Table};
 
 /// How long a read or write waits for another writer to let go of the
 /// file's lock before the run stops. Current choice (2026-10-22): 10
 /// seconds, twice the 5-second default most SQLite tools use; revisable.
 const BUSY: Duration = Duration::from_secs(10);
+
+/// A value of more than this many bytes is read alone when a row is hashed,
+/// so a row's hash holds no more than one large value in memory at once:
+/// memory follows the largest value, not the whole row (FR-SMUGGLR-071).
+const STREAMED: u64 = 1 << 20;
 
 /// A SQLite file on this machine.
 #[derive(Debug)]
@@ -133,26 +138,58 @@ impl Place for LocalFile {
     }
 
     fn hashes(&mut self, table: &Table) -> Result<Vec<(Key, [u8; 16])>, Error> {
+        // Hashed here column by column, the same hash the SQL function
+        // gives; a large value is read alone, and one too large to quote is
+        // hashed as its unquotable text, so its row reads as changed and is
+        // refused when it is read to move.
         let width = table.key.len();
-        self.connection
-            .prepare(&queries::hashes(table))
-            .and_then(|mut statement| {
-                statement
-                    .query_map([], |row| {
-                        let key = (0..width)
-                            .map(|i| row.get::<_, String>(i))
-                            .collect::<rusqlite::Result<Vec<String>>>()?;
-                        Ok((key, row.get::<_, [u8; 16]>(width)?))
-                    })?
-                    .collect()
-            })
-            .map_err(|source| self.sqlite(source))
+        let address = self.address.clone();
+        let sqlite = |source| Error::Sqlite {
+            address: address.clone(),
+            source,
+        };
+        let mut statement = self
+            .connection
+            .prepare(&queries::hashed(table, STREAMED))
+            .map_err(sqlite)?;
+        let mut rows = statement.query([]).map_err(sqlite)?;
+        let mut found = Vec::new();
+        while let Some(row) = rows.next().map_err(sqlite)? {
+            let key = (0..width)
+                .map(|i| row.get::<_, String>(i))
+                .collect::<rusqlite::Result<Key>>()
+                .map_err(sqlite)?;
+            let mut hasher = RowHasher::new();
+            for (i, column) in table.columns.iter().enumerate() {
+                let quoted = if let Some(quoted) =
+                    row.get::<_, Option<String>>(width + i).map_err(sqlite)?
+                {
+                    quoted
+                } else {
+                    let params = key
+                        .iter()
+                        .map(|text| unquote(text))
+                        .collect::<Result<Vec<_>, Error>>()?;
+                    self.connection
+                        .query_row(
+                            &queries::value(table, column, LOCAL_LIMIT),
+                            params_from_iter(params),
+                            |row| row.get::<_, String>(0),
+                        )
+                        .map_err(sqlite)?
+                };
+                hasher.length(quoted.len() as u64);
+                hasher.piece(quoted.as_bytes());
+            }
+            found.push((key, hasher.finish()));
+        }
+        Ok(found)
     }
 
     fn weights(&mut self, table: &Table) -> Result<Vec<(Key, u64)>, Error> {
         let width = table.key.len();
         self.connection
-            .prepare(&queries::weights(table))
+            .prepare(&queries::weights(table, LOCAL_LIMIT))
             .and_then(|mut statement| {
                 statement
                     .query_map([], |row| {
@@ -180,7 +217,9 @@ impl Place for LocalFile {
         let transaction = self.connection.transaction().map_err(sqlite)?;
         let mut found = Vec::new();
         {
-            let mut statement = transaction.prepare(&queries::row(table)).map_err(sqlite)?;
+            let mut statement = transaction
+                .prepare(&queries::row_within(table, LOCAL_LIMIT))
+                .map_err(sqlite)?;
             for key in keys {
                 let key = key
                     .iter()
@@ -448,6 +487,47 @@ mod tests {
         ]
         .map(|(name, keyed)| (name.to_owned(), keyed));
         assert_eq!(self_keyed, want);
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn a_row_with_a_large_value_hashes_as_the_sql_function_hashes_it() -> Result<(), Error> {
+        let path = file("large")?;
+        let sqlite = |source| Error::Sqlite {
+            address: String::new(),
+            source,
+        };
+        let connection = rusqlite::Connection::open(&path).map_err(sqlite)?;
+        connection
+            .execute_batch(
+                "CREATE TABLE big (id TEXT PRIMARY KEY, body TEXT, data BLOB); \
+                 INSERT INTO big VALUES ('a', printf('%.2000000c', 'x') || 'it''s', \
+                 randomblob(1500000)), ('b', 'small', NULL)",
+            )
+            .map_err(sqlite)?;
+        let mut want: Vec<(Vec<String>, [u8; 16])> = Vec::new();
+        for id in ["a", "b"] {
+            let row: Vec<String> = connection
+                .query_row(
+                    "SELECT quote(id), quote(body), quote(data) FROM big WHERE id = ?1",
+                    [id],
+                    |row| Ok(vec![row.get(0)?, row.get(1)?, row.get(2)?]),
+                )
+                .map_err(sqlite)?;
+            let columns: Vec<&str> = row.iter().map(String::as_str).collect();
+            want.push((vec![row[0].clone()], row_hash(&columns)));
+        }
+        drop(connection);
+        let mut place = LocalFile::open(&path)?;
+        let table = place
+            .tables()?
+            .into_iter()
+            .find(|table| table.name == "big")
+            .ok_or(Error::Adapter("no table".to_owned()))?;
+        let mut hashes = place.hashes(&table)?;
+        hashes.sort();
+        assert_eq!(hashes, want);
         let _ = std::fs::remove_file(&path);
         Ok(())
     }

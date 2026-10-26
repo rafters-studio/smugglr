@@ -15,7 +15,7 @@ use crate::change::Op;
 use crate::envelope::Envelope;
 use crate::plan::{Plan, Side};
 use crate::shape::Mismatch;
-use crate::weight::Weight;
+use crate::weight::{Weight, over_limit};
 
 /// Why a table stops when rows changed in both places.
 pub const CHANGED_IN_BOTH: &str = "These rows changed in both places since the last sync. \
@@ -121,6 +121,83 @@ pub struct Record {
     /// as lowercase hex.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replayed: Option<String>,
+    /// The rows not moved because a value was over the value limit
+    /// (FR-SMUGGLR-071).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub refused: Vec<Refused>,
+}
+
+/// A row not moved because one of its values was over the value limit: the
+/// row, the value's column and bytes, the limit and the place whose limit it
+/// passed (FR-SMUGGLR-071).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Refused {
+    /// The row's table.
+    pub table: String,
+    /// The row's key.
+    pub key: Key,
+    /// The column that holds the value.
+    pub column: String,
+    /// The value's bytes.
+    pub bytes: u64,
+    /// The limit it passed.
+    pub limit: u64,
+    /// The place whose limit it passed.
+    pub place: String,
+}
+
+impl Refused {
+    /// The row `key` of `table`, refused for its value of `bytes` in
+    /// `column`, over `place`'s `limit`.
+    #[must_use]
+    pub fn new(
+        table: &str,
+        key: &[String],
+        column: &str,
+        bytes: u64,
+        (limit, place): (u64, &str),
+    ) -> Self {
+        Self {
+            table: table.to_owned(),
+            key: Key(key.to_vec()),
+            column: column.to_owned(),
+            bytes,
+            limit,
+            place: place.to_owned(),
+        }
+    }
+
+    /// The row `key` of `table`, whose columns are `columns` and whose
+    /// values' `quote()` text is `row`, refused for its first value over
+    /// `place`'s `limit`; `None` when every value fits.
+    #[must_use]
+    pub fn find(
+        table: &str,
+        columns: &[String],
+        key: &[String],
+        row: &[String],
+        (limit, place): (u64, &str),
+    ) -> Option<Self> {
+        let (column, bytes) = over_limit(row, limit)?;
+        let column = columns.get(column).map_or("", String::as_str);
+        Some(Self::new(table, key, column, bytes, (limit, place)))
+    }
+}
+
+impl fmt::Display for Refused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "refused: {} {}: a value of {} bytes in {} is over the value limit of {} bytes \
+             for {}",
+            printable(&self.table),
+            keys(std::slice::from_ref(&self.key)),
+            self.bytes,
+            printable(&self.column),
+            self.limit,
+            printable(&self.place)
+        )
+    }
 }
 
 /// Why a change was dropped (FR-SMUGGLR-076).
@@ -227,6 +304,7 @@ impl Record {
             dropped: Vec::new(),
             targets_remaining: None,
             replayed: None,
+            refused: Vec::new(),
         }
     }
 
@@ -251,6 +329,7 @@ impl Record {
             dropped: Vec::new(),
             targets_remaining: None,
             replayed: None,
+            refused: Vec::new(),
         }
     }
 
@@ -271,6 +350,7 @@ impl Record {
             dropped: Vec::new(),
             targets_remaining: None,
             replayed: None,
+            refused: Vec::new(),
         }
     }
 
@@ -570,6 +650,9 @@ impl fmt::Display for Record {
                 dropped.reason.words(),
                 dropped.change
             )?;
+        }
+        for refused in &self.refused {
+            writeln!(f, "  {refused}")?;
         }
         if let Some(remaining) = &self.targets_remaining {
             let remaining: Vec<String> = remaining.iter().map(|t| printable(t)).collect();

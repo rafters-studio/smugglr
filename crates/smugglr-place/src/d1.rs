@@ -42,8 +42,8 @@ use serde_json::{Value as Json, json};
 
 use crate::http_sql::Transport;
 use crate::queries::d1::{Kind, MAX_PARAMS, returning, typed_params, writes};
-use crate::value::{base64, unbase64};
 use crate::{Error, HttpSql};
+use smugglr_core::hex::{base64, unbase64};
 
 /// The variable holding the Cloudflare account id.
 pub const ACCOUNT_ID: &str = "CLOUDFLARE_ACCOUNT_ID";
@@ -393,6 +393,11 @@ fn blob(value: Json) -> Result<Json, String> {
     Ok(json!({"$type": "blob", "$value": base64(&bytes)}))
 }
 
+/// D1's value limit: `quote()` runs on D1, whose strings are at most
+/// 2,000,000 bytes, halved for a blob's hex, less 5% headroom, as for a
+/// local file (FR-SMUGGLR-071 rev 11).
+const VALUE_LIMIT: u64 = 950_000;
+
 impl Transport for D1 {
     fn send(&self, request: &Json) -> Result<(bool, Json), String> {
         let (statements, single) = match request["batch"].as_array() {
@@ -414,6 +419,10 @@ impl Transport for D1 {
 
     fn own_tables(&self) -> &[&str] {
         OWN_TABLES
+    }
+
+    fn value_limit(&self) -> u64 {
+        VALUE_LIMIT
     }
 }
 

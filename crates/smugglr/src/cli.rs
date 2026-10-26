@@ -174,8 +174,8 @@ fn sync_command(command: &Sync) -> ExitCode {
 }
 
 fn sync_once(command: &Sync) -> ExitCode {
-    // The tables to ignore, max_wire and the steering columns come from the
-    // config, never from a flag.
+    // The tables to ignore, max_wire, max_value and the steering columns come
+    // from the config, never from a flag.
     let mut options = command.options.clone();
     let dir = options
         .config_dir
@@ -186,6 +186,7 @@ fn sync_once(command: &Sync) -> ExitCode {
             Ok(config) => {
                 options.ignore = config.ignore;
                 options.max_wire = config.max_wire;
+                options.max_value = config.max_value;
                 options.steering = config.steering;
             }
             Err(err) => {

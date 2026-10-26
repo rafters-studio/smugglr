@@ -64,6 +64,11 @@ pub enum Error {
     Adapter(String),
 }
 
+/// A local SQLite file's value limit, the largest value whose `quote()`
+/// text it can build: SQLite's `SQLITE_MAX_LENGTH` of 1,000,000,000 bytes
+/// halved for a blob's hex, less 5% headroom (FR-SMUGGLR-071 rev 11).
+pub const LOCAL_LIMIT: u64 = 475_000_000;
+
 /// A row's key: SQLite's `quote()` text of each primary-key column, in key
 /// order.
 pub type Key = Vec<String>;
@@ -112,6 +117,13 @@ pub trait Place {
     /// them (FR-SMUGGLR-066). None by default.
     fn own_tables(&self) -> &[&str] {
         &[]
+    }
+
+    /// The place's value limit: the largest value, in bytes, whose
+    /// `quote()` text it can build (FR-SMUGGLR-071 rev 11). A local file's,
+    /// [`LOCAL_LIMIT`], by default.
+    fn value_limit(&self) -> u64 {
+        LOCAL_LIMIT
     }
 
     /// Every table the place holds, except SQLite's own. A table of the

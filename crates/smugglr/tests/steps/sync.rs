@@ -1414,3 +1414,48 @@ fn memory_holds_alike_orders(world: &World) -> Result<(), String> {
         ))
     }
 }
+
+/// A value of 2 MB: 2,000,000 bytes of text.
+const TWO_MB: &str = "printf('%.2000000c', 'x')";
+
+#[given(
+    "two places with the same table, max_value set to 1 MB, and the source holding a row with a 2 MB value and a small row"
+)]
+fn a_value_over_max_value(world: &World) -> Result<(), String> {
+    world.source.set(world.place(
+        "source.db",
+        &format!("{NOTES}; INSERT INTO notes VALUES ('big', {TWO_MB}, 1), ('small', 'fits', 2)"),
+    )?);
+    world.target.set(world.place("target.db", NOTES)?);
+    let config = world.config()?;
+    std::fs::create_dir_all(&config).map_err(|err| err.to_string())?;
+    std::fs::write(config.join("config.toml"), "max_value = \"1 MB\"\n")
+        .map_err(|err| err.to_string())
+}
+
+#[then("the record names the 2 MB value as over the limit, with the place")]
+fn the_record_names_the_value(world: &World) -> Result<(), String> {
+    let output = world.output.get().ok_or("smugglr was not run")?;
+    let said = String::from_utf8_lossy(&output.stdout);
+    let line = said
+        .lines()
+        .find(|line| line.contains("refused: notes big"))
+        .ok_or_else(|| format!("the record names no refused row: {said}"))?;
+    for needed in ["2000000 bytes", "1000000 bytes", "target.db"] {
+        if !line.contains(needed) {
+            return Err(format!(
+                "the record's line {line:?} does not name {needed:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[then("the target holds the small row")]
+fn the_target_holds_the_small_row(world: &World) -> Result<(), String> {
+    let target = world.target.get().ok_or("no target")?;
+    match (note(&target, "small")?, note(&target, "big")?) {
+        (Some(_), None) => Ok(()),
+        other => Err(format!("the target holds {other:?} for small and big")),
+    }
+}

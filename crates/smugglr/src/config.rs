@@ -15,7 +15,9 @@
 //! smugglr mesh broadcasts and listens on, and `backpressure`, the most its
 //! outbox holds, in bytes or text like `max_wire`, and `peers`, addresses a
 //! mesh node announces itself to on a network that carries no broadcast
-//! (FR-SMUGGLR-078). Other settings are left alone.
+//! (FR-SMUGGLR-078); and `max_value`, the largest value a row may hold to
+//! move, in bytes or text like `max_wire` (FR-SMUGGLR-071). Other settings
+//! are left alone.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -46,6 +48,8 @@ pub struct Config {
     pub backpressure: Option<u64>,
     /// Peer addresses for the mesh, as written: `host` or `host:port`.
     pub peers: Vec<String>,
+    /// The largest value a row may hold to move; `None` when not set, 2 MB.
+    pub max_value: Option<u64>,
 }
 
 /// The config as the file holds it, before its settings are checked.
@@ -55,6 +59,7 @@ struct File {
     ignore: Vec<String>,
     max_wire: Option<toml::Value>,
     backpressure: Option<toml::Value>,
+    max_value: Option<toml::Value>,
     #[serde(default)]
     peers: Vec<String>,
     graveyard: Option<u64>,
@@ -134,6 +139,7 @@ fn parse(text: &str) -> Result<Config, Problem> {
     let file: File = toml::from_str(text).map_err(Problem::Toml)?;
     let max_wire = size("max_wire", file.max_wire)?;
     let backpressure = size("backpressure", file.backpressure)?;
+    let max_value = size("max_value", file.max_value)?;
     let tables = file
         .tables
         .into_iter()
@@ -150,6 +156,7 @@ fn parse(text: &str) -> Result<Config, Problem> {
         port: file.port,
         backpressure,
         peers: file.peers,
+        max_value,
     })
 }
 
@@ -271,6 +278,13 @@ mod tests {
         );
         assert_eq!(parse("").ok().map(|c| c.port), Some(None));
         assert!(parse("port = 70000").is_err());
+    }
+
+    #[test]
+    fn max_value_reads_as_bytes_or_a_size() {
+        let max_value = |text| parse(text).ok().map(|config| config.max_value);
+        assert_eq!(max_value("max_value = \"1 MB\""), Some(Some(1_000_000)));
+        assert_eq!(max_value(""), Some(None));
     }
 
     #[test]

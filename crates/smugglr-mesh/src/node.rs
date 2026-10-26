@@ -36,9 +36,10 @@ use smugglr_core::row_hash::row_hash;
 use smugglr_place::Place;
 use socket2::{Domain, Protocol, Socket, Type};
 
-use crate::local::Local;
+use crate::local::{Local, limit, refuse};
 use crate::outbox::{Acked, Outbox, Timing};
-use crate::wire::{ACKS, Message, open, seal};
+use crate::parts::{Piece, Receiving, Sending};
+use crate::wire::{ACKS, DATAGRAM, Id, Message, Range, decode, encode, open, seal, sealed_len};
 use crate::{CHUNK, Error, Settings, sealing, signing};
 
 /// How long a node waits for a datagram before it looks at its clocks.
@@ -162,6 +163,8 @@ pub fn run(place: &mut dyn Place, settings: &Settings, stop: &AtomicBool) -> Res
         sign: held.iter().rev().map(signing).collect(),
         local,
         outbox,
+        sending: Sending::default(),
+        receiving: Receiving::new(limit(place, settings).0),
         peers: BTreeSet::new(),
         timing: HashMap::new(),
         sent: std::cell::Cell::new(0),
@@ -309,6 +312,10 @@ struct Node<'a> {
     sign: Vec<[u8; 32]>,
     local: Local,
     outbox: Outbox,
+    /// Its own changes it sends in parts.
+    sending: Sending,
+    /// The changes it assembles from their parts.
+    receiving: Receiving,
     /// The nodes it has heard.
     peers: BTreeSet<String>,
     /// How each peer has been acknowledging this node's changes.
@@ -381,6 +388,11 @@ impl Node<'_> {
         if !batch.is_empty() {
             self.apply(place, batch)?;
         }
+        for (maker, ack) in self.receiving.acks(&self.settings.node) {
+            // A lost acknowledgement of parts is covered by the maker's
+            // resend and the next acknowledgement's missing parts.
+            let _ = self.send(&ack, self.address(&maker));
+        }
         if self.lost > 0 {
             println!(
                 "smugglr mesh: {} arrived only as a resend; the first copy was lost",
@@ -423,6 +435,7 @@ impl Node<'_> {
             self.tidied = Instant::now();
             let epoch = now();
             self.outbox.prune(epoch)?;
+            self.receiving.tidy();
             self.heard.retain(|_, heard| epoch <= heard.sunset);
             if !self.waiting.is_empty() {
                 // A change waiting past its sunset is dropped.
@@ -460,7 +473,7 @@ impl Node<'_> {
                 .backpressure
                 .saturating_sub(self.outbox.bytes() + INDEX_ROOM);
             let peers = &self.peers;
-            let (found, full) = self.local.changes(
+            let found = self.local.changes(
                 place,
                 self.settings,
                 &self.sign[0],
@@ -468,12 +481,12 @@ impl Node<'_> {
                 budget,
                 |envelope| Outbox::weigh(envelope, peers),
             )?;
-            self.scan_full = full;
-            if !found.is_empty() {
+            self.scan_full = found.full;
+            if !found.found.is_empty() {
                 // In the outbox first, then kept as each key's last hash:
                 // a step that fails leaves the rows to be found again.
-                self.outbox.add(&found, &self.peers)?;
-                self.local.keep(&found)?;
+                self.outbox.add(&found.found, &self.peers)?;
+                self.local.keep(&found.found)?;
             }
             self.scanned = Some(Instant::now());
             self.scan_took = started.elapsed();
@@ -567,9 +580,38 @@ impl Node<'_> {
         }
         if self.peers.insert(sender.clone()) {
             self.outbox.heard(&sender);
+            self.sending.heard(&sender);
         }
         match message {
             Message::Announce { .. } => {}
+            Message::Part {
+                sender,
+                id,
+                n,
+                count,
+                data,
+            } => self.hear_part(&sender, id, (n, count), &data, (from, batch)),
+            Message::Refused { sender, maker, id } => {
+                if maker == self.settings.node {
+                    // Decided at the peer: acknowledged, and sent no more.
+                    for change in self.sending.refused(&sender, &id) {
+                        if let Some(acked) = self.outbox.ack(&change, &sender) {
+                            self.acked(&sender, acked);
+                        }
+                    }
+                }
+            }
+            Message::Parts {
+                sender,
+                maker,
+                id,
+                have,
+                missing,
+            } => {
+                if maker == self.settings.node {
+                    self.hear_parts(&sender, &id, &have, &missing);
+                }
+            }
             Message::Ack {
                 sender,
                 maker,
@@ -618,6 +660,50 @@ impl Node<'_> {
         }
     }
 
+    /// Takes in part `n` of `count` of a change from its maker `sender`; the
+    /// whole change, once its last part arrives, is heard as if it came in
+    /// one datagram.
+    fn hear_part(
+        &mut self,
+        sender: &str,
+        id: Id,
+        (n, count): (u64, u64),
+        data: &[u8],
+        (from, batch): (SocketAddr, &mut Vec<(String, Envelope)>),
+    ) {
+        if let Some(Message::Change {
+            envelope, resend, ..
+        }) = self
+            .receiving
+            .part(sender, id, (n, count), data)
+            .and_then(|whole| decode(&whole))
+        {
+            let change = Message::Change {
+                sender: sender.to_owned(),
+                envelope,
+                resend,
+            };
+            self.hear(change, from, batch);
+        }
+    }
+
+    /// `peer` has the parts `have` of this node's change keyed by `id`, and
+    /// misses `missing`; each first acknowledgement grows the window as a
+    /// change's does.
+    fn hear_parts(&mut self, peer: &str, id: &Id, have: &[Range], missing: &[Range]) {
+        let now = Instant::now();
+        for round_trip in self.sending.ack(peer, id, have, missing, now) {
+            self.acked(
+                peer,
+                Acked {
+                    first: true,
+                    seq: 0,
+                    round_trip,
+                },
+            );
+        }
+    }
+
     /// Applies `batch` with the changes still waiting, acknowledging and
     /// arranging an echo for each it applies, and acknowledging a change it
     /// already had only when the copy came from its maker.
@@ -641,7 +727,30 @@ impl Node<'_> {
         // One decision per signing key; a change no held key signed, or of
         // a table whose shape differs, is refused.
         let mut by_key: Vec<Vec<Envelope>> = vec![Vec::new(); self.sign.len()];
+        let (most, address) = limit(place, self.settings);
+        let mut acks: BTreeMap<String, Vec<[u8; 32]>> = BTreeMap::new();
         for envelope in envelopes {
+            // A value over this node's limit (FR-SMUGGLR-071): named, and
+            // decided, so acknowledged and not resent.
+            let over = self.sign.iter().any(|key| envelope.verify(key))
+                && self
+                    .local
+                    .table(&envelope.change.table)
+                    .is_some_and(|table| refuse(&envelope, table, (most, &address)));
+            if over {
+                self.heard.insert(
+                    envelope.signature,
+                    Heard {
+                        has: true,
+                        copies: 0,
+                        sunset: envelope.sunset,
+                    },
+                );
+                acks.entry(envelope.node.clone())
+                    .or_default()
+                    .push(envelope.signature);
+                continue;
+            }
             match self.sign.iter().position(|key| envelope.verify(key)) {
                 Some(_) if !self.local.same_shape(&envelope) => eprintln!(
                     "smugglr mesh: refused a change to {} from {}: its table's shape differs here",
@@ -654,7 +763,6 @@ impl Node<'_> {
                 ),
             }
         }
-        let mut acks: BTreeMap<String, Vec<[u8; 32]>> = BTreeMap::new();
         for (at, envelopes) in by_key.into_iter().enumerate() {
             if envelopes.is_empty() {
                 continue;
@@ -769,9 +877,42 @@ impl Node<'_> {
         }
     }
 
+    /// The message of `envelope` sent as `resend`, and whether it is too
+    /// large for one datagram, so it goes in parts.
+    fn message(&self, envelope: &Envelope, resend: bool) -> (Vec<u8>, bool) {
+        let message = encode(&Message::Change {
+            sender: self.settings.node.clone(),
+            envelope: Box::new(envelope.clone()),
+            resend,
+        });
+        let large = sealed_len(message.len()) > DATAGRAM;
+        (message, large)
+    }
+
+    /// Sends `pieces`, each unicast to its peer; how many went, and whether
+    /// the send buffer was full.
+    fn send_pieces(&self, pieces: Vec<Piece>) -> (usize, bool) {
+        let mut sent = 0;
+        for piece in pieces {
+            let part = Message::Part {
+                sender: self.settings.node.clone(),
+                id: piece.id,
+                n: piece.n,
+                count: piece.count,
+                data: piece.data,
+            };
+            if self.send(&part, self.address(&piece.peer)).is_err() {
+                return (sent, true);
+            }
+            sent += 1;
+        }
+        (sent, false)
+    }
+
     /// Sends what is due this tick: first sends within the window, then
-    /// resends within the quarter, then echoes. A full send buffer ends the
-    /// tick.
+    /// resends within the quarter, then echoes. A change too large for one
+    /// datagram goes in parts, which share the window and the quarter. A
+    /// full send buffer ends the tick.
     fn send_due(&mut self) -> Result<(), Error> {
         let instant = Instant::now();
         if self.counted.elapsed() >= COUNTED {
@@ -780,15 +921,79 @@ impl Node<'_> {
             self.sent.set(self.sent.get() / 2);
             self.resent.set(self.resent.get() / 2);
         }
+        let outbox = &self.outbox;
+        self.sending
+            .retain(|change, peer| outbox.owes(change, peer));
+        let Some((firsts, mut sent)) = self.send_firsts()? else {
+            return Ok(());
+        };
+        // Parts take turns with first sends under the same window: a change
+        // in parts already holds one place in it, waiting on its parts, so
+        // its parts are held to the window on their own and never wait on
+        // it.
         let room = self
             .window
             .whole()
-            .saturating_sub(self.outbox.in_flight())
-            .min(PER_TICK);
+            .saturating_sub(self.sending.in_flight())
+            .min(PER_TICK.saturating_sub(sent));
+        let parts = self.sending.firsts(room, instant);
+        let first_parts = parts.len();
+        let (went, full) = self.send_pieces(parts);
+        sent += went;
+        if full {
+            self.window.congested(FULL);
+            return Ok(());
+        }
+        // When no first send could go (none left, or the window is held by
+        // changes waiting on repair), repair is all the node can do, and the
+        // quarter would leave it waiting on sends that cannot come.
+        let quarter = if firsts > 0 || first_parts > 0 {
+            self.resend_room()
+        } else if self.outbox.unsent() == 0 {
+            self.resend_room().max(IDLE_RESENDS)
+        } else {
+            // The window is held by changes waiting on repair: just enough
+            // resends to free it.
+            self.resend_room().max(BLOCKED_RESENDS)
+        };
+        let room = quarter.min(PER_TICK.saturating_sub(sent));
+        let Some((resent, changes)) = self.resend_due(instant, room)? else {
+            return Ok(());
+        };
+        sent += resent;
+        self.say_resent(changes, instant);
+        self.send_echoes(instant, sent);
+        Ok(())
+    }
+
+    /// How many first sends, of changes or parts, the window has room for,
+    /// `sent` datagrams already gone this tick.
+    fn room(&self, sent: usize) -> usize {
+        self.window
+            .whole()
+            .saturating_sub(self.outbox.in_flight() + self.sending.in_flight())
+            .min(PER_TICK.saturating_sub(sent))
+    }
+
+    /// Sends the first sends the window has room for, each change in one
+    /// datagram to each peer, or begun in parts; gives how many changes it
+    /// took and how many datagrams went, `None` once the send buffer is
+    /// full.
+    fn send_firsts(&mut self) -> Result<Option<(usize, usize)>, Error> {
         let to = self.destinations();
-        let firsts = self.outbox.first_sends(room)?;
+        let firsts = self.outbox.first_sends(self.room(0))?;
         let mut sent = 0;
         'firsts: for (at, envelope) in firsts.iter().enumerate() {
+            let (message, large) = self.message(envelope, false);
+            if large {
+                self.sending.start(
+                    envelope.signature,
+                    (envelope.change.from, envelope.change.to.unwrap_or_default()),
+                    message,
+                    &self.peers,
+                );
+                continue;
+            }
             for to in &to {
                 match self.change(envelope, false, *to) {
                     Ok(()) => sent += 1,
@@ -799,27 +1004,46 @@ impl Node<'_> {
                     Err(_) => {
                         self.window.congested(FULL);
                         self.outbox.unsend(&firsts[at..]);
-                        return Ok(());
+                        return Ok(None);
                     }
                 }
             }
         }
-        // When no first send could go (none left, or the window is held by
-        // changes waiting on repair), repair is all the node can do, and the
-        // quarter would leave it waiting on sends that cannot come.
-        let quarter = if !firsts.is_empty() {
-            self.resend_room()
-        } else if self.outbox.unsent() == 0 {
-            self.resend_room().max(IDLE_RESENDS)
-        } else {
-            // The window is held by changes waiting on repair: just enough
-            // resends to free it.
-            self.resend_room().max(BLOCKED_RESENDS)
-        };
-        let room = quarter.min(PER_TICK.saturating_sub(sent));
-        let resends = self.outbox.resends(instant, &self.timing, room)?;
+        Ok(Some((firsts.len(), sent)))
+    }
+
+    /// Resends up to `room` datagrams at `instant`: changes due, a change in
+    /// parts as the parts its peers miss; gives how many datagrams went and
+    /// how many changes, `None` once the send buffer is full.
+    fn resend_due(
+        &mut self,
+        instant: Instant,
+        room: usize,
+    ) -> Result<Option<(usize, usize)>, Error> {
+        let sending = &self.sending;
+        let resends = self
+            .outbox
+            .resends(instant, &self.timing, room, |change, peer| {
+                sending.busy(change, peer, instant)
+            })?;
         let (mut resent, mut changes) = (0, 0);
         'resends: for (envelope, owed) in &resends {
+            let (message, large) = self.message(envelope, true);
+            if large {
+                if !self.sending.sends(&envelope.signature) {
+                    self.sending.start(
+                        envelope.signature,
+                        (envelope.change.from, envelope.change.to.unwrap_or_default()),
+                        message,
+                        &self.peers,
+                    );
+                }
+                for peer in owed {
+                    self.sending.again(&envelope.signature, peer);
+                }
+                changes += 1;
+                continue;
+            }
             // One unicast to each owed peer elsewhere; one broadcast covers
             // those on this machine or not yet located.
             let mut to: BTreeSet<(SocketAddr, usize)> =
@@ -839,7 +1063,7 @@ impl Node<'_> {
                     }
                     Err(_) => {
                         self.window.congested(FULL);
-                        return Ok(());
+                        return Ok(None);
                     }
                 }
                 self.resent.set(self.resent.get() + 1);
@@ -847,10 +1071,26 @@ impl Node<'_> {
             }
             changes += 1;
         }
-        sent += resent;
-        self.say_resent(changes, instant);
-        self.send_echoes(instant, sent);
-        Ok(())
+        // The parts a peer misses, within what is left of the quarter.
+        let timing = &self.timing;
+        let pieces = self.sending.resends(
+            instant,
+            |peer| {
+                timing
+                    .get(peer)
+                    .filter(|timing| timing.acknowledging(instant))
+                    .map(Timing::wait)
+            },
+            room.saturating_sub(resent),
+        );
+        let (went, full) = self.send_pieces(pieces);
+        self.resent.set(self.resent.get() + went as u64);
+        resent += went;
+        if full {
+            self.window.congested(FULL);
+            return Ok(None);
+        }
+        Ok(Some((resent, changes)))
     }
 
     /// Notes `changes` resent, and says so at most once a minute.
@@ -888,7 +1128,8 @@ impl Node<'_> {
                 .heard
                 .get(&envelope.signature)
                 .map_or(0, |heard| heard.copies);
-            if copies < self.settings.k {
+            // Echo is redundancy: a change in parts is not echoed.
+            if copies < self.settings.k && !self.message(&envelope, false).1 {
                 match self.change(&envelope, false, (self.to, 0)) {
                     Ok(()) => {}
                     // Its maker refuses it too; an echo just lets it go.
