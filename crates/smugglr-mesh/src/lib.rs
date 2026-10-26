@@ -1,22 +1,32 @@
 //! smugglr mesh: nodes on a local network kept in step with nobody in
 //! charge (FR-SMUGGLR-078).
 //!
-//! [`run`] runs one node until it is told to stop. It finds its own changes
-//! by comparing each row's hash with its last hash per key, and sends each
-//! change as it happens: one envelope (FR-SMUGGLR-075), signed and sealed
-//! under the shared key, broadcast over UDP on the node's port. It applies
-//! the changes it hears in batches, through smugglr-core's one decision
-//! path and the place, one transaction of at most [`CHUNK`] changes per
-//! table, acknowledges each to its maker, and echoes it once, 2 to 4
-//! seconds later, unless it heard it `k` more times in that wait (RFC
-//! 6206's suppression). Multi's stash and retrieve are the slow, offline
-//! path; the mesh's live path does not use them. The maker resends while any node it has heard has not
-//! acknowledged, the interval doubling from 10 s to at most 160 s, until
-//! every one has or the change's sunset passes. Its unacknowledged changes
-//! wait in an outbox in smugglr's own files; at the backpressure line it
-//! takes no new ones until acknowledgements bring the outbox down, and it
-//! sends paced (RFC 8085). There is no member list:
-//! a node's peers are the nodes it hears under the shared key.
+//! [`run`] runs one node until it is told to stop. A node announces itself
+//! by broadcast, and to the addresses in its peers setting on a network
+//! that carries no broadcast; a node's peers are the nodes it hears under
+//! the shared key, at the addresses their datagrams come from. There is no
+//! member list.
+//!
+//! It finds its own changes by comparing each row's hash with its last hash
+//! per key, and sends each change as it happens: one envelope
+//! (FR-SMUGGLR-075), signed and sealed under the shared key, unicast over
+//! UDP to every peer it knows. It applies the changes it hears in batches,
+//! through smugglr-core's one decision path and the place, one transaction
+//! of at most 20,000 changes per table, acknowledges each to its maker,
+//! and echoes it by broadcast once, 2 to 4 seconds later, unless it heard it
+//! `k` more times in that wait (RFC 6206's suppression). Multi's stash and
+//! retrieve are the slow, offline path; the mesh's live path does not use
+//! them.
+//!
+//! The maker resends, unicast, to each peer that has not acknowledged,
+//! until every one has or the change's sunset passes: at once for a change a
+//! peer skipped while acknowledging later ones, after about two round trips
+//! to a peer that is acknowledging, never more than a quarter of what it
+//! sends, and on the 10 s to 160 s doubling only to a peer that has stopped
+//! (FR-SMUGGLR-078 rev 20). Its unacknowledged changes wait in an outbox in
+//! smugglr's own files; at the backpressure line it takes no new ones until
+//! acknowledgements bring the outbox down, and it sends paced, the window
+//! shrinking only on congestion (RFC 8085).
 //!
 //! The keys that seal datagrams and sign envelopes are each derived from
 //! the shared key, so one key never serves two jobs. No key is ever
@@ -27,6 +37,7 @@ mod node;
 mod outbox;
 mod wire;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use smugglr_core::plan::SyncMode;
@@ -98,6 +109,9 @@ pub struct Settings {
     /// The most bytes the node's outbox holds before it takes no new
     /// changes.
     pub backpressure: u64,
+    /// Addresses to announce to besides the broadcast, for a network that
+    /// carries no broadcast.
+    pub peers: Vec<SocketAddr>,
 }
 
 impl std::fmt::Debug for Settings {
@@ -112,6 +126,7 @@ impl std::fmt::Debug for Settings {
             .field("sync_mode", &self.sync_mode)
             .field("k", &self.k)
             .field("backpressure", &self.backpressure)
+            .field("peers", &self.peers)
             .finish_non_exhaustive()
     }
 }

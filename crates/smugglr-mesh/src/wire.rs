@@ -19,6 +19,11 @@ pub(crate) const ACKS: usize = 14;
 /// One message between nodes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Message {
+    /// A node says it is here, so the nodes that hear it learn its address.
+    Announce {
+        /// The node.
+        sender: String,
+    },
     /// One change, from its maker or a node echoing it.
     Change {
         /// The node that sent this copy.
@@ -44,12 +49,15 @@ impl Message {
     /// The node that sent the message.
     pub(crate) fn sender(&self) -> &str {
         match self {
-            Self::Change { sender, .. } | Self::Ack { sender, .. } => sender,
+            Self::Announce { sender } | Self::Change { sender, .. } | Self::Ack { sender, .. } => {
+                sender
+            }
         }
     }
 
     fn to_json(&self) -> Value {
         match self {
+            Self::Announce { sender } => json!({"t": "announce", "sender": sender}),
             Self::Change {
                 sender,
                 envelope,
@@ -75,6 +83,7 @@ impl Message {
         let text = |name: &str| json.get(name)?.as_str().map(str::to_owned);
         let sender = text("sender")?;
         match json.get("t")?.as_str()? {
+            "announce" => Some(Self::Announce { sender }),
             "change" => Some(Self::Change {
                 sender,
                 envelope: Box::new(Envelope::from_json(json.get("envelope")?)?),
@@ -108,21 +117,24 @@ pub(crate) fn seal(message: &Message, key: &[u8; 32]) -> Vec<u8> {
     datagram
 }
 
-/// The message `datagram` holds, opened under the first of the sealing
-/// `keys` that opens it, newest first; `None` when none does or it holds no
-/// message.
-pub(crate) fn open(datagram: &[u8], keys: &[[u8; 32]]) -> Option<Message> {
+/// The message `datagram` holds, and which of the sealing `keys` (tried in
+/// order) opened it; `None` when none does or it holds no message.
+pub(crate) fn open(datagram: &[u8], keys: &[[u8; 32]]) -> Option<(Message, usize)> {
     if datagram.len() < NONCE {
         return None;
     }
     let (nonce, sealed) = datagram.split_at(NONCE);
     let nonce = XNonce::from_slice(nonce);
-    let plain = keys.iter().rev().find_map(|key| {
+    let (plain, at) = keys.iter().enumerate().find_map(|(at, key)| {
         XChaCha20Poly1305::new(key.into())
             .decrypt(nonce, sealed)
             .ok()
+            .map(|plain| (plain, at))
     })?;
-    Message::from_json(&serde_json::from_slice(&plain).ok()?)
+    Some((
+        Message::from_json(&serde_json::from_slice(&plain).ok()?)?,
+        at,
+    ))
 }
 
 #[cfg(test)]
@@ -140,7 +152,7 @@ mod tests {
     #[test]
     fn a_sealed_message_opens_under_its_key_and_no_other() {
         let datagram = seal(&ack(), &[1; 32]);
-        assert_eq!(open(&datagram, &[[2; 32], [1; 32]]), Some(ack()));
+        assert_eq!(open(&datagram, &[[2; 32], [1; 32]]), Some((ack(), 1)));
         assert_eq!(open(&datagram, &[[2; 32]]), None);
     }
 

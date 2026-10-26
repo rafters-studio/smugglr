@@ -4,7 +4,6 @@
 //! sends to every other node's port by broadcast, captures every datagram,
 //! and drops those a scenario says to.
 
-use std::collections::{BTreeMap, HashSet};
 use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -67,16 +66,12 @@ struct Seen {
 /// Says whether to drop a datagram, given what the relay saw before it.
 type Filter = Box<dyn FnMut(&Seen, &[Seen]) -> bool + Send>;
 
-/// Listens beside every node on its port and passes what each node sends to
-/// every other node's port, and keeps it. It passes a datagram on from the
-/// socket beside the node it goes to, so the datagram reaches that port as
-/// a node's own broadcast does, and it knows its own datagrams by their
-/// nonces.
+/// Stands between a scenario's nodes: each node's peers setting names the
+/// relay, and the relay passes what each node sends it to every other
+/// node's port, unicast, and keeps it, dropping what a scenario says to.
 struct Relay {
-    /// The socket beside each node, by its port.
-    sockets: Mutex<BTreeMap<u16, Arc<UdpSocket>>>,
-    /// The nonces of the datagrams the relay sent itself.
-    sent: Mutex<HashSet<Vec<u8>>>,
+    socket: UdpSocket,
+    ports: Mutex<Vec<u16>>,
     seen: Mutex<Vec<Seen>>,
     filter: Mutex<Option<Filter>>,
     count: AtomicUsize,
@@ -84,75 +79,56 @@ struct Relay {
 }
 
 impl Relay {
-    fn start() -> Arc<Self> {
-        Arc::new(Self {
-            sockets: Mutex::new(BTreeMap::new()),
-            sent: Mutex::new(HashSet::new()),
+    fn start() -> Result<Arc<Self>, String> {
+        let socket = relay_socket().map_err(|err| err.to_string())?;
+        let relay = Arc::new(Self {
+            socket,
+            ports: Mutex::new(Vec::new()),
             seen: Mutex::new(Vec::new()),
             filter: Mutex::new(None),
             count: AtomicUsize::new(0),
             stop: AtomicBool::new(false),
-        })
+        });
+        let running = relay.clone();
+        thread::spawn(move || running.pass());
+        Ok(relay)
     }
 
-    /// Listens on a port of its own choosing, which the node that will use
-    /// it shares; holding the port from the start, no other scenario can
-    /// take it.
-    fn listen(self: &Arc<Self>) -> Result<u16, String> {
-        let socket = Arc::new(shared(0).map_err(|err| err.to_string())?);
-        let port = socket.local_addr().map_err(|err| err.to_string())?.port();
-        self.sockets
+    /// The relay's address, for each node's peers setting.
+    fn address(&self) -> Result<SocketAddr, String> {
+        self.socket.local_addr().map_err(|err| err.to_string())
+    }
+
+    /// A port for a new node, passed to from now on.
+    fn listen(&self) -> Result<u16, String> {
+        let port = UdpSocket::bind("127.0.0.1:0")
+            .and_then(|socket| socket.local_addr())
+            .map_err(|err| err.to_string())?
+            .port();
+        self.ports
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(port, socket.clone());
-        let relay = self.clone();
-        thread::spawn(move || relay.pass(&socket, port));
+            .push(port);
         Ok(port)
     }
 
-    /// Sends `datagram` to the node on `port`, from the socket beside it.
-    fn send(&self, datagram: &[u8], port: u16) -> Result<(), String> {
-        let socket = self
-            .sockets
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&port)
-            .cloned()
-            .ok_or_else(|| format!("no node on port {port}"))?;
-        self.sent
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(datagram[..datagram.len().min(24)].to_vec());
-        socket
-            .send_to(datagram, ("255.255.255.255", port))
-            .map_err(|err| err.to_string())?;
-        Ok(())
-    }
-
-    fn pass(&self, socket: &UdpSocket, port: u16) {
+    fn pass(&self) {
         let mut buffer = vec![0; 65_536];
         while !self.stop.load(Ordering::Relaxed) {
-            let Ok((len, _)) = socket.recv_from(&mut buffer) else {
+            let Ok((len, from)) = self.socket.recv_from(&mut buffer) else {
                 continue;
             };
+            let port = from.port();
             let bytes = buffer[..len].to_vec();
-            // What the relay sent itself is not a node's.
-            if self
-                .sent
+            let message = open(&bytes);
+            let ports = self
+                .ports
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .contains(&bytes[..len.min(24)])
-            {
+                .clone();
+            if !ports.contains(&port) {
                 continue;
             }
-            let message = open(&bytes);
-            let ports: Vec<u16> = self
-                .sockets
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .keys()
-                .copied()
-                .collect();
             let mut to: Vec<u16> = ports.into_iter().filter(|to| *to != port).collect();
             // A datagram with no node to go to is still seen, going nowhere.
             if to.is_empty() {
@@ -176,7 +152,7 @@ impl Relay {
                 };
                 seen.dropped = dropped;
                 if !dropped && to != 0 {
-                    let _ = self.send(&bytes, to);
+                    let _ = self.socket.send_to(&bytes, ("127.0.0.1", to));
                 }
                 self.seen
                     .lock()
@@ -196,7 +172,10 @@ impl Relay {
             .map_err(|err| err.to_string())?;
         let mut datagram = nonce.to_vec();
         datagram.extend(sealed);
-        self.send(&datagram, port)
+        self.socket
+            .send_to(&datagram, ("127.0.0.1", port))
+            .map_err(|err| err.to_string())?;
+        Ok(())
     }
 
     fn seen(&self) -> Vec<Seen> {
@@ -207,14 +186,15 @@ impl Relay {
     }
 }
 
-/// A UDP socket on `port` that the node using it shares.
-fn shared(port: u16) -> std::io::Result<UdpSocket> {
+/// The relay's socket on loopback, with a receive buffer large enough that
+/// it drops only what a scenario says to.
+fn relay_socket() -> std::io::Result<UdpSocket> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-    socket.set_reuse_address(true)?;
-    #[cfg(unix)]
-    socket.set_reuse_port(true)?;
-    socket.set_broadcast(true)?;
-    socket.bind(&SocketAddr::from(([0, 0, 0, 0], port)).into())?;
+    let mut size = 8 << 20;
+    while size >= 1 << 20 && socket.set_recv_buffer_size(size).is_err() {
+        size /= 2;
+    }
+    socket.bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into())?;
     let socket: UdpSocket = socket.into();
     socket.set_read_timeout(Some(Duration::from_millis(50)))?;
     Ok(socket)
@@ -333,7 +313,7 @@ impl Net {
         Ok(Self {
             name,
             folder,
-            relay: Relay::start(),
+            relay: Relay::start()?,
             nodes: Mutex::new(Vec::new()),
         })
     }
@@ -377,6 +357,7 @@ impl Net {
             ignore: Vec::new(),
             k: K,
             backpressure,
+            peers: vec![self.relay.address()?],
         };
         let mut node = Node {
             path,
@@ -797,7 +778,14 @@ fn the_change_is_applied(mesh: &Mesh) -> Result<(), String> {
 
 #[given("a node holding the previous key and a newer key")]
 fn a_node_with_two_keys(mesh: &Mesh) -> Result<(), String> {
-    mesh.net()?.start(&[PREVIOUS, KEY], GRAVEYARD, "")?;
+    let net = mesh.net()?;
+    net.start(&[PREVIOUS, KEY], GRAVEYARD, "")?;
+    // A peer it has heard, so its change has somewhere to go.
+    net.relay.inject(
+        &json!({"t": "announce", "sender": "witness"}),
+        &KEY,
+        net.port(0)?,
+    )?;
     sleep(Duration::from_secs(1));
     Ok(())
 }

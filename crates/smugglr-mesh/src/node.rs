@@ -2,18 +2,23 @@
 //! changes it hears in batches, acknowledges and echoes them; and resends
 //! its own until every peer has them or their sunset passes.
 //!
-//! First sends and echoes go out as broadcasts; a maker's resends and every
-//! acknowledgement go unicast to the peer's last-seen address at the mesh
-//! port (toy Z), because a link retries a unicast frame and does not retry
-//! a broadcast one. A peer on this same machine shares the port, where a
-//! unicast reaches only one of the sockets on it, so it is sent to by
-//! broadcast.
+//! Broadcast finds peers and unicast talks to them (FR-SMUGGLR-078 rev
+//! 19): a node announces itself by broadcast, and to the addresses in its
+//! peers setting, when it starts and every [`ANNOUNCE`]; a node that hears
+//! a peer for the first time announces itself back to it. A change's first
+//! send, the maker's resends and every acknowledgement go unicast to each
+//! peer's last-seen address (the source of its datagrams, never its name),
+//! because a link retries a unicast frame and does not retry a broadcast
+//! one; echoes are broadcast. A peer on this same machine and port shares
+//! the node's socket group, where a unicast reaches only one socket, so it
+//! is sent to by broadcast.
 //!
 //! A reader thread drains the socket into memory as datagrams arrive, so a
 //! long look at the database or a large batch never leaves the socket's
 //! buffer to overflow. Everything a node sends is paced: first sends are
 //! held to a window that starts small, grows with each change a peer
-//! acknowledges and halves on loss or a full send buffer (RFC 8085), and
+//! acknowledges and halves only on congestion, a full send buffer or
+//! acknowledgements slowing, never for a lost broadcast (RFC 8085), and
 //! each tick sends at most [`PER_TICK`] datagrams, resends and echoes
 //! first.
 
@@ -32,7 +37,7 @@ use smugglr_place::Place;
 use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::local::Local;
-use crate::outbox::Outbox;
+use crate::outbox::{Acked, Outbox, Timing};
 use crate::wire::{ACKS, Message, open, seal};
 use crate::{CHUNK, Error, Settings, sealing, signing};
 
@@ -49,8 +54,14 @@ const PER_TICK: usize = 2_000;
 /// The window a node's first sends start from.
 const FIRST_WINDOW: f64 = 32.0;
 
-/// The largest window: a batch's worth of changes.
-const LARGEST: f64 = 20_000.0;
+/// The largest window. A larger one queues more first copies at a busy
+/// peer, and a resend waits behind them all: past about 4,000, a lost copy
+/// takes longer than a second to repair.
+const LARGEST: f64 = 4_000.0;
+
+/// How often a node announces itself again, so a peer that missed it, or
+/// started since, learns its address.
+const ANNOUNCE: Duration = Duration::from_secs(10);
 
 /// How often at most the record names datagrams that did not open.
 const SAY_UNOPENED: Duration = Duration::from_secs(60);
@@ -60,6 +71,20 @@ const TIDY: Duration = Duration::from_secs(1);
 
 /// Bytes kept free under the backpressure line for the outbox's index.
 const INDEX_ROOM: u64 = 1_024;
+
+/// The resends a tick may send when the node has nothing left to send
+/// first.
+const IDLE_RESENDS: usize = 100;
+
+/// How often the counts behind the resend quarter halve, so it is the
+/// quarter of what the node has sent lately.
+const COUNTED: Duration = Duration::from_secs(60);
+
+/// Why the window halves when a send finds the send buffer full.
+const FULL: &str = "the send buffer is full";
+
+/// A round trip shorter than this is never acknowledgements slowing.
+const SLOWING: Duration = Duration::from_millis(250);
 
 /// The receive buffer a node asks its system for.
 const RECEIVE_BUFFER: usize = 8 << 20;
@@ -89,8 +114,13 @@ pub fn run(place: &mut dyn Place, settings: &Settings, stop: &AtomicBool) -> Res
         local,
         outbox,
         peers: BTreeSet::new(),
+        timing: HashMap::new(),
+        sent: std::cell::Cell::new(0),
+        resent: std::cell::Cell::new(0),
+        counted: Instant::now(),
         addresses: HashMap::new(),
-        own: BTreeSet::new(),
+        keys: HashMap::new(),
+        own: own_address(settings.port).into_iter().collect(),
         heard: HashMap::new(),
         waiting: Vec::new(),
         echoes: VecDeque::new(),
@@ -99,6 +129,7 @@ pub fn run(place: &mut dyn Place, settings: &Settings, stop: &AtomicBool) -> Res
         scan_took: Duration::ZERO,
         scan_full: false,
         lost: 0,
+        announced: None,
         unopened: 0,
         said_unopened: None,
         tidied: Instant::now(),
@@ -110,7 +141,7 @@ pub fn run(place: &mut dyn Place, settings: &Settings, stop: &AtomicBool) -> Res
             let mut buffer = vec![0; 65_536];
             while reading.load(Ordering::Relaxed) {
                 if let Ok((len, from)) = reader.recv_from(&mut buffer)
-                    && tx.send((buffer[..len].to_vec(), from.ip())).is_err()
+                    && tx.send((buffer[..len].to_vec(), from)).is_err()
                 {
                     break;
                 }
@@ -186,9 +217,10 @@ impl Window {
         self.size = self.size.min(LARGEST);
     }
 
-    /// A loss or a full send buffer: the window halves, at most once a
-    /// second.
-    fn lost(&mut self) {
+    /// Congestion, `why`: a full send buffer or acknowledgements slowing.
+    /// The window halves, at most once a second, and the record says so. A
+    /// lost broadcast never shrinks it (FR-SMUGGLR-078 rev 17).
+    fn congested(&mut self, why: &str) {
         if self
             .cut
             .is_none_or(|at| at.elapsed() >= Duration::from_secs(1))
@@ -196,6 +228,10 @@ impl Window {
             self.threshold = (self.size / 2.0).max(4.0);
             self.size = self.threshold;
             self.cut = Some(Instant::now());
+            println!(
+                "smugglr mesh: send window halved to {}: {why}",
+                self.whole()
+            );
         }
     }
 
@@ -222,8 +258,16 @@ struct Node<'a> {
     outbox: Outbox,
     /// The nodes it has heard.
     peers: BTreeSet<String>,
+    /// How each peer has been acknowledging this node's changes.
+    timing: HashMap<String, Timing>,
+    /// Datagrams sent lately, and of them resends.
+    sent: std::cell::Cell<u64>,
+    resent: std::cell::Cell<u64>,
+    counted: Instant,
     /// Each peer's address, as its last datagram came from.
-    addresses: HashMap<String, IpAddr>,
+    addresses: HashMap<String, SocketAddr>,
+    /// Which sealing key opened each peer's last datagram.
+    keys: HashMap<String, usize>,
     /// This machine's addresses, as the node's own broadcasts come from.
     own: BTreeSet<IpAddr>,
     heard: HashMap<[u8; 32], Heard>,
@@ -238,6 +282,8 @@ struct Node<'a> {
     scan_full: bool,
     /// Changes heard this turn only as a resend.
     lost: usize,
+    /// When the node last announced itself.
+    announced: Option<Instant>,
     /// Datagrams that opened under no key held, since the record last said.
     unopened: usize,
     said_unopened: Option<Instant>,
@@ -250,7 +296,7 @@ impl Node<'_> {
     fn turn(
         &mut self,
         place: &mut dyn Place,
-        rx: &Receiver<(Vec<u8>, IpAddr)>,
+        rx: &Receiver<(Vec<u8>, SocketAddr)>,
     ) -> Result<(), Error> {
         let mut batch: Vec<(String, Envelope)> = Vec::new();
         let mut first = match rx.recv_timeout(TICK) {
@@ -260,7 +306,14 @@ impl Node<'_> {
         };
         while let Some((datagram, from)) = first.take().or_else(|| rx.try_recv().ok()) {
             match open(&datagram, &self.seal) {
-                Some(message) => self.hear(message, from, &mut batch),
+                Some((message, key)) => {
+                    // A peer is spoken to in the key it speaks, so a peer
+                    // that holds only the previous key still hears this one.
+                    if message.sender() != self.settings.node {
+                        self.keys.insert(message.sender().to_owned(), key);
+                    }
+                    self.hear(message, from, &mut batch);
+                }
                 None => self.unopened += 1,
             }
             if batch.len() >= CHUNK {
@@ -338,6 +391,9 @@ impl Node<'_> {
             self.unopened = 0;
             self.said_unopened = Some(Instant::now());
         }
+        if self.announced.is_none_or(|at| at.elapsed() >= ANNOUNCE) {
+            self.announce();
+        }
         if self.tidied.elapsed() >= TIDY {
             self.tidied = Instant::now();
             let epoch = now();
@@ -351,13 +407,28 @@ impl Node<'_> {
         Ok(())
     }
 
-    fn send(&self, message: &Message, to: SocketAddr) -> std::io::Result<()> {
+    fn send(&self, message: &Message, (to, key): (SocketAddr, usize)) -> std::io::Result<()> {
         self.socket
-            .send_to(&seal(message, &self.seal[0]), to)
-            .map(drop)
+            .send_to(&seal(message, &self.seal[key]), to)
+            .map(drop)?;
+        self.sent.set(self.sent.get() + 1);
+        Ok(())
     }
 
-    fn change(&self, envelope: &Envelope, resend: bool, to: SocketAddr) -> std::io::Result<()> {
+    /// How many resend datagrams may go now, so resends never take more
+    /// than a quarter of what the node sends (FR-SMUGGLR-078 rev 20).
+    fn resend_room(&self) -> usize {
+        let (sent, resent) = (self.sent.get(), self.resent.get());
+        let others = sent.saturating_sub(resent);
+        usize::try_from((others / 3).saturating_sub(resent)).unwrap_or(usize::MAX)
+    }
+
+    fn change(
+        &self,
+        envelope: &Envelope,
+        resend: bool,
+        to: (SocketAddr, usize),
+    ) -> std::io::Result<()> {
         self.send(
             &Message::Change {
                 sender: self.settings.node.clone(),
@@ -368,27 +439,60 @@ impl Node<'_> {
         )
     }
 
-    /// Where a message for `peer` alone goes: its last-seen address at the
-    /// mesh port, or the broadcast address for a peer on this machine or one
+    /// Where a message for `peer` alone goes: its last-seen address, or the
+    /// broadcast address for a peer in this node's own socket group or one
     /// whose address is not known.
-    fn address(&self, peer: &str) -> SocketAddr {
-        unicast(self.addresses.get(peer), &self.own, self.settings.port).unwrap_or(self.to)
+    fn address(&self, peer: &str) -> (SocketAddr, usize) {
+        let address =
+            unicast(self.addresses.get(peer), &self.own, self.settings.port).unwrap_or(self.to);
+        (address, self.keys.get(peer).copied().unwrap_or(0))
+    }
+
+    /// Where a change's first send goes: each known peer's address, once
+    /// each; nowhere when the node knows no peer.
+    fn destinations(&self) -> BTreeSet<(SocketAddr, usize)> {
+        self.peers.iter().map(|peer| self.address(peer)).collect()
+    }
+
+    /// Says the node is here: by broadcast, and to each address in the
+    /// peers setting.
+    fn announce(&mut self) {
+        self.announced = Some(Instant::now());
+        let announce = Message::Announce {
+            sender: self.settings.node.clone(),
+        };
+        // A lost announcement is said again at the next.
+        let _ = self.send(&announce, (self.to, 0));
+        for peer in &self.settings.peers {
+            let _ = self.send(&announce, (*peer, 0));
+        }
     }
 
     /// Takes in one message from another node; a change it does not have
     /// yet joins `batch`.
-    fn hear(&mut self, message: Message, from: IpAddr, batch: &mut Vec<(String, Envelope)>) {
+    fn hear(&mut self, message: Message, from: SocketAddr, batch: &mut Vec<(String, Envelope)>) {
         let sender = message.sender().to_owned();
         if sender == self.settings.node {
             // The node hears its own broadcasts: from its own addresses.
-            self.own.insert(from);
+            self.own.insert(from.ip());
             return;
         }
-        self.addresses.insert(sender.clone(), from);
+        let moved = self.addresses.insert(sender.clone(), from) != Some(from);
+        if moved && matches!(message, Message::Announce { .. }) {
+            // A peer heard for the first time, or at a new address, hears
+            // this node back, so each knows the other.
+            let _ = self.send(
+                &Message::Announce {
+                    sender: self.settings.node.clone(),
+                },
+                self.address(&sender),
+            );
+        }
         if self.peers.insert(sender.clone()) {
             self.outbox.heard(&sender);
         }
         match message {
+            Message::Announce { .. } => {}
             Message::Ack {
                 sender,
                 maker,
@@ -396,8 +500,8 @@ impl Node<'_> {
             } => {
                 if maker == self.settings.node {
                     for change in &changes {
-                        if self.outbox.ack(change, &sender) {
-                            self.window.acked();
+                        if let Some(acked) = self.outbox.ack(change, &sender) {
+                            self.acked(&sender, acked);
                         }
                     }
                 }
@@ -511,6 +615,32 @@ impl Node<'_> {
         Ok(())
     }
 
+    /// What `peer`'s acknowledgement of one change tells: the window grows
+    /// on a first acknowledgement; the peer's round trip is measured, and a
+    /// round trip far beyond it is acknowledgements slowing.
+    fn acked(&mut self, peer: &str, acked: Acked) {
+        if acked.first {
+            self.window.acked();
+        }
+        let now = Instant::now();
+        let first = acked.round_trip.unwrap_or(Duration::from_secs(1));
+        let timing = self.timing.entry(peer.to_owned()).or_insert(Timing {
+            round_trip: first,
+            variation: first / 2,
+            last_ack: now,
+            highest: 0,
+        });
+        timing.last_ack = now;
+        timing.highest = timing.highest.max(acked.seq);
+        if let Some(sample) = acked.round_trip {
+            let slowing = sample > timing.round_trip * 4 && sample > SLOWING;
+            timing.measure(sample);
+            if slowing {
+                self.window.congested("acknowledgements slowing");
+            }
+        }
+    }
+
     /// Acknowledges each maker's changes, [`ACKS`] to a datagram.
     fn acks(&self, acks: BTreeMap<String, Vec<[u8; 32]>>) {
         for (maker, changes) in acks {
@@ -528,31 +658,68 @@ impl Node<'_> {
         }
     }
 
-    /// Sends what is due this tick: resends, then echoes, then first sends
-    /// within the window. A full send buffer ends the tick.
+    /// Sends what is due this tick: first sends within the window, then
+    /// resends within the quarter, then echoes. A full send buffer ends the
+    /// tick.
     fn send_due(&mut self) -> Result<(), Error> {
         let instant = Instant::now();
-        let (resends, lost) = self.outbox.resends(instant, PER_TICK)?;
-        if lost {
-            self.window.lost();
+        if self.counted.elapsed() >= COUNTED {
+            // The quarter is of what the node has sent lately.
+            self.counted = instant;
+            self.sent.set(self.sent.get() / 2);
+            self.resent.set(self.resent.get() / 2);
         }
-        let (mut sent, mut changes) = (0, 0);
-        for (envelope, owed) in &resends {
-            // One unicast to each owed peer elsewhere; one broadcast covers
-            // those on this machine or not yet located.
-            let mut to: BTreeSet<SocketAddr> = owed.iter().map(|peer| self.address(peer)).collect();
-            if to.is_empty() {
-                to.insert(self.to);
-            }
-            for to in to {
-                if self.change(envelope, true, to).is_err() {
-                    self.window.lost();
+        let room = self
+            .window
+            .whole()
+            .saturating_sub(self.outbox.in_flight())
+            .min(PER_TICK);
+        let to = self.destinations();
+        let firsts = self.outbox.first_sends(room)?;
+        let mut sent = 0;
+        for (at, envelope) in firsts.iter().enumerate() {
+            for to in &to {
+                if self.change(envelope, false, *to).is_err() {
+                    self.window.congested(FULL);
+                    self.outbox.unsend(&firsts[at..]);
                     return Ok(());
                 }
                 sent += 1;
             }
+        }
+        // When no first send could go (none left, or the window is held by
+        // changes waiting on repair), repair is all the node can do, and the
+        // quarter would leave it waiting on sends that cannot come.
+        let quarter = if firsts.is_empty() {
+            self.resend_room().max(IDLE_RESENDS)
+        } else {
+            self.resend_room()
+        };
+        let room = quarter.min(PER_TICK.saturating_sub(sent));
+        let resends = self.outbox.resends(instant, &self.timing, room)?;
+        let (mut resent, mut changes) = (0, 0);
+        'resends: for (envelope, owed) in &resends {
+            // One unicast to each owed peer elsewhere; one broadcast covers
+            // those on this machine or not yet located.
+            let mut to: BTreeSet<(SocketAddr, usize)> =
+                owed.iter().map(|peer| self.address(peer)).collect();
+            if to.is_empty() {
+                to.insert((self.to, 0));
+            }
+            for to in to {
+                if resent >= room {
+                    break 'resends;
+                }
+                if self.change(envelope, true, to).is_err() {
+                    self.window.congested(FULL);
+                    return Ok(());
+                }
+                self.resent.set(self.resent.get() + 1);
+                resent += 1;
+            }
             changes += 1;
         }
+        sent += resent;
         if changes > 0 {
             println!(
                 "smugglr mesh: resent {changes} {} a peer has not acknowledged",
@@ -568,24 +735,11 @@ impl Node<'_> {
                 .get(&envelope.signature)
                 .map_or(0, |heard| heard.copies);
             if copies < self.settings.k {
-                if self.change(&envelope, false, self.to).is_err() {
-                    self.window.lost();
+                if self.change(&envelope, false, (self.to, 0)).is_err() {
+                    self.window.congested(FULL);
                     return Ok(());
                 }
                 sent += 1;
-            }
-        }
-        let room = self
-            .window
-            .whole()
-            .saturating_sub(self.outbox.in_flight())
-            .min(PER_TICK - sent);
-        let firsts = self.outbox.first_sends(room)?;
-        for (at, envelope) in firsts.iter().enumerate() {
-            if self.change(envelope, false, self.to).is_err() {
-                self.window.lost();
-                self.outbox.unsend(&firsts[at..]);
-                break;
             }
         }
         Ok(())
@@ -601,12 +755,23 @@ impl std::fmt::Debug for Node<'_> {
     }
 }
 
-/// The unicast address for a peer last seen at `seen`, at the mesh `port`;
-/// `None` for a peer not yet seen or on this machine (one of `own`, or
-/// loopback), which is sent to by broadcast.
-fn unicast(seen: Option<&IpAddr>, own: &BTreeSet<IpAddr>, port: u16) -> Option<SocketAddr> {
-    let ip = *seen?;
-    (!ip.is_loopback() && !own.contains(&ip)).then(|| SocketAddr::new(ip, port))
+/// The address this machine's broadcasts leave from: the system picks it
+/// for a socket connected toward the broadcast address, and sends nothing.
+fn own_address(port: u16) -> Option<IpAddr> {
+    let probe = UdpSocket::bind("0.0.0.0:0").ok()?;
+    probe.set_broadcast(true).ok()?;
+    probe.connect(("255.255.255.255", port)).ok()?;
+    Some(probe.local_addr().ok()?.ip())
+}
+
+/// The unicast address for a peer last seen at `seen`; `None` for a peer
+/// not yet seen, or in the node's own socket group (on this machine, one of
+/// `own` or loopback, at the node's `port`), which is sent to by broadcast.
+fn unicast(seen: Option<&SocketAddr>, own: &BTreeSet<IpAddr>, port: u16) -> Option<SocketAddr> {
+    let seen = *seen?;
+    let ip = seen.ip();
+    let shares = seen.port() == port && (ip.is_loopback() || own.contains(&ip));
+    (!shares).then_some(seen)
 }
 
 /// Now, in seconds since the Unix epoch.
@@ -628,25 +793,35 @@ mod tests {
 
     use super::unicast;
 
+    const PUCK: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 88, 7));
+
     #[test]
-    fn a_peer_elsewhere_is_sent_to_at_its_address_and_the_mesh_port() {
-        let rzr = IpAddr::V4(Ipv4Addr::new(192, 168, 88, 20));
-        let own = BTreeSet::from([IpAddr::V4(Ipv4Addr::new(192, 168, 88, 7))]);
+    fn a_peer_elsewhere_is_sent_to_at_the_address_its_datagrams_came_from() {
+        let rzr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 88, 20)), 31337);
         assert_eq!(
-            unicast(Some(&rzr), &own, 31337),
-            Some(SocketAddr::new(rzr, 31337))
+            unicast(Some(&rzr), &BTreeSet::from([PUCK]), 31337),
+            Some(rzr)
         );
     }
 
     #[test]
-    fn a_peer_on_this_machine_or_not_yet_seen_is_sent_to_by_broadcast() {
-        let puck = IpAddr::V4(Ipv4Addr::new(192, 168, 88, 7));
-        let own = BTreeSet::from([puck]);
-        assert_eq!(unicast(Some(&puck), &own, 31337), None);
+    fn a_peer_on_this_machine_at_another_port_is_sent_to_unicast() {
+        let beside = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40000);
         assert_eq!(
-            unicast(Some(&IpAddr::V4(Ipv4Addr::LOCALHOST)), &own, 31337),
+            unicast(Some(&beside), &BTreeSet::from([PUCK]), 31337),
+            Some(beside)
+        );
+    }
+
+    #[test]
+    fn a_peer_sharing_the_port_on_this_machine_or_not_yet_seen_is_sent_to_by_broadcast() {
+        let own = BTreeSet::from([PUCK]);
+        assert_eq!(
+            unicast(Some(&SocketAddr::new(PUCK, 31337)), &own, 31337),
             None
         );
+        let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 31337);
+        assert_eq!(unicast(Some(&loopback), &own, 31337), None);
         assert_eq!(unicast(None, &own, 31337), None);
     }
 }

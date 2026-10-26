@@ -3,21 +3,23 @@
 //! machine name (a `hostname` first on its `PATH`), broadcasting on the
 //! port its config names.
 
+use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::thread::sleep;
+use std::thread::{self, sleep};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use chacha20poly1305::XChaCha20Poly1305;
 use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use rstest::fixture;
 use rstest_bdd::Slot;
 use rstest_bdd_macros::{ScenarioState, given, then, when};
 use rusqlite::Connection;
-use serde_json::json;
+use serde_json::{Value, json};
 use smugglr_core::change::{Change, Op};
 use smugglr_core::envelope::{Envelope, VERSION};
 use smugglr_core::hex::hex;
@@ -85,6 +87,8 @@ pub(crate) struct Front {
     refused: Slot<std::process::Output>,
     /// A key file a scenario names.
     key: Slot<PathBuf>,
+    /// The relay a scenario's nodes talk through.
+    relay: Slot<Arc<Relay>>,
 }
 
 #[fixture]
@@ -112,6 +116,20 @@ impl Front {
         port: Option<u16>,
         front_end: FrontEnd,
     ) -> Result<usize, String> {
+        self.start_with(world, name, key, port, front_end, &[])
+    }
+
+    /// Starts a node as [`Front::start`] does, its peers setting naming
+    /// `peers`.
+    fn start_with(
+        &self,
+        world: &World,
+        name: &str,
+        key: &Path,
+        port: Option<u16>,
+        front_end: FrontEnd,
+        peers: &[String],
+    ) -> Result<usize, String> {
         let folder = world.folder()?.join(name);
         std::fs::create_dir_all(&folder).map_err(|err| err.to_string())?;
         let path = folder.join("node.db");
@@ -120,9 +138,14 @@ impl Front {
             .map_err(|err| err.to_string())?;
         let config = folder.join("config").join("smugglr");
         std::fs::create_dir_all(&config).map_err(|err| err.to_string())?;
-        if let Some(port) = port {
-            std::fs::write(config.join("config.toml"), format!("port = {port}\n"))
-                .map_err(|err| err.to_string())?;
+        let mut settings = port
+            .map(|port| format!("port = {port}\n"))
+            .unwrap_or_default();
+        if !peers.is_empty() {
+            settings = format!("{settings}peers = {peers:?}\n");
+        }
+        if !settings.is_empty() {
+            std::fs::write(config.join("config.toml"), settings).map_err(|err| err.to_string())?;
         }
         let bin = folder.join("bin");
         std::fs::create_dir_all(&bin).map_err(|err| err.to_string())?;
@@ -746,4 +769,320 @@ fn applied_in_batches(front: &Front) -> Result<(), String> {
         return Err(format!("{} transactions for 50,000 changes", batches.len()));
     }
     Ok(())
+}
+
+/// What the relay saw of the two nodes' traffic.
+#[derive(Debug, Default)]
+struct Seen {
+    /// The changes whose first copy the first node sent the relay.
+    first_copies: HashSet<String>,
+    /// When the relay last dropped a datagram carrying each change.
+    lost: BTreeMap<String, Instant>,
+    /// When a resend of each change first passed the relay after its loss.
+    resent_at: BTreeMap<String, Instant>,
+    /// When the second node first acknowledged each change.
+    acked: BTreeMap<String, Instant>,
+    /// Datagrams the first node sent, and of them resends.
+    sent: u64,
+    resent: u64,
+}
+
+/// Stands between two nodes on a network that carries no broadcast: each
+/// node's peers setting names the relay, and the relay passes each node's
+/// datagrams to the other, unicast, dropping one in ten while `lossy` is set.
+#[derive(Debug)]
+struct Relay {
+    port: u16,
+    stop: AtomicBool,
+    lossy: AtomicBool,
+    dropped: AtomicU64,
+    seen: Mutex<Seen>,
+}
+
+impl Drop for Relay {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// The relay's socket on loopback, with the largest receive buffer the
+/// system allows, so the relay drops only what it means to.
+fn relay_socket() -> std::io::Result<UdpSocket> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    let mut size = 8 << 20;
+    while size >= 1 << 20 && socket.set_recv_buffer_size(size).is_err() {
+        size /= 2;
+    }
+    socket.bind(&std::net::SocketAddr::from(([127, 0, 0, 1], 0)).into())?;
+    let socket: UdpSocket = socket.into();
+    socket.set_read_timeout(Some(Duration::from_millis(50)))?;
+    Ok(socket)
+}
+
+/// The message in `datagram`, sealed under `seal`.
+fn open_with(datagram: &[u8], seal: &[u8; 32]) -> Option<Value> {
+    let (nonce, sealed) = datagram.split_at_checked(24)?;
+    let plain = XChaCha20Poly1305::new(seal.into())
+        .decrypt(XNonce::from_slice(nonce), sealed)
+        .ok()?;
+    serde_json::from_slice(&plain).ok()
+}
+
+impl Relay {
+    /// A relay for the nodes on `ports` (the first node's, then the
+    /// second's), their datagrams sealed under the key derived from
+    /// `shared_key`.
+    fn start(ports: [u16; 2], shared_key: &[u8; 32], lossy: bool) -> Result<Arc<Self>, String> {
+        let socket = relay_socket().map_err(|err| err.to_string())?;
+        let relay = Arc::new(Self {
+            port: socket.local_addr().map_err(|err| err.to_string())?.port(),
+            stop: AtomicBool::new(false),
+            lossy: AtomicBool::new(lossy),
+            dropped: AtomicU64::new(0),
+            seen: Mutex::new(Seen::default()),
+        });
+        let seal = blake3::derive_key("smugglr mesh 0.6 datagram seal", shared_key);
+        let weak = Arc::downgrade(&relay);
+        thread::spawn(move || {
+            let mut buffer = vec![0; 65_536];
+            let mut random = 0x9e37_79b9_7f4a_7c15_u64;
+            while let Some(relay) = weak.upgrade() {
+                if relay.stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let Ok((len, from)) = socket.recv_from(&mut buffer) else {
+                    continue;
+                };
+                let (from_first, to) = match from.port() {
+                    port if port == ports[0] => (true, ports[1]),
+                    port if port == ports[1] => (false, ports[0]),
+                    _ => continue,
+                };
+                random ^= random << 13;
+                random ^= random >> 7;
+                random ^= random << 17;
+                let drop = relay.lossy.load(Ordering::Relaxed) && random.is_multiple_of(10);
+                relay.note(open_with(&buffer[..len], &seal), from_first, drop);
+                if drop {
+                    relay.dropped.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    let _ = socket.send_to(&buffer[..len], ("127.0.0.1", to));
+                }
+            }
+        });
+        Ok(relay)
+    }
+
+    fn note(&self, message: Option<Value>, from_first: bool, dropped: bool) {
+        let Some(message) = message else {
+            return;
+        };
+        let now = Instant::now();
+        let text = |value: &Value| value.as_str().map(str::to_owned);
+        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        match message.get("t").and_then(Value::as_str) {
+            Some("change") if from_first => {
+                let Some(change) = message
+                    .get("envelope")
+                    .and_then(|envelope| text(envelope.get("signature")?))
+                else {
+                    return;
+                };
+                let resend = message.get("resend").and_then(Value::as_bool) == Some(true);
+                seen.sent += 1;
+                if resend {
+                    seen.resent += 1;
+                    if !dropped && seen.lost.contains_key(&change) {
+                        seen.resent_at.entry(change.clone()).or_insert(now);
+                    }
+                } else {
+                    seen.first_copies.insert(change.clone());
+                }
+                if dropped {
+                    // Measured from its latest loss: a resend lost too is a
+                    // loss of its own.
+                    seen.lost.insert(change, now);
+                }
+            }
+            Some("ack") if !from_first => {
+                for change in message
+                    .get("changes")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(text)
+                {
+                    seen.acked.entry(change).or_insert(now);
+                }
+            }
+            _ if from_first => seen.sent += 1,
+            _ => {}
+        }
+    }
+}
+
+/// Two nodes, each naming the relay in its peers setting, the relay
+/// dropping one datagram in ten when `lossy`; returns once each has heard
+/// the other.
+fn two_on_a_relay(world: &World, front: &Front, lossy: bool) -> Result<(), String> {
+    let key = key_file(world, front, "mesh.key")?;
+    let line = key_lines(&key)?.pop().ok_or("the key file holds no key")?;
+    let ports = [free_port()?, free_port()?];
+    let relay = Relay::start(ports, &decode(&line)?, lossy)?;
+    let peers = [format!("127.0.0.1:{}", relay.port)];
+    front.relay.set(relay);
+    front.start_with(world, "first", &key, Some(ports[0]), FrontEnd::Mesh, &peers)?;
+    front.start_with(
+        world,
+        "second",
+        &key,
+        Some(ports[1]),
+        FrontEnd::Mesh,
+        &peers,
+    )?;
+    front.sql(0, "INSERT INTO notes VALUES ('w0', 'heard')")?;
+    front.holds(1, "w0", "heard")?;
+    front.sql(1, "INSERT INTO notes VALUES ('w1', 'heard')")?;
+    front.holds(0, "w1", "heard")
+}
+
+#[given("two nodes running smugglr mesh that have heard each other")]
+fn two_that_heard_each_other(world: &World, front: &Front) -> Result<(), String> {
+    two_on_a_relay(world, front, false)
+}
+
+#[when(
+    "50,000 rows are written at once on the first node, and the relay drops one datagram in ten"
+)]
+fn fifty_thousand_through_loss(front: &Front) -> Result<(), String> {
+    front
+        .relay
+        .get()
+        .ok_or("no relay")?
+        .lossy
+        .store(true, Ordering::Relaxed);
+    write_rows(front, 0, 50_000)?;
+    holds_rows(front, 1, 50_002, Duration::from_secs(300))
+}
+
+#[then("the first node sends each change's first copy unicast to the second node")]
+fn first_copies_unicast(front: &Front) -> Result<(), String> {
+    // The relay sits on no broadcast: what reaches it was sent to it.
+    let relay = front.relay.get().ok_or("no relay")?;
+    let firsts = relay
+        .seen
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .first_copies
+        .len();
+    if firsts >= 50_001 {
+        Ok(())
+    } else {
+        Err(format!("the relay saw first copies of {firsts} changes"))
+    }
+}
+
+#[then("each lost copy is applied on the second node within one second of its loss")]
+fn lost_copies_within_a_second(front: &Front) -> Result<(), String> {
+    let relay = front.relay.get().ok_or("no relay")?;
+    let seen = relay.seen.lock().unwrap_or_else(PoisonError::into_inner);
+    if seen.lost.is_empty() {
+        return Err("the relay lost no copy of a change".to_owned());
+    }
+    let late: Vec<Duration> = seen
+        .lost
+        .iter()
+        .filter_map(|(change, lost)| match seen.acked.get(change) {
+            Some(acked) => acked.checked_duration_since(*lost),
+            None => Some(Duration::MAX),
+        })
+        .filter(|took| *took > Duration::from_secs(1))
+        .collect();
+    if late.is_empty() {
+        Ok(())
+    } else {
+        let resent: Vec<Option<Duration>> = seen
+            .lost
+            .iter()
+            .filter(|(change, lost)| {
+                seen.acked
+                    .get(*change)
+                    .and_then(|acked| acked.checked_duration_since(**lost))
+                    .is_none_or(|took| took > Duration::from_secs(1))
+            })
+            .take(12)
+            .map(|(change, lost)| {
+                seen.resent_at
+                    .get(change)
+                    .and_then(|at| at.checked_duration_since(*lost))
+            })
+            .collect();
+        Err(format!(
+            "{} of {} lost copies took longer than a second, the slowest {:?}; resent after {resent:?}; resends {} of {}",
+            late.len(),
+            seen.lost.len(),
+            late.iter().max(),
+            seen.resent,
+            seen.sent
+        ))
+    }
+}
+
+#[then("resends never take more than a quarter of what the first node sends")]
+fn resends_a_quarter_at_most(front: &Front) -> Result<(), String> {
+    let relay = front.relay.get().ok_or("no relay")?;
+    let seen = relay.seen.lock().unwrap_or_else(PoisonError::into_inner);
+    if seen.resent * 4 <= seen.sent {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} of {} datagrams were resends",
+            seen.resent, seen.sent
+        ))
+    }
+}
+
+#[given("two nodes running smugglr mesh, and a relay that drops one datagram in ten")]
+fn two_through_a_lossy_relay(world: &World, front: &Front) -> Result<(), String> {
+    two_on_a_relay(world, front, false)?;
+    front
+        .relay
+        .get()
+        .ok_or("no relay")?
+        .lossy
+        .store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+#[then("the first node's send window never halves for a lost datagram")]
+fn the_window_holds(front: &Front) -> Result<(), String> {
+    holds_rows(front, 1, 50_002, Duration::from_secs(300))?;
+    let relay = front.relay.get().ok_or("no relay")?;
+    if relay.dropped.load(Ordering::Relaxed) == 0 {
+        return Err("the relay dropped no datagram".to_owned());
+    }
+    let printed = front.with(0, Node::printed)?;
+    let congestion = ["the send buffer is full", "acknowledgements slowing"];
+    match printed.lines().find(|line| {
+        line.contains("send window halved") && !congestion.iter().any(|why| line.ends_with(why))
+    }) {
+        Some(line) => Err(format!("the first node: {line}")),
+        None => Ok(()),
+    }
+}
+
+#[given(
+    "two nodes running smugglr mesh on a relay that passes no broadcast, each naming the other in its peers setting"
+)]
+fn two_named_in_peers(world: &World, front: &Front) -> Result<(), String> {
+    two_on_a_relay(world, front, false)
+}
+
+#[when("a row is written on the first node")]
+fn a_row_on_the_first_node(front: &Front) -> Result<(), String> {
+    front.sql(0, "INSERT INTO notes VALUES ('n9', 'across')")
 }
