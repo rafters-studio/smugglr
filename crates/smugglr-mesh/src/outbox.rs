@@ -60,6 +60,8 @@ struct Due {
     change: [u8; 32],
     to: Vec<String>,
     silent: bool,
+    /// The copy is known lost, or its peer has had none: not a guess.
+    sure: bool,
 }
 
 /// A change due a resend, and the targets it is due to.
@@ -401,11 +403,12 @@ impl Outbox {
             if !entry.sent {
                 continue;
             }
-            let (mut to, mut silent) = (Vec::new(), false);
+            let (mut to, mut silent, mut sure) = (Vec::new(), false, false);
             for peer in entry.targets.difference(&entry.acked) {
                 if entry.unsent_to.contains(peer) {
                     // Its first copy to a peer heard since the first send.
                     to.push(peer.clone());
+                    sure = true;
                     continue;
                 }
                 match timing.get(peer).filter(|timing| timing.acknowledging(now)) {
@@ -414,6 +417,7 @@ impl Outbox {
                             > entry.resent_by.get(peer).copied().unwrap_or(entry.seq) + SKIPPED =>
                     {
                         to.push(peer.clone());
+                        sure = true;
                     }
                     Some(timing) => {
                         // Every two round trips, never doubling: the
@@ -438,10 +442,14 @@ impl Outbox {
                     change: *change,
                     to,
                     silent,
+                    sure,
                 });
             }
         }
-        due.sort_unstable_by_key(|due| due.seq);
+        // A copy known lost (a peer acknowledged what came after it) goes
+        // before one whose acknowledgement may only be slow, so a busy
+        // machine's guesses never take the quarter from a real loss.
+        due.sort_unstable_by_key(|due| (!due.sure, due.seq));
         due.truncate(limit);
         let latest = self.seq;
         for Due {
