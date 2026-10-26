@@ -518,3 +518,96 @@ fn exits_0(world: &World) -> Result<(), String> {
 fn exits_3(world: &World) -> Result<(), String> {
     exits(world, 3)
 }
+
+#[when("the agent runs smugglr sync on them with --sync-type multi and --sync-mode source")]
+fn multi_with_source(world: &World) -> Result<(), String> {
+    world
+        .sync(&["--sync-type", "multi", "--sync-mode", "source"])
+        .map(|_| ())
+}
+
+#[given("a node's database")]
+fn a_nodes_database(world: &World) -> Result<(), String> {
+    world.source.set(world.place("node.db", NOTES)?);
+    Ok(())
+}
+
+#[when("the agent runs smugglr sync on it with --sync-type mesh and --sync-mode target")]
+fn mesh_with_target(world: &World) -> Result<(), String> {
+    let place = world.source.get().ok_or("no node's database")?;
+    world
+        .smugglr(&[
+            "sync",
+            &place,
+            "--sync-type",
+            "mesh",
+            "--sync-mode",
+            "target",
+        ])
+        .map(|_| ())
+}
+
+/// Fails unless smugglr exited 2 and the first line it said, before any
+/// usage, names stop and last as the modes `kind` takes.
+fn refused_naming_modes(world: &World, kind: &str) -> Result<(), String> {
+    let output = world.output.get().ok_or("smugglr was not run")?;
+    let said = String::from_utf8_lossy(&output.stderr);
+    let first = said.lines().next().unwrap_or_default();
+    let words: Vec<&str> = first
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    let names = ["stop", "last", kind, "takes"]
+        .iter()
+        .all(|word| words.contains(word));
+    if output.status.code() == Some(2) && names {
+        Ok(())
+    } else {
+        Err(format!(
+            "smugglr exited {:?}, its first line {first:?}",
+            output.status.code()
+        ))
+    }
+}
+
+#[then("smugglr exits 2 naming stop and last as the modes multi takes")]
+fn refused_naming_multi(world: &World) -> Result<(), String> {
+    refused_naming_modes(world, "multi")
+}
+
+#[then("smugglr exits 2 naming stop and last as the modes mesh takes")]
+fn refused_naming_mesh(world: &World) -> Result<(), String> {
+    refused_naming_modes(world, "mesh")
+}
+
+#[when(
+    "the agent reads the help of smugglr sync, smugglr mesh, smugglr stash and smugglr retrieve"
+)]
+fn reads_every_help(world: &World) -> Result<(), String> {
+    let mut helps = Vec::new();
+    for command in ["sync", "mesh", "stash", "retrieve"] {
+        let output = world.smugglr(&[command, "--help"])?;
+        let help = String::from_utf8_lossy(&output.stdout).into_owned();
+        if !output.status.success() || !help.contains(&format!("smugglr {command} <")) {
+            return Err(format!(
+                "smugglr {command} --help exited {} printing {help:?}",
+                output.status
+            ));
+        }
+        helps.push(help);
+    }
+    world.watched.set(helps.join("\n"));
+    Ok(())
+}
+
+#[then("none of it contains the word wins")]
+fn no_wins(world: &World) -> Result<(), String> {
+    let helps = world.watched.get().ok_or("no help was read")?;
+    match helps
+        .split(|c: char| !c.is_alphanumeric())
+        .find(|word| word.eq_ignore_ascii_case("wins"))
+    {
+        Some(word) => Err(format!("the help says {word:?}")),
+        None => Ok(()),
+    }
+}

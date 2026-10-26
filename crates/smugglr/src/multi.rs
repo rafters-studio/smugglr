@@ -1,5 +1,6 @@
 //! `smugglr stash <place> <dir>` and `smugglr retrieve <place> <blob or
-//! dir>` (FR-SMUGGLR-059, FR-SMUGGLR-077).
+//! dir>` (FR-SMUGGLR-059, FR-SMUGGLR-077), and `smugglr retrieve <place>
+//! --replay <change hash>` (FR-SMUGGLR-076).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -11,7 +12,7 @@ use smugglr_core::envelope::GRAVEYARD;
 use smugglr_core::hex::{hex, unhex};
 use smugglr_core::plan::SyncMode;
 use smugglr_core::row_hash::row_hash;
-use smugglr_multi::{Blob, Settings, retrieve};
+use smugglr_multi::{Blob, Settings, replay, retrieve};
 
 use crate::cli::{NOT_DONE, STOPPED, USAGE, exit, print_record};
 
@@ -22,6 +23,8 @@ const HELP: &str = "usage: smugglr stash <place> <dir> --key-file <path> --node 
      [--target <name>]... [--whole]
        smugglr retrieve <place> <blob or dir> --key-file <path> --node <name> \
      [--crossed-off <name>]... [--sync-mode stop|last] [--json]
+       smugglr retrieve <place> --key-file <path> --node <name> \
+     --replay <change hash> [--sync-mode stop|last] [--json]
 
 stash writes one new blob into <dir> and prints its path; retrieve applies one
 blob, or every blob in a directory, in any order.
@@ -36,6 +39,9 @@ blob, or every blob in a directory, in any order.
                            stop (the default) names it, last keeps the copy
                            whose steering column (named in config) is further
                            on
+  --replay <change hash>   decide the change the dropped log holds under
+                           this hash again, with a fresh sunset, overriding
+                           its drop
   --json                   print the record as JSON";
 
 /// A `smugglr stash` or `smugglr retrieve` command line.
@@ -49,6 +55,7 @@ struct Multi {
     whole: bool,
     json: bool,
     sync_mode: SyncMode,
+    replay: Option<String>,
 }
 
 /// Runs `smugglr stash` (`stash` true) or `smugglr retrieve` with `args`.
@@ -65,6 +72,26 @@ pub(crate) fn run(stash: bool, args: &[String]) -> ExitCode {
         Ok(settings) => settings,
         Err(err) => return usage(&err),
     };
+    if let (Some(change), [place]) = (&command.replay, command.places.as_slice()) {
+        let mut place = match smugglr_place::open(place) {
+            Ok(place) => place,
+            Err(err) => return usage(&err.to_string()),
+        };
+        return match replay(place.as_mut(), change, &settings) {
+            Ok(record) => {
+                print_record(&record, command.json);
+                exit(&record)
+            }
+            Err(err @ smugglr_multi::Error::NotDropped(_)) => {
+                eprintln!("{err}");
+                ExitCode::from(USAGE)
+            }
+            Err(err) => {
+                eprintln!("{err}");
+                ExitCode::from(NOT_DONE)
+            }
+        };
+    }
     let [place, path] = command.places.as_slice() else {
         return usage("give a place and a blob or directory");
     };
@@ -128,6 +155,7 @@ fn parse(stash: bool, args: &[String]) -> Result<Multi, String> {
             "--whole" if stash => command.whole = true,
             "--crossed-off" if !stash => command.crossed_off.push(value("--crossed-off")?),
             "--json" if !stash => command.json = true,
+            "--replay" if !stash => command.replay = Some(value("--replay")?),
             "--sync-mode" if !stash => {
                 command.sync_mode = match value("--sync-mode")?.as_str() {
                     "stop" => SyncMode::Stop,
@@ -141,7 +169,11 @@ fn parse(stash: bool, args: &[String]) -> Result<Multi, String> {
             place => command.places.push(place.to_owned()),
         }
     }
-    if command.places.len() != 2 {
+    if command.replay.is_some() {
+        if command.places.len() != 1 {
+            return Err("retrieve --replay takes one place and no blob".to_owned());
+        }
+    } else if command.places.len() != 2 {
         return Err("give a place and a blob or directory".to_owned());
     }
     Ok(command)

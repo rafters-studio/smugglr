@@ -44,7 +44,7 @@ use smugglr_core::plan::SyncMode;
 use smugglr_core::steering::Steering;
 use smugglr_memory::Store;
 
-pub use node::run;
+pub use node::{replay, run};
 
 /// The UDP port a node broadcasts and listens on when the config sets none.
 pub const PORT: u16 = 31337;
@@ -79,6 +79,9 @@ pub enum Error {
     /// The node holds no key.
     #[error("the mesh needs a shared key")]
     NoKey,
+    /// A replay named a change the dropped log does not hold.
+    #[error("the dropped log holds no change {0}")]
+    NotDropped(String),
 }
 
 /// How a node runs.

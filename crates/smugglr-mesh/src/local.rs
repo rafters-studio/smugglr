@@ -6,13 +6,15 @@
 //! What it keeps per key (the last hash, the last applied `from`, and a
 //! delete's tombstone) lives in memory and in a journal in smugglr's own
 //! files, to which each change appends only the keys it touched. The journal
-//! is rewritten once, when the node starts.
+//! is rewritten once, when the node starts. The same journal is the node's
+//! dropped log: every change it drops, envelope and values, kept so it can
+//! be replayed (FR-SMUGGLR-076).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde_json::{Value, json};
 use smugglr_core::change::{Change, op};
-use smugglr_core::envelope::{Arrival, Envelope, Here, VERSION, receive};
+use smugglr_core::envelope::{self, Arrival, Envelope, Here, VERSION, receive, receive_replayed};
 use smugglr_core::hex::{hex, unhex};
 use smugglr_core::ignore::Ignore;
 use smugglr_core::plan::Hashes;
@@ -52,6 +54,8 @@ pub(crate) struct Local {
     held: HashSet<[u8; 32]>,
     /// The changes stopped or dropped the record has named, likewise.
     named: HashSet<[u8; 32]>,
+    /// The dropped log: every change the node dropped, until it is replayed.
+    dropped: Vec<Envelope>,
 }
 
 impl Local {
@@ -73,6 +77,7 @@ impl Local {
             tombstones: HashMap::new(),
             held: HashSet::new(),
             named: HashSet::new(),
+            dropped: Vec::new(),
         };
         local.read_tables(place, settings)?;
         match local.store.read(&local.journal)? {
@@ -154,6 +159,8 @@ impl Local {
         } else if let Some(envelope) = line.get("t").and_then(Envelope::from_json) {
             let row = (envelope.change.table.clone(), envelope.change.key.clone());
             self.tombstones.insert(row, envelope);
+        } else if let Some(envelope) = line.get("d").and_then(Envelope::from_json) {
+            self.log_dropped(envelope);
         }
     }
 
@@ -172,6 +179,10 @@ impl Local {
         }
         for tombstone in self.tombstones.values() {
             text.push_str(&json!({"t": tombstone.to_json()}).to_string());
+            text.push('\n');
+        }
+        for envelope in &self.dropped {
+            text.push_str(&json!({"d": envelope.to_json()}).to_string());
             text.push('\n');
         }
         Ok(self.store.replace(&self.journal, &text)?)
@@ -379,15 +390,58 @@ impl Local {
         envelopes: &[Envelope],
         now: u64,
     ) -> Result<Applied, Error> {
+        self.decide(place, settings, sign, envelopes, now, false)
+    }
+
+    /// Replays the change the dropped log holds under the change hash
+    /// `hash` (FR-SMUGGLR-076): re-signed with `sign` and a fresh sunset, it
+    /// leaves the log and is decided like any change, overriding its drop;
+    /// dropped again, it goes back in. What it writes is not noted as the
+    /// row's last hash, so the node's next run finds it as its own change
+    /// and sends it to its peers. `None` when the log holds no such change.
+    pub(crate) fn replay_dropped(
+        &mut self,
+        place: &mut dyn Place,
+        settings: &Settings,
+        sign: &[u8; 32],
+        hash: &[u8; 32],
+        now: u64,
+    ) -> Result<Option<Applied>, Error> {
+        let sunset = now.saturating_add(settings.graveyard);
+        let Some(resent) = envelope::replay(&self.dropped, hash, sunset, sign) else {
+            return Ok(None);
+        };
+        self.dropped.retain(|logged| &logged.signature != hash);
+        self.named.remove(hash);
+        let applied = self.decide(place, settings, sign, &[resent], now, true)?;
+        self.rewrite()?;
+        Ok(Some(applied))
+    }
+
+    fn decide(
+        &mut self,
+        place: &mut dyn Place,
+        settings: &Settings,
+        sign: &[u8; 32],
+        envelopes: &[Envelope],
+        now: u64,
+        replayed: bool,
+    ) -> Result<Applied, Error> {
         let refs: Vec<&Envelope> = envelopes.iter().collect();
         let here = self.here(place, settings, &refs)?;
-        let arrivals = receive(envelopes, sign, settings.sync_mode, now, |change| {
+        let here = |change: &Change| {
             here.get(&(change.table.clone(), change.key.clone()))
                 .cloned()
                 .unwrap_or_default()
-        });
+        };
+        let arrivals = if replayed {
+            receive_replayed(envelopes, sign, settings.sync_mode, now, here)
+        } else {
+            receive(envelopes, sign, settings.sync_mode, now, here)
+        };
         let mut applied = Applied::default();
         let (mut moves, mut tombstones): (Vec<Envelope>, Vec<Envelope>) = (Vec::new(), Vec::new());
+        let mut dropped = Vec::new();
         let mut writing: BTreeMap<String, Vec<&Envelope>> = BTreeMap::new();
         for (envelope, arrival) in envelopes.iter().zip(arrivals) {
             let change = &envelope.change;
@@ -403,9 +457,7 @@ impl Local {
                     applied.has.push(envelope.signature);
                 }
                 Arrival::Hold => {
-                    let here = here
-                        .get(&(change.table.clone(), change.key.clone()))
-                        .and_then(|here| here.hash);
+                    let here = here(change).hash;
                     self.hold(
                         envelope,
                         &format!(
@@ -429,16 +481,20 @@ impl Local {
                     applied.decided.push(envelope.signature);
                 }
                 Arrival::Dropped(reason) => {
-                    self.name(
+                    if self.name(
                         envelope,
                         &format!(
-                            "dropped a change to {} {:?} from {}: {}",
+                            "dropped a change to {} {:?} from {}: {} (change {})",
                             change.table,
                             change.key,
                             envelope.node,
-                            reason.words()
+                            reason.words(),
+                            hex(&envelope.signature)
                         ),
-                    );
+                    ) && self.log_dropped(envelope.clone())
+                    {
+                        dropped.push(envelope.clone());
+                    }
                     applied.decided.push(envelope.signature);
                 }
                 Arrival::Refused => eprintln!(
@@ -450,11 +506,20 @@ impl Local {
         for (name, envelopes) in writing {
             self.write(place, &name, &envelopes, &mut applied, &mut moves)?;
         }
+        if replayed {
+            // Left for the next run to find as the node's own change.
+            return Ok(applied);
+        }
         // The journal first, then memory, as for the node's own changes.
         let lines: String = moves
             .iter()
             .map(Self::moved_lines)
             .chain(tombstones.iter().map(Self::tombstone_line))
+            .chain(
+                dropped
+                    .iter()
+                    .map(|envelope| format!("{}\n", json!({"d": envelope.to_json()}))),
+            )
             .collect();
         self.append(&lines)?;
         for envelope in &moves {
@@ -532,11 +597,26 @@ impl Local {
     }
 
     /// Prints `line` for `envelope`, a change decided (stopped or dropped),
-    /// in the record, once however often a copy of it arrives.
-    fn name(&mut self, envelope: &Envelope, line: &str) {
-        if self.named.insert(envelope.signature) {
+    /// in the record, once however often a copy of it arrives; whether it
+    /// printed.
+    fn name(&mut self, envelope: &Envelope, line: &str) -> bool {
+        let first = self.named.insert(envelope.signature);
+        if first {
             println!("smugglr mesh: {line}");
         }
+        first
+    }
+
+    /// Keeps `envelope` in the dropped log, once; whether it was new there.
+    fn log_dropped(&mut self, envelope: Envelope) -> bool {
+        let new = self
+            .dropped
+            .iter()
+            .all(|logged| logged.signature != envelope.signature);
+        if new {
+            self.dropped.push(envelope);
+        }
+        new
     }
 
     /// Whether `envelope`'s table is one this node keeps, with the same

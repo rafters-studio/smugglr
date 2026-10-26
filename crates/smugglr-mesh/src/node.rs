@@ -31,7 +31,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use chacha20poly1305::aead::OsRng;
 use chacha20poly1305::aead::rand_core::RngCore;
 use smugglr_core::envelope::Envelope;
-use smugglr_core::hex::hex;
+use smugglr_core::hex::{hex, unhex};
 use smugglr_core::row_hash::row_hash;
 use smugglr_place::Place;
 use socket2::{Domain, Protocol, Socket, Type};
@@ -100,6 +100,35 @@ const SLOWING: Duration = Duration::from_millis(250);
 /// The receive buffer a node asks its system for.
 const RECEIVE_BUFFER: usize = 8 << 20;
 
+/// Replays the change the node's dropped log holds under `change`, its
+/// change hash as hex (FR-SMUGGLR-076): re-sends it with a fresh sunset,
+/// overriding its drop, decides it on the node's own database through the
+/// one decision path, prints what came of it, and returns.
+///
+/// # Errors
+/// [`Error::NotDropped`] when the dropped log holds no such change; when the
+/// node holds no key; or when its place or what smugglr keeps for it cannot
+/// be read or written.
+pub fn replay(place: &mut dyn Place, settings: &Settings, change: &str) -> Result<(), Error> {
+    let newest = settings.keys.last().ok_or(Error::NoKey)?;
+    let not_dropped = || Error::NotDropped(change.to_owned());
+    let hash: [u8; 32] = unhex(change)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(not_dropped)?;
+    let folder = folder(place);
+    let mut local = Local::open(place, settings, &folder, now())?;
+    local
+        .replay_dropped(place, settings, &signing(newest), &hash, now())?
+        .ok_or_else(not_dropped)?;
+    println!("smugglr mesh: replayed change {change}");
+    Ok(())
+}
+
+/// Where smugglr keeps what the node whose database is `place` needs.
+fn folder(place: &dyn Place) -> String {
+    format!("mesh/{}", hex(&row_hash(&["mesh", place.address()])))
+}
+
 /// Runs the node whose database is `place` until `stop` is set.
 ///
 /// # Errors
@@ -113,7 +142,7 @@ pub fn run(place: &mut dyn Place, settings: &Settings, stop: &AtomicBool) -> Res
     }
     let socket = bind(settings.port)?;
     let reader = socket.try_clone()?;
-    let folder = format!("mesh/{}", hex(&row_hash(&["mesh", place.address()])));
+    let folder = folder(place);
     let ran = format!("{folder}/ran");
     if let Some(away) = away(settings, &ran)? {
         println!("{}", catch_up(away, settings, place.address()));

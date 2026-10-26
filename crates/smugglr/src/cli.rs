@@ -93,6 +93,8 @@ fn usage(err: &str) -> ExitCode {
 
 fn parse(args: &[String]) -> Result<Sync, String> {
     let mut command = Sync::default();
+    // A type smugglr sync does not run yet, refused once every flag is read.
+    let mut unbuilt = None;
     let mut args = args.iter().peekable();
     while let Some(arg) = args.next() {
         let mut value = |flag: &str| {
@@ -106,9 +108,7 @@ fn parse(args: &[String]) -> Result<Sync, String> {
             "--table" => command.options.tables.push(value("--table")?),
             "--sync-type" => match value("--sync-type")?.as_str() {
                 "direct" => command.options.sync_type = SyncType::Direct,
-                kind @ ("hub" | "multi") => {
-                    return Err(format!("--sync-type {kind} is not built yet"));
-                }
+                kind @ ("hub" | "multi") => unbuilt = Some(kind.to_owned()),
                 other => return Err(format!("--sync-type {other}: use direct or mesh")),
             },
             "--sync-mode" => {
@@ -139,6 +139,20 @@ fn parse(args: &[String]) -> Result<Sync, String> {
             flag if flag.starts_with("--") => return Err(format!("unknown flag {flag}")),
             place => command.places.push(place.to_owned()),
         }
+    }
+    // source and target work with direct and hub only (FR-SMUGGLR-059).
+    if let Some(kind) = unbuilt {
+        let mode = match command.options.sync_mode {
+            SyncMode::Source => Some("source"),
+            SyncMode::Target => Some("target"),
+            SyncMode::Stop | SyncMode::Last => None,
+        };
+        return Err(match mode {
+            Some(mode) if kind == "multi" => {
+                format!("--sync-mode {mode}: multi takes stop and last")
+            }
+            _ => format!("--sync-type {kind} is not built yet"),
+        });
     }
     if command.places.len() == 2 {
         Ok(command)

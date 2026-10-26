@@ -109,3 +109,21 @@ Feature: smugglr sync on the command line
     Given two places where orders has rows to move and notes has a row changed in both places since the last sync
     When the agent runs smugglr sync on them
     Then smugglr exits 4
+
+  @criterion-01a14bed-4909-7023-8f5a-6a8d0742c221 @module-front-ends
+  Scenario: source is refused with multi
+    Given two places
+    When the agent runs smugglr sync on them with --sync-type multi and --sync-mode source
+    Then smugglr exits 2 naming stop and last as the modes multi takes
+
+  @criterion-01a14bed-4909-7023-8f5a-6a9d4b4fc554 @module-front-ends
+  Scenario: target is refused with mesh
+    Given a node's database
+    When the agent runs smugglr sync on it with --sync-type mesh and --sync-mode target
+    Then smugglr exits 2 naming stop and last as the modes mesh takes
+
+  @criterion-01a14bed-6ee4-73d2-a7eb-4f5034e44a20 @module-front-ends
+  Scenario: no word for a better copy in the help
+    Given the smugglr CLI
+    When the agent reads the help of smugglr sync, smugglr mesh, smugglr stash and smugglr retrieve
+    Then none of it contains the word wins
