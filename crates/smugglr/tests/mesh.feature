@@ -1,5 +1,5 @@
 # Generated from the legion requirement. Do not hand-edit this file.
-Feature: smugglr mesh as a command: its front ends, its node's name and port, and its key file (FR-SMUGGLR-078)
+Feature: smugglr mesh as a command: its front ends, its node's name and port, its key file, and a flood (FR-SMUGGLR-078)
 
   @criterion-01a14bed-95be-7e81-9e8e-2e7689ef819b @module-front-ends
   Scenario: smugglr mesh is smugglr sync --sync-type mesh
@@ -40,3 +40,16 @@ Feature: smugglr mesh as a command: its front ends, its node's name and port, an
     When a row is written and a change signed with an unknown key arrives
     Then neither node's output or errors contain the key
     And the record names the key only by its key_id
+
+  @criterion-01a17646-71f8-7dd0-8860-1e64e558f4b7 @module-mesh
+  Scenario: a flood is paced, not dropped
+    Given two nodes running smugglr mesh
+    When 500,000 rows are written at once on the first node
+    Then the second node holds all 500,000 once acknowledgements stop
+    And neither node's socket reports a datagram dropped for a full buffer
+
+  @criterion-01a17646-71f8-7dd0-8860-1e73cea8e31b @module-mesh
+  Scenario: received changes are applied in batches
+    Given two nodes running smugglr mesh
+    When 50,000 rows are written at once on the first node
+    Then the second node applies them in transactions of at most 20,000 changes, not one per change

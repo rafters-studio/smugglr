@@ -26,7 +26,7 @@ use smugglr_core::plan::SyncMode;
 use smugglr_core::row_hash::row_hash;
 use smugglr_core::shape::{Column, Stamp};
 use smugglr_core::steering::Steering;
-use smugglr_mesh::{K, Settings, key_id};
+use smugglr_mesh::{BACKPRESSURE, K, Settings, key_id};
 use socket2::{Domain, Protocol, Socket, Type};
 
 /// The key every node of a scenario holds, unless it says otherwise.
@@ -246,7 +246,9 @@ fn open(datagram: &[u8]) -> Option<Value> {
 /// One running node.
 struct Node {
     path: PathBuf,
+    config: PathBuf,
     port: u16,
+    settings: Settings,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<Result<(), String>>>,
 }
@@ -257,6 +259,38 @@ impl Node {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+
+    /// Runs the node in a thread of its own until it is stopped.
+    fn run(&mut self) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (address, settings, stopping) = (
+            self.path.display().to_string(),
+            self.settings.clone(),
+            stop.clone(),
+        );
+        self.thread = Some(thread::spawn(move || {
+            let mut place = smugglr_place::open(&address).map_err(|err| err.to_string())?;
+            smugglr_mesh::run(place.as_mut(), &settings, &stopping).map_err(|err| {
+                eprintln!("{}: {err}", settings.node);
+                err.to_string()
+            })
+        }));
+        self.stop = stop;
+    }
+
+    /// The bytes of the files in the node's outbox.
+    fn outbox(&self) -> u64 {
+        let Ok(folders) = std::fs::read_dir(self.config.join("mesh")) else {
+            return 0;
+        };
+        folders
+            .flatten()
+            .filter_map(|folder| std::fs::read_dir(folder.path().join("outbox")).ok())
+            .flat_map(Iterator::flatten)
+            .filter_map(|file| file.metadata().ok())
+            .map(|metadata| metadata.len())
+            .sum()
     }
 }
 
@@ -311,6 +345,18 @@ impl Net {
     /// Starts a node holding `keys`, its database made by `sql`, and returns
     /// its index.
     fn start(&self, keys: &[[u8; 32]], graveyard: u64, sql: &str) -> Result<usize, String> {
+        self.start_with(keys, graveyard, BACKPRESSURE, sql)
+    }
+
+    /// Starts a node as [`Net::start`] does, its outbox held to
+    /// `backpressure` bytes.
+    fn start_with(
+        &self,
+        keys: &[[u8; 32]],
+        graveyard: u64,
+        backpressure: u64,
+        sql: &str,
+    ) -> Result<usize, String> {
         let index = self.nodes().len();
         let path = self.folder.join(format!("node{index}.db"));
         Connection::open(&path)
@@ -330,23 +376,18 @@ impl Net {
             steering: Steering::default(),
             ignore: Vec::new(),
             k: K,
+            backpressure,
         };
-        let stop = Arc::new(AtomicBool::new(false));
-        let address = path.display().to_string();
-        let stopping = stop.clone();
-        let thread = thread::spawn(move || {
-            let mut place = smugglr_place::open(&address).map_err(|err| err.to_string())?;
-            smugglr_mesh::run(place.as_mut(), &settings, &stopping).map_err(|err| {
-                eprintln!("node {index}: {err}");
-                err.to_string()
-            })
-        });
-        self.nodes().push(Node {
+        let mut node = Node {
             path,
+            config: config.clone(),
             port,
-            stop,
-            thread: Some(thread),
-        });
+            settings,
+            stop: Arc::new(AtomicBool::new(false)),
+            thread: None,
+        };
+        node.run();
+        self.nodes().push(node);
         // A node's first look notes every row as it is, and sends nothing;
         // a row written before it would never be sent. Its look is done
         // once it keeps what it saw.
@@ -644,7 +685,7 @@ fn a_peer_that_never_acknowledges(mesh: &Mesh) -> Result<(), String> {
     // the sender with no peer to resend to.
     for _ in 0..4 {
         net.relay.inject(
-            &json!({"t": "ack", "sender": "silent", "maker": "elsewhere", "change": hex(&[0; 32])}),
+            &json!({"t": "ack", "sender": "silent", "maker": "elsewhere", "changes": [hex(&[0; 32])]}),
             &KEY,
             net.port(0)?,
         )?;
@@ -841,4 +882,145 @@ fn nothing_in_the_clear(mesh: &Mesh) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+impl Net {
+    fn stop(&self, index: usize) -> Result<(), String> {
+        let mut nodes = self.nodes();
+        nodes
+            .get_mut(index)
+            .ok_or_else(|| format!("no node {index}"))?
+            .stop();
+        Ok(())
+    }
+
+    /// Starts again node `index`, stopped, on its database, config and port.
+    fn restart(&self, index: usize) -> Result<(), String> {
+        let mut nodes = self.nodes();
+        nodes
+            .get_mut(index)
+            .ok_or_else(|| format!("no node {index}"))?
+            .run();
+        drop(nodes);
+        // Its look at its rows is done well within this.
+        sleep(Duration::from_secs(1));
+        Ok(())
+    }
+
+    fn count(&self, index: usize) -> Result<i64, String> {
+        let db = Connection::open(self.path(index)?).map_err(|err| err.to_string())?;
+        db.busy_timeout(Duration::from_secs(5))
+            .map_err(|err| err.to_string())?;
+        db.query_row("SELECT count(*) FROM notes", [], |row| row.get(0))
+            .map_err(|err| err.to_string())
+    }
+}
+
+#[given("two nodes running smugglr mesh, and the second node stopped")]
+fn two_nodes_the_second_stopped(mesh: &Mesh) -> Result<(), String> {
+    let net = mesh.net()?;
+    net.start_many(2, "")?;
+    net.stop(1)
+}
+
+#[when("a row is written on the first node, and the first node is stopped and started again")]
+fn the_first_restarts(mesh: &Mesh) -> Result<(), String> {
+    let net = mesh.net()?;
+    net.sql(0, "INSERT INTO notes VALUES ('n9', 'kept')")?;
+    // The row is in the outbox once the node has sent it.
+    wait(SOON, || {
+        net.sent_by(0)
+            .unwrap_or_default()
+            .iter()
+            .any(|(_, envelope)| envelope.change.key == ["'n9'"])
+    })
+    .map_err(|()| "the first node never sent the row".to_owned())?;
+    net.stop(0)?;
+    net.restart(0)
+}
+
+#[when("the second node starts again")]
+fn the_second_starts_again(mesh: &Mesh) -> Result<(), String> {
+    mesh.net()?.restart(1)
+}
+
+#[then("the second node holds the row")]
+fn the_second_holds_the_row(mesh: &Mesh) -> Result<(), String> {
+    // The first node resends at 10, 20 and 40 s after it starts again.
+    mesh.net()?.holds(1, "n9", "kept", Duration::from_secs(80))
+}
+
+#[then("the user's database holds no table smugglr made")]
+fn no_table_of_smugglrs(mesh: &Mesh) -> Result<(), String> {
+    let net = mesh.net()?;
+    for index in 0..2 {
+        let db = Connection::open(net.path(index)?).map_err(|err| err.to_string())?;
+        let mut statement = db
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+            .map_err(|err| err.to_string())?;
+        let tables: Vec<String> = statement
+            .query_map([], |row| row.get(0))
+            .map_err(|err| err.to_string())?
+            .collect::<Result<_, _>>()
+            .map_err(|err| err.to_string())?;
+        if tables != ["notes"] {
+            return Err(format!("node {index}'s database holds {tables:?}"));
+        }
+    }
+    Ok(())
+}
+
+/// The backpressure line the scenario sets: 1 MB.
+const LINE: u64 = 1_000_000;
+
+/// How many rows make the 5 MB written: each row's body is 1,000 bytes.
+const ROWS: i64 = 5_000;
+
+#[given("a node with backpressure set to 1 MB whose only peer is asleep")]
+fn a_node_with_a_line(mesh: &Mesh) -> Result<(), String> {
+    let net = mesh.net()?;
+    net.start_with(&[KEY], GRAVEYARD, LINE, "")?;
+    net.start(&[KEY], GRAVEYARD, "")?;
+    // Each hears the other before the peer sleeps.
+    net.sql(0, "INSERT INTO notes VALUES ('w0', 'heard')")?;
+    net.holds(1, "w0", "heard", SOON)?;
+    sleep(Duration::from_secs(1));
+    net.stop(1)
+}
+
+#[when("5 MB of rows are written on the node")]
+fn five_mb_written(mesh: &Mesh) -> Result<(), String> {
+    mesh.net()?.sql(
+        0,
+        &format!(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {ROWS}) \
+             INSERT INTO notes SELECT 'r' || i, printf('%.1000c', 'x') FROM n"
+        ),
+    )
+}
+
+#[then("the node's outbox holds no more than 1 MB")]
+fn the_outbox_holds_its_line(mesh: &Mesh) -> Result<(), String> {
+    let net = mesh.net()?;
+    let outbox = || net.nodes().first().map_or(0, Node::outbox);
+    // Several looks for its own changes.
+    wait(SOON, || outbox() > LINE / 2)
+        .map_err(|()| format!("the outbox only reached {} bytes", outbox()))?;
+    sleep(Duration::from_secs(3));
+    match outbox() {
+        bytes if bytes <= LINE => Ok(()),
+        bytes => Err(format!("the outbox holds {bytes} bytes")),
+    }
+}
+
+#[then(
+    "once the peer wakes and acknowledges, the node takes the remaining rows and the peer ends with them all"
+)]
+fn the_peer_ends_with_all(mesh: &Mesh) -> Result<(), String> {
+    let net = mesh.net()?;
+    net.restart(1)?;
+    wait(Duration::from_secs(180), || {
+        net.count(1).is_ok_and(|count| count == ROWS + 1)
+    })
+    .map_err(|()| format!("the peer holds {:?} rows of {}", net.count(1), ROWS + 1))
 }

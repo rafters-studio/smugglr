@@ -54,3 +54,18 @@ Feature: smugglr mesh, a local network where nobody is in charge, sends each cha
     Given two mesh nodes sharing a key, and a capture of the traffic between them
     When a row holding a known value is changed on one node
     Then the capture holds neither that value nor that row's key in the clear
+
+  @criterion-01a17646-71f8-7dd0-8860-1e498d7b5f0c @module-mesh
+  Scenario: the outbox survives a restart
+    Given two nodes running smugglr mesh, and the second node stopped
+    When a row is written on the first node, and the first node is stopped and started again
+    And the second node starts again
+    Then the second node holds the row
+    And the user's database holds no table smugglr made
+
+  @criterion-01a17646-71f8-7dd0-8860-1e587ee0d5d8 @module-mesh
+  Scenario: back-pressure stops the outbox at its line
+    Given a node with backpressure set to 1 MB whose only peer is asleep
+    When 5 MB of rows are written on the node
+    Then the node's outbox holds no more than 1 MB
+    And once the peer wakes and acknowledges, the node takes the remaining rows and the peer ends with them all

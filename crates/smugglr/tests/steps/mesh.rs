@@ -332,7 +332,7 @@ fn a_row_on_puck(front: &Front) -> Result<(), String> {
 #[then("the change the other nodes receive names puck as its node")]
 fn the_change_names_puck(front: &Front) -> Result<(), String> {
     front.holds(1, "n9", "from puck")?;
-    front.prints(1, "applied a change to notes from puck,")
+    front.prints(1, "to notes from puck,")
 }
 
 #[given("one node with no port setting and one node with port set to 40000")]
@@ -617,4 +617,133 @@ fn decode(line: &str) -> Result<[u8; 32], String> {
     bytes
         .try_into()
         .map_err(|_| "the key is not 32 bytes".to_owned())
+}
+
+/// The datagrams the sockets on UDP `port` have dropped for a full receive
+/// buffer, as Linux counts them per socket in `/proc/net/udp`; `None` on a
+/// system that keeps no count per socket. (macOS counts drops only for the
+/// whole system, and there counts broadcasts it delivered to every socket on
+/// the port: 200 sent and 200 received counted 109 drops.)
+fn dropped_on(port: u16) -> Result<Option<u64>, String> {
+    if !cfg!(target_os = "linux") {
+        return Ok(None);
+    }
+    let table = std::fs::read_to_string("/proc/net/udp").map_err(|err| err.to_string())?;
+    let port = format!(":{port:04X}");
+    Ok(Some(
+        table
+            .lines()
+            .skip(1)
+            .filter(|line| {
+                line.split_whitespace()
+                    .nth(1)
+                    .is_some_and(|local| local.ends_with(&port))
+            })
+            .filter_map(|line| line.split_whitespace().last()?.parse::<u64>().ok())
+            .sum(),
+    ))
+}
+
+/// Writes `rows` rows on node `index` in one statement.
+fn write_rows(front: &Front, index: usize, rows: u64) -> Result<(), String> {
+    front.sql(
+        index,
+        &format!(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {rows}) \
+             INSERT INTO notes SELECT 'k' || i, 'row ' || i FROM n"
+        ),
+    )
+}
+
+/// Waits up to `within` for node `index` to hold `rows` rows.
+fn holds_rows(front: &Front, index: usize, rows: i64, within: Duration) -> Result<(), String> {
+    let path = front.with(index, |node| node.path.clone())?;
+    let count = || {
+        Connection::open(&path)
+            .and_then(|db| {
+                db.busy_timeout(Duration::from_secs(10))?;
+                db.query_row("SELECT count(*) FROM notes", [], |row| row.get::<_, i64>(0))
+            })
+            .ok()
+    };
+    let started = Instant::now();
+    while started.elapsed() < within {
+        if count() == Some(rows) {
+            return Ok(());
+        }
+        sleep(Duration::from_secs(1));
+    }
+    Err(format!("node {index} holds {:?} rows of {rows}", count()))
+}
+
+#[given("two nodes running smugglr mesh")]
+fn two_nodes(world: &World, front: &Front) -> Result<(), String> {
+    let key = key_file(world, front, "mesh.key")?;
+    let port = free_port()?;
+    front.start(world, "first", &key, Some(port), FrontEnd::Mesh)?;
+    front.start(world, "second", &key, Some(port), FrontEnd::Mesh)?;
+    Ok(())
+}
+
+#[when("500,000 rows are written at once on the first node")]
+fn a_flood(front: &Front) -> Result<(), String> {
+    write_rows(front, 0, 500_000)
+}
+
+#[then("the second node holds all 500,000 once acknowledgements stop")]
+fn the_second_holds_the_flood(front: &Front) -> Result<(), String> {
+    holds_rows(front, 1, 500_000, Duration::from_secs(1_200))
+}
+
+#[then("neither node's socket reports a datagram dropped for a full buffer")]
+fn nothing_dropped(front: &Front) -> Result<(), String> {
+    // A change lost on the way, for a full buffer or any other cause,
+    // reaches its node only as a resend, and the node says so.
+    for index in 0..2 {
+        let printed = front.with(index, Node::printed)?;
+        if let Some(line) = printed
+            .lines()
+            .find(|line| line.contains("only as a resend"))
+        {
+            return Err(format!("node {index}: {line}"));
+        }
+    }
+    let port = front.with(0, |node| node.port)?;
+    match dropped_on(port)? {
+        None | Some(0) => Ok(()),
+        Some(dropped) => Err(format!(
+            "the sockets on port {port} dropped {dropped} datagrams for a full buffer"
+        )),
+    }
+}
+
+#[when("50,000 rows are written at once on the first node")]
+fn fifty_thousand(front: &Front) -> Result<(), String> {
+    write_rows(front, 0, 50_000)
+}
+
+#[then(
+    "the second node applies them in transactions of at most 20,000 changes, not one per change"
+)]
+fn applied_in_batches(front: &Front) -> Result<(), String> {
+    holds_rows(front, 1, 50_000, Duration::from_secs(300))?;
+    let printed = front.with(1, Node::printed)?;
+    let batches: Vec<u64> = printed
+        .lines()
+        .filter_map(|line| line.strip_prefix("smugglr mesh: applied "))
+        .filter_map(|rest| rest.split_whitespace().next()?.parse().ok())
+        .collect();
+    let (total, largest) = (batches.iter().sum::<u64>(), batches.iter().max().copied());
+    if total != 50_000 {
+        return Err(format!(
+            "the second node applied {total} changes, not 50,000"
+        ));
+    }
+    if largest > Some(20_000) {
+        return Err(format!("a transaction applied {largest:?} changes"));
+    }
+    if batches.len() > 5_000 {
+        return Err(format!("{} transactions for 50,000 changes", batches.len()));
+    }
+    Ok(())
 }

@@ -1,34 +1,58 @@
-//! One node: finds its own changes and sends them, applies, acknowledges
-//! and echoes the changes it hears, and resends its own until every peer
-//! has them or their sunset passes.
+//! One node: finds its own changes and sends them, paced; applies the
+//! changes it hears in batches, acknowledges and echoes them; and resends
+//! its own until every peer has them or their sunset passes.
+//!
+//! A reader thread drains the socket into memory as datagrams arrive, so a
+//! long look at the database or a large batch never leaves the socket's
+//! buffer to overflow. Everything a node sends is paced: first sends are
+//! held to a window that starts small, grows with each change a peer
+//! acknowledges and halves on loss or a full send buffer (RFC 8085), and
+//! each tick sends at most [`PER_TICK`] datagrams, resends and echoes
+//! first.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chacha20poly1305::aead::OsRng;
 use chacha20poly1305::aead::rand_core::RngCore;
 use smugglr_core::envelope::Envelope;
-use smugglr_core::record::Status;
-use smugglr_multi::{Blob, retrieve, stash};
+use smugglr_core::hex::hex;
+use smugglr_core::row_hash::row_hash;
 use smugglr_place::Place;
 use socket2::{Domain, Protocol, Socket, Type};
 
-use crate::wire::{Message, open, seal};
-use crate::{Error, Settings, sealing, signing};
+use crate::local::Local;
+use crate::outbox::Outbox;
+use crate::wire::{ACKS, Message, open, seal};
+use crate::{CHUNK, Error, Settings, sealing, signing};
 
 /// How long a node waits for a datagram before it looks at its clocks.
 const TICK: Duration = Duration::from_millis(100);
 
-/// How often a node looks for its own changes.
+/// The shortest wait between two looks for its own changes; a look that
+/// took long waits twice as long as it took.
 const SCAN: Duration = Duration::from_millis(500);
 
-/// The first resend's wait; each later one doubles, up to [`LAST_RESEND`].
-const FIRST_RESEND: Duration = Duration::from_secs(10);
+/// The most datagrams a node sends in one tick.
+const PER_TICK: usize = 2_000;
 
-/// The longest wait between two resends.
-const LAST_RESEND: Duration = Duration::from_secs(160);
+/// The window a node's first sends start from.
+const FIRST_WINDOW: f64 = 32.0;
+
+/// The largest window: a batch's worth of changes.
+const LARGEST: f64 = 20_000.0;
+
+/// How often the outbox and what the node has heard are tidied.
+const TIDY: Duration = Duration::from_secs(1);
+
+/// Bytes kept free under the backpressure line for the outbox's index.
+const INDEX_ROOM: u64 = 1_024;
+
+/// The receive buffer a node asks its system for.
+const RECEIVE_BUFFER: usize = 8 << 20;
 
 /// Runs the node whose database is `place` until `stop` is set.
 ///
@@ -41,26 +65,53 @@ pub fn run(place: &mut dyn Place, settings: &Settings, stop: &AtomicBool) -> Res
     if held.is_empty() {
         return Err(Error::NoKey);
     }
+    let socket = bind(settings.port)?;
+    let reader = socket.try_clone()?;
+    let folder = format!("mesh/{}", hex(&row_hash(&["mesh", place.address()])));
+    let local = Local::open(place, settings, &folder, now())?;
+    let outbox = Outbox::open(settings.store.clone(), &format!("{folder}/outbox"), now())?;
     let mut node = Node {
-        place,
         settings,
-        socket: bind(settings.port)?,
+        socket,
         to: SocketAddr::from(([255, 255, 255, 255], settings.port)),
         seal: held.iter().rev().map(sealing).collect(),
         sign: held.iter().rev().map(signing).collect(),
+        local,
+        outbox,
         peers: BTreeSet::new(),
         heard: HashMap::new(),
-        outbox: HashMap::new(),
+        waiting: Vec::new(),
+        echoes: VecDeque::new(),
+        window: Window::new(),
+        scanned: None,
+        scan_took: Duration::ZERO,
+        scan_full: false,
+        lost: 0,
+        tidied: Instant::now(),
     };
-    let mut scanned: Option<Instant> = None;
-    let mut buffer = vec![0; 65_536];
-    while !stop.load(Ordering::Relaxed) {
-        // A busy database or a datagram that could not go out is a moment's
-        // trouble: the node says so and goes on, and resends cover the gap.
-        if let Err(err) = node.turn(&mut buffer, &mut scanned) {
-            eprintln!("smugglr mesh: {err}");
+    let (tx, rx) = mpsc::channel();
+    let reading = AtomicBool::new(true);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let mut buffer = vec![0; 65_536];
+            while reading.load(Ordering::Relaxed) {
+                if let Ok((len, _)) = reader.recv_from(&mut buffer)
+                    && tx.send(buffer[..len].to_vec()).is_err()
+                {
+                    break;
+                }
+            }
+        });
+        while !stop.load(Ordering::Relaxed) {
+            // A busy database or a datagram that could not go out is a
+            // moment's trouble: the node says so and goes on, and resends
+            // cover the gap.
+            if let Err(err) = node.turn(place, &rx) {
+                eprintln!("smugglr mesh: {err}");
+            }
         }
-    }
+        reading.store(false, Ordering::Relaxed);
+    });
     Ok(())
 }
 
@@ -72,6 +123,12 @@ fn bind(port: u16) -> std::io::Result<UdpSocket> {
     #[cfg(unix)]
     socket.set_reuse_port(true)?;
     socket.set_broadcast(true)?;
+    // The largest receive buffer the system allows, up to RECEIVE_BUFFER;
+    // a system that refuses one too large keeps its default.
+    let mut size = RECEIVE_BUFFER;
+    while size >= 1 << 20 && socket.set_recv_buffer_size(size).is_err() {
+        size /= 2;
+    }
     socket.bind(&SocketAddr::from(([0, 0, 0, 0], port)).into())?;
     let socket: UdpSocket = socket.into();
     socket.set_read_timeout(Some(TICK))?;
@@ -81,27 +138,64 @@ fn bind(port: u16) -> std::io::Result<UdpSocket> {
 /// A change this node has heard.
 #[derive(Debug)]
 struct Heard {
-    envelope: Envelope,
     /// The node has the change: applied, or already at it.
     has: bool,
-    /// Copies heard since the node applied it.
+    /// Copies heard since the node had it.
     copies: u32,
-    /// When the node echoes it, if it applied it and has not yet.
-    echo_at: Option<Instant>,
+    sunset: u64,
 }
 
-/// One of this node's own changes, and the peers that have not
-/// acknowledged it.
+/// How many first sends may be unacknowledged at once (RFC 8085).
 #[derive(Debug)]
-struct Outgoing {
-    envelope: Envelope,
-    targets: BTreeSet<String>,
-    resend_at: Instant,
-    interval: Duration,
+struct Window {
+    size: f64,
+    threshold: f64,
+    cut: Option<Instant>,
+}
+
+impl Window {
+    fn new() -> Self {
+        Self {
+            size: FIRST_WINDOW,
+            threshold: LARGEST,
+            cut: None,
+        }
+    }
+
+    /// A first acknowledgement of one change: the window grows.
+    fn acked(&mut self) {
+        self.size += if self.size < self.threshold {
+            1.0
+        } else {
+            1.0 / self.size
+        };
+        self.size = self.size.min(LARGEST);
+    }
+
+    /// A loss or a full send buffer: the window halves, at most once a
+    /// second.
+    fn lost(&mut self) {
+        if self
+            .cut
+            .is_none_or(|at| at.elapsed() >= Duration::from_secs(1))
+        {
+            self.threshold = (self.size / 2.0).max(4.0);
+            self.size = self.threshold;
+            self.cut = Some(Instant::now());
+        }
+    }
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the window is between 4 and LARGEST"
+    )]
+    fn whole(&self) -> usize {
+        self.size as usize
+    }
 }
 
 struct Node<'a> {
-    place: &'a mut dyn Place,
     settings: &'a Settings,
     socket: UdpSocket,
     /// Where the node sends: the broadcast address on its port.
@@ -110,232 +204,320 @@ struct Node<'a> {
     seal: Vec<[u8; 32]>,
     /// The signing keys it accepts, newest first; it signs with the first.
     sign: Vec<[u8; 32]>,
+    local: Local,
+    outbox: Outbox,
     /// The nodes it has heard.
     peers: BTreeSet<String>,
     heard: HashMap<[u8; 32], Heard>,
-    outbox: HashMap<[u8; 32], Outgoing>,
+    /// Changes that wait for their `from` to appear.
+    waiting: Vec<Envelope>,
+    /// Applied changes due an echo, in the order they are due.
+    echoes: VecDeque<(Instant, Envelope)>,
+    window: Window,
+    scanned: Option<Instant>,
+    scan_took: Duration,
+    /// The last look stopped at the backpressure line.
+    scan_full: bool,
+    /// Changes heard this turn only as a resend.
+    lost: usize,
+    tidied: Instant,
 }
 
 impl Node<'_> {
-    /// Takes in what arrives within one tick, looks for its own changes
-    /// when a look is due, and runs its clocks.
-    fn turn(&mut self, buffer: &mut [u8], scanned: &mut Option<Instant>) -> Result<(), Error> {
-        match self.socket.recv_from(buffer) {
-            Ok((len, _)) => {
-                if let Some(message) = open(&buffer[..len], &self.seal) {
-                    self.hear(message)?;
-                }
+    /// Takes in what has arrived, up to a batch, applies it, looks for its
+    /// own changes when a look is due, and sends what is due.
+    fn turn(&mut self, place: &mut dyn Place, rx: &Receiver<Vec<u8>>) -> Result<(), Error> {
+        let mut batch: Vec<(String, Envelope)> = Vec::new();
+        let mut first = match rx.recv_timeout(TICK) {
+            Ok(datagram) => Some(datagram),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => return Ok(()),
+        };
+        while let Some(datagram) = first.take().or_else(|| rx.try_recv().ok()) {
+            if let Some(message) = open(&datagram, &self.seal) {
+                self.hear(message, &mut batch);
             }
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) => {}
-            Err(err) => return Err(err.into()),
+            if batch.len() >= CHUNK {
+                break;
+            }
         }
-        if scanned.is_none_or(|at| at.elapsed() >= SCAN) {
-            *scanned = Some(Instant::now());
-            self.scan()?;
+        if !batch.is_empty() {
+            self.apply(place, batch)?;
         }
-        self.timers()
-    }
-
-    fn send(&self, message: &Message) -> Result<(), Error> {
-        self.socket
-            .send_to(&seal(message, &self.seal[0]), self.to)?;
-        Ok(())
-    }
-
-    /// multi's settings for a stash or retrieve now, with the signing key
-    /// `key`.
-    fn multi(&self, key: [u8; 32]) -> smugglr_multi::Settings {
-        smugglr_multi::Settings {
-            store: self.settings.store.clone(),
-            key,
-            node: self.settings.node.clone(),
-            targets: Vec::new(),
-            graveyard: self.settings.graveyard,
-            now: now(),
-            sync_mode: self.settings.sync_mode,
-            steering: self.settings.steering.clone(),
-            ignore: self.settings.ignore.clone(),
-        }
-    }
-
-    /// Sends each row changed here since the last look as one change, and
-    /// keeps it to resend. A node's first look only notes every row's hash.
-    fn scan(&mut self) -> Result<(), Error> {
-        let settings = self.multi(self.sign[0]);
-        let blob = stash(self.place, &settings, false, |_| Ok(()))?;
-        if blob.whole {
-            return Ok(());
-        }
-        for envelope in blob.changes {
-            self.send(&Message::Change {
-                sender: self.settings.node.clone(),
-                envelope: Box::new(envelope.clone()),
-            })?;
-            self.outbox.insert(
-                envelope.signature,
-                Outgoing {
-                    envelope,
-                    targets: self.peers.clone(),
-                    resend_at: Instant::now() + FIRST_RESEND,
-                    interval: FIRST_RESEND,
-                },
+        if self.lost > 0 {
+            println!(
+                "smugglr mesh: {} arrived only as a resend; the first copy was lost",
+                if self.lost == 1 {
+                    "1 change".to_owned()
+                } else {
+                    format!("{} changes", self.lost)
+                }
             );
+            self.lost = 0;
+        }
+        if self.outbox.settled() {
+            // Room in the outbox as soon as acknowledgements make it.
+            self.outbox.prune(now())?;
+        }
+        // A look that stopped at the backpressure line looks again once
+        // acknowledgements have emptied half the outbox, not for every
+        // change they settle; any other look waits its turn.
+        let due = if self.scan_full {
+            self.outbox.bytes() <= self.settings.backpressure / 2
+        } else {
+            self.outbox.bytes() < self.settings.backpressure
+                && self
+                    .scanned
+                    .is_none_or(|at| at.elapsed() >= SCAN.max(self.scan_took * 2))
+        };
+        if due {
+            let started = Instant::now();
+            // Room for the segment index to grow by the segments added.
+            let budget = self
+                .settings
+                .backpressure
+                .saturating_sub(self.outbox.bytes() + INDEX_ROOM);
+            let peers = &self.peers;
+            let (found, full) = self.local.changes(
+                place,
+                self.settings,
+                &self.sign[0],
+                now(),
+                budget,
+                |envelope| Outbox::weigh(envelope, peers),
+            )?;
+            self.scan_full = full;
+            if !found.is_empty() {
+                self.outbox.add(&found, &self.peers)?;
+            }
+            self.scanned = Some(Instant::now());
+            self.scan_took = started.elapsed();
+        }
+        self.send_due()?;
+        if self.tidied.elapsed() >= TIDY {
+            self.tidied = Instant::now();
+            let epoch = now();
+            self.outbox.prune(epoch)?;
+            self.heard.retain(|_, heard| epoch <= heard.sunset);
+            if !self.waiting.is_empty() {
+                // A change waiting past its sunset is dropped.
+                self.apply(place, Vec::new())?;
+            }
         }
         Ok(())
     }
 
-    /// Takes in one message from another node.
-    fn hear(&mut self, message: Message) -> Result<(), Error> {
+    fn send(&self, message: &Message) -> std::io::Result<()> {
+        self.socket
+            .send_to(&seal(message, &self.seal[0]), self.to)
+            .map(drop)
+    }
+
+    fn change(&self, envelope: &Envelope, resend: bool) -> std::io::Result<()> {
+        self.send(&Message::Change {
+            sender: self.settings.node.clone(),
+            envelope: Box::new(envelope.clone()),
+            resend,
+        })
+    }
+
+    /// Takes in one message from another node; a change it does not have
+    /// yet joins `batch`.
+    fn hear(&mut self, message: Message, batch: &mut Vec<(String, Envelope)>) {
         let sender = message.sender().to_owned();
         if sender == self.settings.node {
-            return Ok(());
+            return;
         }
-        // Every other node is a target: one heard for the first time is a
-        // target of each change this node is still resending.
         if self.peers.insert(sender.clone()) {
-            for outgoing in self.outbox.values_mut() {
-                outgoing.targets.insert(sender.clone());
-            }
+            self.outbox.heard(&sender);
         }
         match message {
             Message::Ack {
                 sender,
                 maker,
-                change,
+                changes,
             } => {
-                if maker == self.settings.node
-                    && let Some(outgoing) = self.outbox.get_mut(&change)
-                {
-                    outgoing.targets.remove(&sender);
-                    if outgoing.targets.is_empty() {
-                        self.outbox.remove(&change);
+                if maker == self.settings.node {
+                    for change in &changes {
+                        if self.outbox.ack(change, &sender) {
+                            self.window.acked();
+                        }
                     }
                 }
-                Ok(())
             }
-            Message::Change { sender, envelope } => self.change(&sender, *envelope),
+            Message::Change {
+                sender,
+                envelope,
+                resend,
+            } => {
+                if envelope.node == self.settings.node {
+                    return;
+                }
+                match self.heard.get_mut(&envelope.signature) {
+                    Some(heard) if heard.has => {
+                        heard.copies += 1;
+                        if sender == envelope.node {
+                            let maker = envelope.node.clone();
+                            self.acks(BTreeMap::from([(maker, vec![envelope.signature])]));
+                        }
+                    }
+                    Some(_) => batch.push((sender, *envelope)),
+                    None => {
+                        // Its first copy never arrived: lost on the way.
+                        self.lost += usize::from(resend);
+                        self.heard.insert(
+                            envelope.signature,
+                            Heard {
+                                has: false,
+                                copies: 0,
+                                sunset: envelope.sunset,
+                            },
+                        );
+                        batch.push((sender, *envelope));
+                    }
+                }
+            }
         }
     }
 
-    /// Takes in a copy of a change: applies it the first time it can,
-    /// acknowledging and arranging its echo; acknowledges a later copy only
-    /// when it comes from the maker.
-    fn change(&mut self, sender: &str, envelope: Envelope) -> Result<(), Error> {
-        let maker = envelope.node.clone();
-        if maker == self.settings.node {
-            return Ok(());
-        }
-        let signature = envelope.signature;
-        if let Some(heard) = self.heard.get_mut(&signature)
-            && heard.has
-        {
-            heard.copies += 1;
-            if sender == maker {
-                self.ack(maker, signature)?;
+    /// Applies `batch` with the changes still waiting, acknowledging and
+    /// arranging an echo for each it applies, and acknowledging a change it
+    /// already had only when the copy came from its maker.
+    fn apply(
+        &mut self,
+        place: &mut dyn Place,
+        batch: Vec<(String, Envelope)>,
+    ) -> Result<(), Error> {
+        let epoch = now();
+        let from_maker: BTreeSet<[u8; 32]> = batch
+            .iter()
+            .filter(|(sender, envelope)| *sender == envelope.node)
+            .map(|(_, envelope)| envelope.signature)
+            .collect();
+        let mut seen = BTreeSet::new();
+        let envelopes: Vec<Envelope> = std::mem::take(&mut self.waiting)
+            .into_iter()
+            .chain(batch.into_iter().map(|(_, envelope)| envelope))
+            .filter(|envelope| seen.insert(envelope.signature))
+            .collect();
+        // One decision per signing key; a change no held key signed, or of
+        // a table whose shape differs, is refused.
+        let mut by_key: Vec<Vec<Envelope>> = vec![Vec::new(); self.sign.len()];
+        for envelope in envelopes {
+            match self.sign.iter().position(|key| envelope.verify(key)) {
+                Some(_) if !self.local.same_shape(&envelope) => eprintln!(
+                    "smugglr mesh: refused a change to {} from {}: its table's shape differs here",
+                    envelope.change.table, envelope.node
+                ),
+                Some(at) => by_key[at].push(envelope),
+                None => eprintln!(
+                    "smugglr mesh: refused a change to {} from {}: key {} is not one this node holds",
+                    envelope.change.table, envelope.node, envelope.key_id
+                ),
             }
-            return Ok(());
         }
-        let (has, applied) = self.receive(&envelope)?;
-        let echo_at = applied.then(|| Instant::now() + echo_wait());
-        self.heard.insert(
-            signature,
-            Heard {
-                envelope,
-                has,
-                copies: 0,
-                echo_at,
-            },
-        );
-        if applied || (has && sender == maker) {
-            self.ack(maker, signature)?;
+        let mut acks: BTreeMap<String, Vec<[u8; 32]>> = BTreeMap::new();
+        for (at, envelopes) in by_key.into_iter().enumerate() {
+            if envelopes.is_empty() {
+                continue;
+            }
+            let sign = self.sign[at];
+            let applied = self
+                .local
+                .apply(place, self.settings, &sign, &envelopes, epoch)?;
+            let wrote: BTreeSet<[u8; 32]> = applied.wrote.iter().copied().collect();
+            let has: BTreeSet<[u8; 32]> = applied.has.iter().copied().collect();
+            for envelope in envelopes {
+                let change = envelope.signature;
+                if !has.contains(&change) {
+                    continue;
+                }
+                self.heard.insert(
+                    change,
+                    Heard {
+                        has: true,
+                        copies: 0,
+                        sunset: envelope.sunset,
+                    },
+                );
+                if wrote.contains(&change) || from_maker.contains(&change) {
+                    acks.entry(envelope.node.clone()).or_default().push(change);
+                }
+                if wrote.contains(&change) {
+                    self.echoes
+                        .push_back((Instant::now() + echo_wait(), envelope));
+                }
+            }
+            self.waiting.extend(applied.waiting);
         }
+        self.acks(acks);
         Ok(())
     }
 
-    fn ack(&self, maker: String, change: [u8; 32]) -> Result<(), Error> {
-        self.send(&Message::Ack {
-            sender: self.settings.node.clone(),
-            maker,
-            change,
-        })
+    /// Acknowledges each maker's changes, [`ACKS`] to a datagram.
+    fn acks(&self, acks: BTreeMap<String, Vec<[u8; 32]>>) {
+        for (maker, changes) in acks {
+            for changes in changes.chunks(ACKS) {
+                // A lost acknowledgement is covered by the maker's resend.
+                let _ = self.send(&Message::Ack {
+                    sender: self.settings.node.clone(),
+                    maker: maker.clone(),
+                    changes: changes.to_vec(),
+                });
+            }
+        }
     }
 
-    /// Retrieves `envelope` by the envelope rules, verified with the key
-    /// that signed it; a change no key the node accepts signed is refused.
-    /// Returns whether the node has the change, and whether this retrieve
-    /// applied it.
-    fn receive(&mut self, envelope: &Envelope) -> Result<(bool, bool), Error> {
-        let Some(&key) = self.sign.iter().find(|key| envelope.verify(key)) else {
-            eprintln!(
-                "smugglr mesh: refused a change to {} from {}: key {} is not one this node holds",
-                envelope.change.table, envelope.node, envelope.key_id
-            );
-            return Ok((false, false));
-        };
-        let mut blob = Blob {
-            node: envelope.node.clone(),
-            targets: Vec::new(),
-            whole: false,
-            stamps: BTreeMap::from([(envelope.change.table.clone(), envelope.stamp)]),
-            changes: vec![envelope.clone()],
-            graveyard: Vec::new(),
-            signature: [0; 32],
-            sunset: envelope.sunset,
-        };
-        blob.sign(&key);
-        let settings = self.multi(key);
-        let record = retrieve(self.place, &[blob], &settings, &[])?;
-        let has = record.status == Status::Done && record.dropped.is_empty();
-        let applied = has && record.wrote();
-        if applied {
+    /// Sends what is due this tick: resends, then echoes, then first sends
+    /// within the window. A full send buffer ends the tick.
+    fn send_due(&mut self) -> Result<(), Error> {
+        let instant = Instant::now();
+        let (resends, lost) = self.outbox.resends(instant, PER_TICK)?;
+        if lost {
+            self.window.lost();
+        }
+        let mut sent = 0;
+        for envelope in &resends {
+            if self.change(envelope, true).is_err() {
+                self.window.lost();
+                return Ok(());
+            }
+            sent += 1;
+        }
+        if sent > 0 {
             println!(
-                "smugglr mesh: applied a change to {} from {}, key {}",
-                envelope.change.table, envelope.node, envelope.key_id
+                "smugglr mesh: resent {sent} {} a peer has not acknowledged",
+                if sent == 1 { "change" } else { "changes" }
             );
         }
-        Ok((has, applied))
-    }
-
-    /// Echoes what is due, resends what is due, and forgets what is past its
-    /// sunset.
-    fn timers(&mut self) -> Result<(), Error> {
-        let (instant, epoch) = (Instant::now(), now());
-        let mut echoes = Vec::new();
-        for heard in self.heard.values_mut() {
-            if heard.echo_at.is_some_and(|at| instant >= at) {
-                heard.echo_at = None;
-                if heard.copies < self.settings.k {
-                    echoes.push(heard.envelope.clone());
+        while sent < PER_TICK && self.echoes.front().is_some_and(|(due, _)| instant >= *due) {
+            let Some((_, envelope)) = self.echoes.pop_front() else {
+                break;
+            };
+            let copies = self
+                .heard
+                .get(&envelope.signature)
+                .map_or(0, |heard| heard.copies);
+            if copies < self.settings.k {
+                if self.change(&envelope, false).is_err() {
+                    self.window.lost();
+                    return Ok(());
                 }
+                sent += 1;
             }
         }
-        for envelope in echoes {
-            self.send(&Message::Change {
-                sender: self.settings.node.clone(),
-                envelope: Box::new(envelope),
-            })?;
-        }
-        self.heard
-            .retain(|_, heard| heard.echo_at.is_some() || epoch <= heard.envelope.sunset);
-        self.outbox
-            .retain(|_, outgoing| epoch <= outgoing.envelope.sunset);
-        let mut resends = Vec::new();
-        for outgoing in self.outbox.values_mut() {
-            if instant >= outgoing.resend_at && !outgoing.targets.is_empty() {
-                outgoing.interval = (outgoing.interval * 2).min(LAST_RESEND);
-                outgoing.resend_at = instant + outgoing.interval;
-                resends.push(outgoing.envelope.clone());
+        let room = self
+            .window
+            .whole()
+            .saturating_sub(self.outbox.in_flight())
+            .min(PER_TICK - sent);
+        let firsts = self.outbox.first_sends(room)?;
+        for (at, envelope) in firsts.iter().enumerate() {
+            if self.change(envelope, false).is_err() {
+                self.window.lost();
+                self.outbox.unsend(&firsts[at..]);
+                break;
             }
-        }
-        for envelope in resends {
-            self.send(&Message::Change {
-                sender: self.settings.node.clone(),
-                envelope: Box::new(envelope),
-            })?;
         }
         Ok(())
     }
