@@ -100,3 +100,10 @@ Feature: smugglr mesh as a command: its front ends, its node's name and port, it
     When both nodes change the same row at once
     Then each node names the conflict in its record once
     And neither node resends that change after it is acknowledged
+
+  @criterion-01a150da-4790-7900-b298-053869017f14 @module-front-ends
+  Scenario: replay re-sends a logged change, and an unknown hash is a usage error
+    Given a mesh node whose dropped log holds a change
+    When the agent runs smugglr mesh with --replay and that change's hash
+    Then the change is sent again with a fresh sunset
+    And running smugglr mesh with --replay and a change hash not in the dropped log exits 2

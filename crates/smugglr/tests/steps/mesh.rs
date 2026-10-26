@@ -1566,3 +1566,121 @@ fn not_resent(front: &Front) -> Result<(), String> {
         None => Ok(()),
     }
 }
+
+/// The graveyard, in seconds, of the replay scenario's nodes: short, so a
+/// logged change is past its own sunset by the time it is replayed.
+const REPLAY_GRAVEYARD: u64 = 6;
+
+impl Front {
+    /// Runs smugglr with `args` as node `index` runs, on its database, and
+    /// waits for it to exit.
+    fn run_as(&self, index: usize, args: &[&str]) -> Result<std::process::Output, String> {
+        let path = self.with(index, |node| node.path.clone())?;
+        let folder = path.parent().ok_or("a node's database has no folder")?;
+        let mut command = Command::new(env!("CARGO_BIN_EXE_smugglr"));
+        command
+            .arg("mesh")
+            .arg(&path)
+            .args(args)
+            .env("XDG_CONFIG_HOME", folder.join("config"))
+            .env("PATH", search_path(&folder.join("bin")))
+            .env("COMPUTERNAME", "replayer");
+        command
+            .output()
+            .map_err(|err| format!("failed to start smugglr: {err}"))
+    }
+
+    /// Waits for node `index` to hold no note `id`.
+    fn lacks(&self, index: usize, id: &str) -> Result<(), String> {
+        let path = self.with(index, |node| node.path.clone())?;
+        wait(SOON, || {
+            Connection::open(&path)
+                .and_then(|db| {
+                    db.busy_timeout(Duration::from_secs(5))?;
+                    db.query_row("SELECT count(*) FROM notes WHERE id = ?1", [id], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                })
+                .is_ok_and(|count| count == 0)
+        })
+        .map_err(|()| format!("node {index} still holds {id}"))
+    }
+}
+
+#[given("a mesh node whose dropped log holds a change")]
+fn a_node_with_a_dropped_change(world: &World, front: &Front) -> Result<(), String> {
+    let key = key_file(world, front, "replay.key")?;
+    start_named(
+        world,
+        front,
+        &[("ra", &key, FrontEnd::Mesh), ("rb", &key, FrontEnd::Mesh)],
+        &format!("graveyard = {REPLAY_GRAVEYARD}\n"),
+    )?;
+    front.key.set(key);
+    front.sql(0, "INSERT INTO notes VALUES ('n1', 'first')")?;
+    front.holds(1, "n1", "first")?;
+    // Deleted, then made again inside the graveyard window: the second
+    // node drops the insert and keeps it in its dropped log.
+    front.sql(0, "DELETE FROM notes WHERE id = 'n1'")?;
+    front.lacks(1, "n1")?;
+    front.sql(0, "INSERT INTO notes VALUES ('n1', 'again')")?;
+    front.prints(1, "dropped a change to notes")?;
+    front.stop(0)?;
+    front.stop(1)?;
+    // Past the logged change's own sunset: only a fresh one lets it in.
+    sleep(Duration::from_secs(REPLAY_GRAVEYARD + 2));
+    Ok(())
+}
+
+/// The change hash the record of node `index` names its first drop by.
+fn dropped_hash(front: &Front, index: usize) -> Result<String, String> {
+    let printed = front.with(index, Node::printed)?;
+    printed
+        .lines()
+        .find(|line| line.contains("dropped a change to notes"))
+        .and_then(|line| line.rsplit_once("(change ")?.1.strip_suffix(')'))
+        .map(str::to_owned)
+        .ok_or_else(|| format!("no drop named by its change hash in {printed:?}"))
+}
+
+#[when("the agent runs smugglr mesh with --replay and that change's hash")]
+fn replays_it(front: &Front) -> Result<(), String> {
+    let key = front.key.get().ok_or("no key file")?;
+    let hash = dropped_hash(front, 1)?;
+    let key = key.display().to_string();
+    let output = front.run_as(1, &["--key-file", &key, "--replay", &hash])?;
+    front.refused.set(output);
+    Ok(())
+}
+
+#[then("the change is sent again with a fresh sunset")]
+fn sent_again(front: &Front) -> Result<(), String> {
+    let output = front.refused.get().ok_or("smugglr was not run")?;
+    let printed = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() || !printed.contains("replayed change") {
+        return Err(format!(
+            "the replay exited {}, printing {printed:?} and saying {:?}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    // Past its own sunset, the change is applied only with a fresh one.
+    front.holds_within(1, "n1", "again", Duration::ZERO)
+}
+
+#[then("running smugglr mesh with --replay and a change hash not in the dropped log exits 2")]
+fn unknown_hash_exits_2(front: &Front) -> Result<(), String> {
+    let key = front.key.get().ok_or("no key file")?;
+    let key = key.display().to_string();
+    let unknown = hex(&[0_u8; 32]);
+    let output = front.run_as(1, &["--key-file", &key, "--replay", &unknown])?;
+    let said = String::from_utf8_lossy(&output.stderr);
+    if output.status.code() == Some(2) && said.contains("dropped log holds no change") {
+        Ok(())
+    } else {
+        Err(format!(
+            "an unknown hash exited {:?}, saying {said:?}",
+            output.status.code()
+        ))
+    }
+}

@@ -1,5 +1,6 @@
 //! `smugglr mesh <place>`, the same as `smugglr sync <place> --sync-type
-//! mesh`, and `smugglr mesh keygen` (FR-SMUGGLR-078).
+//! mesh`, `smugglr mesh keygen` (FR-SMUGGLR-078), and `smugglr mesh <place>
+//! --replay <change hash>` (FR-SMUGGLR-076).
 //!
 //! A node is named by its machine's name, as the `hostname` command gives
 //! it. The key file holds one key per line, base64, newest last; a line
@@ -23,6 +24,7 @@ use crate::cli::{STOPPED, USAGE};
 
 const HELP: &str = "usage: smugglr mesh <place> --key-file <path> [--sync-mode stop|last]
        smugglr sync <place> --sync-type mesh (the same flags)
+       smugglr mesh <place> --key-file <path> --replay <change hash>
        smugglr mesh keygen --key-file <path>
 
 Keeps <place> in step with every node on the local network that holds the
@@ -39,6 +41,9 @@ backpressure setting, 6 MB when not set.
                            change: stop (the default) names it, last keeps
                            the copy whose steering column (named in config)
                            is further on
+  --replay <change hash>   decide the change the dropped log holds under
+                           this hash again, with a fresh sunset, overriding
+                           its drop; print what came of it and exit
 keygen writes a new key at the end of the key file, making the file when
 there is none; appending a key rotates to it.";
 
@@ -51,7 +56,7 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
     if args.first().is_some_and(|arg| arg == "keygen") {
         return keygen(&args[1..]);
     }
-    let (place, settings) = match parse(args) {
+    let (place, settings, replay) = match parse(args) {
         Ok(parsed) => parsed,
         Err(Refusal::Usage(err)) => {
             eprintln!("{err}\n{HELP}");
@@ -69,6 +74,20 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
             return ExitCode::from(USAGE);
         }
     };
+    if let Some(change) = replay {
+        return match smugglr_mesh::replay(place.as_mut(), &settings, &change) {
+            Ok(true) => ExitCode::SUCCESS,
+            Ok(false) => ExitCode::from(STOPPED),
+            Err(err @ smugglr_mesh::Error::NotDropped(_)) => {
+                eprintln!("{err}");
+                ExitCode::from(USAGE)
+            }
+            Err(err) => {
+                eprintln!("{err}");
+                ExitCode::from(STOPPED)
+            }
+        };
+    }
     println!(
         "smugglr mesh: node {} on UDP port {}, key {}",
         settings.node,
@@ -93,10 +112,11 @@ enum Refusal {
     Key(String),
 }
 
-/// The place and the node's settings a command line gives, with the
-/// config's.
-fn parse(args: &[String]) -> Result<(String, Settings), Refusal> {
+/// The place, the node's settings and the change to replay, if any, a
+/// command line gives, with the config's.
+fn parse(args: &[String]) -> Result<(String, Settings, Option<String>), Refusal> {
     let (mut places, mut key_file, mut sync_mode) = (Vec::new(), None, SyncMode::Stop);
+    let mut replay = None;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         let mut value = |flag: &str| {
@@ -106,6 +126,7 @@ fn parse(args: &[String]) -> Result<(String, Settings), Refusal> {
         };
         match arg.as_str() {
             "--key-file" => key_file = Some(PathBuf::from(value("--key-file")?)),
+            "--replay" => replay = Some(value("--replay")?),
             "--sync-mode" => {
                 sync_mode = match value("--sync-mode")?.as_str() {
                     "stop" => SyncMode::Stop,
@@ -147,6 +168,7 @@ fn parse(args: &[String]) -> Result<(String, Settings), Refusal> {
             backpressure: config.backpressure.unwrap_or(BACKPRESSURE),
             peers: peers(&config.peers, config.port.unwrap_or(PORT)).map_err(Refusal::Usage)?,
         },
+        replay,
     ))
 }
 
