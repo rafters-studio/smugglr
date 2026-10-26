@@ -6,6 +6,91 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+The mesh release. `smugglr mesh <place> --key-file <path>` keeps a SQLite
+database in step with every machine on the local network that holds the same
+key, with nobody in charge: each node finds its own changes as they happen,
+sends each as a signed, sealed UDP datagram to the peers it has heard, and
+applies what it hears through the same decision path as sync. 0.6.0 wrote the
+mesh down as a protocol; 0.6.1 builds it, and adds `--replay` so a change
+dropped past its sunset can be decided again from the command line. Patch
+release: the mesh fills the `--sync-type mesh` slot 0.6.0 reserved; direct
+sync, the stash blob and the memory format are unchanged, and the mesh's own
+state lives in new files beside them.
+
+Not in 0.6.1 (#521): a node back from longer than the sunset does not catch
+up by itself, and instead prints the `smugglr stash` and `smugglr retrieve`
+commands that do it; there is no `smugglr mesh remove`; and nothing checks
+for two machines with one name, which ignore each other as themselves. Limits
+of the mesh as built (#520): a previous key stays accepted for as long as it
+is in the key file, since nothing retires it; a row too large for one
+datagram (about 9 KB on macOS, the system's limit) is refused loudly, named
+with the stash-and-retrieve catch-up, rather than sent; and the check that
+the key file is readable only by its owner runs on unix only.
+
+### Added
+
+- **`smugglr mesh`** (PR #593, #520): `smugglr mesh <place> --key-file <path>
+  [--sync-mode stop|last]`, also reachable as `smugglr sync <place>
+  --sync-type mesh`, runs one node until stopped. A node is named by its
+  machine's name and listens on the UDP port in the `port` setting (31337 when
+  not set). It announces itself by broadcast every 10 seconds, and to the
+  addresses in the `peers` setting on a network that carries no broadcast;
+  its peers are the nodes it hears under the shared key, and there is no
+  member list. A node finds its own changes by comparing each row's hash with
+  its last hash per key, and sends each change unicast to every peer it
+  knows, sealed with XChaCha20-Poly1305 under a key derived from the shared
+  key apart from the one that signs. A change it hears is decided by
+  smugglr-core's one decision path and written through the place, at most
+  20,000 changes per table in one transaction, then acknowledged to its maker
+  and echoed by broadcast once unless others already did. The maker resends
+  unicast to each peer that has not acknowledged until every one has or the
+  sunset passes: at once for a copy a peer skipped, within 300 ms for a peer
+  that is acknowledging, and on a 10 to 160 second doubling for a silent one.
+  Unacknowledged changes wait in an outbox in smugglr's own files and survive
+  a restart; at the `backpressure` setting (6 MB when not set) the node takes
+  no new changes until acknowledgements empty half the outbox. The record
+  names every change a node holds, stops or drops, once. `--sync-mode source`
+  and `target` are refused, since a mesh has no source or target.
+- **`smugglr mesh keygen`** (PR #593, #520): `smugglr mesh keygen --key-file
+  <path>` writes a new key at the end of the key file, creating the file when
+  there is none. The file holds one base64 key per line, newest last; a node
+  sends under the newest, opens datagrams under any key the file holds, and
+  answers a peer in the key it speaks, so appending a key rotates to it. A
+  key is never written to output or errors, only its id. A key file that its
+  group or others can read is refused, on unix.
+- **`--replay <change hash>` on `smugglr mesh` and `smugglr retrieve`** (PR
+  #595, #523): a mesh node keeps each change it drops past its sunset, the
+  envelope and its values, in a dropped log in its journal, and names each
+  drop by its change hash. `smugglr mesh <place> --key-file <path> --replay
+  <hash>` decides that change again on this node with a fresh sunset,
+  overriding its drop, prints what came of it and exits; what it writes goes
+  out on the node's next run. `smugglr retrieve <place> --key-file <path>
+  --node <name> --replay <hash>` does the same from multi's dropped log and
+  takes no blob. An unknown hash is a usage error, exit 2.
+- **The mesh settings** (PR #593, #520): config gains `port`, the mesh's UDP
+  port; `backpressure`, the most the outbox holds, in bytes or as text like
+  `max_wire`; and `peers`, addresses as `host` or `host:port` that a node
+  announces itself to where broadcast does not reach.
+- **A node back from past the sunset says so** (PR #593, #520): a node notes
+  when it last ran, and started after being away longer than the sunset (the
+  `graveyard` setting), it prints how long it was away, that changes made
+  meanwhile may not reach it, and the `smugglr stash --whole` and `smugglr
+  retrieve` commands that catch it up, then keeps running for new changes.
+
+### Changed
+
+- **`--sync-type multi` with `--sync-mode source` or `target`** (PR #595,
+  #523): `smugglr sync` exits 2 naming `stop` and `last` as the modes multi
+  takes, rather than saying only that multi is not built. `--sync-type hub`
+  and `multi` remain unbuilt.
+
+### Fixed
+
+- **The README names the release archives as published** (PR #592, #591):
+  the install section names `smugglr-<target>.tar.gz` for the four unix
+  targets and `smugglr-x86_64-pc-windows-msvc.zip` for Windows, the files the
+  GitHub release carries.
+
 ## [0.6.0] - 2026-10-25
 
 The greenfield release. smugglr 0.6.0 is a new engine, rebuilt from service
