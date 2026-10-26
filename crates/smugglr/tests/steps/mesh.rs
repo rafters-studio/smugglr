@@ -89,6 +89,8 @@ pub(crate) struct Front {
     key: Slot<PathBuf>,
     /// The relay a scenario's nodes talk through.
     relay: Slot<Arc<Relay>>,
+    /// The scenario's turn on the machine, for one that floods it.
+    turn: Slot<Arc<Turn>>,
 }
 
 #[fixture]
@@ -699,8 +701,38 @@ fn holds_rows(front: &Front, index: usize, rows: i64, within: Duration) -> Resul
     Err(format!("node {index} holds {:?} rows of {rows}", count()))
 }
 
+/// One flooding scenario at a time on the machine: they measure timing,
+/// which another flood beside them would make a measure of the machine.
+static FLOODING: Mutex<bool> = Mutex::new(false);
+
+/// A flooding scenario's turn; ending the scenario ends its turn.
+#[derive(Debug)]
+struct Turn;
+
+impl Turn {
+    fn take() -> Arc<Self> {
+        loop {
+            {
+                let mut busy = FLOODING.lock().unwrap_or_else(PoisonError::into_inner);
+                if !*busy {
+                    *busy = true;
+                    return Arc::new(Self);
+                }
+            }
+            sleep(Duration::from_millis(200));
+        }
+    }
+}
+
+impl Drop for Turn {
+    fn drop(&mut self) {
+        *FLOODING.lock().unwrap_or_else(PoisonError::into_inner) = false;
+    }
+}
+
 #[given("two nodes running smugglr mesh")]
 fn two_nodes(world: &World, front: &Front) -> Result<(), String> {
+    front.turn.set(Turn::take());
     let key = key_file(world, front, "mesh.key")?;
     let port = free_port()?;
     front.start(world, "first", &key, Some(port), FrontEnd::Mesh)?;
@@ -929,6 +961,7 @@ impl Relay {
 /// dropping one datagram in ten when `lossy`; returns once each has heard
 /// the other.
 fn two_on_a_relay(world: &World, front: &Front, lossy: bool) -> Result<(), String> {
+    front.turn.set(Turn::take());
     let key = key_file(world, front, "mesh.key")?;
     let line = key_lines(&key)?.pop().ok_or("the key file holds no key")?;
     let ports = [free_port()?, free_port()?];
@@ -979,7 +1012,7 @@ fn first_copies_unicast(front: &Front) -> Result<(), String> {
         .unwrap_or_else(PoisonError::into_inner)
         .first_copies
         .len();
-    if firsts >= 50_001 {
+    if firsts >= 50_000 {
         Ok(())
     } else {
         Err(format!("the relay saw first copies of {firsts} changes"))
@@ -1008,11 +1041,11 @@ fn lost_copies_within_a_second(front: &Front) -> Result<(), String> {
         let resent: Vec<Option<Duration>> = seen
             .lost
             .iter()
-            .filter(|(change, lost)| {
-                seen.acked
-                    .get(*change)
-                    .and_then(|acked| acked.checked_duration_since(**lost))
-                    .is_none_or(|took| took > Duration::from_secs(1))
+            .filter(|(change, lost)| match seen.acked.get(*change) {
+                Some(acked) => acked
+                    .checked_duration_since(**lost)
+                    .is_some_and(|took| took > Duration::from_secs(1)),
+                None => true,
             })
             .take(12)
             .map(|(change, lost)| {

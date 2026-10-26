@@ -55,9 +55,9 @@ const PER_TICK: usize = 2_000;
 const FIRST_WINDOW: f64 = 32.0;
 
 /// The largest window. A larger one queues more first copies at a busy
-/// peer, and a resend waits behind them all: past about 4,000, a lost copy
+/// peer, and a resend waits behind them all: past about 2,000, a lost copy
 /// takes longer than a second to repair.
-const LARGEST: f64 = 4_000.0;
+const LARGEST: f64 = 2_000.0;
 
 /// How often a node announces itself again, so a peer that missed it, or
 /// started since, learns its address.
@@ -75,6 +75,10 @@ const INDEX_ROOM: u64 = 1_024;
 /// The resends a tick may send when the node has nothing left to send
 /// first.
 const IDLE_RESENDS: usize = 100;
+
+/// The resends a tick may send when its window is held by changes waiting
+/// on repair.
+const BLOCKED_RESENDS: usize = 10;
 
 /// How often the counts behind the resend quarter halve, so it is the
 /// quarter of what the node has sent lately.
@@ -342,7 +346,13 @@ impl Node<'_> {
         // acknowledgements have emptied half the outbox, not for every
         // change they settle; any other look waits its turn.
         let due = if self.scan_full {
+            // Or once fewer changes wait for their first send than the
+            // window holds, so first sends never run dry while acks drain:
+            // a dry spell leaves the last changes sent nothing after them
+            // to show a gap, and their repair waits on round trips.
             self.outbox.bytes() <= self.settings.backpressure / 2
+                || (self.outbox.bytes() < self.settings.backpressure
+                    && self.outbox.unsent() < self.window.whole())
         } else {
             self.outbox.bytes() < self.settings.backpressure
                 && self
@@ -690,10 +700,14 @@ impl Node<'_> {
         // When no first send could go (none left, or the window is held by
         // changes waiting on repair), repair is all the node can do, and the
         // quarter would leave it waiting on sends that cannot come.
-        let quarter = if firsts.is_empty() {
+        let quarter = if !firsts.is_empty() {
+            self.resend_room()
+        } else if self.outbox.unsent() == 0 {
             self.resend_room().max(IDLE_RESENDS)
         } else {
-            self.resend_room()
+            // The window is held by changes waiting on repair: just enough
+            // resends to free it.
+            self.resend_room().max(BLOCKED_RESENDS)
         };
         let room = quarter.min(PER_TICK.saturating_sub(sent));
         let resends = self.outbox.resends(instant, &self.timing, room)?;
