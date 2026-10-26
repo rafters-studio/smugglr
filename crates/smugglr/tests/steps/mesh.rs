@@ -1569,7 +1569,7 @@ fn not_resent(front: &Front) -> Result<(), String> {
 
 /// The graveyard, in seconds, of the replay scenario's nodes: short, so a
 /// logged change is past its own sunset by the time it is replayed.
-const REPLAY_GRAVEYARD: u64 = 3;
+const REPLAY_GRAVEYARD: u64 = 6;
 
 impl Front {
     /// Runs smugglr with `args` as node `index` runs, on its database, and

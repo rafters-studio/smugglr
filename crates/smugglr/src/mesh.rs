@@ -76,7 +76,8 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
     };
     if let Some(change) = replay {
         return match smugglr_mesh::replay(place.as_mut(), &settings, &change) {
-            Ok(()) => ExitCode::SUCCESS,
+            Ok(true) => ExitCode::SUCCESS,
+            Ok(false) => ExitCode::from(STOPPED),
             Err(err @ smugglr_mesh::Error::NotDropped(_)) => {
                 eprintln!("{err}");
                 ExitCode::from(USAGE)

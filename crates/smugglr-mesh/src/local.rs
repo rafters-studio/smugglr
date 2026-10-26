@@ -398,7 +398,8 @@ impl Local {
     /// leaves the log and is decided like any change, overriding its drop;
     /// dropped again, it goes back in. What it writes is not noted as the
     /// row's last hash, so the node's next run finds it as its own change
-    /// and sends it to its peers. `None` when the log holds no such change.
+    /// and sends it to its peers; one that waits for its `from` stays in the
+    /// log. `None` when the log holds no such change.
     pub(crate) fn replay_dropped(
         &mut self,
         place: &mut dyn Place,
@@ -411,9 +412,19 @@ impl Local {
         let Some(resent) = envelope::replay(&self.dropped, hash, sunset, sign) else {
             return Ok(None);
         };
-        self.dropped.retain(|logged| &logged.signature != hash);
+        let at = self
+            .dropped
+            .iter()
+            .position(|logged| &logged.signature == hash);
+        let logged = at.map(|at| self.dropped.remove(at));
         self.named.remove(hash);
         let applied = self.decide(place, settings, sign, &[resent], now, true)?;
+        // A replay that waits has no one to send it again: it stays logged.
+        if !applied.waiting.is_empty()
+            && let Some(logged) = logged
+        {
+            self.log_dropped(logged);
+        }
         self.rewrite()?;
         Ok(Some(applied))
     }

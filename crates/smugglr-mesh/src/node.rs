@@ -103,13 +103,14 @@ const RECEIVE_BUFFER: usize = 8 << 20;
 /// Replays the change the node's dropped log holds under `change`, its
 /// change hash as hex (FR-SMUGGLR-076): re-sends it with a fresh sunset,
 /// overriding its drop, decides it on the node's own database through the
-/// one decision path, prints what came of it, and returns.
+/// one decision path, prints what came of it, and returns whether it was
+/// decided: `false` when it waits for its `from`, and so stays in the log.
 ///
 /// # Errors
 /// [`Error::NotDropped`] when the dropped log holds no such change; when the
 /// node holds no key; or when its place or what smugglr keeps for it cannot
 /// be read or written.
-pub fn replay(place: &mut dyn Place, settings: &Settings, change: &str) -> Result<(), Error> {
+pub fn replay(place: &mut dyn Place, settings: &Settings, change: &str) -> Result<bool, Error> {
     let newest = settings.keys.last().ok_or(Error::NoKey)?;
     let not_dropped = || Error::NotDropped(change.to_owned());
     let hash: [u8; 32] = unhex(change)
@@ -117,11 +118,15 @@ pub fn replay(place: &mut dyn Place, settings: &Settings, change: &str) -> Resul
         .ok_or_else(not_dropped)?;
     let folder = folder(place);
     let mut local = Local::open(place, settings, &folder, now())?;
-    local
+    let applied = local
         .replay_dropped(place, settings, &signing(newest), &hash, now())?
         .ok_or_else(not_dropped)?;
+    if !applied.waiting.is_empty() {
+        println!("smugglr mesh: change {change} waits for its from; it stays in the dropped log");
+        return Ok(false);
+    }
     println!("smugglr mesh: replayed change {change}");
-    Ok(())
+    Ok(true)
 }
 
 /// Where smugglr keeps what the node whose database is `place` needs.
