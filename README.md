@@ -21,35 +21,48 @@ The first place named is the source, the second the target. `--dryrun` writes no
 ```
 $ smugglr sync laptop/shop.db server/shop.db --dryrun
 smugglr sync: preview
-  products: would move, 1 to target, 1 to source, 1 deleted in target, 0 deleted in source, 0 overwritten in target, 0 overwritten in source
-    deleted in target: sku-0233
+  first sync: a row on one side only is copied as new; deletes are not seen
+  weight: 3 rows, 68 B in 1 table
+  products: would move, 3 to target, 0 to source, 0 deleted in target, 0 deleted in source, 0 overwritten in target, 0 overwritten in source
 ```
 
 ```
 $ smugglr sync laptop/shop.db server/shop.db
-smugglr sync: stopped
-  products: stopped
-    rows: sku-0412
-    These rows changed in both places since the last sync. smugglr stops rather than choose. Rerun with --sync-mode source or target to keep one place's copy, or name a steering column and use --sync-mode last.
+smugglr sync: done
+  first sync: a row on one side only is copied as new; deletes are not seen
+  weight: 3 rows, 68 B in 1 table
+  products: moved, 3 to target, 0 to source, 0 deleted in target, 0 deleted in source, 0 overwritten in target, 0 overwritten in source
 $ echo $?
-3
+0
 ```
 
-Same counts. Run it again and the record says `in step`. Add `--json` and the record is one JSON object:
+Same counts. Run it again and the record says `in step`:
+
+```
+$ smugglr sync laptop/shop.db server/shop.db
+smugglr sync: done
+  products: in step
+```
+
+After a row is edited on each side and another deleted, `--json` prints the record as one JSON object:
 
 ```
 $ smugglr sync laptop/shop.db server/shop.db --json
 {
-  "status": "stopped",
+  "status": "done",
   "first_sync": false,
   "deletes_seen": true,
   "tables": {
     "products": {
-      "status": "stopped",
-      "rows": [
-        "sku-0412"
+      "status": "moved",
+      "to_target": 1,
+      "to_source": 1,
+      "deleted_in_target": [
+        "sku-0233"
       ],
-      "why": "These rows changed in both places since the last sync. smugglr stops rather than choose. Rerun with --sync-mode source or target to keep one place's copy, or name a steering column and use --sync-mode last."
+      "deleted_in_source": [],
+      "overwritten_in_target": [],
+      "overwritten_in_source": []
     }
   },
   "ignored": []
@@ -140,7 +153,10 @@ blobs/1793029348893-b3e7393d49f72c5cb0802f80bfc414ca.blob
 ```
 $ smugglr retrieve b/shop.db blobs --key-file shop.key --node phone
 smugglr sync: done
+  products: moved, 3 to target, 0 to source, 0 deleted in target, 0 deleted in source, 0 overwritten in target, 0 overwritten in source
   targets remaining: 
+$ echo $?
+0
 ```
 
 A retrieve drops changes the same way, and names each with its change hash. `smugglr retrieve <place> --key-file <path> --node <name> --replay <change hash>` takes no blob; it decides the dropped change again and exits. A change dropped here is a row re-created inside the graveyard window:
@@ -185,7 +201,7 @@ $ smugglr mesh keygen --key-file ./mesh.key
 smugglr mesh: wrote key 180627566f7a4e3b to ./mesh.key
 ```
 
-The key file holds one base64 key per line, newest last; a line starting with `#` is a note. A node signs and seals with the newest key and also accepts the one before it, so a key is rotated by appending a new one. On unix a node refuses a key file its group or others can read, and exits 2:
+The key file holds one base64 key per line, newest last; a line starting with `#` is a note. A node signs and seals with the newest key and also accepts the one before it; a datagram sealed with an older key does not open. A key is rotated by appending a new one. On unix a node refuses a key file its group or others can read, and exits 2:
 
 ```
 $ chmod 644 ./loose.key
@@ -302,7 +318,7 @@ Designed and tested for up to 50 nodes. Clocks should agree to within one twelft
 
 - Automatic catch-up past the sunset (#521). A node away longer than the sunset prints the commands above; the person runs `smugglr stash` and `smugglr retrieve`.
 - `smugglr mesh remove` (#521). A node gone for good stops being a target when the sunset passes.
-- Retiring the previous key. A node accepts the key before the newest with no end date.
+- Retiring the previous key. A node accepts the key before the newest with no end date; nothing removes it but taking it out of the key file.
 - A loud name clash (#521). Two machines with one name ignore each other and nothing says so.
 - The `mesh_wire` setting, which belongs to the automatic catch-up.
 

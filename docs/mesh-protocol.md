@@ -37,7 +37,7 @@ Scope: designed and tested for up to 50 nodes. Acknowledgements grow with the no
 
 The key file holds one key per line, base64 of 32 bytes, newest last. A line starting with `#` is a note. A file with one key is the single key.
 
-A node signs and seals with the newest key and accepts the one before it. In 0.6.1 the previous key is accepted with no retirement: the rule that drops it once its last change passes its sunset is not built.
+A node signs and seals with the newest key and accepts the one before it. A datagram sealed with an older key does not open (checked in 0.6.1 with a three-key file). In 0.6.1 the previous key is accepted with no retirement: the rule that drops it once its last change passes its sunset is not built, and nothing removes it but taking it out of the key file.
 
 `smugglr mesh keygen --key-file <path>` appends a new key from the operating system's random source, and makes the file when there is none. A key is rotated by appending a new one.
 
