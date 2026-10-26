@@ -377,10 +377,7 @@ impl Run {
                 .iter()
                 .filter(|(key, envelope)| {
                     let to = envelope.change.to;
-                    own(key)
-                        && !dead.contains(**key)
-                        && to != at_stash.get(**key).copied()
-                        && to != here.get(**key).copied()
+                    own(key) && to != at_stash.get(**key).copied() && to != here.get(**key).copied()
                 })
                 .map(|(_, envelope)| (*envelope).clone())
                 .collect();
