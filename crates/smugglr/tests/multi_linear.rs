@@ -36,7 +36,6 @@ fn time_whole_retrieve(rows: u32) -> Result<Duration, Box<dyn std::error::Error>
         sync_mode: SyncMode::Stop,
         steering: Steering::default(),
         ignore: Vec::new(),
-        max_value: smugglr_core::weight::DEFAULT_MAX_VALUE,
     };
     let blob = stash(
         &mut LocalFile::open(folder.join("a.db"))?,

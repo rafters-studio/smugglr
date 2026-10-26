@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
-use crate::wire::{Message, RANGES, Range};
+use crate::wire::{Id, Message, RANGES, Range};
 
 /// The bytes of a change's message one part carries, so a sealed part stays
 /// within [`crate::wire::DATAGRAM`].
@@ -116,7 +116,7 @@ fn count(len: usize) -> u64 {
 #[derive(Debug)]
 pub(crate) struct Piece {
     pub(crate) peer: String,
-    pub(crate) row: [u8; 16],
+    pub(crate) id: Id,
     pub(crate) n: u64,
     pub(crate) count: u64,
     pub(crate) data: Vec<u8>,
@@ -146,7 +146,7 @@ struct PeerOut {
 #[derive(Debug)]
 struct Out {
     change: [u8; 32],
-    row: [u8; 16],
+    id: Id,
     message: Vec<u8>,
     count: u64,
     peers: BTreeMap<String, PeerOut>,
@@ -161,7 +161,7 @@ impl Out {
         let end = start.saturating_add(PART).min(self.message.len());
         Piece {
             peer,
-            row: self.row,
+            id: self.id,
             n,
             count: self.count,
             data: self.message[start..end].to_vec(),
@@ -177,12 +177,12 @@ pub(crate) struct Sending {
 }
 
 impl Sending {
-    /// The change `change`, whose row hash is `row` and whose message is
-    /// `message`, goes in parts to `peers`.
+    /// The change `change`, whose `from` and `to` are `id` and whose
+    /// message is `message`, goes in parts to `peers`.
     pub(crate) fn start(
         &mut self,
         change: [u8; 32],
-        row: [u8; 16],
+        id: Id,
         message: Vec<u8>,
         peers: &BTreeSet<String>,
     ) {
@@ -191,7 +191,7 @@ impl Sending {
         }
         self.outs.push(Out {
             change,
-            row,
+            id,
             count: count(message.len()),
             message,
             peers: peers
@@ -354,7 +354,7 @@ impl Sending {
         pieces
     }
 
-    /// `peer` has the parts `have` of the change keyed by `row` and misses
+    /// `peer` has the parts `have` of the change keyed by `id` and misses
     /// `missing`; a part it names missing is resent even if it was
     /// acknowledged, since a peer that started again lost it. Gives, for
     /// each part acknowledged for the first time, its round trip (`None`
@@ -362,13 +362,13 @@ impl Sending {
     pub(crate) fn ack(
         &mut self,
         peer: &str,
-        row: &[u8; 16],
+        id: &Id,
         have: &[Range],
         missing: &[Range],
         now: Instant,
     ) -> Vec<Option<Duration>> {
         let mut acked = Vec::new();
-        for out in self.outs.iter_mut().filter(|out| out.row == *row) {
+        for out in self.outs.iter_mut().filter(|out| out.id == *id) {
             let count = out.count;
             let Some(state) = out.peers.get_mut(peer) else {
                 continue;
@@ -419,33 +419,59 @@ struct In {
     every: bool,
 }
 
-/// The changes a node assembles from their parts, by maker and row hash.
+/// The changes a node assembles from their parts, by maker and change.
 #[derive(Debug, Default)]
 pub(crate) struct Receiving {
-    ins: HashMap<(String, [u8; 16]), In>,
+    /// The most bytes a change's message may take here; a change of more
+    /// parts is let go before anything is kept for it.
+    most: u64,
+    /// The changes let go for their size, so each is named once.
+    too_large: std::collections::HashSet<(String, Id)>,
+    ins: HashMap<(String, Id), In>,
     /// Changes assembled lately, so a late copy of a part is acknowledged,
     /// not begun again.
-    done: HashMap<(String, [u8; 16]), Instant>,
+    done: HashMap<(String, Id), Instant>,
     /// Acknowledgements of parts of changes already assembled.
-    late: Vec<(String, [u8; 16], u64)>,
+    late: Vec<(String, Id, u64)>,
 }
 
 impl Receiving {
-    /// Takes in part `n` of `count` of the change keyed by `row` from
+    /// Assembles changes whose values are at most `limit` bytes, the node's
+    /// value limit: a message of up to four times that, a blob's hex for
+    /// about two such values, and a mebibyte besides for the rest of the
+    /// row and the envelope.
+    pub(crate) fn new(limit: u64) -> Self {
+        Self {
+            most: limit.saturating_mul(4).saturating_add(1 << 20),
+            ..Self::default()
+        }
+    }
+
+    /// Takes in part `n` of `count` of the change keyed by `id` from
     /// `maker`; the change's message, once every part has arrived.
     pub(crate) fn part(
         &mut self,
         maker: &str,
-        row: [u8; 16],
+        id: Id,
         (n, count): (u64, u64),
         data: &[u8],
     ) -> Option<Vec<u8>> {
         if n >= count || data.len() > PART {
             return None;
         }
-        let key = (maker.to_owned(), row);
+        let key = (maker.to_owned(), id);
+        if count.saturating_mul(PART as u64) > self.most {
+            if self.too_large.insert(key) {
+                println!(
+                    "smugglr mesh: let go a change from {maker} in {count} parts: more than \
+                     the {} bytes a change may take here",
+                    self.most
+                );
+            }
+            return None;
+        }
         if self.done.contains_key(&key) {
-            self.late.push((maker.to_owned(), row, n));
+            self.late.push((maker.to_owned(), id, n));
             return None;
         }
         let assembling = self.ins.entry(key.clone()).or_insert_with(|| In {
@@ -483,7 +509,7 @@ impl Receiving {
         }
         let whole = self.ins.remove(&key)?;
         self.late
-            .extend(whole.fresh.iter().map(|&n| (maker.to_owned(), row, n)));
+            .extend(whole.fresh.iter().map(|&n| (maker.to_owned(), id, n)));
         self.done.insert(key, Instant::now());
         Some(whole.message)
     }
@@ -494,25 +520,25 @@ impl Receiving {
     /// stalled).
     pub(crate) fn acks(&mut self, node: &str) -> Vec<(String, Message)> {
         let mut acks = Vec::new();
-        let mut late: BTreeMap<(String, [u8; 16]), Vec<u64>> = BTreeMap::new();
-        for (maker, row, n) in self.late.drain(..) {
-            late.entry((maker, row)).or_default().push(n);
+        let mut late: BTreeMap<(String, Id), Vec<u64>> = BTreeMap::new();
+        for (maker, id, n) in self.late.drain(..) {
+            late.entry((maker, id)).or_default().push(n);
         }
-        for ((maker, row), numbers) in late {
+        for ((maker, id), numbers) in late {
             for have in ranges(numbers).chunks(RANGES) {
                 acks.push((
                     maker.clone(),
                     Message::Parts {
                         sender: node.to_owned(),
                         maker: maker.clone(),
-                        row,
+                        id,
                         have: have.to_vec(),
                         missing: Vec::new(),
                     },
                 ));
             }
         }
-        for ((maker, row), assembling) in &mut self.ins {
+        for ((maker, id), assembling) in &mut self.ins {
             if assembling.last.elapsed() >= STALLED {
                 assembling.every = true;
                 assembling.last = Instant::now();
@@ -538,7 +564,7 @@ impl Receiving {
                     Message::Parts {
                         sender: node.to_owned(),
                         maker: maker.clone(),
-                        row: *row,
+                        id: *id,
                         have: have.to_vec(),
                         missing: std::mem::take(&mut missing),
                     },
@@ -584,29 +610,29 @@ mod tests {
         let mut sending = Sending::default();
         sending.start(
             [1; 32],
-            [2; 16],
+            (None, [2; 16]),
             message.clone(),
             &BTreeSet::from(["b".to_owned()]),
         );
         let now = Instant::now();
         let pieces = sending.firsts(100, now);
         assert_eq!(pieces.len(), 4);
-        let mut receiving = Receiving::default();
+        let mut receiving = Receiving::new(1_000);
         // Part 1 is lost.
         for piece in pieces.iter().filter(|piece| piece.n != 1) {
             assert_eq!(
-                receiving.part("a", piece.row, (piece.n, piece.count), &piece.data),
+                receiving.part("a", piece.id, (piece.n, piece.count), &piece.data),
                 None
             );
         }
         let acks = receiving.acks("b");
         for (_, ack) in &acks {
             if let crate::wire::Message::Parts {
-                row, have, missing, ..
+                id, have, missing, ..
             } = ack
             {
                 assert_eq!(missing, &vec![(1, 2)]);
-                sending.ack("b", row, have, missing, now);
+                sending.ack("b", id, have, missing, now);
             }
         }
         let resent = sending.resends(now + super::AGAIN, |_| None, 100);
@@ -616,8 +642,14 @@ mod tests {
         );
         let piece = &resent[0];
         assert_eq!(
-            receiving.part("a", piece.row, (piece.n, piece.count), &piece.data),
+            receiving.part("a", piece.id, (piece.n, piece.count), &piece.data),
             Some(message)
         );
+        // A change of more parts than the node's limit allows is let go
+        // before anything is kept for it.
+        let mut small = Receiving::new(0);
+        let parts = (1 << 20) / PART as u64 + 2;
+        assert_eq!(small.part("a", (None, [3; 16]), (0, parts), &[1]), None);
+        assert!(small.ins.is_empty());
     }
 }

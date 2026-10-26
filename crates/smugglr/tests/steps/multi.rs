@@ -396,7 +396,6 @@ fn the_app_calls_retrieve(world: &World, devices: &Devices) -> Result<(), String
         sync_mode: SyncMode::Stop,
         steering: smugglr_core::steering::Steering::default(),
         ignore: Vec::new(),
-        max_value: smugglr_core::weight::DEFAULT_MAX_VALUE,
     };
     let record = smugglr_multi::retrieve(&mut place, &[blob], &settings, &[])
         .map_err(|err| err.to_string())?;

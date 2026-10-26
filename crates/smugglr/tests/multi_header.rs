@@ -42,7 +42,6 @@ fn devices() -> Result<(PathBuf, Settings), String> {
         sync_mode: SyncMode::Stop,
         steering: Steering::default(),
         ignore: Vec::new(),
-        max_value: smugglr_core::weight::DEFAULT_MAX_VALUE,
     };
     // b has stashed, so a whole take would replace each row of b's.
     let b = Settings {

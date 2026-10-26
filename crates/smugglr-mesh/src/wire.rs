@@ -28,6 +28,26 @@ pub(crate) const RANGES: usize = 16;
 /// Part numbers `[start, end)`.
 pub(crate) type Range = (u64, u64);
 
+/// What keys a change's parts: its `from` and its `to`, so a row that
+/// comes back to an earlier content is a new change, not late copies.
+pub(crate) type Id = (Option<[u8; 16]>, [u8; 16]);
+
+fn id_json((from, to): &Id) -> (Value, Value) {
+    (
+        from.map_or(Value::Null, |from| json!(hex(&from))),
+        json!(hex(to)),
+    )
+}
+
+fn id_of(json: &Value) -> Option<Id> {
+    let to = unhex(json.get("to")?.as_str()?)?.try_into().ok()?;
+    let from = match json.get("from")? {
+        Value::Null => None,
+        from => Some(unhex(from.as_str()?)?.try_into().ok()?),
+    };
+    Some((from, to))
+}
+
 /// One message between nodes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Message {
@@ -60,8 +80,8 @@ pub(crate) enum Message {
     Part {
         /// The maker.
         sender: String,
-        /// The change's row hash, its `to`, which keys its parts.
-        row: [u8; 16],
+        /// The change's `from` and `to`, which key its parts.
+        id: Id,
         /// The part's number, from 0.
         n: u64,
         /// How many parts the change has.
@@ -76,8 +96,8 @@ pub(crate) enum Message {
         sender: String,
         /// The change's maker.
         maker: String,
-        /// The change's row hash.
-        row: [u8; 16],
+        /// The change's `from` and `to`.
+        id: Id,
         /// Parts that arrived, at most [`RANGES`].
         have: Vec<Range>,
         /// Parts missing, at most [`RANGES`].
@@ -120,14 +140,15 @@ impl Message {
             }
             Self::Part {
                 sender,
-                row,
+                id,
                 n,
                 count,
                 data,
             } => json!({
                 "t": "part",
                 "sender": sender,
-                "row": hex(row),
+                "from": id_json(id).0,
+                "to": id_json(id).1,
                 "n": n,
                 "count": count,
                 "data": base64(data),
@@ -135,14 +156,15 @@ impl Message {
             Self::Parts {
                 sender,
                 maker,
-                row,
+                id,
                 have,
                 missing,
             } => json!({
                 "t": "parts",
                 "sender": sender,
                 "maker": maker,
-                "row": hex(row),
+                "from": id_json(id).0,
+                "to": id_json(id).1,
                 "have": have,
                 "missing": missing,
             }),
@@ -171,7 +193,7 @@ impl Message {
             }),
             "part" => Some(Self::Part {
                 sender,
-                row: unhex(json.get("row")?.as_str()?)?.try_into().ok()?,
+                id: id_of(json)?,
                 n: json.get("n")?.as_u64()?,
                 count: json.get("count")?.as_u64()?,
                 data: unbase64(json.get("data")?.as_str()?)?,
@@ -187,7 +209,7 @@ impl Message {
                 Some(Self::Parts {
                     sender,
                     maker: text("maker")?,
-                    row: unhex(json.get("row")?.as_str()?)?.try_into().ok()?,
+                    id: id_of(json)?,
                     have: ranges("have")?,
                     missing: ranges("missing")?,
                 })
@@ -267,7 +289,7 @@ mod tests {
     fn a_part_and_its_acknowledgement_fit_one_datagram_and_open() {
         let part = Message::Part {
             sender: "a-machine-with-a-long-name.local".to_owned(),
-            row: [9; 16],
+            id: (Some([8; 16]), [9; 16]),
             n: 999_999_999,
             count: 999_999_999,
             data: vec![0xff; crate::parts::PART],
@@ -275,7 +297,7 @@ mod tests {
         let parts = Message::Parts {
             sender: "a-machine-with-a-long-name.local".to_owned(),
             maker: "another-machine-with-a-long-name".to_owned(),
-            row: [9; 16],
+            id: (Some([8; 16]), [9; 16]),
             have: vec![(999_999_990, 999_999_999); super::RANGES],
             missing: vec![(999_999_990, 999_999_999); super::RANGES],
         };

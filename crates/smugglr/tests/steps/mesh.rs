@@ -1910,3 +1910,38 @@ fn the_second_names_the_value(front: &Front) -> Result<(), String> {
 fn the_second_holds_the_small_row(front: &Front) -> Result<(), String> {
     front.holds(1, "after", "small")
 }
+
+/// A change its own maker refuses for a value over its limit leaves the
+/// key's last hash where its peers hold it, so the next edit that fits
+/// crosses; the maker names the refusal once, not on every look.
+#[test]
+fn a_change_its_maker_refuses_leaves_the_next_edit_free_to_cross() -> Result<(), String> {
+    let (world, front) = (World::default(), Front::default());
+    two_on_a_relay_with(
+        &world,
+        &front,
+        false,
+        ["max_value = \"1 MB\"\n", ""],
+        FrontEnd::Mesh,
+    )?;
+    front.sql(0, "INSERT INTO notes VALUES ('k', 'first')")?;
+    front.holds(1, "k", "first")?;
+    front.sql(
+        0,
+        &format!("UPDATE notes SET body = {TWO_MB} WHERE id = 'k'"),
+    )?;
+    front.prints(0, "refused: notes k")?;
+    // Several looks at the row while it is over the limit.
+    sleep(Duration::from_secs(3));
+    front.sql(0, "UPDATE notes SET body = 'fits' WHERE id = 'k'")?;
+    front.holds(1, "k", "fits")?;
+    let named = front
+        .with(0, Node::printed)?
+        .matches("refused: notes k")
+        .count();
+    if named == 1 {
+        Ok(())
+    } else {
+        Err(format!("the first node named the refusal {named} times"))
+    }
+}

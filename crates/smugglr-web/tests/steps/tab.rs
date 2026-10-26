@@ -254,7 +254,6 @@ impl Web {
             sync_mode: SyncMode::Stop,
             steering: Steering::default(),
             ignore: Vec::new(),
-            max_value: smugglr_core::weight::DEFAULT_MAX_VALUE,
         })
     }
 

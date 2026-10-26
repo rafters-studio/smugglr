@@ -7,7 +7,6 @@ use smugglr_core::change::{Change, op};
 use smugglr_core::envelope::{self, Arrival, Envelope, Here, receive, receive_replayed};
 use smugglr_core::hex::{hex, unhex};
 use smugglr_core::plan::{Hashes, Side, SyncMode};
-use smugglr_core::record::Refused;
 use smugglr_core::record::{
     self, CHANGED_HERE_AND_IN_BLOB, Dropped, EDIT_VERSUS_DELETE, Key as Named, Moves, PAST_SUNSET,
     REFUSED, Record, WAITING,
@@ -48,41 +47,15 @@ pub fn retrieve(
         ),
         _ => None,
     };
-    let (tables, ignored) = tables(place, settings)?;
     let (mut accepted, mut refused) = (Vec::new(), Vec::new());
-    // A change with a value over the value limit is named and not taken
-    // (FR-SMUGGLR-071).
-    let (limit, address) = settings.limit(place);
-    let mut over = Vec::new();
     for blob in blobs {
-        if let Some(why) = refusal(blob, settings) {
-            refused.push((blob, why));
-        } else {
-            let mut blob = blob.clone();
-            blob.changes.retain(|envelope| {
-                let change = &envelope.change;
-                let columns = tables
-                    .iter()
-                    .find(|table| table.name == change.table)
-                    .map_or(&[][..], |table| table.columns.as_slice());
-                match Refused::find(
-                    &change.table,
-                    columns,
-                    &change.key,
-                    &change.values,
-                    (limit, &address),
-                ) {
-                    Some(refused) => {
-                        over.push(refused);
-                        false
-                    }
-                    None => true,
-                }
-            });
-            accepted.push(blob);
+        match refusal(blob, settings) {
+            Some(why) => refused.push((blob, why)),
+            None => accepted.push(blob.clone()),
         }
     }
     let blobs = accepted.as_slice();
+    let (tables, ignored) = tables(place, settings)?;
     if let Some(mismatch) = mismatch(blobs, &tables, &ignored) {
         let mut record = Record::shape_mismatch(mismatch, ignored, false);
         record.targets_remaining = remaining;
@@ -105,7 +78,6 @@ pub fn retrieve(
     run.receive_all(place, envelopes, settings)?;
     let mut record = run.finish(place, ignored, settings)?;
     record.targets_remaining = remaining;
-    record.refused = over;
     Ok(record)
 }
 

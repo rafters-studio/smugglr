@@ -337,6 +337,9 @@ fn write_all(
             continue;
         };
         if dryrun {
+            // A dry run writes nothing and names what it would refuse.
+            let refused = refused(&table, &mut *source, &mut *target, &writes, wrote.max_value)?;
+            wrote.refused.extend(refused);
             continue;
         }
         wrote.writing = Some(table.name.clone());
@@ -757,6 +760,47 @@ fn key_of(table: &Table, row: &[String]) -> Option<Vec<String>> {
             row.get(i).cloned()
         })
         .collect()
+}
+
+/// The rows of `writes` a run would refuse for a value over the value
+/// limit, each read from the place it is copied from, `CHUNK` at a time.
+fn refused(
+    table: &Table,
+    source: &mut dyn Place,
+    target: &mut dyn Place,
+    writes: &[Write],
+    max_value: u64,
+) -> Result<Vec<Refused>, Error> {
+    let mut refused = side_refused(table, source, target, writes, Side::Target, max_value)?;
+    refused.extend(side_refused(
+        table,
+        target,
+        source,
+        writes,
+        Side::Source,
+        max_value,
+    )?);
+    Ok(refused)
+}
+
+/// The rows of `writes` for `side`, whose place is `to`, that a run would
+/// refuse, read from `from`.
+fn side_refused(
+    table: &Table,
+    from: &mut dyn Place,
+    to: &dyn Place,
+    writes: &[Write],
+    side: Side,
+    max_value: u64,
+) -> Result<Vec<Refused>, Error> {
+    let (limit, place) = limit(from, to, max_value);
+    let place = place.to_owned();
+    let side: Vec<Write> = writes.iter().filter(|w| w.side == side).cloned().collect();
+    let mut refused = Vec::new();
+    for writes in side.chunks(CHUNK) {
+        refused.extend(changes(table, from, writes, (limit, &place))?.1);
+    }
+    Ok(refused)
 }
 
 /// The value limit between `from` and `to` (FR-SMUGGLR-071): the smaller of

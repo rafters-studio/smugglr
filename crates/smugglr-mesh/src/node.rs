@@ -39,7 +39,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 use crate::local::{Local, limit, refuse};
 use crate::outbox::{Acked, Outbox, Timing};
 use crate::parts::{Piece, Receiving, Sending};
-use crate::wire::{ACKS, DATAGRAM, Message, Range, decode, encode, open, seal, sealed_len};
+use crate::wire::{ACKS, DATAGRAM, Id, Message, Range, decode, encode, open, seal, sealed_len};
 use crate::{CHUNK, Error, Settings, sealing, signing};
 
 /// How long a node waits for a datagram before it looks at its clocks.
@@ -164,7 +164,7 @@ pub fn run(place: &mut dyn Place, settings: &Settings, stop: &AtomicBool) -> Res
         local,
         outbox,
         sending: Sending::default(),
-        receiving: Receiving::default(),
+        receiving: Receiving::new(limit(place, settings).0),
         peers: BTreeSet::new(),
         timing: HashMap::new(),
         sent: std::cell::Cell::new(0),
@@ -486,12 +486,7 @@ impl Node<'_> {
                 // In the outbox first, then kept as each key's last hash:
                 // a step that fails leaves the rows to be found again.
                 self.outbox.add(&found.found, &self.peers)?;
-            }
-            // A change refused for a value over the limit is kept as the
-            // key's last hash too, so it is named once, not on every look.
-            let kept: Vec<Envelope> = found.found.into_iter().chain(found.refused).collect();
-            if !kept.is_empty() {
-                self.local.keep(&kept)?;
+                self.local.keep(&found.found)?;
             }
             self.scanned = Some(Instant::now());
             self.scan_took = started.elapsed();
@@ -591,20 +586,20 @@ impl Node<'_> {
             Message::Announce { .. } => {}
             Message::Part {
                 sender,
-                row,
+                id,
                 n,
                 count,
                 data,
-            } => self.hear_part(&sender, row, (n, count), &data, (from, batch)),
+            } => self.hear_part(&sender, id, (n, count), &data, (from, batch)),
             Message::Parts {
                 sender,
                 maker,
-                row,
+                id,
                 have,
                 missing,
             } => {
                 if maker == self.settings.node {
-                    self.hear_parts(&sender, &row, &have, &missing);
+                    self.hear_parts(&sender, &id, &have, &missing);
                 }
             }
             Message::Ack {
@@ -661,7 +656,7 @@ impl Node<'_> {
     fn hear_part(
         &mut self,
         sender: &str,
-        row: [u8; 16],
+        id: Id,
         (n, count): (u64, u64),
         data: &[u8],
         (from, batch): (SocketAddr, &mut Vec<(String, Envelope)>),
@@ -670,7 +665,7 @@ impl Node<'_> {
             envelope, resend, ..
         }) = self
             .receiving
-            .part(sender, row, (n, count), data)
+            .part(sender, id, (n, count), data)
             .and_then(|whole| decode(&whole))
         {
             let change = Message::Change {
@@ -682,12 +677,12 @@ impl Node<'_> {
         }
     }
 
-    /// `peer` has the parts `have` of this node's change keyed by `row`, and
+    /// `peer` has the parts `have` of this node's change keyed by `id`, and
     /// misses `missing`; each first acknowledgement grows the window as a
     /// change's does.
-    fn hear_parts(&mut self, peer: &str, row: &[u8; 16], have: &[Range], missing: &[Range]) {
+    fn hear_parts(&mut self, peer: &str, id: &Id, have: &[Range], missing: &[Range]) {
         let now = Instant::now();
-        for round_trip in self.sending.ack(peer, row, have, missing, now) {
+        for round_trip in self.sending.ack(peer, id, have, missing, now) {
             self.acked(
                 peer,
                 Acked {
@@ -891,7 +886,7 @@ impl Node<'_> {
         for piece in pieces {
             let part = Message::Part {
                 sender: self.settings.node.clone(),
-                row: piece.row,
+                id: piece.id,
                 n: piece.n,
                 count: piece.count,
                 data: piece.data,
@@ -983,7 +978,7 @@ impl Node<'_> {
             if large {
                 self.sending.start(
                     envelope.signature,
-                    envelope.change.to.unwrap_or_default(),
+                    (envelope.change.from, envelope.change.to.unwrap_or_default()),
                     message,
                     &self.peers,
                 );
@@ -1028,7 +1023,7 @@ impl Node<'_> {
                 if !self.sending.sends(&envelope.signature) {
                     self.sending.start(
                         envelope.signature,
-                        envelope.change.to.unwrap_or_default(),
+                        (envelope.change.from, envelope.change.to.unwrap_or_default()),
                         message,
                         &self.peers,
                     );

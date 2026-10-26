@@ -4,12 +4,9 @@ use std::collections::BTreeMap;
 
 use smugglr_core::change::{Change, op};
 use smugglr_core::envelope::{Envelope, VERSION};
-use smugglr_core::plan::Hashes;
-use smugglr_core::record::Refused;
 use smugglr_core::row_hash::row_hash;
-use smugglr_core::weight::over_limit;
 use smugglr_memory::Device;
-use smugglr_place::{Key, Place, Table};
+use smugglr_place::{Key, Place};
 
 use crate::{Blob, Error, Settings, hashes, rows, stamp, tables};
 
@@ -43,9 +40,7 @@ pub fn stash(
         graveyard: Vec::new(),
         signature: [0; 32],
         sunset,
-        refused: Vec::new(),
     };
-    let limit = settings.limit(place);
     for table in &tables {
         let stamp = stamp(table);
         blob.stamps.insert(table.name.clone(), stamp);
@@ -69,15 +64,15 @@ pub fn stash(
         let mut changes = Vec::new();
         for key in keys {
             match values.get(&key) {
-                Some(values) if let Some(over) = over_limit(values, limit.0) => blob
-                    .refused
-                    .push(refused(table, key, over, &limit, (&mut baseline, &before))),
                 Some(values) => {
                     let columns: Vec<&str> = values.iter().map(String::as_str).collect();
                     changes.push((key.clone(), from(&key), Some(row_hash(&columns)), values));
                 }
                 // Deleted while the stash read: the next stash carries it.
-                None => keep_last(&mut baseline, &before, key),
+                None => match before.get(&key) {
+                    Some(hash) => drop(baseline.insert(key, *hash)),
+                    None => drop(baseline.remove(&key)),
+                },
             }
         }
         let empty = Vec::new();
@@ -132,34 +127,4 @@ pub fn stash(
     device.stashed = true;
     device.save(&*settings.store, settings.now)?;
     Ok(blob)
-}
-
-/// Keeps `key`'s last stashed hash in `baseline`, as `before` holds it, so
-/// the next stash carries its row.
-fn keep_last(baseline: &mut Hashes, before: &Hashes, key: Key) {
-    match before.get(&key) {
-        Some(hash) => drop(baseline.insert(key, *hash)),
-        None => drop(baseline.remove(&key)),
-    }
-}
-
-/// The row `key` of `table`, refused for its value of `bytes` in column
-/// `column`, over the limit of `place`: named, and its last hash kept in
-/// `baseline` as `before` holds it, so a later stash carries it once it fits.
-fn refused(
-    table: &Table,
-    key: Key,
-    (column, bytes): (usize, u64),
-    (limit, place): &(u64, String),
-    (baseline, before): (&mut Hashes, &Hashes),
-) -> Refused {
-    let refused = Refused::new(
-        &table.name,
-        &key,
-        table.columns.get(column).map_or("", String::as_str),
-        bytes,
-        (*limit, place),
-    );
-    keep_last(baseline, before, key);
-    refused
 }

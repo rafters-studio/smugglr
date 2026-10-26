@@ -21,7 +21,6 @@ use smugglr_core::envelope::Envelope;
 use smugglr_core::hex::{hex, unhex};
 use smugglr_core::ignore::Ignore;
 use smugglr_core::plan::{Hashes, SyncMode};
-use smugglr_core::record::Refused;
 use smugglr_core::row_hash::row_hash;
 use smugglr_core::shape::{Column, Stamp};
 use smugglr_core::steering::Steering;
@@ -77,21 +76,9 @@ pub struct Settings {
     pub steering: Steering,
     /// The tables to ignore, beside those smugglr always ignores.
     pub ignore: Vec<String>,
-    /// The largest value a row may hold to be stashed or retrieved, below
-    /// the place's own value limit (FR-SMUGGLR-071).
-    pub max_value: u64,
 }
 
 impl Settings {
-    /// The value limit for `place` (FR-SMUGGLR-071): its own, lowered by
-    /// `max_value`, and the place it is named by.
-    fn limit(&self, place: &dyn Place) -> (u64, String) {
-        (
-            place.value_limit().min(self.max_value),
-            place.address().to_owned(),
-        )
-    }
-
     /// The id of the key that signs.
     fn key_id(&self) -> String {
         key_id(&self.key)
@@ -129,9 +116,6 @@ pub struct Blob {
     /// stash time plus the graveyard window. A whole blob past it is dead,
     /// even one with no envelopes.
     pub sunset: u64,
-    /// The rows the stash left out for a value over the value limit, each
-    /// named (FR-SMUGGLR-071); never written into the blob.
-    pub refused: Vec<Refused>,
 }
 
 impl Blob {
@@ -251,7 +235,6 @@ impl Blob {
                 .map(|target| target.as_str().map(str::to_owned))
                 .collect::<Option<_>>()?,
             whole: json.get("whole")?.as_bool()?,
-            refused: Vec::new(),
             changes: envelopes("changes")?,
             graveyard: envelopes("graveyard")?,
             signature: unhex(json.get("signature")?.as_str()?)?.try_into().ok()?,

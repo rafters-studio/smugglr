@@ -189,7 +189,7 @@ impl Place for LocalFile {
     fn weights(&mut self, table: &Table) -> Result<Vec<(Key, u64)>, Error> {
         let width = table.key.len();
         self.connection
-            .prepare(&queries::weights(table))
+            .prepare(&queries::weights(table, LOCAL_LIMIT))
             .and_then(|mut statement| {
                 statement
                     .query_map([], |row| {

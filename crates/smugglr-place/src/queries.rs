@@ -148,12 +148,28 @@ pub(crate) fn quoted_rows(table: &Table, limit: u64) -> String {
 }
 
 /// Each row's key columns' `quote()` text, then the bytes of all its
-/// columns' `quote()` text.
-pub(crate) fn weights(table: &Table) -> String {
+/// columns' `quote()` text, a value over `limit` bytes outside the key
+/// weighed as its unquotable mark, never quoted: it is named when the row is
+/// read to move.
+pub(crate) fn weights(table: &Table, limit: u64) -> String {
+    let one = |column: &String| Table {
+        columns: vec![column.clone()],
+        key: if table.key.contains(column) {
+            vec![column.clone()]
+        } else {
+            Vec::new()
+        },
+        ..table.clone()
+    };
     let bytes: Vec<String> = table
         .columns
         .iter()
-        .map(|column| format!("length(CAST(quote({}) AS BLOB))", ident(column)))
+        .map(|column| {
+            format!(
+                "length(CAST({} AS BLOB))",
+                quoted_within(&one(column), limit)
+            )
+        })
         .collect();
     format!(
         "SELECT {}, {} FROM {}",
