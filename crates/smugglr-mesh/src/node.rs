@@ -2,6 +2,13 @@
 //! changes it hears in batches, acknowledges and echoes them; and resends
 //! its own until every peer has them or their sunset passes.
 //!
+//! First sends and echoes go out as broadcasts; a maker's resends and every
+//! acknowledgement go unicast to the peer's last-seen address at the mesh
+//! port (toy Z), because a link retries a unicast frame and does not retry
+//! a broadcast one. A peer on this same machine shares the port, where a
+//! unicast reaches only one of the sockets on it, so it is sent to by
+//! broadcast.
+//!
 //! A reader thread drains the socket into memory as datagrams arrive, so a
 //! long look at the database or a large batch never leaves the socket's
 //! buffer to overflow. Everything a node sends is paced: first sends are
@@ -11,7 +18,7 @@
 //! first.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -44,6 +51,9 @@ const FIRST_WINDOW: f64 = 32.0;
 
 /// The largest window: a batch's worth of changes.
 const LARGEST: f64 = 20_000.0;
+
+/// How often at most the record names datagrams that did not open.
+const SAY_UNOPENED: Duration = Duration::from_secs(60);
 
 /// How often the outbox and what the node has heard are tidied.
 const TIDY: Duration = Duration::from_secs(1);
@@ -79,6 +89,8 @@ pub fn run(place: &mut dyn Place, settings: &Settings, stop: &AtomicBool) -> Res
         local,
         outbox,
         peers: BTreeSet::new(),
+        addresses: HashMap::new(),
+        own: BTreeSet::new(),
         heard: HashMap::new(),
         waiting: Vec::new(),
         echoes: VecDeque::new(),
@@ -87,6 +99,8 @@ pub fn run(place: &mut dyn Place, settings: &Settings, stop: &AtomicBool) -> Res
         scan_took: Duration::ZERO,
         scan_full: false,
         lost: 0,
+        unopened: 0,
+        said_unopened: None,
         tidied: Instant::now(),
     };
     let (tx, rx) = mpsc::channel();
@@ -95,8 +109,8 @@ pub fn run(place: &mut dyn Place, settings: &Settings, stop: &AtomicBool) -> Res
         scope.spawn(|| {
             let mut buffer = vec![0; 65_536];
             while reading.load(Ordering::Relaxed) {
-                if let Ok((len, _)) = reader.recv_from(&mut buffer)
-                    && tx.send(buffer[..len].to_vec()).is_err()
+                if let Ok((len, from)) = reader.recv_from(&mut buffer)
+                    && tx.send((buffer[..len].to_vec(), from.ip())).is_err()
                 {
                     break;
                 }
@@ -208,6 +222,10 @@ struct Node<'a> {
     outbox: Outbox,
     /// The nodes it has heard.
     peers: BTreeSet<String>,
+    /// Each peer's address, as its last datagram came from.
+    addresses: HashMap<String, IpAddr>,
+    /// This machine's addresses, as the node's own broadcasts come from.
+    own: BTreeSet<IpAddr>,
     heard: HashMap<[u8; 32], Heard>,
     /// Changes that wait for their `from` to appear.
     waiting: Vec<Envelope>,
@@ -220,22 +238,30 @@ struct Node<'a> {
     scan_full: bool,
     /// Changes heard this turn only as a resend.
     lost: usize,
+    /// Datagrams that opened under no key held, since the record last said.
+    unopened: usize,
+    said_unopened: Option<Instant>,
     tidied: Instant,
 }
 
 impl Node<'_> {
     /// Takes in what has arrived, up to a batch, applies it, looks for its
     /// own changes when a look is due, and sends what is due.
-    fn turn(&mut self, place: &mut dyn Place, rx: &Receiver<Vec<u8>>) -> Result<(), Error> {
+    fn turn(
+        &mut self,
+        place: &mut dyn Place,
+        rx: &Receiver<(Vec<u8>, IpAddr)>,
+    ) -> Result<(), Error> {
         let mut batch: Vec<(String, Envelope)> = Vec::new();
         let mut first = match rx.recv_timeout(TICK) {
             Ok(datagram) => Some(datagram),
             Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
         };
-        while let Some(datagram) = first.take().or_else(|| rx.try_recv().ok()) {
-            if let Some(message) = open(&datagram, &self.seal) {
-                self.hear(message, &mut batch);
+        while let Some((datagram, from)) = first.take().or_else(|| rx.try_recv().ok()) {
+            match open(&datagram, &self.seal) {
+                Some(message) => self.hear(message, from, &mut batch),
+                None => self.unopened += 1,
             }
             if batch.len() >= CHUNK {
                 break;
@@ -294,6 +320,24 @@ impl Node<'_> {
             self.scan_took = started.elapsed();
         }
         self.send_due()?;
+        if self.unopened > 0
+            && self
+                .said_unopened
+                .is_none_or(|at| at.elapsed() >= SAY_UNOPENED)
+        {
+            // Another mesh on the port, or a peer holding another key.
+            println!(
+                "smugglr mesh: {} on port {} did not open under a key this node holds",
+                if self.unopened == 1 {
+                    "1 datagram".to_owned()
+                } else {
+                    format!("{} datagrams", self.unopened)
+                },
+                self.settings.port
+            );
+            self.unopened = 0;
+            self.said_unopened = Some(Instant::now());
+        }
         if self.tidied.elapsed() >= TIDY {
             self.tidied = Instant::now();
             let epoch = now();
@@ -307,27 +351,40 @@ impl Node<'_> {
         Ok(())
     }
 
-    fn send(&self, message: &Message) -> std::io::Result<()> {
+    fn send(&self, message: &Message, to: SocketAddr) -> std::io::Result<()> {
         self.socket
-            .send_to(&seal(message, &self.seal[0]), self.to)
+            .send_to(&seal(message, &self.seal[0]), to)
             .map(drop)
     }
 
-    fn change(&self, envelope: &Envelope, resend: bool) -> std::io::Result<()> {
-        self.send(&Message::Change {
-            sender: self.settings.node.clone(),
-            envelope: Box::new(envelope.clone()),
-            resend,
-        })
+    fn change(&self, envelope: &Envelope, resend: bool, to: SocketAddr) -> std::io::Result<()> {
+        self.send(
+            &Message::Change {
+                sender: self.settings.node.clone(),
+                envelope: Box::new(envelope.clone()),
+                resend,
+            },
+            to,
+        )
+    }
+
+    /// Where a message for `peer` alone goes: its last-seen address at the
+    /// mesh port, or the broadcast address for a peer on this machine or one
+    /// whose address is not known.
+    fn address(&self, peer: &str) -> SocketAddr {
+        unicast(self.addresses.get(peer), &self.own, self.settings.port).unwrap_or(self.to)
     }
 
     /// Takes in one message from another node; a change it does not have
     /// yet joins `batch`.
-    fn hear(&mut self, message: Message, batch: &mut Vec<(String, Envelope)>) {
+    fn hear(&mut self, message: Message, from: IpAddr, batch: &mut Vec<(String, Envelope)>) {
         let sender = message.sender().to_owned();
         if sender == self.settings.node {
+            // The node hears its own broadcasts: from its own addresses.
+            self.own.insert(from);
             return;
         }
+        self.addresses.insert(sender.clone(), from);
         if self.peers.insert(sender.clone()) {
             self.outbox.heard(&sender);
         }
@@ -459,11 +516,14 @@ impl Node<'_> {
         for (maker, changes) in acks {
             for changes in changes.chunks(ACKS) {
                 // A lost acknowledgement is covered by the maker's resend.
-                let _ = self.send(&Message::Ack {
-                    sender: self.settings.node.clone(),
-                    maker: maker.clone(),
-                    changes: changes.to_vec(),
-                });
+                let _ = self.send(
+                    &Message::Ack {
+                        sender: self.settings.node.clone(),
+                        maker: maker.clone(),
+                        changes: changes.to_vec(),
+                    },
+                    self.address(&maker),
+                );
             }
         }
     }
@@ -476,18 +536,27 @@ impl Node<'_> {
         if lost {
             self.window.lost();
         }
-        let mut sent = 0;
-        for envelope in &resends {
-            if self.change(envelope, true).is_err() {
-                self.window.lost();
-                return Ok(());
+        let (mut sent, mut changes) = (0, 0);
+        for (envelope, owed) in &resends {
+            // One unicast to each owed peer elsewhere; one broadcast covers
+            // those on this machine or not yet located.
+            let mut to: BTreeSet<SocketAddr> = owed.iter().map(|peer| self.address(peer)).collect();
+            if to.is_empty() {
+                to.insert(self.to);
             }
-            sent += 1;
+            for to in to {
+                if self.change(envelope, true, to).is_err() {
+                    self.window.lost();
+                    return Ok(());
+                }
+                sent += 1;
+            }
+            changes += 1;
         }
-        if sent > 0 {
+        if changes > 0 {
             println!(
-                "smugglr mesh: resent {sent} {} a peer has not acknowledged",
-                if sent == 1 { "change" } else { "changes" }
+                "smugglr mesh: resent {changes} {} a peer has not acknowledged",
+                if changes == 1 { "change" } else { "changes" }
             );
         }
         while sent < PER_TICK && self.echoes.front().is_some_and(|(due, _)| instant >= *due) {
@@ -499,7 +568,7 @@ impl Node<'_> {
                 .get(&envelope.signature)
                 .map_or(0, |heard| heard.copies);
             if copies < self.settings.k {
-                if self.change(&envelope, false).is_err() {
+                if self.change(&envelope, false, self.to).is_err() {
                     self.window.lost();
                     return Ok(());
                 }
@@ -513,7 +582,7 @@ impl Node<'_> {
             .min(PER_TICK - sent);
         let firsts = self.outbox.first_sends(room)?;
         for (at, envelope) in firsts.iter().enumerate() {
-            if self.change(envelope, false).is_err() {
+            if self.change(envelope, false, self.to).is_err() {
                 self.window.lost();
                 self.outbox.unsend(&firsts[at..]);
                 break;
@@ -532,6 +601,14 @@ impl std::fmt::Debug for Node<'_> {
     }
 }
 
+/// The unicast address for a peer last seen at `seen`, at the mesh `port`;
+/// `None` for a peer not yet seen or on this machine (one of `own`, or
+/// loopback), which is sent to by broadcast.
+fn unicast(seen: Option<&IpAddr>, own: &BTreeSet<IpAddr>, port: u16) -> Option<SocketAddr> {
+    let ip = *seen?;
+    (!ip.is_loopback() && !own.contains(&ip)).then(|| SocketAddr::new(ip, port))
+}
+
 /// Now, in seconds since the Unix epoch.
 fn now() -> u64 {
     SystemTime::now()
@@ -542,4 +619,34 @@ fn now() -> u64 {
 /// A random wait of 2 to 4 seconds before an echo.
 fn echo_wait() -> Duration {
     Duration::from_millis(2_000 + u64::from(OsRng.next_u32() % 2_001))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use super::unicast;
+
+    #[test]
+    fn a_peer_elsewhere_is_sent_to_at_its_address_and_the_mesh_port() {
+        let rzr = IpAddr::V4(Ipv4Addr::new(192, 168, 88, 20));
+        let own = BTreeSet::from([IpAddr::V4(Ipv4Addr::new(192, 168, 88, 7))]);
+        assert_eq!(
+            unicast(Some(&rzr), &own, 31337),
+            Some(SocketAddr::new(rzr, 31337))
+        );
+    }
+
+    #[test]
+    fn a_peer_on_this_machine_or_not_yet_seen_is_sent_to_by_broadcast() {
+        let puck = IpAddr::V4(Ipv4Addr::new(192, 168, 88, 7));
+        let own = BTreeSet::from([puck]);
+        assert_eq!(unicast(Some(&puck), &own, 31337), None);
+        assert_eq!(
+            unicast(Some(&IpAddr::V4(Ipv4Addr::LOCALHOST)), &own, 31337),
+            None
+        );
+        assert_eq!(unicast(None, &own, 31337), None);
+    }
 }
