@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-10-26
+
 The mesh release. `smugglr mesh <place> --key-file <path>` keeps a SQLite
 database in step with every machine on the local network that holds the same
 key, with nobody in charge: each node finds its own changes as they happen,
