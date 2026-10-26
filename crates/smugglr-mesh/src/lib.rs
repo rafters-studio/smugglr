@@ -16,9 +16,9 @@
 //! changes it hears in batches, through smugglr-core's one decision path and
 //! the place, one transaction of at most 20,000 changes per table,
 //! acknowledges each to its maker, and echoes it by broadcast once, 2 to 4
-//! seconds later, unless it heard it `k` more times in that wait (RFC 6206's suppression). Multi's stash and
-//! retrieve are the slow, offline path; the mesh's live path does not use
-//! them.
+//! seconds later, unless it heard it `k` more times in that wait (RFC
+//! 6206's suppression). Multi's stash and retrieve are the slow, offline
+//! path; the mesh's live path does not use them.
 //!
 //! The maker resends, unicast, to each peer that has not acknowledged,
 //! until every one has or the change's sunset passes: at once for a change a
