@@ -107,6 +107,10 @@ pub fn run(place: &mut dyn Place, settings: &Settings, stop: &AtomicBool) -> Res
     let socket = bind(settings.port)?;
     let reader = socket.try_clone()?;
     let folder = format!("mesh/{}", hex(&row_hash(&["mesh", place.address()])));
+    let ran = format!("{folder}/ran");
+    if let Some(away) = away(settings, &ran)? {
+        println!("{}", catch_up(away, settings, place.address()));
+    }
     let local = Local::open(place, settings, &folder, now())?;
     let outbox = Outbox::open(settings.store.clone(), &format!("{folder}/outbox"), now())?;
     let mut node = Node {
@@ -134,6 +138,7 @@ pub fn run(place: &mut dyn Place, settings: &Settings, stop: &AtomicBool) -> Res
         scan_full: false,
         lost: 0,
         announced: None,
+        ran,
         unopened: 0,
         said_unopened: None,
         tidied: Instant::now(),
@@ -288,6 +293,8 @@ struct Node<'a> {
     lost: usize,
     /// When the node last announced itself.
     announced: Option<Instant>,
+    /// Where it keeps when it last ran.
+    ran: String,
     /// Datagrams that opened under no key held, since the record last said.
     unopened: usize,
     said_unopened: Option<Instant>,
@@ -468,6 +475,9 @@ impl Node<'_> {
     /// peers setting.
     fn announce(&mut self) {
         self.announced = Some(Instant::now());
+        // When the node last ran, for the next start to know how long it
+        // was away; a write that fails only costs that message.
+        let _ = self.settings.store.replace(&self.ran, &now().to_string());
         let announce = Message::Announce {
             sender: self.settings.node.clone(),
         };
@@ -769,6 +779,44 @@ impl std::fmt::Debug for Node<'_> {
     }
 }
 
+/// How long the node was away, when its last run, kept at `ran` in
+/// smugglr's own files, ended longer ago than the sunset (the graveyard
+/// setting); `None` on a first run or a short absence.
+fn away(settings: &Settings, ran: &str) -> Result<Option<u64>, Error> {
+    let last = settings
+        .store
+        .read(ran)?
+        .and_then(|text| text.trim().parse::<u64>().ok());
+    Ok(last
+        .map(|last| now().saturating_sub(last))
+        .filter(|away| *away > settings.graveyard))
+}
+
+/// What a node back from past the sunset prints: how long it was away, and
+/// how to catch up (FR-SMUGGLR-078 rev 22).
+fn catch_up(away: u64, settings: &Settings, place: &str) -> String {
+    format!(
+        "smugglr mesh: this node has been away {}, longer than the sunset ({}); \
+         changes made meanwhile may not reach it. Catch up with: smugglr stash \
+         <a peer's place> <dir> --key-file <path> --node <name> --whole, then smugglr \
+         retrieve {place} <dir> --key-file <path> --node {}",
+        span(away),
+        span(settings.graveyard),
+        settings.node
+    )
+}
+
+/// `seconds` as a person reads a span: days, hours, minutes or seconds.
+fn span(seconds: u64) -> String {
+    let (count, unit) = match seconds {
+        s if s >= 86_400 => (s / 86_400, "day"),
+        s if s >= 3_600 => (s / 3_600, "hour"),
+        s if s >= 60 => (s / 60, "minute"),
+        s => (s, "second"),
+    };
+    format!("{count} {unit}{}", if count == 1 { "" } else { "s" })
+}
+
 /// The address this machine's broadcasts leave from: the system picks it
 /// for a socket connected toward the broadcast address, and sends nothing.
 fn own_address(port: u16) -> Option<IpAddr> {
@@ -805,7 +853,15 @@ mod tests {
     use std::collections::BTreeSet;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    use super::unicast;
+    use super::{span, unicast};
+
+    #[test]
+    fn a_span_reads_in_its_largest_whole_unit() {
+        assert_eq!(span(3 * 86_400 + 5), "3 days");
+        assert_eq!(span(12 * 3_600), "12 hours");
+        assert_eq!(span(60), "1 minute");
+        assert_eq!(span(4), "4 seconds");
+    }
 
     const PUCK: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 88, 7));
 

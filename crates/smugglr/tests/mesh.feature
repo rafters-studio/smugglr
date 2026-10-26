@@ -73,3 +73,23 @@ Feature: smugglr mesh as a command: its front ends, its node's name and port, it
     Given two nodes running smugglr mesh on a relay that passes no broadcast, each naming the other in its peers setting
     When a row is written on the first node
     Then the second node holds that row
+
+  @criterion-01a17782-0bc1-7e61-8719-715911ed27bc @module-mesh
+  Scenario: repair continues after the first sends run out
+    Given two nodes running smugglr mesh, and a relay that drops one datagram in ten
+    When 50,000 rows are written at once on the first node and every first copy has been sent
+    Then the first node keeps resending until the second node holds all 50,000 rows
+
+  @criterion-01a17782-0bc1-7e61-8719-71661f5e4c21 @module-mesh
+  Scenario: a burst's last change is repaired like its first
+    Given two nodes running smugglr mesh with the backpressure setting at 1 MB, and a relay that drops one datagram in ten
+    When 50,000 rows are written at once on the first node
+    Then the second node holds the last row written within one second of its latest loss
+
+  @criterion-01a17782-0bc1-7e61-8719-71785d97eff3 @module-mesh
+  Scenario: a node back from past the sunset says how to catch up
+    Given a node whose last run ended longer ago than the sunset
+    When it starts smugglr mesh
+    Then it prints that it has been away longer than the sunset
+    And it names smugglr stash and smugglr retrieve as the way to catch up
+    And it keeps running and applies new changes

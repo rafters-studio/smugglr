@@ -54,6 +54,8 @@ struct Node {
     err: PathBuf,
     port: u16,
     child: Child,
+    /// How it was started, to start it again.
+    command: Command,
 }
 
 impl Node {
@@ -118,11 +120,10 @@ impl Front {
         port: Option<u16>,
         front_end: FrontEnd,
     ) -> Result<usize, String> {
-        self.start_with(world, name, key, port, front_end, &[])
+        self.start_with(world, name, key, port, front_end, "")
     }
 
-    /// Starts a node as [`Front::start`] does, its peers setting naming
-    /// `peers`.
+    /// Starts a node as [`Front::start`] does, `more` added to its config.
     fn start_with(
         &self,
         world: &World,
@@ -130,7 +131,7 @@ impl Front {
         key: &Path,
         port: Option<u16>,
         front_end: FrontEnd,
-        peers: &[String],
+        more: &str,
     ) -> Result<usize, String> {
         let folder = world.folder()?.join(name);
         std::fs::create_dir_all(&folder).map_err(|err| err.to_string())?;
@@ -140,12 +141,10 @@ impl Front {
             .map_err(|err| err.to_string())?;
         let config = folder.join("config").join("smugglr");
         std::fs::create_dir_all(&config).map_err(|err| err.to_string())?;
-        let mut settings = port
+        let settings = port
             .map(|port| format!("port = {port}\n"))
-            .unwrap_or_default();
-        if !peers.is_empty() {
-            settings = format!("{settings}peers = {peers:?}\n");
-        }
+            .unwrap_or_default()
+            + more;
         if !settings.is_empty() {
             std::fs::write(config.join("config.toml"), settings).map_err(|err| err.to_string())?;
         }
@@ -166,15 +165,12 @@ impl Front {
             ],
         };
         let (out, err) = (folder.join("out.txt"), folder.join("err.txt"));
-        let file = |path: &Path| File::create(path).map_err(|err| err.to_string());
-        let child = Command::new(env!("CARGO_BIN_EXE_smugglr"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_smugglr"));
+        command
             .args(&args)
             .env("XDG_CONFIG_HOME", folder.join("config"))
-            .env("PATH", search_path(&bin))
-            .stdout(Stdio::from(file(&out)?))
-            .stderr(Stdio::from(file(&err)?))
-            .spawn()
-            .map_err(|err| format!("failed to start smugglr: {err}"))?;
+            .env("PATH", search_path(&bin));
+        let child = spawn(&mut command, &out, &err)?;
         let nodes = self.nodes();
         let mut nodes = nodes.0.lock().unwrap_or_else(PoisonError::into_inner);
         nodes.push(Node {
@@ -183,6 +179,7 @@ impl Front {
             err,
             port: port.unwrap_or(31337),
             child,
+            command,
         });
         let index = nodes.len() - 1;
         drop(nodes);
@@ -197,6 +194,25 @@ impl Front {
         })
         .map_err(|()| format!("{name} did not look at its rows"))?;
         Ok(index)
+    }
+
+    /// Stops node `index`.
+    fn stop(&self, index: usize) -> Result<(), String> {
+        let nodes = self.nodes();
+        let mut nodes = nodes.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let node = nodes.get_mut(index).ok_or(format!("no node {index}"))?;
+        let _ = node.child.kill();
+        let _ = node.child.wait();
+        Ok(())
+    }
+
+    /// Starts node `index` again, stopped, as it was started.
+    fn restart(&self, index: usize) -> Result<(), String> {
+        let nodes = self.nodes();
+        let mut nodes = nodes.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let node = nodes.get_mut(index).ok_or(format!("no node {index}"))?;
+        node.child = spawn(&mut node.command, &node.out, &node.err)?;
+        Ok(())
     }
 
     fn with<T>(&self, index: usize, read: impl FnOnce(&Node) -> T) -> Result<T, String> {
@@ -245,6 +261,16 @@ impl Front {
             )
         })
     }
+}
+
+/// Runs `command`, its output and errors written to `out` and `err`.
+fn spawn(command: &mut Command, out: &Path, err: &Path) -> Result<Child, String> {
+    let file = |path: &Path| File::create(path).map_err(|err| err.to_string());
+    command
+        .stdout(Stdio::from(file(out)?))
+        .stderr(Stdio::from(file(err)?))
+        .spawn()
+        .map_err(|err| format!("failed to start smugglr: {err}"))
 }
 
 /// Puts a `hostname` in `bin` that names this machine `name`.
@@ -814,6 +840,8 @@ struct Seen {
     resent_at: BTreeMap<String, Instant>,
     /// When the second node first acknowledged each change.
     acked: BTreeMap<String, Instant>,
+    /// The change to the last row a scenario writes.
+    last_row: Option<String>,
     /// Datagrams the first node sent, and of them resends.
     sent: u64,
     resent: u64,
@@ -827,6 +855,8 @@ struct Relay {
     port: u16,
     stop: AtomicBool,
     lossy: AtomicBool,
+    /// Lose the first copy of the change to the last row written.
+    lose_last: AtomicBool,
     dropped: AtomicU64,
     seen: Mutex<Seen>,
 }
@@ -874,6 +904,7 @@ impl Relay {
             port: socket.local_addr().map_err(|err| err.to_string())?.port(),
             stop: AtomicBool::new(false),
             lossy: AtomicBool::new(lossy),
+            lose_last: AtomicBool::new(false),
             dropped: AtomicU64::new(0),
             seen: Mutex::new(Seen::default()),
         });
@@ -897,8 +928,10 @@ impl Relay {
                 random ^= random << 13;
                 random ^= random >> 7;
                 random ^= random << 17;
-                let drop = relay.lossy.load(Ordering::Relaxed) && random.is_multiple_of(10);
-                relay.note(open_with(&buffer[..len], &seal), from_first, drop);
+                let message = open_with(&buffer[..len], &seal);
+                let drop = (relay.lossy.load(Ordering::Relaxed) && random.is_multiple_of(10))
+                    || relay.last_first_copy(message.as_ref());
+                relay.note(message, from_first, drop);
                 if drop {
                     relay.dropped.fetch_add(1, Ordering::Relaxed);
                 } else {
@@ -907,6 +940,31 @@ impl Relay {
             }
         });
         Ok(relay)
+    }
+
+    /// Whether `message` is the first copy of the change to the last row a
+    /// scenario writes, which the relay then loses so its repair shows.
+    fn last_first_copy(&self, message: Option<&Value>) -> bool {
+        let Some(message) = message else {
+            return false;
+        };
+        let key = message
+            .get("envelope")
+            .and_then(|envelope| envelope.get("key")?.get(0)?.as_str());
+        let last = format!("'k{LAST_ROW}'");
+        if !self.lose_last.load(Ordering::Relaxed)
+            || message.get("resend").and_then(Value::as_bool) == Some(true)
+            || key != Some(last.as_str())
+        {
+            return false;
+        }
+        let signature = message
+            .get("envelope")
+            .and_then(|envelope| envelope.get("signature")?.as_str())
+            .map(str::to_owned);
+        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        seen.last_row = signature;
+        true
     }
 
     fn note(&self, message: Option<Value>, from_first: bool, dropped: bool) {
@@ -960,15 +1018,16 @@ impl Relay {
 /// Two nodes, each naming the relay in its peers setting, the relay
 /// dropping one datagram in ten when `lossy`; returns once each has heard
 /// the other.
-fn two_on_a_relay(world: &World, front: &Front, lossy: bool) -> Result<(), String> {
+fn two_on_a_relay(world: &World, front: &Front, lossy: bool, first: &str) -> Result<(), String> {
     front.turn.set(Turn::take());
     let key = key_file(world, front, "mesh.key")?;
     let line = key_lines(&key)?.pop().ok_or("the key file holds no key")?;
     let ports = [free_port()?, free_port()?];
     let relay = Relay::start(ports, &decode(&line)?, lossy)?;
-    let peers = [format!("127.0.0.1:{}", relay.port)];
+    let peers = format!("peers = [\"127.0.0.1:{}\"]\n", relay.port);
     front.relay.set(relay);
-    front.start_with(world, "first", &key, Some(ports[0]), FrontEnd::Mesh, &peers)?;
+    let more = format!("{peers}{first}");
+    front.start_with(world, "first", &key, Some(ports[0]), FrontEnd::Mesh, &more)?;
     front.start_with(
         world,
         "second",
@@ -985,7 +1044,7 @@ fn two_on_a_relay(world: &World, front: &Front, lossy: bool) -> Result<(), Strin
 
 #[given("two nodes running smugglr mesh that have heard each other")]
 fn two_that_heard_each_other(world: &World, front: &Front) -> Result<(), String> {
-    two_on_a_relay(world, front, false)
+    two_on_a_relay(world, front, false, "")
 }
 
 #[when(
@@ -1081,7 +1140,7 @@ fn resends_a_quarter_at_most(front: &Front) -> Result<(), String> {
 
 #[given("two nodes running smugglr mesh, and a relay that drops one datagram in ten")]
 fn two_through_a_lossy_relay(world: &World, front: &Front) -> Result<(), String> {
-    two_on_a_relay(world, front, false)?;
+    two_on_a_relay(world, front, false, "")?;
     front
         .relay
         .get()
@@ -1112,10 +1171,131 @@ fn the_window_holds(front: &Front) -> Result<(), String> {
     "two nodes running smugglr mesh on a relay that passes no broadcast, each naming the other in its peers setting"
 )]
 fn two_named_in_peers(world: &World, front: &Front) -> Result<(), String> {
-    two_on_a_relay(world, front, false)
+    two_on_a_relay(world, front, false, "")
 }
 
 #[when("a row is written on the first node")]
 fn a_row_on_the_first_node(front: &Front) -> Result<(), String> {
     front.sql(0, "INSERT INTO notes VALUES ('n9', 'across')")
+}
+
+/// The last row a 50,000-row scenario writes.
+const LAST_ROW: u64 = 50_000;
+
+#[when("50,000 rows are written at once on the first node and every first copy has been sent")]
+fn fifty_thousand_all_sent(front: &Front) -> Result<(), String> {
+    write_rows(front, 0, LAST_ROW)?;
+    let relay = front.relay.get().ok_or("no relay")?;
+    let firsts = || {
+        relay
+            .seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .first_copies
+            .len()
+    };
+    wait(Duration::from_secs(300), || firsts() >= 50_000)
+        .map_err(|()| format!("the first node sent first copies of {} changes", firsts()))
+}
+
+#[then("the first node keeps resending until the second node holds all 50,000 rows")]
+fn repair_goes_on(front: &Front) -> Result<(), String> {
+    let relay = front.relay.get().ok_or("no relay")?;
+    let resent = || {
+        relay
+            .seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .resent
+    };
+    let before = resent();
+    let path = front.with(1, |node| node.path.clone())?;
+    let missing = Connection::open(&path)
+        .and_then(|db| {
+            db.query_row("SELECT 50002 - count(*) FROM notes", [], |row| {
+                row.get::<_, i64>(0)
+            })
+        })
+        .map_err(|err| err.to_string())?;
+    holds_rows(front, 1, 50_002, Duration::from_secs(120))?;
+    if missing > 0 && resent() == before {
+        return Err(format!(
+            "the second node lacked {missing} rows when first sends ran out, and nothing was resent"
+        ));
+    }
+    Ok(())
+}
+
+#[given(
+    "two nodes running smugglr mesh with the backpressure setting at 1 MB, and a relay that drops one datagram in ten"
+)]
+fn two_with_a_small_line(world: &World, front: &Front) -> Result<(), String> {
+    two_on_a_relay(world, front, false, "backpressure = \"1 MB\"\n")?;
+    let relay = front.relay.get().ok_or("no relay")?;
+    relay.lose_last.store(true, Ordering::Relaxed);
+    relay.lossy.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+#[then("the second node holds the last row written within one second of its latest loss")]
+fn the_last_row_within_a_second(front: &Front) -> Result<(), String> {
+    holds_rows(front, 1, 50_002, Duration::from_secs(300))?;
+    let relay = front.relay.get().ok_or("no relay")?;
+    let seen = relay.seen.lock().unwrap_or_else(PoisonError::into_inner);
+    let last = seen
+        .last_row
+        .clone()
+        .ok_or("the relay saw no first copy of the last row")?;
+    let lost = seen
+        .lost
+        .get(&last)
+        .ok_or("the relay never lost the last row")?;
+    let acked = seen
+        .acked
+        .get(&last)
+        .ok_or("the second node never acknowledged the last row")?;
+    match acked.checked_duration_since(*lost) {
+        Some(took) if took > Duration::from_secs(1) => Err(format!(
+            "the last row was repaired {took:?} after its latest loss"
+        )),
+        _ => Ok(()),
+    }
+}
+
+#[given("a node whose last run ended longer ago than the sunset")]
+fn a_node_back_from_away(world: &World, front: &Front) -> Result<(), String> {
+    let key = key_file(world, front, "mesh.key")?;
+    let port = free_port()?;
+    // A sunset of 2 seconds, so a short absence is longer than it.
+    let sunset = "graveyard = 2\n";
+    front.start_with(world, "away", &key, Some(port), FrontEnd::Mesh, sunset)?;
+    front.start_with(world, "stayed", &key, Some(port), FrontEnd::Mesh, sunset)?;
+    // The node notes that it is running as soon as it announces itself.
+    sleep(Duration::from_secs(1));
+    front.stop(0)?;
+    sleep(Duration::from_secs(4));
+    Ok(())
+}
+
+#[when("it starts smugglr mesh")]
+fn it_starts_again(front: &Front) -> Result<(), String> {
+    front.restart(0)
+}
+
+#[then("it prints that it has been away longer than the sunset")]
+fn it_says_it_was_away(front: &Front) -> Result<(), String> {
+    front.prints(0, "longer than the sunset")
+}
+
+#[then("it names smugglr stash and smugglr retrieve as the way to catch up")]
+fn it_names_the_catch_up(front: &Front) -> Result<(), String> {
+    front.prints(0, "smugglr stash")?;
+    front.prints(0, "smugglr retrieve")
+}
+
+#[then("it keeps running and applies new changes")]
+fn it_keeps_running(front: &Front) -> Result<(), String> {
+    sleep(Duration::from_secs(1));
+    front.sql(1, "INSERT INTO notes VALUES ('n7', 'after')")?;
+    front.holds(0, "n7", "after")
 }
