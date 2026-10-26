@@ -23,6 +23,7 @@ Scope: designed and tested for up to 50 nodes. Acknowledgements grow with the no
 | Setting | Where | Default | What it does |
 |---|---|---|---|
 | `--key-file <path>` | flag | none, required | the shared key file (below) |
+| `--replay <change hash>` | flag | none | decide a dropped change again and exit (below) |
 | `--sync-mode stop\|last` | flag | `stop` | what happens to a row changed here and in a change; `source` and `target` are for two places and are refused |
 | `port` | config | 31337 | the UDP port a node broadcasts and listens on |
 | `peers` | config | none | addresses to announce to on a network with no broadcast: `host` or `host:port`, the mesh port when none is given |
@@ -130,6 +131,12 @@ A node decides each envelope in this order, the same order `smugglr-core` uses f
 A conflict follows `--sync-mode`: `stop` (the default) names the row; `last` keeps the copy whose steering column is further on.
 
 A change past its sunset is ignored on arrival.
+
+## The dropped log and replay
+
+Every change a node drops is kept, envelope and values, in a dropped log in smugglr's own files, and named in the record with its table, key, reason and change hash. A change is dropped by step 1 of the order above (its key is in the graveyard and it is neither a delete nor the edit that step answers), or when it waited past its sunset.
+
+`smugglr mesh <place> --key-file <path> --replay <change hash>` decides that logged change again on this node, with a fresh sunset, overriding the drop. It prints what came of it and exits. It is then decided like any change: an edit to a row deleted elsewhere stops as edit-versus-delete or follows `--sync-mode`, and a replayed insert for a key whose tombstone is still live is applied, since the replay overrides the drop. What the replay writes reaches the other nodes when the node next runs. A replay that still waits for its `from` stays in the dropped log. An unknown hash is a usage error, exit 2. `smugglr retrieve <place> --key-file <path> --node <name> --replay <change hash>` does the same for a change a retrieve dropped. Replay adds no rule; it only decides again.
 
 ## The record
 

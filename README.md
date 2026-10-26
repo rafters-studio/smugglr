@@ -21,19 +21,18 @@ The first place named is the source, the second the target. `--dryrun` writes no
 ```
 $ smugglr sync laptop/shop.db server/shop.db --dryrun
 smugglr sync: preview
-  first sync: a row on one side only is copied as new; deletes are not seen
-  weight: 3 rows, 68 B in 1 table
-  products: would move, 3 to target, 0 to source, 0 deleted in target, 0 deleted in source, 0 overwritten in target, 0 overwritten in source
+  products: would move, 1 to target, 1 to source, 1 deleted in target, 0 deleted in source, 0 overwritten in target, 0 overwritten in source
+    deleted in target: sku-0233
 ```
 
 ```
 $ smugglr sync laptop/shop.db server/shop.db
-smugglr sync: done
-  first sync: a row on one side only is copied as new; deletes are not seen
-  weight: 3 rows, 68 B in 1 table
-  products: moved, 3 to target, 0 to source, 0 deleted in target, 0 deleted in source, 0 overwritten in target, 0 overwritten in source
+smugglr sync: stopped
+  products: stopped
+    rows: sku-0412
+    These rows changed in both places since the last sync. smugglr stops rather than choose. Rerun with --sync-mode source or target to keep one place's copy, or name a steering column and use --sync-mode last.
 $ echo $?
-0
+3
 ```
 
 Same counts. Run it again and the record says `in step`. Add `--json` and the record is one JSON object:
@@ -41,20 +40,16 @@ Same counts. Run it again and the record says `in step`. Add `--json` and the re
 ```
 $ smugglr sync laptop/shop.db server/shop.db --json
 {
-  "status": "done",
+  "status": "stopped",
   "first_sync": false,
   "deletes_seen": true,
   "tables": {
     "products": {
-      "status": "moved",
-      "to_target": 1,
-      "to_source": 1,
-      "deleted_in_target": [
-        "sku-0233"
+      "status": "stopped",
+      "rows": [
+        "sku-0412"
       ],
-      "deleted_in_source": [],
-      "overwritten_in_target": [],
-      "overwritten_in_source": []
+      "why": "These rows changed in both places since the last sync. smugglr stops rather than choose. Rerun with --sync-mode source or target to keep one place's copy, or name a steering column and use --sync-mode last."
     }
   },
   "ignored": []
@@ -139,14 +134,28 @@ smugglr sync: too much
 
 ```
 $ smugglr stash a/shop.db blobs --key-file shop.key --node laptop --whole
-blobs/1793024890191-9acad5a77fc6de0a037c7cfc8ca03112.blob
+blobs/1793029348893-b3e7393d49f72c5cb0802f80bfc414ca.blob
 ```
 
 ```
 $ smugglr retrieve b/shop.db blobs --key-file shop.key --node phone
 smugglr sync: done
-  products: moved, 3 to target, 0 to source, 0 deleted in target, 0 deleted in source, 0 overwritten in target, 0 overwritten in source
   targets remaining: 
+```
+
+A retrieve drops changes the same way, and names each with its change hash. `smugglr retrieve <place> --key-file <path> --node <name> --replay <change hash>` takes no blob; it decides the dropped change again and exits. A change dropped here is a row re-created inside the graveyard window:
+
+```
+$ smugglr retrieve b/shop.db blobs/1793029352129-f96dca92cc240975f6584d8930ab08a1.blob --key-file shop.key --node phone
+smugglr sync: done
+  dropped: notes n1, its key is in the graveyard, change f83318454e7df3a77410b8f707dd567c327e59763e5390426f002830016c348e
+  targets remaining: 
+```
+
+```
+$ smugglr retrieve b/shop.db --key-file shop.key --node phone --replay f83318454e7df3a77410b8f707dd567c327e59763e5390426f002830016c348e
+smugglr sync: done
+  notes: moved, 1 to target, 0 to source, 0 deleted in target, 0 deleted in source, 0 overwritten in target, 0 overwritten in source
 $ echo $?
 0
 ```
@@ -173,7 +182,7 @@ A mesh is one shared key. `keygen` writes it with `chmod 600`; copy the file to 
 
 ```
 $ smugglr mesh keygen --key-file ./mesh.key
-smugglr mesh: wrote key 9b22c29fc58e8e87 to ./mesh.key
+smugglr mesh: wrote key 180627566f7a4e3b to ./mesh.key
 ```
 
 The key file holds one base64 key per line, newest last; a line starting with `#` is a note. A node signs and seals with the newest key and also accepts the one before it, so a key is rotated by appending a new one. On unix a node refuses a key file its group or others can read, and exits 2:
@@ -209,9 +218,9 @@ Both tables exist before the nodes start. A node's first run notes the rows alre
 
 ```
 $ smugglr mesh ./node.db --key-file ../mesh.key   # on puck
-smugglr mesh: node puck on UDP port 31401, key 9b22c29fc58e8e87
+smugglr mesh: node puck on UDP port 31401, key 180627566f7a4e3b
 $ smugglr mesh ./node.db --key-file ../mesh.key   # on rzr
-smugglr mesh: node rzr on UDP port 31402, key 9b22c29fc58e8e87
+smugglr mesh: node rzr on UDP port 31402, key 180627566f7a4e3b
 ```
 
 A row written on puck reaches rzr with no sync run, whichever program wrote it. A delete crosses the same way.
@@ -221,8 +230,8 @@ $ sqlite3 ./node.db "insert into notes values('n1','first note');"   # on puck
 $ sqlite3 ./node.db "select * from notes"   # on rzr
 n1|first note
 # rzr, output so far
-smugglr mesh: node rzr on UDP port 31402, key 9b22c29fc58e8e87
-smugglr mesh: applied 1 change to notes from puck, key 9b22c29fc58e8e87
+smugglr mesh: node rzr on UDP port 31402, key 180627566f7a4e3b
+smugglr mesh: applied 1 change to notes from puck, key 180627566f7a4e3b
 ```
 
 ```
@@ -230,17 +239,17 @@ $ sqlite3 ./node.db "delete from notes where id='n1'"   # on puck
 $ sqlite3 ./node.db "select count(*) from notes"   # on rzr
 0
 # rzr, output so far
-smugglr mesh: node rzr on UDP port 31402, key 9b22c29fc58e8e87
-smugglr mesh: applied 1 change to notes from puck, key 9b22c29fc58e8e87
-smugglr mesh: applied 1 change to notes from puck, key 9b22c29fc58e8e87
+smugglr mesh: node rzr on UDP port 31402, key 180627566f7a4e3b
+smugglr mesh: applied 1 change to notes from puck, key 180627566f7a4e3b
+smugglr mesh: applied 1 change to notes from puck, key 180627566f7a4e3b
 ```
 
 A node that starts after being away longer than the sunset (the `graveyard` setting, 12 hours by default; 3 seconds here) says so, and names the commands that catch it up. It keeps running for new changes.
 
 ```
 $ smugglr mesh ./node.db --key-file ../mesh.key   # on rzr, restarted after being stopped longer than its graveyard (3 seconds); the scratch directory is shown as .
-smugglr mesh: node rzr on UDP port 31402, key 9b22c29fc58e8e87
-smugglr mesh: this node has been away 11 seconds, longer than the sunset (3 seconds); changes made meanwhile may not reach it. Catch up with: smugglr stash <a peer's place> <dir> --key-file <path> --node <name> --whole, then smugglr retrieve ./node.db <dir> --key-file <path> --node rzr
+smugglr mesh: node rzr on UDP port 31402, key 180627566f7a4e3b
+smugglr mesh: this node has been away 7 seconds, longer than the sunset (3 seconds); changes made meanwhile may not reach it. Catch up with: smugglr stash <a peer's place> <dir> --key-file <path> --node <name> --whole, then smugglr retrieve ./node.db <dir> --key-file <path> --node rzr
 ```
 
 A change too large for one datagram is refused loudly and dropped from the outbox, so it does not hold up the changes after it. On macOS the limit is about 9 KB (`net.inet.udp.maxdgram`). Move the row with stash and retrieve.
@@ -248,8 +257,36 @@ A change too large for one datagram is refused loudly and dropped from the outbo
 ```
 $ sqlite3 ./node.db "insert into notes values('big', <30,000 characters>);"   # on puck
 # puck, output so far
-smugglr mesh: node puck on UDP port 31401, key 9b22c29fc58e8e87
+smugglr mesh: node puck on UDP port 31401, key 180627566f7a4e3b
+smugglr mesh: 1 change arrived only as a resend; the first copy was lost
 smugglr mesh: a change to notes ["'big'"] is too large for one datagram and is not sent; catch it up with smugglr stash and smugglr retrieve
+```
+
+### Dropped changes and replay
+
+A node decides each change it hears. An insert for a key deleted inside the graveyard window is dropped: the record names it with its change hash, and the node keeps the change and its values in a dropped log. Here puck deletes `n1`, then writes it again, and rzr drops the second insert:
+
+```
+$ sqlite3 ./node.db "insert into notes values('n1','back again');"   # on puck, after the delete above
+$ sqlite3 ./node.db "select count(*) from notes"   # on rzr
+0
+# rzr, output so far
+smugglr mesh: node rzr on UDP port 31402, key 180627566f7a4e3b
+smugglr mesh: applied 1 change to notes from puck, key 180627566f7a4e3b
+smugglr mesh: applied 1 change to notes from puck, key 180627566f7a4e3b
+smugglr mesh: dropped a change to notes ["'n1'"] from puck: its key is in the graveyard (change 79838289357156ba44a650973925ce44c6567e6017139d68acf10aae9ee8cd43)
+```
+
+`--replay <change hash>` decides that logged change again on this node, with a fresh sunset, overriding the drop. It prints what came of it and exits; what it wrote reaches the other nodes when the node next runs. An unknown hash is a usage error, exit 2.
+
+```
+$ smugglr mesh ./node.db --key-file ../mesh.key --replay 79838289357156ba44a650973925ce44c6567e6017139d68acf10aae9ee8cd43   # on rzr
+smugglr mesh: applied 1 change to notes from puck, key 180627566f7a4e3b
+smugglr mesh: replayed change 79838289357156ba44a650973925ce44c6567e6017139d68acf10aae9ee8cd43
+$ echo $?
+0
+$ sqlite3 ./node.db "select * from notes"   # on rzr
+n1|back again
 ```
 
 | setting | default | what it does |
