@@ -306,7 +306,7 @@ Designed and tested for up to 50 nodes. Clocks should agree to within one twelft
 - A loud name clash (#521). Two machines with one name ignore each other and nothing says so.
 - The `mesh_wire` setting, which belongs to the automatic catch-up.
 
-## Not in 0.6.1
+## Sync types not built yet
 
 `--sync-type` accepts `direct` and `mesh`. `hub` and `multi` are refused as not built yet.
 
