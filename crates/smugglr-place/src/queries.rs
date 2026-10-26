@@ -66,6 +66,85 @@ pub(crate) fn hashes(table: &Table) -> String {
     )
 }
 
+/// Each row's key columns' `quote()` text and its rowid (`rowid`, the name
+/// it answers to); then each column's `quote()` text, NULL for a text or
+/// blob of more than `large` bytes outside the key, read only by its
+/// length; then for each column whether it is such a blob, NULL when it is
+/// not such a value. Only the rows of one key, the key's parameters first,
+/// when `by_key`.
+pub(crate) fn apart(table: &Table, rowid: &str, large: u64, one_key: bool) -> String {
+    let big = |column: &String| format!("octet_length({}) > {large}", ident(column));
+    let values: Vec<String> = table
+        .columns
+        .iter()
+        .map(|column| {
+            if table.key.contains(column) {
+                format!("quote({})", ident(column))
+            } else {
+                format!(
+                    "CASE WHEN {} THEN NULL ELSE quote({}) END",
+                    big(column),
+                    ident(column)
+                )
+            }
+        })
+        .collect();
+    let blobs: Vec<String> = table
+        .columns
+        .iter()
+        .map(|column| {
+            if table.key.contains(column) {
+                "NULL".to_owned()
+            } else {
+                format!(
+                    "CASE WHEN {} THEN typeof({}) = 'blob' END",
+                    big(column),
+                    ident(column)
+                )
+            }
+        })
+        .collect();
+    let mut sql = format!(
+        "SELECT {}, {}, {}, {} FROM {}",
+        quoted(&table.key),
+        ident(rowid),
+        values.join(", "),
+        blobs.join(", "),
+        ident(&table.name)
+    );
+    if one_key {
+        sql.push_str(" WHERE ");
+        sql.push_str(&by_key(&table.key, 1));
+    }
+    sql
+}
+
+/// The rowid (`rowid`, the name it answers to) of one row, by key.
+pub(crate) fn rowid(table: &Table, rowid: &str) -> String {
+    format!(
+        "SELECT {} FROM {} WHERE {}",
+        ident(rowid),
+        ident(&table.name),
+        by_key(&table.key, 1)
+    )
+}
+
+/// Whether a table is `WITHOUT ROWID`.
+pub(crate) const WITHOUT_ROWID: &str =
+    "SELECT wr FROM pragma_table_list WHERE schema = 'main' AND name = ?1";
+
+/// One column's value, by key, as its bytes (`whole`) or only its length in
+/// bytes, for a table with no rowid, whose value is read whole.
+pub(crate) fn value(table: &Table, column: &str, whole: bool) -> String {
+    let read = if whole { "CAST({} AS BLOB)" } else { "octet_length({})" };
+    format!(
+        "SELECT {} FROM {} WHERE {}",
+        read.replace("{}", &ident(column)),
+        ident(&table.name),
+        by_key(&table.key, 1)
+    )
+}
+
 /// Each row's key columns' `quote()` text, then its row hash as hex, for an
 /// HTTP-SQL place whose connection runs the row hash.
 pub(crate) fn hex_hashes(table: &Table) -> String {

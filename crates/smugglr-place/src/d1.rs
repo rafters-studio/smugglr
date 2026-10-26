@@ -42,7 +42,7 @@ use serde_json::{Value as Json, json};
 
 use crate::http_sql::Transport;
 use crate::queries::d1::{Kind, MAX_PARAMS, returning, typed_params, writes};
-use crate::value::{base64, unbase64};
+use smugglr_core::hex::{base64, unbase64};
 use crate::{Error, HttpSql};
 
 /// The variable holding the Cloudflare account id.

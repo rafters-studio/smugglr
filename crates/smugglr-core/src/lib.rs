@@ -10,6 +10,7 @@ pub mod change;
 pub mod envelope;
 pub mod hex;
 pub mod ignore;
+pub mod large;
 pub mod plan;
 pub mod record;
 pub mod row_hash;

@@ -19,8 +19,10 @@ smugglr-place = { path = "crates/smugglr-place", version = "0.6.1", default-feat
 smugglr-sync = { path = "crates/smugglr-sync", version = "0.6.1" }
 # The local file place (smugglr-place). `bundled`: SQLite is built in, so the
 # binary reads any file the same way; `functions`: the row hash runs as a SQL
-# function on the connection, where the data lives.
-rusqlite = { version = "0.40", features = ["bundled", "functions"] }
+# function on the connection, where the data lives; `blob`: a value too large
+# to hold is read and written a piece at a time, by SQLite's incremental blob
+# I/O (#600, approved 2026-10-26).
+rusqlite = { version = "0.40", features = ["bundled", "functions", "blob"] }
 thiserror = "2"
 # The mesh (smugglr-mesh): each datagram sealed with XChaCha20-Poly1305
 # under a key derived from the shared key, with a fresh random 24-byte nonce

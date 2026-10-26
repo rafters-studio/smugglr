@@ -14,16 +14,43 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde_json::{Value, json};
 use smugglr_core::change::{Change, op};
-use smugglr_core::envelope::{self, Arrival, Envelope, Here, VERSION, receive, receive_replayed};
+use std::path::PathBuf;
+
+use smugglr_core::envelope::{self, Arrival, Envelope, Here, VERSION, receive_checked};
 use smugglr_core::hex::{hex, unhex};
 use smugglr_core::ignore::Ignore;
+use smugglr_core::large::{self, Large};
 use smugglr_core::plan::Hashes;
-use smugglr_core::row_hash::row_hash;
 use smugglr_core::shape::{Column, Stamp};
 use smugglr_memory::Store;
 use smugglr_place::{Key, Place, Table};
 
+use crate::parts::large_values;
+use crate::wire::{DATAGRAM, Message, sealed_len};
 use crate::{Error, Settings};
+
+/// A text or blob value of more than this many bytes never travels in its
+/// envelope: it cannot fit one datagram (FR-SMUGGLR-078 rev 28), so the
+/// place reads it apart, a piece at a time.
+const LARGE: u64 = DATAGRAM as u64;
+
+/// The bytes of a large value read from the database at once.
+const PIECE: usize = 1 << 20;
+
+/// What decides a batch: which changes with large values have them all,
+/// checked, and where each value's own bytes are.
+pub(crate) struct Assembled<'a> {
+    /// Whether the change's large values have arrived and checked.
+    pub(crate) verified: &'a dyn Fn(&[u8; 32]) -> bool,
+    /// The file that holds a large value's own bytes.
+    pub(crate) file: &'a dyn Fn(&Large) -> Option<PathBuf>,
+}
+
+impl std::fmt::Debug for Assembled<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Assembled").finish_non_exhaustive()
+    }
+}
 
 /// A table's row, by its table and key.
 type Row = (String, Key);
@@ -253,6 +280,9 @@ impl Local {
     /// the rows left over are found again on a later look. Also whether the
     /// budget left rows over. Nothing is kept until [`Local::keep`], so a
     /// look that fails part way loses no row.
+    /// A change larger than `budget` is taken on its own when `alone`: the
+    /// outbox is empty.
+    #[expect(clippy::too_many_arguments, reason = "the look's one call")]
     pub(crate) fn changes(
         &self,
         place: &mut dyn Place,
@@ -260,6 +290,7 @@ impl Local {
         sign: &[u8; 32],
         now: u64,
         budget: u64,
+        alone: bool,
         weigh: impl Fn(&Envelope) -> u64,
     ) -> Result<(Vec<Envelope>, bool), Error> {
         let (mut found, mut spent) = (Vec::new(), 0_u64);
@@ -283,17 +314,14 @@ impl Local {
             );
             for chunk in moved.chunks(1_000) {
                 let keys: Vec<Key> = chunk.iter().map(|(key, _)| key.clone()).collect();
-                let rows: BTreeMap<Key, Vec<String>> = place
-                    .rows(table, &keys)?
+                let rows: BTreeMap<Key, (Vec<String>, [u8; 16])> = place
+                    .rows_apart(table, &keys, LARGE)?
                     .into_iter()
-                    .map(|row| (table.key_of(&row), row))
+                    .map(|(row, hash)| (table.key_of(&row), (row, hash)))
                     .collect();
                 for (key, from) in chunk {
-                    let values = rows.get(key).cloned().unwrap_or_default();
-                    let to = rows.get(key).map(|values| {
-                        let columns: Vec<&str> = values.iter().map(String::as_str).collect();
-                        row_hash(&columns)
-                    });
+                    let values = rows.get(key).map(|(row, _)| row.clone()).unwrap_or_default();
+                    let to = rows.get(key).map(|(_, hash)| *hash);
                     if to == *from {
                         continue;
                     }
@@ -316,13 +344,19 @@ impl Local {
                         signature: [0; 32],
                     };
                     envelope.sign(sign);
+                    fit(&mut envelope, table, &settings.node);
                     let size = weigh(&envelope);
-                    if spent + size > budget {
+                    if spent + size > budget && !(alone && found.is_empty()) {
                         full = true;
                         break 'tables;
                     }
                     spent += size;
                     found.push(envelope);
+                    if spent > budget {
+                        // Taken on its own, past the line.
+                        full = true;
+                        break 'tables;
+                    }
                 }
             }
         }
@@ -353,17 +387,14 @@ impl Local {
                 .column(name)
                 .and_then(|column| table.columns.iter().position(|c| c == column));
             let keys: Vec<Key> = keys.into_iter().collect();
-            let rows: BTreeMap<Key, Vec<String>> = place
-                .rows(table, &keys)?
+            let rows: BTreeMap<Key, (Vec<String>, [u8; 16])> = place
+                .rows_apart(table, &keys, LARGE)?
                 .into_iter()
-                .map(|row| (table.key_of(&row), row))
+                .map(|(row, hash)| (table.key_of(&row), (row, hash)))
                 .collect();
             for key in keys {
-                let row = rows.get(&key);
-                let hash = row.map(|values| {
-                    let columns: Vec<&str> = values.iter().map(String::as_str).collect();
-                    row_hash(&columns)
-                });
+                let row = rows.get(&key).map(|(row, _)| row);
+                let hash = rows.get(&key).map(|(_, hash)| *hash);
                 let at = (name.to_owned(), key);
                 here.insert(
                     at.clone(),
@@ -389,8 +420,9 @@ impl Local {
         sign: &[u8; 32],
         envelopes: &[Envelope],
         now: u64,
+        assembled: &Assembled<'_>,
     ) -> Result<Applied, Error> {
-        self.decide(place, settings, sign, envelopes, now, false)
+        self.decide(place, settings, sign, envelopes, now, false, assembled)
     }
 
     /// Replays the change the dropped log holds under the change hash
@@ -412,13 +444,29 @@ impl Local {
         let Some(resent) = envelope::replay(&self.dropped, hash, sunset, sign) else {
             return Ok(None);
         };
+        if !large_values(&resent).is_empty() {
+            // Its large values went with its parts once it was dropped.
+            println!(
+                "smugglr mesh: change {} carried large values this node no longer holds; \
+                 it cannot be replayed",
+                hex(hash)
+            );
+            return Ok(Some(Applied {
+                waiting: vec![resent],
+                ..Applied::default()
+            }));
+        }
         let at = self
             .dropped
             .iter()
             .position(|logged| &logged.signature == hash);
         let logged = at.map(|at| self.dropped.remove(at));
         self.named.remove(hash);
-        let applied = self.decide(place, settings, sign, &[resent], now, true)?;
+        let none = Assembled {
+            verified: &|_| false,
+            file: &|_| None,
+        };
+        let applied = self.decide(place, settings, sign, &[resent], now, true, &none)?;
         // A replay that waits has no one to send it again: it stays logged.
         if !applied.waiting.is_empty()
             && let Some(logged) = logged
@@ -429,6 +477,7 @@ impl Local {
         Ok(Some(applied))
     }
 
+    #[expect(clippy::too_many_arguments, reason = "apply and replay share it")]
     fn decide(
         &mut self,
         place: &mut dyn Place,
@@ -437,6 +486,7 @@ impl Local {
         envelopes: &[Envelope],
         now: u64,
         replayed: bool,
+        assembled: &Assembled<'_>,
     ) -> Result<Applied, Error> {
         let refs: Vec<&Envelope> = envelopes.iter().collect();
         let here = self.here(place, settings, &refs)?;
@@ -445,11 +495,16 @@ impl Local {
                 .cloned()
                 .unwrap_or_default()
         };
-        let arrivals = if replayed {
-            receive_replayed(envelopes, sign, settings.sync_mode, now, here)
-        } else {
-            receive(envelopes, sign, settings.sync_mode, now, here)
+        // A change with large values is checked once they have arrived: its
+        // signature here, its row by the hash of what arrived.
+        let verified = |envelope: &Envelope| {
+            if large_values(envelope).is_empty() {
+                envelope.verify(sign)
+            } else {
+                envelope.signed_by(sign) && (assembled.verified)(&envelope.signature)
+            }
         };
+        let arrivals = receive_checked(envelopes, verified, settings.sync_mode, now, here, replayed);
         let mut applied = Applied::default();
         let (mut moves, mut tombstones): (Vec<Envelope>, Vec<Envelope>) = (Vec::new(), Vec::new());
         let mut dropped = Vec::new();
@@ -515,7 +570,7 @@ impl Local {
             }
         }
         for (name, envelopes) in writing {
-            self.write(place, &name, &envelopes, &mut applied, &mut moves)?;
+            self.write(place, &name, &envelopes, (&mut applied, &mut moves), assembled.file)?;
         }
         if replayed {
             // Left for the next run to find as the node's own change.
@@ -549,14 +604,17 @@ impl Local {
         place: &mut dyn Place,
         name: &str,
         envelopes: &[&Envelope],
-        applied: &mut Applied,
-        moves: &mut Vec<Envelope>,
+        (applied, moves): (&mut Applied, &mut Vec<Envelope>),
+        file: &dyn Fn(&Large) -> Option<PathBuf>,
     ) -> Result<(), Error> {
         let Some(table) = self.tables.get(name).cloned() else {
             return Ok(());
         };
         let changes: Vec<Change> = envelopes.iter().map(|e| e.change.clone()).collect();
-        let landed: BTreeSet<Key> = place.write(&table, &changes)?.into_iter().collect();
+        let landed: BTreeSet<Key> = place
+            .write_apart(&table, &changes, file)?
+            .into_iter()
+            .collect();
         let read_back = read_back(place, &table, &landed)?;
         let (mut makers, mut keys, mut count) = (BTreeSet::new(), BTreeSet::new(), 0);
         for &envelope in envelopes {
@@ -630,6 +688,50 @@ impl Local {
         new
     }
 
+    /// Copies each large value of `envelope`, one of the node's own changes,
+    /// from the database into the file `path` names for its column, a piece
+    /// at a time. Whether every copy holds its value: one that does not means
+    /// the row moved on since it was read, so the change is not taken and the
+    /// next look's change carries the row (FR-SMUGGLR-078 rev 28).
+    pub(crate) fn snapshot(
+        &self,
+        place: &mut dyn Place,
+        envelope: &Envelope,
+        path: impl Fn(usize) -> PathBuf,
+    ) -> Result<bool, Error> {
+        let Some(table) = self.tables.get(&envelope.change.table) else {
+            return Ok(false);
+        };
+        for (column, value) in large_values(envelope) {
+            let path = path(column);
+            let io = |err: std::io::Error| {
+                Error::Shape(format!("{}: {err}", path.display()))
+            };
+            if let Some(folder) = path.parent() {
+                std::fs::create_dir_all(folder).map_err(io)?;
+            }
+            let mut file = std::fs::File::create(&path).map_err(io)?;
+            let mut hasher = large::Hasher::new(value.blob);
+            let mut at = 0;
+            while at < value.size {
+                let piece =
+                    place.read_value(table, &envelope.change.key, column, at, PIECE)?;
+                if piece.is_empty() {
+                    break;
+                }
+                std::io::Write::write_all(&mut file, &piece).map_err(io)?;
+                hasher.update(&piece);
+                at += piece.len() as u64;
+            }
+            if at != value.size || hasher.finish() != value.hash {
+                drop(file);
+                let _ = std::fs::remove_file(&path);
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Whether `envelope`'s table is one this node keeps, with the same
     /// shape.
     pub(crate) fn same_shape(&self, envelope: &Envelope) -> bool {
@@ -647,13 +749,40 @@ fn read_back(
 ) -> Result<HashMap<Key, [u8; 16]>, Error> {
     let keys: Vec<Key> = keys.iter().cloned().collect();
     Ok(place
-        .rows(table, &keys)?
+        .rows_apart(table, &keys, LARGE)?
         .into_iter()
-        .map(|row| {
-            let columns: Vec<&str> = row.iter().map(String::as_str).collect();
-            (table.key_of(&row), row_hash(&columns))
-        })
+        .map(|(row, hash)| (table.key_of(&row), hash))
         .collect())
+}
+
+/// Puts `envelope`'s largest values apart, each as its placeholder, until
+/// the change sealed fits one datagram, or none is left to put apart.
+fn fit(envelope: &mut Envelope, table: &Table, node: &str) {
+    loop {
+        let message = Message::Change {
+            sender: node.to_owned(),
+            envelope: Box::new(envelope.clone()),
+            resend: true,
+        };
+        if sealed_len(&message) <= DATAGRAM {
+            return;
+        }
+        let largest = envelope
+            .change
+            .values
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| table.columns.get(*i).is_some_and(|c| !table.key.contains(c)))
+            .filter_map(|(i, quoted)| {
+                let (large, _) = Large::of(quoted)?;
+                (large.placeholder().len() < quoted.len()).then_some((quoted.len(), i, large))
+            })
+            .max_by_key(|(len, i, _)| (*len, *i));
+        let Some((_, i, large)) = largest else {
+            return;
+        };
+        envelope.change.values[i] = large.placeholder();
+    }
 }
 
 /// A row hash as the record shows it: its first 8 bytes, or "absent".
