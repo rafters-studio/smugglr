@@ -191,7 +191,9 @@ impl HttpSql {
     /// The row each key names, as its columns' `quote()` text; `None` where
     /// the key holds no row.
     fn read(&self, table: &Table, keys: &[&Key]) -> Result<Vec<Option<Vec<String>>>, Error> {
-        let sql = queries::row(table);
+        // A value over the place's limit is never quoted, so the service
+        // never fails the read; the engine refuses and names it.
+        let sql = queries::row_within(table, self.value_limit());
         let statements = keys
             .iter()
             .map(|key| Ok((sql.clone(), params(key)?)))
@@ -320,7 +322,7 @@ impl Place for HttpSql {
         let width = table.key.len();
         if self.transport.hashes_where_rows_live() {
             return self
-                .query(&queries::hex_hashes(table), &[])?
+                .query(&queries::hex_hashes(table, self.value_limit()), &[])?
                 .iter()
                 .map(|row| {
                     let mut texts = self.texts(row)?;
@@ -333,7 +335,7 @@ impl Place for HttpSql {
                 })
                 .collect();
         }
-        self.query(&queries::quoted_rows(table), &[])?
+        self.query(&queries::quoted_rows(table, self.value_limit()), &[])?
             .iter()
             .map(|row| {
                 let mut texts = self.texts(row)?;

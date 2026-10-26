@@ -68,9 +68,11 @@ fn quoted_within(table: &Table, limit: u64) -> String {
             if table.key.contains(column) {
                 format!("quote({})", ident(column))
             } else {
+                // The value's own bytes, read without building its quote()
+                // text, which a service that cannot build it fails on.
                 format!(
-                    "CASE WHEN octet_length({0}) > {limit} THEN '@over ' || octet_length({0}) \
-                     ELSE quote({0}) END",
+                    "CASE WHEN length(CAST({0} AS BLOB)) > {limit} \
+                     THEN '@over ' || length(CAST({0} AS BLOB)) ELSE quote({0}) END",
                     ident(column)
                 )
             }
@@ -122,23 +124,25 @@ pub(crate) fn value(table: &Table, column: &str, limit: u64) -> String {
 }
 
 /// Each row's key columns' `quote()` text, then its row hash as hex, for an
-/// HTTP-SQL place whose connection runs the row hash.
-pub(crate) fn hex_hashes(table: &Table) -> String {
+/// HTTP-SQL place whose connection runs the row hash; a value over `limit`
+/// bytes is hashed as [`quoted_within`] gives it, never quoted.
+pub(crate) fn hex_hashes(table: &Table, limit: u64) -> String {
     format!(
         "SELECT {}, hex({ROW_HASH}({})) FROM {}",
         quoted(&table.key),
-        quoted(&table.columns),
+        quoted_within(table, limit),
         ident(&table.name)
     )
 }
 
-/// Each row's key columns' `quote()` text, then every column's, for a place
-/// that cannot run the row hash where the rows live.
-pub(crate) fn quoted_rows(table: &Table) -> String {
+/// Each row's key columns' `quote()` text, then every column's as
+/// [`quoted_within`] gives it, for a place that cannot run the row hash
+/// where the rows live.
+pub(crate) fn quoted_rows(table: &Table, limit: u64) -> String {
     format!(
         "SELECT {}, {} FROM {}",
         quoted(&table.key),
-        quoted(&table.columns),
+        quoted_within(table, limit),
         ident(&table.name)
     )
 }
@@ -156,16 +160,6 @@ pub(crate) fn weights(table: &Table) -> String {
         quoted(&table.key),
         bytes.join(" + "),
         ident(&table.name)
-    )
-}
-
-/// One row's columns' `quote()` text, by key.
-pub(crate) fn row(table: &Table) -> String {
-    format!(
-        "SELECT {} FROM {} WHERE {}",
-        quoted(&table.columns),
-        ident(&table.name),
-        by_key(&table.key, 1)
     )
 }
 
@@ -385,8 +379,10 @@ mod tests {
     fn http_sql_statements_read_and_write_by_quote_text() {
         let table = notes();
         assert_eq!(
-            quoted_rows(&table),
-            "SELECT quote(\"id\"), quote(\"id\"), quote(\"body\") FROM \"notes\""
+            quoted_rows(&table, 9),
+            "SELECT quote(\"id\"), quote(\"id\"), CASE WHEN length(CAST(\"body\" AS BLOB)) > 9 \
+             THEN '@over ' || length(CAST(\"body\" AS BLOB)) ELSE quote(\"body\") END \
+             FROM \"notes\""
         );
         assert_eq!(
             update_at_quoted(&table),
