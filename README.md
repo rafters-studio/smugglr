@@ -123,7 +123,15 @@ graveyard = 43200
 steering = "modified"
 ```
 
-`max_wire` caps a first sync; unset, a first sync has no limit. A first sync heavier than the cap stops with exit 5.
+`max_wire` caps a first sync, 100 MB when unset. A first sync heavier than the cap stops with exit 5 and names the commands that move it. Here `max_wire = "10 B"` trips on two small rows:
+
+```
+$ smugglr sync ./laptop/shop.db ./server/shop.db | sed "s#$PWD#.#g"
+smugglr sync: too much
+  first sync: a row on one side only is copied as new; deletes are not seen
+  Too much for one sync: 2 rows, 44 B in 1 table.
+  Move it with: smugglr stash ./laptop/shop.db <dir> --key-file <path> --node <name> --whole, then smugglr retrieve ./server/shop.db <dir> --key-file <path> --node <name>
+```
 
 ## A large first sync
 
@@ -131,7 +139,7 @@ steering = "modified"
 
 ```
 $ smugglr stash a/shop.db blobs --key-file shop.key --node laptop --whole
-blobs/1792973901416-a8167c190f72bb4802369516ca94ceb0.blob
+blobs/1792977241457-31250147751667d1c02b67c6ec99a5a6.blob
 ```
 
 ```
