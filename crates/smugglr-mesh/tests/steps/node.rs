@@ -1024,3 +1024,36 @@ fn the_peer_ends_with_all(mesh: &Mesh) -> Result<(), String> {
     })
     .map_err(|()| format!("the peer holds {:?} rows of {}", net.count(1), ROWS + 1))
 }
+
+/// A delete made on one node after its insert crossed reaches the other,
+/// its first copy lost on the way so only a resend can bring it, and the
+/// node records that the change arrived only as a resend.
+#[test]
+fn a_delete_crosses_after_its_insert() -> Result<(), String> {
+    let net = Net::new()?;
+    net.start_many(2, "")?;
+    net.sql(0, "INSERT INTO notes VALUES ('p2', 'made')")?;
+    net.holds(1, "p2", "made", SOON)?;
+    let maker = net.port(0)?;
+    let filter: Filter = Box::new(move |seen, before| {
+        let delete = |seen: &Seen| {
+            changed(seen).is_some_and(|envelope| {
+                envelope.change.key == ["'p2'"] && envelope.change.to.is_none()
+            })
+        };
+        delete(seen)
+            && seen.from == maker
+            && !before
+                .iter()
+                .any(|other| other.from == maker && delete(other))
+    });
+    *net.relay
+        .filter
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some(filter);
+    net.sql(0, "DELETE FROM notes WHERE id = 'p2'")?;
+    wait(Duration::from_secs(20), || {
+        net.body(1, "p2").is_ok_and(|body| body.is_none())
+    })
+    .map_err(|()| format!("node 1 still holds p2: {:?}", net.body(1, "p2")))
+}

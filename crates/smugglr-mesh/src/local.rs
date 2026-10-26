@@ -8,7 +8,7 @@
 //! files, to which each change appends only the keys it touched. The journal
 //! is rewritten once, when the node starts.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde_json::{Value, json};
 use smugglr_core::change::{Change, op};
@@ -46,6 +46,8 @@ pub(crate) struct Local {
     baseline: BTreeMap<String, Hashes>,
     last_from: HashMap<Row, Option<[u8; 16]>>,
     tombstones: HashMap<Row, Envelope>,
+    /// The waiting changes the record has named, so each is named once.
+    named: HashSet<[u8; 32]>,
 }
 
 impl Local {
@@ -65,6 +67,7 @@ impl Local {
             baseline: BTreeMap::new(),
             last_from: HashMap::new(),
             tombstones: HashMap::new(),
+            named: HashSet::new(),
         };
         local.read_tables(place, settings)?;
         match local.store.read(&local.journal)? {
@@ -370,7 +373,20 @@ impl Local {
                     }
                     applied.has.push(envelope.signature);
                 }
-                Arrival::Hold => applied.waiting.push(envelope.clone()),
+                Arrival::Hold => {
+                    let here = here
+                        .get(&(change.table.clone(), change.key.clone()))
+                        .and_then(|here| here.hash);
+                    self.hold(
+                        envelope,
+                        &format!(
+                            "its from {} matches nothing here (the row here is {})",
+                            short(change.from),
+                            short(here)
+                        ),
+                    );
+                    applied.waiting.push(envelope.clone());
+                }
                 Arrival::Stop => println!(
                     "smugglr mesh: stopped {} {:?}: changed here and in a change from {}",
                     change.table, change.key, envelope.node
@@ -394,9 +410,21 @@ impl Local {
             };
             let changes: Vec<Change> = envelopes.iter().map(|e| e.change.clone()).collect();
             let landed: BTreeSet<Key> = place.write(&table, &changes)?.into_iter().collect();
+            let read_back = read_back(place, &table, &landed)?;
             let (mut makers, mut keys, mut count) = (BTreeSet::new(), BTreeSet::new(), 0);
             for envelope in envelopes {
                 if landed.contains(&envelope.change.key) {
+                    let now_here = read_back.get(&envelope.change.key).copied();
+                    if now_here != envelope.change.to {
+                        println!(
+                            "smugglr mesh: a change to {name} {:?} from {} reads back as {}, not {}",
+                            envelope.change.key,
+                            envelope.node,
+                            short(now_here),
+                            short(envelope.change.to)
+                        );
+                    }
+                    self.named.remove(&envelope.signature);
                     self.moved(envelope, &mut lines);
                     applied.has.push(envelope.signature);
                     applied.wrote.push(envelope.signature);
@@ -404,7 +432,10 @@ impl Local {
                     keys.insert(envelope.key_id.as_str());
                     count += 1;
                 } else {
-                    // The row moved here between the read and the write.
+                    self.hold(
+                        envelope,
+                        "the row moved here between the read and the write",
+                    );
                     applied.waiting.push(envelope.clone());
                 }
             }
@@ -421,6 +452,16 @@ impl Local {
         Ok(applied)
     }
 
+    /// Names in the record, once, a change that waits, and why.
+    fn hold(&mut self, envelope: &Envelope, why: &str) {
+        if self.named.insert(envelope.signature) {
+            println!(
+                "smugglr mesh: holding a change to {} {:?} from {}: {why}",
+                envelope.change.table, envelope.change.key, envelope.node
+            );
+        }
+    }
+
     /// Whether `envelope`'s table is one this node keeps, with the same
     /// shape.
     pub(crate) fn same_shape(&self, envelope: &Envelope) -> bool {
@@ -428,6 +469,28 @@ impl Local {
             .get(&envelope.change.table)
             .is_some_and(|table| stamp(table) == envelope.stamp)
     }
+}
+
+/// The hash each of `keys` reads back as, after a write.
+fn read_back(
+    place: &mut dyn Place,
+    table: &Table,
+    keys: &BTreeSet<Key>,
+) -> Result<HashMap<Key, [u8; 16]>, Error> {
+    let keys: Vec<Key> = keys.iter().cloned().collect();
+    Ok(place
+        .rows(table, &keys)?
+        .into_iter()
+        .map(|row| {
+            let columns: Vec<&str> = row.iter().map(String::as_str).collect();
+            (table.key_of(&row), row_hash(&columns))
+        })
+        .collect())
+}
+
+/// A row hash as the record shows it: its first 8 bytes, or "absent".
+fn short(hash: Option<[u8; 16]>) -> String {
+    hash.map_or_else(|| "absent".to_owned(), |hash| hex(&hash[..8]))
 }
 
 /// A table's shape stamp.

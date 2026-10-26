@@ -33,6 +33,9 @@ const FIRST_RESEND: Duration = Duration::from_secs(10);
 /// The longest wait between two resends.
 const LAST_RESEND: Duration = Duration::from_secs(160);
 
+/// A change due a resend, and the targets that have not acknowledged it.
+pub(crate) type Owed = (Envelope, Vec<String>);
+
 #[derive(Debug)]
 struct Entry {
     segment: u64,
@@ -265,14 +268,15 @@ impl Outbox {
         }
     }
 
-    /// Up to `limit` changes due a resend at `now` to a target that has not
-    /// acknowledged them, each next due after twice its last wait; and
-    /// whether one of them no peer has acknowledged, a sign of loss.
+    /// Up to `limit` changes due a resend at `now`, each with the targets
+    /// that have not acknowledged it, each next due after twice its last
+    /// wait; and whether one of them no peer has acknowledged, a sign of
+    /// loss.
     pub(crate) fn resends(
         &mut self,
         now: Instant,
         limit: usize,
-    ) -> Result<(Vec<Envelope>, bool), Error> {
+    ) -> Result<(Vec<Owed>, bool), Error> {
         let mut due: Vec<([u8; 32], bool)> = self
             .entries
             .iter()
@@ -285,12 +289,14 @@ impl Outbox {
         let lost = due.iter().any(|(_, none)| *none);
         let mut out = Vec::new();
         for (change, _) in due {
+            let mut owed = Vec::new();
             if let Some(entry) = self.entries.get_mut(&change) {
                 entry.interval = (entry.interval * 2).min(LAST_RESEND);
                 entry.resend_at = now + entry.interval;
+                owed = entry.targets.difference(&entry.acked).cloned().collect();
             }
             if let Some(envelope) = self.envelope(&change)? {
-                out.push(envelope);
+                out.push((envelope, owed));
             }
         }
         Ok((out, lost))
