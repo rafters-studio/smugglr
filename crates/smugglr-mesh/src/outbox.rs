@@ -49,14 +49,13 @@ const COMPACT: u64 = 64 * 1024;
 const LAST_RESEND: Duration = Duration::from_secs(160);
 
 /// A change due a resend: to which peers, and whether to a silent peer (on
-/// the doubling) or to an acknowledging one after its round trips.
+/// the doubling).
 #[derive(Debug)]
 struct Due {
     seq: u64,
     change: [u8; 32],
     to: Vec<String>,
     silent: bool,
-    paced: bool,
 }
 
 /// A change due a resend, and the targets it is due to.
@@ -78,8 +77,6 @@ struct Entry {
     sent_at: Instant,
     /// When it last went out, first send or resend.
     last_sent: Instant,
-    /// Resends to acknowledging peers so far: each waits twice the last.
-    tries: u32,
     /// For each peer it has been resent to, the last first send by then: a
     /// peer that acknowledges changes sent after that has skipped the resend
     /// too, so it is resent at once again.
@@ -111,7 +108,9 @@ impl Timing {
     /// The wait before a first resend: about two round trips, longer when
     /// round trips vary (RFC 6298).
     fn wait(&self) -> Duration {
-        (self.round_trip * 2).max(SHORTEST)
+        (self.round_trip * 2)
+            .max(self.round_trip + self.variation * 4)
+            .max(SHORTEST)
     }
 
     /// Takes in one round trip measured.
@@ -310,6 +309,11 @@ impl Outbox {
             .cloned())
     }
 
+    /// How many changes wait for their first send.
+    pub(crate) fn unsent(&self) -> usize {
+        self.unsent.len()
+    }
+
     /// How many changes have been sent and acknowledged by no peer yet.
     pub(crate) fn in_flight(&self) -> usize {
         self.entries
@@ -380,7 +384,7 @@ impl Outbox {
             if !entry.sent {
                 continue;
             }
-            let (mut to, mut silent, mut paced) = (Vec::new(), false, false);
+            let (mut to, mut silent) = (Vec::new(), false);
             for peer in entry.targets.difference(&entry.acked) {
                 if entry.unsent_to.contains(peer) {
                     // Its first copy to a peer heard since the first send.
@@ -395,9 +399,11 @@ impl Outbox {
                         to.push(peer.clone());
                     }
                     Some(timing) => {
-                        let wait = timing.wait() * 2_u32.pow(entry.tries.min(8));
-                        if now >= entry.last_sent + wait.min(LAST_RESEND) {
-                            paced = true;
+                        // Every two round trips, never doubling: the
+                        // doubling is only for a peer that has stopped
+                        // (FR-SMUGGLR-078 rev 20); the quarter cap is
+                        // what keeps resends from crowding out the rest.
+                        if now >= entry.last_sent + timing.wait() {
                             to.push(peer.clone());
                         }
                     }
@@ -415,7 +421,6 @@ impl Outbox {
                     change: *change,
                     to,
                     silent,
-                    paced,
                 });
             }
         }
@@ -423,11 +428,7 @@ impl Outbox {
         due.truncate(limit);
         let latest = self.seq;
         for Due {
-            change,
-            to,
-            silent,
-            paced,
-            ..
+            change, to, silent, ..
         } in &due
         {
             let Some(entry) = self.entries.get_mut(change) else {
@@ -436,9 +437,6 @@ impl Outbox {
             if *silent {
                 entry.interval = (entry.interval * 2).min(LAST_RESEND);
                 entry.resend_at = now + entry.interval;
-            }
-            if *paced {
-                entry.tries += 1;
             }
             entry.last_sent = now;
             entry.resent = true;
@@ -586,7 +584,6 @@ fn entry(segment: u64, envelope: &Envelope, targets: BTreeSet<String>) -> Entry 
         seq: 0,
         sent_at: Instant::now(),
         last_sent: Instant::now(),
-        tries: 0,
         resent_by: HashMap::new(),
         resent: false,
         resend_at: Instant::now(),
