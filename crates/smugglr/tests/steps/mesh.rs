@@ -1945,3 +1945,44 @@ fn a_change_its_maker_refuses_leaves_the_next_edit_free_to_cross() -> Result<(),
         Err(format!("the first node named the refusal {named} times"))
     }
 }
+
+/// A change over a receiver's part cap is refused from its part count, and
+/// its maker is told: its parts no longer hold the maker's window, and a
+/// small change after it crosses within a second.
+#[test]
+fn a_change_over_a_receivers_part_cap_releases_its_maker() -> Result<(), String> {
+    let (world, front) = (World::default(), Front::default());
+    two_on_a_relay_with(
+        &world,
+        &front,
+        false,
+        ["", "max_value = \"500 kB\"\n"],
+        FrontEnd::Mesh,
+    )?;
+    // 2 MB of blob is 4 MB of hex: past the receiver's cap of four times
+    // its 500 kB limit and a mebibyte.
+    front.sql(
+        0,
+        "INSERT INTO files VALUES ('blob', NULL, randomblob(2000000))",
+    )?;
+    front.prints(1, "refused a change from")?;
+    let relay = front.relay.get().ok_or("no relay")?;
+    let parts = || relay.seen().parts.len();
+    // Released: the maker sends no more of its parts.
+    sleep(Duration::from_secs(1));
+    let released = parts();
+    let written = Instant::now();
+    front.sql(0, "INSERT INTO notes VALUES ('after', 'small')")?;
+    front.holds_within(1, "after", "small", Duration::from_secs(1))?;
+    if written.elapsed() > Duration::from_millis(1_100) {
+        return Err(format!("the small change took {:?}", written.elapsed()));
+    }
+    sleep(Duration::from_secs(2));
+    match parts() {
+        now if now == released => Ok(()),
+        now => Err(format!(
+            "the maker sent {} more parts after it was told",
+            now - released
+        )),
+    }
+}

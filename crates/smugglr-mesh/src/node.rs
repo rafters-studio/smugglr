@@ -591,6 +591,16 @@ impl Node<'_> {
                 count,
                 data,
             } => self.hear_part(&sender, id, (n, count), &data, (from, batch)),
+            Message::Refused { sender, maker, id } => {
+                if maker == self.settings.node {
+                    // Decided at the peer: acknowledged, and sent no more.
+                    for change in self.sending.refused(&sender, &id) {
+                        if let Some(acked) = self.outbox.ack(&change, &sender) {
+                            self.acked(&sender, acked);
+                        }
+                    }
+                }
+            }
             Message::Parts {
                 sender,
                 maker,

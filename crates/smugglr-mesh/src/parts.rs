@@ -265,6 +265,18 @@ impl Sending {
         }
     }
 
+    /// `peer` refuses the change keyed by `id` for its size: it is sent no
+    /// more of its parts. Gives the changes it names.
+    pub(crate) fn refused(&mut self, peer: &str, id: &Id) -> Vec<[u8; 32]> {
+        let mut changes = Vec::new();
+        for out in self.outs.iter_mut().filter(|out| out.id == *id) {
+            if out.peers.remove(peer).is_some() {
+                changes.push(out.change);
+            }
+        }
+        changes
+    }
+
     /// Up to `limit` parts never sent, the oldest change first.
     pub(crate) fn firsts(&mut self, limit: usize, now: Instant) -> Vec<Piece> {
         let mut pieces = Vec::new();
@@ -428,6 +440,8 @@ pub(crate) struct Receiving {
     /// The changes let go for their size, so each is named once.
     too_large: std::collections::HashSet<(String, Id)>,
     ins: HashMap<(String, Id), In>,
+    /// Changes refused for their size whose makers are due word of it.
+    refusals: Vec<(String, Id)>,
     /// Changes assembled lately, so a late copy of a part is acknowledged,
     /// not begun again.
     done: HashMap<(String, Id), Instant>,
@@ -461,12 +475,17 @@ impl Receiving {
         }
         let key = (maker.to_owned(), id);
         if count.saturating_mul(PART as u64) > self.most {
-            if self.too_large.insert(key) {
+            // Refused as it would be once assembled, and its maker told, so
+            // its parts no longer hold the maker's window.
+            if self.too_large.insert(key.clone()) {
                 println!(
-                    "smugglr mesh: let go a change from {maker} in {count} parts: more than \
+                    "smugglr mesh: refused a change from {maker} in {count} parts: more than \
                      the {} bytes a change may take here",
                     self.most
                 );
+            }
+            if !self.refusals.contains(&key) {
+                self.refusals.push(key);
             }
             return None;
         }
@@ -519,7 +538,18 @@ impl Receiving {
     /// highest arrived (every part missing, for a change whose parts have
     /// stalled).
     pub(crate) fn acks(&mut self, node: &str) -> Vec<(String, Message)> {
-        let mut acks = Vec::new();
+        let mut acks: Vec<(String, Message)> = self
+            .refusals
+            .drain(..)
+            .map(|(maker, id)| {
+                let refused = Message::Refused {
+                    sender: node.to_owned(),
+                    maker: maker.clone(),
+                    id,
+                };
+                (maker, refused)
+            })
+            .collect();
         let mut late: BTreeMap<(String, Id), Vec<u64>> = BTreeMap::new();
         for (maker, id, n) in self.late.drain(..) {
             late.entry((maker, id)).or_default().push(n);
@@ -651,5 +681,20 @@ mod tests {
         let parts = (1 << 20) / PART as u64 + 2;
         assert_eq!(small.part("a", (None, [3; 16]), (0, parts), &[1]), None);
         assert!(small.ins.is_empty());
+        // Its maker is told it is refused, and sends it no more.
+        let mut big = Sending::default();
+        big.start(
+            [4; 32],
+            (None, [3; 16]),
+            vec![0; PART * 2],
+            &BTreeSet::from(["b".to_owned()]),
+        );
+        assert_eq!(big.firsts(10, now).len(), 2);
+        let told = small.acks("b");
+        assert!(
+            matches!(told.as_slice(), [(maker, super::Message::Refused { .. })] if maker == "a")
+        );
+        assert_eq!(big.refused("b", &(None, [3; 16])), vec![[4; 32]]);
+        assert_eq!(big.in_flight(), 0);
     }
 }

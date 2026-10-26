@@ -103,6 +103,16 @@ pub(crate) enum Message {
         /// Parts missing, at most [`RANGES`].
         missing: Vec<Range>,
     },
+    /// A node refuses a change made by `maker` for its size, from its part
+    /// count: decided, so its maker sends it no more.
+    Refused {
+        /// The node.
+        sender: String,
+        /// The change's maker.
+        maker: String,
+        /// The change's `from` and `to`.
+        id: Id,
+    },
 }
 
 impl Message {
@@ -113,7 +123,8 @@ impl Message {
             | Self::Change { sender, .. }
             | Self::Ack { sender, .. }
             | Self::Part { sender, .. }
-            | Self::Parts { sender, .. } => sender,
+            | Self::Parts { sender, .. }
+            | Self::Refused { sender, .. } => sender,
         }
     }
 
@@ -152,6 +163,13 @@ impl Message {
                 "n": n,
                 "count": count,
                 "data": base64(data),
+            }),
+            Self::Refused { sender, maker, id } => json!({
+                "t": "refused",
+                "sender": sender,
+                "maker": maker,
+                "from": id_json(id).0,
+                "to": id_json(id).1,
             }),
             Self::Parts {
                 sender,
@@ -214,6 +232,11 @@ impl Message {
                     missing: ranges("missing")?,
                 })
             }
+            "refused" => Some(Self::Refused {
+                sender,
+                maker: text("maker")?,
+                id: id_of(json)?,
+            }),
             _ => None,
         }
     }
