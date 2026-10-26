@@ -9,7 +9,7 @@ use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, sleep};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -947,8 +947,6 @@ struct Seen {
     resent_at: BTreeMap<String, Instant>,
     /// When the second node first acknowledged each change.
     acked: BTreeMap<String, Instant>,
-    /// The change to the last row a scenario writes.
-    last_row: Option<String>,
     /// Datagrams the first node sent, and of them resends.
     sent: u64,
     resent: u64,
@@ -972,7 +970,13 @@ struct Relay {
     lossy: AtomicBool,
     /// Lose the first copy of the change to the last row written.
     lose_last: AtomicBool,
+    /// The change to the last row a scenario writes, apart from what the
+    /// relay notes, so deciding a datagram's fate never waits on noting.
+    last_row: Mutex<Option<String>>,
     dropped: AtomicU64,
+    /// Datagrams the relay has read, and of them those it has noted.
+    read: AtomicU64,
+    noted: AtomicU64,
     seen: Mutex<Seen>,
 }
 
@@ -1020,40 +1024,34 @@ impl Relay {
             stop: AtomicBool::new(false),
             lossy: AtomicBool::new(lossy),
             lose_last: AtomicBool::new(false),
+            last_row: Mutex::new(None),
             dropped: AtomicU64::new(0),
+            read: AtomicU64::new(0),
+            noted: AtomicU64::new(0),
             seen: Mutex::new(Seen::default()),
         });
         let seal = blake3::derive_key("smugglr mesh 0.6 datagram seal", shared_key);
-        // A reader drains the socket as datagrams arrive, so a system that
-        // gives a small receive buffer does not drop what the relay means to
-        // pass; the relay's own work happens beside it.
-        let reader = socket.try_clone().map_err(|err| err.to_string())?;
-        let (tx, rx) = std::sync::mpsc::channel::<(Vec<u8>, std::net::SocketAddr)>();
+        // One thread reads each datagram, decides its fate and passes it on
+        // as it arrives, so the socket drains even where the system gives a
+        // small receive buffer; what the relay notes of it happens on
+        // another thread, timed from its arrival, so the relay's bookkeeping
+        // never delays the traffic it measures (#598: on a loaded runner it
+        // queued for hundreds of milliseconds on each pass through the
+        // relay, and a repair crosses the relay three times).
+        let (tx, rx) = std::sync::mpsc::channel::<(Vec<u8>, bool, bool, Instant)>();
         let weak = Arc::downgrade(&relay);
         thread::spawn(move || {
             let mut buffer = vec![0; 65_536];
-            while weak
-                .upgrade()
-                .is_some_and(|relay| !relay.stop.load(Ordering::Relaxed))
-            {
-                if let Ok((len, from)) = reader.recv_from(&mut buffer)
-                    && tx.send((buffer[..len].to_vec(), from)).is_err()
-                {
-                    break;
-                }
-            }
-        });
-        let weak = Arc::downgrade(&relay);
-        thread::spawn(move || {
             let mut random = 0x9e37_79b9_7f4a_7c15_u64;
             while let Some(relay) = weak.upgrade() {
                 if relay.stop.load(Ordering::Relaxed) {
                     break;
                 }
-                let Ok((buffer, from)) = rx.recv_timeout(Duration::from_millis(50)) else {
+                let Ok((len, from)) = socket.recv_from(&mut buffer) else {
                     continue;
                 };
-                let len = buffer.len();
+                let arrived = Instant::now();
+                let datagram = &buffer[..len];
                 let (from_first, to) = match from.port() {
                     port if port == ports[0] => (true, ports[1]),
                     port if port == ports[1] => (false, ports[0]),
@@ -1062,21 +1060,47 @@ impl Relay {
                 random ^= random << 13;
                 random ^= random >> 7;
                 random ^= random << 17;
-                let message = open_with(&buffer[..len], &seal);
                 // The forced loss is looked at on every datagram, before the
                 // random one, so it never goes unseen.
-                let forced = relay.last_first_copy(message.as_ref(), from_first);
+                let forced = relay.lose_last.load(Ordering::Relaxed)
+                    && relay.last_first_copy(open_with(datagram, &seal).as_ref(), from_first);
                 let drop =
                     forced || (relay.lossy.load(Ordering::Relaxed) && random.is_multiple_of(10));
-                relay.note(message, from_first, drop);
                 if drop {
                     relay.dropped.fetch_add(1, Ordering::Relaxed);
                 } else {
-                    let _ = socket.send_to(&buffer[..len], ("127.0.0.1", to));
+                    let _ = socket.send_to(datagram, ("127.0.0.1", to));
+                }
+                relay.read.fetch_add(1, Ordering::SeqCst);
+                if tx
+                    .send((datagram.to_vec(), from_first, drop, arrived))
+                    .is_err()
+                {
+                    break;
                 }
             }
         });
+        let weak = Arc::downgrade(&relay);
+        thread::spawn(move || {
+            while let Ok((datagram, from_first, dropped, arrived)) = rx.recv() {
+                let Some(relay) = weak.upgrade() else {
+                    break;
+                };
+                relay.note(open_with(&datagram, &seal), from_first, dropped, arrived);
+                relay.noted.fetch_add(1, Ordering::SeqCst);
+            }
+        });
         Ok(relay)
+    }
+
+    /// What the relay saw, once it has noted every datagram it had read
+    /// when asked (waiting up to 30 s).
+    fn seen(&self) -> MutexGuard<'_, Seen> {
+        let read = self.read.load(Ordering::SeqCst);
+        let _ = wait(Duration::from_secs(30), || {
+            self.noted.load(Ordering::SeqCst) >= read
+        });
+        self.seen.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Whether `message` is the first copy the relay sees of the change to
@@ -1097,21 +1121,21 @@ impl Relay {
         {
             return false;
         }
-        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
-        if seen.last_row.is_some() {
+        let mut last_row = self.last_row.lock().unwrap_or_else(PoisonError::into_inner);
+        if last_row.is_some() {
             return false;
         }
-        seen.last_row = envelope
+        *last_row = envelope
             .and_then(|envelope| envelope.get("signature")?.as_str())
             .map(str::to_owned);
         true
     }
 
-    fn note(&self, message: Option<Value>, from_first: bool, dropped: bool) {
+    /// Notes `message`, which reached the relay at `now`.
+    fn note(&self, message: Option<Value>, from_first: bool, dropped: bool, now: Instant) {
         let Some(message) = message else {
             return;
         };
-        let now = Instant::now();
         let text = |value: &Value| value.as_str().map(str::to_owned);
         let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(envelope) = message.get("envelope")
@@ -1254,7 +1278,7 @@ fn first_copies_unicast(front: &Front) -> Result<(), String> {
     // unicast. A change whose first copy the system dropped before the relay
     // read it reaches the relay as a resend, to the same address.
     let relay = front.relay.get().ok_or("no relay")?;
-    let seen = relay.seen.lock().unwrap_or_else(PoisonError::into_inner);
+    let seen = relay.seen();
     let (firsts, changes) = (seen.first_copies.len(), seen.changes.len());
     if changes >= 50_000 && firsts * 100 >= changes * 99 {
         Ok(())
@@ -1268,7 +1292,7 @@ fn first_copies_unicast(front: &Front) -> Result<(), String> {
 #[then("each lost copy is applied on the second node within one second of its loss")]
 fn lost_copies_within_a_second(front: &Front) -> Result<(), String> {
     let relay = front.relay.get().ok_or("no relay")?;
-    let seen = relay.seen.lock().unwrap_or_else(PoisonError::into_inner);
+    let seen = relay.seen();
     if seen.lost.is_empty() {
         return Err("the relay lost no copy of a change".to_owned());
     }
@@ -1316,7 +1340,7 @@ fn lost_copies_within_a_second(front: &Front) -> Result<(), String> {
 )]
 fn resends_a_quarter_at_most(front: &Front) -> Result<(), String> {
     let relay = front.relay.get().ok_or("no relay")?;
-    let seen = relay.seen.lock().unwrap_or_else(PoisonError::into_inner);
+    let seen = relay.seen();
     // Counted up to the last first copy: until then first copies were
     // waiting to be sent.
     let (sent, resent) = seen.at_last_first;
@@ -1379,14 +1403,7 @@ fn fifty_thousand_all_sent(front: &Front) -> Result<(), String> {
     let relay = front.relay.get().ok_or("no relay")?;
     // A change the relay has seen at all, first copy or resend, has had its
     // first send.
-    let sent = || {
-        relay
-            .seen
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .changes
-            .len()
-    };
+    let sent = || relay.seen().changes.len();
     wait(Duration::from_secs(300), || sent() >= 50_000)
         .map_err(|()| format!("the first node sent first copies of {} changes", sent()))
 }
@@ -1394,13 +1411,7 @@ fn fifty_thousand_all_sent(front: &Front) -> Result<(), String> {
 #[then("the first node keeps resending until the second node holds all 50,000 rows")]
 fn repair_goes_on(front: &Front) -> Result<(), String> {
     let relay = front.relay.get().ok_or("no relay")?;
-    let resent = || {
-        relay
-            .seen
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .resent
-    };
+    let resent = || relay.seen().resent;
     let before = resent();
     let path = front.with(1, |node| node.path.clone())?;
     let missing = Connection::open(&path)
@@ -1434,11 +1445,13 @@ fn two_with_a_small_line(world: &World, front: &Front) -> Result<(), String> {
 fn the_last_row_within_a_second(front: &Front) -> Result<(), String> {
     holds_rows(front, 1, 50_002, Duration::from_secs(300))?;
     let relay = front.relay.get().ok_or("no relay")?;
-    let seen = relay.seen.lock().unwrap_or_else(PoisonError::into_inner);
-    let last = seen
+    let last = relay
         .last_row
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
         .clone()
         .ok_or("the relay saw no copy of the last row")?;
+    let seen = relay.seen();
     let lost = seen
         .lost
         .get(&last)
@@ -1534,7 +1547,7 @@ fn named_once(front: &Front) -> Result<(), String> {
 #[then("neither node resends that change after it is acknowledged")]
 fn not_resent(front: &Front) -> Result<(), String> {
     let relay = front.relay.get().ok_or("no relay")?;
-    let seen = relay.seen.lock().unwrap_or_else(PoisonError::into_inner);
+    let seen = relay.seen();
     // Each change to the row, the stopped ones too, was acknowledged.
     let changes = seen.changes_by_key.get("'c1'").cloned().unwrap_or_default();
     if changes.len() < 3 {
