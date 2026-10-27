@@ -687,7 +687,7 @@ fn carry_both(
 /// The most rows carried at once. Each chunk's rows are read, journaled,
 /// written and read back, each step its own transaction, so a place's lock
 /// is held for one chunk, never a whole table, and only one chunk's rows
-/// are held. Current choice (2026-10-22, #580): 20,000; revisable.
+/// are held.
 const CHUNK: usize = 20_000;
 
 /// Journals and writes `wrote`'s writes in `range` in `to`, [`CHUNK`] rows

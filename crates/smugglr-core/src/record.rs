@@ -78,10 +78,9 @@ pub enum Status {
     Stopped,
     /// A first sync over `max_wire`: nothing was written.
     ///
-    /// Current choice (2026-10-19): its own run status, not `stopped`,
-    /// because each exit code then follows from one status (3 for stopped,
-    /// 5 for too much, FR-SMUGGLR-060) and "too much" is the spec's word for
-    /// it; revisable.
+    /// Its own run status, not `stopped`, so each exit code follows from one
+    /// status (3 for stopped, 5 for too much, FR-SMUGGLR-060), and "too much"
+    /// is the spec's word for it.
     #[serde(rename = "too much")]
     TooMuch,
 }

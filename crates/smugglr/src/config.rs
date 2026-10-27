@@ -1,9 +1,7 @@
 //! The person's config: a TOML file in smugglr's config directory.
 //!
-//! Current choice (2026-10-19): the file is `config.toml` in smugglr's
-//! config directory, beside its memory, because the form names the config
-//! but not its file, and one place for everything smugglr keeps is the
-//! simplest to find; revisable.
+//! The file is `config.toml` in smugglr's config directory, beside its
+//! memory, so everything smugglr keeps is in one place.
 //!
 //! Only what smugglr reads is taken from it: the tables to ignore;
 //! `max_wire`, the most a first sync moves (FR-SMUGGLR-065), as bytes or text
@@ -252,12 +250,15 @@ mod tests {
 
     #[test]
     fn peers_are_read_as_written() {
-        let peers = parse("peers = [\"10.0.0.2\", \"rzr.local:40000\"]")
+        let peers = parse("peers = [\"10.0.0.2\", \"desktop.local:40000\"]")
             .ok()
             .map(|c| c.peers);
         assert_eq!(
             peers,
-            Some(vec!["10.0.0.2".to_owned(), "rzr.local:40000".to_owned()])
+            Some(vec![
+                "10.0.0.2".to_owned(),
+                "desktop.local:40000".to_owned()
+            ])
         );
     }
 

@@ -295,8 +295,8 @@ mod tests {
 
     fn ack() -> Message {
         Message::Ack {
-            sender: "rzr".to_owned(),
-            maker: "puck".to_owned(),
+            sender: "desktop".to_owned(),
+            maker: "laptop".to_owned(),
             changes: vec![[3; 32]; super::ACKS],
         }
     }

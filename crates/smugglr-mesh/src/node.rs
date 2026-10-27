@@ -1252,14 +1252,14 @@ mod tests {
         assert_eq!(span(4), "4 seconds");
     }
 
-    const PUCK: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 88, 7));
+    const LAPTOP: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7));
 
     #[test]
     fn a_peer_elsewhere_is_sent_to_at_the_address_its_datagrams_came_from() {
-        let rzr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 88, 20)), 31337);
+        let desktop = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20)), 31337);
         assert_eq!(
-            unicast(Some(&rzr), &BTreeSet::from([PUCK]), 31337),
-            Some(rzr)
+            unicast(Some(&desktop), &BTreeSet::from([LAPTOP]), 31337),
+            Some(desktop)
         );
     }
 
@@ -1267,16 +1267,16 @@ mod tests {
     fn a_peer_on_this_machine_at_another_port_is_sent_to_unicast() {
         let beside = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40000);
         assert_eq!(
-            unicast(Some(&beside), &BTreeSet::from([PUCK]), 31337),
+            unicast(Some(&beside), &BTreeSet::from([LAPTOP]), 31337),
             Some(beside)
         );
     }
 
     #[test]
     fn a_peer_sharing_the_port_on_this_machine_or_not_yet_seen_is_sent_to_by_broadcast() {
-        let own = BTreeSet::from([PUCK]);
+        let own = BTreeSet::from([LAPTOP]);
         assert_eq!(
-            unicast(Some(&SocketAddr::new(PUCK, 31337)), &own, 31337),
+            unicast(Some(&SocketAddr::new(LAPTOP, 31337)), &own, 31337),
             None
         );
         let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 31337);

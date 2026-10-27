@@ -18,8 +18,8 @@ use crate::value::{Value, unquote};
 use crate::{Error, Key, LOCAL_LIMIT, Place, Table};
 
 /// How long a read or write waits for another writer to let go of the
-/// file's lock before the run stops. Current choice (2026-10-22): 10
-/// seconds, twice the 5-second default most SQLite tools use; revisable.
+/// file's lock before the run stops: 10 seconds, twice the 5-second default
+/// most SQLite tools use.
 const BUSY: Duration = Duration::from_secs(10);
 
 /// A value of more than this many bytes is read alone when a row is hashed,
