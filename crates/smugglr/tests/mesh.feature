@@ -9,9 +9,9 @@ Feature: smugglr mesh as a command: its front ends, its node's name and port, it
 
   @criterion-01a17503-1c41-7da1-bfbe-c356defeddf0 @module-mesh
   Scenario: a node is named by its machine
-    Given a node running smugglr mesh on a machine named puck
-    When a row is written on puck's database
-    Then the change the other nodes receive names puck as its node
+    Given a node running smugglr mesh on a machine named laptop
+    When a row is written on laptop's database
+    Then the change the other nodes receive names laptop as its node
 
   @criterion-01a17503-1c41-7da1-bfbe-c3603bc1e06c @module-mesh
   Scenario: the mesh port is a setting

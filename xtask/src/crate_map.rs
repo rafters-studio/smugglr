@@ -15,7 +15,6 @@ use cargo_metadata::{DependencyKind, Metadata};
 const CORE: &str = "smugglr-core";
 
 /// Each crate the map names, and the workspace crates it may depend on.
-/// Current choice 2026-10-22 (NFR-SMUGGLR-009 rev 7); revisable.
 const CRATE_MAP: &[(&str, &[&str])] = &[
     (CORE, &[]),
     ("smugglr-memory", &[CORE]),
@@ -52,12 +51,8 @@ const CRATE_MAP: &[(&str, &[&str])] = &[
 
 /// External crates smugglr-core may depend on. Each one does no I/O and reads
 /// no clock; a crate joins this list only after that is checked.
-/// Current choice 2026-10-19: blake3 (its portable `pure` build) for the row
-/// hash (#499, FR-SMUGGLR-058), because it does no I/O, reads no clock and
-/// builds for wasm32; revisable.
-/// Current choice 2026-10-19: serde and `serde_json` for the record and its
-/// JSON (#509, FR-SMUGGLR-063), because neither does I/O or reads a clock and
-/// both build for wasm32; revisable.
+/// blake3 (its portable `pure` build) for the row hash, and serde and
+/// `serde_json` for the record and its JSON.
 const CORE_MAY_USE: &[&str] = &["blake3", "serde", "serde_json"];
 
 /// One way the workspace leaves the crate map.

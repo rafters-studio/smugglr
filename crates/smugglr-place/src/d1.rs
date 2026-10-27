@@ -54,9 +54,8 @@ pub const API_TOKEN: &str = "CLOUDFLARE_API_TOKEN";
 /// The variable naming where Cloudflare's API is, when not at
 /// [`DEFAULT_API`]: a stand-in of the API, as the tests run.
 ///
-/// Current choice (2026-10-20, #555): the variable wrangler reads for the
-/// same, because CI runs the D1 scenarios against a local stand-in of the
-/// API and the CLI must reach it; revisable.
+/// It is the variable wrangler reads for the same, because CI runs the D1
+/// scenarios against a local stand-in of the API and the CLI must reach it.
 pub const API_BASE_URL: &str = "CLOUDFLARE_API_BASE_URL";
 
 /// Cloudflare's API.

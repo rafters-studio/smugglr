@@ -17,16 +17,14 @@ use serde::Serialize;
 
 /// `max_wire` when the config does not set it: 100 MB.
 ///
-/// Current choice (2026-10-19): MB is 10^6 bytes, so the default is
-/// 100,000,000 bytes, because the record writes sizes in the same decimal
-/// units (`2.1 GB`); revisable.
+/// MB is 10^6 bytes, so the default is 100,000,000 bytes, because the record
+/// writes sizes in the same decimal units (`2.1 GB`).
 pub const DEFAULT_MAX_WIRE: u64 = 100_000_000;
 
 /// `max_value` when the config does not set it: 2 MB, 2,000,000 bytes.
 ///
-/// Current choice (2026-10-26, Sean): sane hosted services keep rows that
-/// size, and it sits well inside the backpressure and wire lines; it may be
-/// raised up to a place's own limit.
+/// Hosted services keep rows that size, and it sits well inside the
+/// backpressure and wire lines; it may be raised up to a place's own limit.
 pub const DEFAULT_MAX_VALUE: u64 = 2_000_000;
 
 /// What a place gives, in place of its `quote()` text, for a value too
@@ -68,9 +66,8 @@ pub fn over_limit(row: &[String], limit: u64) -> Option<(usize, u64)> {
 
 /// What a sync would move.
 ///
-/// Current choice (2026-10-19): a row's bytes are the length of SQLite's
-/// `quote()` text of each of its columns, because that text is what travels
-/// between places; revisable.
+/// A row's bytes are the length of SQLite's `quote()` text of each of its
+/// columns, because that text is what travels between places.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct Weight {
     /// Rows written, in either place.

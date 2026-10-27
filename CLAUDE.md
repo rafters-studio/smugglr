@@ -11,10 +11,9 @@ Acceptance criteria are Gherkin scenarios, one per criterion, tagged
 - **Where they live.** In the crate's `tests/`, mirroring `src/`: the scenario
   for behaviour whose entry point is `src/a/b.rs` lives at `tests/a/b.feature`,
   beside any `tests/a/b.rs`.
-- **Runner.** Current choice (2026-10-07): rstest-bdd (`rstest-bdd`,
-  `rstest-bdd-macros`, and their required peer `rstest`, all workspace
-  dev-dependencies), because scenarios then run as ordinary tests under
-  `cargo test` with no separate runner or CI workflow; revisable.
+- **Runner.** rstest-bdd (`rstest-bdd`, `rstest-bdd-macros`, and their
+  required peer `rstest`, all workspace dev-dependencies), so scenarios run as
+  ordinary tests under `cargo test` with no separate runner or CI workflow.
 - **One runner per crate.** Each crate's `tests/scenarios.rs` calls
   `scenarios!("tests")`, which finds every `.feature` file under `tests/` and
   emits one test per scenario. Step definitions are registered per test binary,

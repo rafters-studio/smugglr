@@ -25,15 +25,13 @@ thiserror = "2"
 # The mesh (smugglr-mesh): each datagram sealed with XChaCha20-Poly1305
 # under a key derived from the shared key, with a fresh random 24-byte nonce
 # (FR-SMUGGLR-078 rev 11); `getrandom` gives the nonces, the echo waits and
-# the keys smugglr mesh keygen writes. Approved 2026-10-25 (#520); revisable.
+# the keys smugglr mesh keygen writes.
 chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["alloc", "getrandom"] }
 # The mesh's socket: several nodes on one machine share one broadcast port
-# (SO_REUSEADDR, SO_REUSEPORT), which std cannot set. Approved 2026-10-25
-# (#520); revisable.
+# (SO_REUSEADDR, SO_REUSEPORT), which std cannot set.
 socket2 = { version = "0.6", features = ["all"] }
 # The HTTP-SQL place (smugglr-place). Blocking, because a place is
 # synchronous; `rustls`: https, so a hosted service is reached over TLS.
-# Current choice 2026-10-19 (#504); revisable.
 ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
 # The row hash (smugglr-core); does no I/O and reads no clock.
 # `pure`: the portable Rust build, no C or assembly, so it builds for wasm32.
@@ -44,7 +42,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # The engine in the browser (smugglr-web). Pinned exactly: the
 # wasm-bindgen CLI that wasm-pack runs must match it.
-# Current choice 2026-10-22 (#524); revisable.
 wasm-bindgen = "=0.2.129"
 # The config file (smugglr, the CLI): read only, so its parser, and display
 # for naming a setting smugglr cannot use.
@@ -76,8 +73,7 @@ strip = true
 
 # The mesh scenarios measure timing (a lost copy repaired within a second,
 # resends within a quarter of what a node sends); unoptimized, the cipher,
-# the hash and the JSON make a debug build too slow to show it. Current
-# choice 2026-10-26 (#520); revisable.
+# the hash and the JSON make a debug build too slow to show it.
 [profile.dev.package."*"]
 opt-level = 2
 [profile.dev.package.smugglr-mesh]

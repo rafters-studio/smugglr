@@ -76,10 +76,9 @@ pub struct Envelope {
     /// The signature over every field above but the values. It is also the
     /// change hash the record and the dropped log name the change by.
     ///
-    /// Current choice (2026-10-22): the signature is the change hash,
-    /// because it is already a digest of every field, the same for every
-    /// copy of the change, and new once a replay gives a fresh sunset;
-    /// revisable.
+    /// The signature is the change hash because it is already a digest of
+    /// every field, the same for every copy of the change, and new once a
+    /// replay gives a fresh sunset.
     pub signature: [u8; 32],
 }
 

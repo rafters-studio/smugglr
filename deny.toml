@@ -5,10 +5,9 @@ all-features = true
 version = 2
 yanked = "deny"
 ignore = [
-    # Current choice 2026-10-20 (#560): basic-toml is unmaintained with no
-    # safe upgrade, and reaches smugglr only as a dev-dependency (rstest-bdd
-    # -> i18n-embed -> i18n-embed-impl -> i18n-config), never the binary.
-    # Revisit when rstest-bdd drops basic-toml; revisable.
+    # basic-toml is unmaintained with no safe upgrade, and reaches smugglr
+    # only as a dev-dependency (rstest-bdd -> i18n-embed -> i18n-embed-impl
+    # -> i18n-config), never the binary. Remove when rstest-bdd drops it.
     { id = "RUSTSEC-2026-0374", reason = "dev-dependency only via rstest-bdd; no safe upgrade upstream; revisit when rstest-bdd drops basic-toml" },
 ]
 
@@ -23,9 +22,8 @@ allow = [
     "ISC",
     "Unicode-3.0",
     "Zlib",
-    # Current choice 2026-10-19 (#504): webpki-roots, the root certificates
-    # ureq's rustls uses so the HTTP-SQL place reaches https services, is
-    # under this permissive licence; revisable.
+    # webpki-roots, the root certificates ureq's rustls uses so the HTTP-SQL
+    # place reaches https services, is under this permissive licence.
     "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9

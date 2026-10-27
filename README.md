@@ -198,14 +198,14 @@ A mesh is one shared key. `keygen` writes it with `chmod 600`; copy the file to 
 
 ```
 $ smugglr mesh keygen --key-file ./mesh.key
-smugglr mesh: wrote key 180627566f7a4e3b to ./mesh.key
+smugglr mesh: wrote key 2373c72a9e5e965a to ./mesh.key
 ```
 
 The key file holds one base64 key per line, newest last; a line starting with `#` is a note. A node signs and seals with the newest key and also accepts the one before it; a datagram sealed with an older key does not open. A key is rotated by appending a new one. On unix a node refuses a key file its group or others can read, and exits 2:
 
 ```
 $ chmod 644 ./loose.key
-$ smugglr mesh ./puck/node.db --key-file ./loose.key
+$ smugglr mesh ./laptop/node.db --key-file ./loose.key
 ./loose.key: the key file is readable by its group or others; chmod 600 ./loose.key fixes it
 $ echo $?
 2
@@ -216,92 +216,91 @@ Every datagram is sealed with XChaCha20-Poly1305 under a key derived from the sh
 A node announces itself by broadcast and learns each peer's address from where its datagrams come from. After that it talks to peers by unicast. On a network that carries no broadcast (WireGuard, Tailscale, a cloud network) the `peers` setting names the addresses to announce to. A node is named by its machine's name, `hostname` or `COMPUTERNAME` on Windows, so every node needs its own name. The two nodes below share one machine, each with its own port and a one-line `hostname` script ahead of the real one on its `PATH`, and name each other in `peers`:
 
 ```toml
-# puck's config.toml
+# laptop's config.toml
 port = 31401
 peers = ["127.0.0.1:31402"]
 ```
 
 ```toml
-# rzr's config.toml
+# desktop's config.toml
 port = 31402
 peers = ["127.0.0.1:31401"]
 graveyard = 3
 ```
 
-`graveyard = 3` on rzr is for the sunset demonstration below; leave it out for a real mesh.
+`graveyard = 3` on desktop is for the sunset demonstration below; leave it out for a real mesh.
 
 Both tables exist before the nodes start. A node's first run notes the rows already in its database and sends none of them; use stash and retrieve to bring a new node up to date.
 
 ```
-$ smugglr mesh ./node.db --key-file ../mesh.key   # on puck
-smugglr mesh: node puck on UDP port 31401, key 180627566f7a4e3b
-$ smugglr mesh ./node.db --key-file ../mesh.key   # on rzr
-smugglr mesh: node rzr on UDP port 31402, key 180627566f7a4e3b
+$ smugglr mesh ./node.db --key-file ../mesh.key   # on laptop
+smugglr mesh: node laptop on UDP port 31401, key 2373c72a9e5e965a
+$ smugglr mesh ./node.db --key-file ../mesh.key   # on desktop
+smugglr mesh: node desktop on UDP port 31402, key 2373c72a9e5e965a
 ```
 
-A row written on puck reaches rzr with no sync run, whichever program wrote it. A delete crosses the same way.
+A row written on laptop reaches desktop with no sync run, whichever program wrote it. A delete crosses the same way.
 
 ```
-$ sqlite3 ./node.db "insert into notes values('n1','first note');"   # on puck
-$ sqlite3 ./node.db "select * from notes"   # on rzr
+$ sqlite3 ./node.db "insert into notes values('n1','first note');"   # on laptop
+$ sqlite3 ./node.db "select * from notes"   # on desktop
 n1|first note
-# rzr, output so far
-smugglr mesh: node rzr on UDP port 31402, key 180627566f7a4e3b
-smugglr mesh: applied 1 change to notes from puck, key 180627566f7a4e3b
+# desktop, output so far
+smugglr mesh: node desktop on UDP port 31402, key 2373c72a9e5e965a
+smugglr mesh: applied 1 change to notes from laptop, key 2373c72a9e5e965a
 ```
 
 ```
-$ sqlite3 ./node.db "delete from notes where id='n1'"   # on puck
-$ sqlite3 ./node.db "select count(*) from notes"   # on rzr
+$ sqlite3 ./node.db "delete from notes where id='n1'"   # on laptop
+$ sqlite3 ./node.db "select count(*) from notes"   # on desktop
 0
-# rzr, output so far
-smugglr mesh: node rzr on UDP port 31402, key 180627566f7a4e3b
-smugglr mesh: applied 1 change to notes from puck, key 180627566f7a4e3b
-smugglr mesh: applied 1 change to notes from puck, key 180627566f7a4e3b
+# desktop, output so far
+smugglr mesh: node desktop on UDP port 31402, key 2373c72a9e5e965a
+smugglr mesh: applied 1 change to notes from laptop, key 2373c72a9e5e965a
+smugglr mesh: applied 1 change to notes from laptop, key 2373c72a9e5e965a
 ```
 
 A node that starts after being away longer than the sunset (the `graveyard` setting, 12 hours by default; 3 seconds here) says so, and names the commands that catch it up. It keeps running for new changes.
 
 ```
-$ smugglr mesh ./node.db --key-file ../mesh.key   # on rzr, restarted after being stopped longer than its graveyard (3 seconds); the scratch directory is shown as .
-smugglr mesh: node rzr on UDP port 31402, key 180627566f7a4e3b
-smugglr mesh: this node has been away 7 seconds, longer than the sunset (3 seconds); changes made meanwhile may not reach it. Catch up with: smugglr stash <a peer's place> <dir> --key-file <path> --node <name> --whole, then smugglr retrieve ./node.db <dir> --key-file <path> --node rzr
+$ smugglr mesh ./node.db --key-file ../mesh.key   # on desktop, restarted after being stopped longer than its graveyard (3 seconds); the scratch directory is shown as .
+smugglr mesh: node desktop on UDP port 31402, key 2373c72a9e5e965a
+smugglr mesh: this node has been away 4 seconds, longer than the sunset (3 seconds); changes made meanwhile may not reach it. Catch up with: smugglr stash <a peer's place> <dir> --key-file <path> --node <name> --whole, then smugglr retrieve ./node.db <dir> --key-file <path> --node desktop
 ```
 
 A change too large for one datagram is refused loudly and dropped from the outbox, so it does not hold up the changes after it. On macOS the limit is about 9 KB (`net.inet.udp.maxdgram`). Move the row with stash and retrieve.
 
 ```
-$ sqlite3 ./node.db "insert into notes values('big', <30,000 characters>);"   # on puck
-# puck, output so far
-smugglr mesh: node puck on UDP port 31401, key 180627566f7a4e3b
-smugglr mesh: 1 change arrived only as a resend; the first copy was lost
+$ sqlite3 ./node.db "insert into notes values('big', <30,000 characters>);"   # on laptop
+# laptop, output so far
+smugglr mesh: node laptop on UDP port 31401, key 2373c72a9e5e965a
 smugglr mesh: a change to notes ["'big'"] is too large for one datagram and is not sent; catch it up with smugglr stash and smugglr retrieve
 ```
 
 ### Dropped changes and replay
 
-A node decides each change it hears. An insert for a key deleted inside the graveyard window is dropped: the record names it with its change hash, and the node keeps the change and its values in a dropped log. Here puck deletes `n1`, then writes it again, and rzr drops the second insert:
+A node decides each change it hears. An insert for a key deleted inside the graveyard window is dropped: the record names it with its change hash, and the node keeps the change and its values in a dropped log. Here laptop deletes `n1`, then writes it again, and desktop drops the second insert:
 
 ```
-$ sqlite3 ./node.db "insert into notes values('n1','back again');"   # on puck, after the delete above
-$ sqlite3 ./node.db "select count(*) from notes"   # on rzr
+$ sqlite3 ./node.db "insert into notes values('n1','back again');"   # on laptop, after the delete above
+$ sqlite3 ./node.db "select count(*) from notes"   # on desktop
 0
-# rzr, output so far
-smugglr mesh: node rzr on UDP port 31402, key 180627566f7a4e3b
-smugglr mesh: applied 1 change to notes from puck, key 180627566f7a4e3b
-smugglr mesh: applied 1 change to notes from puck, key 180627566f7a4e3b
-smugglr mesh: dropped a change to notes ["'n1'"] from puck: its key is in the graveyard (change 79838289357156ba44a650973925ce44c6567e6017139d68acf10aae9ee8cd43)
+# desktop, output so far
+smugglr mesh: node desktop on UDP port 31402, key 2373c72a9e5e965a
+smugglr mesh: applied 1 change to notes from laptop, key 2373c72a9e5e965a
+smugglr mesh: applied 1 change to notes from laptop, key 2373c72a9e5e965a
+smugglr mesh: dropped a change to notes ["'n1'"] from laptop: its key is in the graveyard (change d41d2b98df9b09d1949d51b387a584fad11c4ef1d550ad0d5aa878393615d3a5)
 ```
 
 `--replay <change hash>` decides that logged change again on this node, with a fresh sunset, overriding the drop. It prints what came of it and exits; what it wrote reaches the other nodes when the node next runs. An unknown hash is a usage error, exit 2.
 
 ```
-$ smugglr mesh ./node.db --key-file ../mesh.key --replay 79838289357156ba44a650973925ce44c6567e6017139d68acf10aae9ee8cd43   # on rzr
-smugglr mesh: applied 1 change to notes from puck, key 180627566f7a4e3b
-smugglr mesh: replayed change 79838289357156ba44a650973925ce44c6567e6017139d68acf10aae9ee8cd43
+$ smugglr mesh ./node.db --key-file ../mesh.key --replay d41d2b98df9b09d1949d51b387a584fad11c4ef1d550ad0d5aa878393615d3a5   # on desktop
+smugglr mesh: applied 1 change to notes from laptop, key 2373c72a9e5e965a
+smugglr mesh: replayed change d41d2b98df9b09d1949d51b387a584fad11c4ef1d550ad0d5aa878393615d3a5
 $ echo $?
 0
-$ sqlite3 ./node.db "select * from notes"   # on rzr
+$ sqlite3 ./node.db "select * from notes"   # on desktop
 n1|back again
 ```
 

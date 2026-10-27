@@ -425,29 +425,29 @@ fn the_second_holds_it(front: &Front) -> Result<(), String> {
     front.holds(1, "n9", "across")
 }
 
-#[given("a node running smugglr mesh on a machine named puck")]
-fn a_node_on_puck(world: &World, front: &Front) -> Result<(), String> {
+#[given("a node running smugglr mesh on a machine named laptop")]
+fn a_node_on_laptop(world: &World, front: &Front) -> Result<(), String> {
     let key = key_file(world, front, "mesh.key")?;
     start_named(
         world,
         front,
         &[
-            ("puck", &key, FrontEnd::Mesh),
-            ("rzr", &key, FrontEnd::Mesh),
+            ("laptop", &key, FrontEnd::Mesh),
+            ("desktop", &key, FrontEnd::Mesh),
         ],
         "",
     )
 }
 
-#[when("a row is written on puck's database")]
-fn a_row_on_puck(front: &Front) -> Result<(), String> {
-    front.sql(0, "INSERT INTO notes VALUES ('n9', 'from puck')")
+#[when("a row is written on laptop's database")]
+fn a_row_on_laptop(front: &Front) -> Result<(), String> {
+    front.sql(0, "INSERT INTO notes VALUES ('n9', 'from laptop')")
 }
 
-#[then("the change the other nodes receive names puck as its node")]
-fn the_change_names_puck(front: &Front) -> Result<(), String> {
-    front.holds(1, "n9", "from puck")?;
-    front.prints(1, "to notes from puck,")
+#[then("the change the other nodes receive names laptop as its node")]
+fn the_change_names_laptop(front: &Front) -> Result<(), String> {
+    front.holds(1, "n9", "from laptop")?;
+    front.prints(1, "to notes from laptop,")
 }
 
 #[given("one node with no port setting and one node with port set to 40000")]

@@ -17,8 +17,7 @@ use crate::wire::{Id, Message, RANGES, Range};
 pub(crate) const PART: usize = 720;
 
 /// A half-assembled change no part of which has arrived for this long is let
-/// go; its maker resends what the peer then names missing. Current choice
-/// 2026-10-26: 10 minutes; revisable.
+/// go; its maker resends what the peer then names missing. 10 minutes.
 const EXPIRY: Duration = Duration::from_secs(600);
 
 /// A half-assembled change no part of which has arrived for this long names

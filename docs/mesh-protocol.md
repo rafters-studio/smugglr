@@ -1,6 +1,6 @@
 # The smugglr mesh protocol
 
-Status: 0.6.1. Written from FR-SMUGGLR-078 (rev 26) and FR-SMUGGLR-079 and checked against the binary. Where a requirement is not built yet, the section says so and names the issue. Current choice of the design team (Sean with smugglr): smugglr carries its own mesh protocol rather than a gossip or membership library, and documents it here for its own code and for programs that use the crates. Revisable.
+Status: 0.6.1. Written from FR-SMUGGLR-078 (rev 26) and FR-SMUGGLR-079 and checked against the binary. Where a requirement is not built yet, the section says so and names the issue. smugglr carries its own mesh protocol rather than a gossip or membership library, and documents it here for its own code and for programs that use the crates.
 
 `smugglr mesh` keeps the copies of one SQLite database in step across machines where nobody is in charge: no server, no hub, no coordinator. Any node can leave and the rest go on. This document says what goes over the wire and what each node does with it. The rules that decide what a change means (apply, skip, hold, conflict, graveyard) belong to `smugglr-core` and are the same for every sync type; the mesh only carries them.
 
@@ -125,7 +125,7 @@ A node decides each envelope in this order, the same order `smugglr-core` uses f
 3. The key's last applied `from` equals this change's `from` and the row has moved: a conflict.
 4. The node has its own unacknowledged change on the key with the same `from` and a different `to`: a conflict.
 5. The row is at `from`: apply. A delete leaves a tombstone.
-6. The change's `to` is the `from` of the last change applied to this key: the row has already moved past it, so it is skipped, not held (current choice 2026-10-22: a late copy delivered after the row moved on otherwise waited forever).
+6. The change's `to` is the `from` of the last change applied to this key: the row has already moved past it, so it is skipped, not held. Without this rule, a late copy that arrived after the row moved on would wait forever.
 7. Otherwise hold it until its `from` appears or its sunset passes. A held change dropped at its sunset is named in the record.
 
 A conflict follows `--sync-mode`: `stop` (the default) names the row; `last` keeps the copy whose steering column is further on.
