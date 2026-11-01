@@ -24,6 +24,7 @@ use smugglr_core::shape::{Column, Stamp};
 use smugglr_memory::Store;
 use smugglr_place::{Key, Place, Table};
 
+use crate::wire::{Line, RowNow};
 use crate::{Error, Settings};
 
 /// A table's row, by its table and key.
@@ -439,6 +440,41 @@ impl Local {
             }
         }
         Ok(here)
+    }
+
+    /// Each of `lines`' rows as it is here, for a wazzup's answer, in order.
+    pub(crate) fn rows_now(
+        &self,
+        place: &mut dyn Place,
+        lines: &[Line],
+    ) -> Result<Vec<RowNow>, Error> {
+        let mut keys: BTreeMap<&str, BTreeSet<Key>> = BTreeMap::new();
+        for line in lines {
+            keys.entry(&line.table)
+                .or_default()
+                .insert(line.key.clone());
+        }
+        let mut hashes: HashMap<Row, [u8; 16]> = HashMap::new();
+        for (name, keys) in keys {
+            let Some(table) = self.tables.get(name) else {
+                continue;
+            };
+            let keys: Vec<Key> = keys.into_iter().collect();
+            for row in place.rows(table, &keys)? {
+                let columns: Vec<&str> = row.iter().map(String::as_str).collect();
+                hashes.insert((name.to_owned(), table.key_of(&row)), row_hash(&columns));
+            }
+        }
+        Ok(lines
+            .iter()
+            .map(|line| {
+                let row = (line.table.clone(), line.key.clone());
+                RowNow {
+                    hash: hashes.get(&row).copied(),
+                    last_from: self.last_from.get(&row).copied(),
+                }
+            })
+            .collect())
     }
 
     /// Decides `envelopes`, all verified with `sign` and of tables whose
@@ -861,6 +897,7 @@ mod tests {
                 ignore: Vec::new(),
                 k: K,
                 backpressure: BACKPRESSURE,
+                mesh_wire: 8_000_000,
                 peers: Vec::new(),
                 max_value: u64::MAX,
             };

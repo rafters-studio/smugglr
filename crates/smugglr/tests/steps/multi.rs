@@ -17,6 +17,7 @@ use smugglr_place::LocalFile;
 
 use crate::cli::config;
 use crate::http_sql::service;
+use crate::mesh::Front;
 use crate::setup::{NOTES, ORDERS, THREE_NOTES, World, rows_of, sql_on};
 
 /// The devices of a scenario and the blobs they stashed.
@@ -443,7 +444,11 @@ fn retrieves_a_whole_stash(world: &World, devices: &Devices) -> Result<(), Strin
 }
 
 #[then("it holds the same rows as the others")]
-fn holds_the_same_as_the_others(devices: &Devices) -> Result<(), String> {
+fn holds_the_same_as_the_others(devices: &Devices, front: &Front) -> Result<(), String> {
+    // One step, since the same words end a mesh scenario and a stash one.
+    if front.runs_mesh_nodes() {
+        return front.sleeper_holds_what_changed();
+    }
     devices.same_rows(&["a", "b", "c"])
 }
 

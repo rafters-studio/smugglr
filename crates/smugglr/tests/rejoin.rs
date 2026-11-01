@@ -255,3 +255,181 @@ fn two_nodes_apart_settle_on_one_row_each_and_drain() -> Tried {
     let _ = fs::remove_dir_all(&root);
     Ok(())
 }
+
+/// Two nodes that have noted their rows and heard each other, the second's
+/// config carrying `second_more`.
+fn two_running(name: &str, second_more: &str) -> Tried<(PathBuf, PathBuf, Node, Node)> {
+    let root = std::env::temp_dir().join(format!("smugglr-rejoin-{name}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root)?;
+    let (first_port, second_port) = (free_port()?, free_port()?);
+    let mut first = Node::new(&root, "first", first_port, second_port, "")?;
+    let mut second = Node::new(&root, "second", second_port, first_port, second_more)?;
+    let key = root.join("mesh.key");
+    let made = Command::new(env!("CARGO_BIN_EXE_smugglr"))
+        .args(["mesh", "keygen", "--key-file"])
+        .arg(&key)
+        .stdout(Stdio::null())
+        .status()?;
+    assert!(made.success());
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o600))?;
+    first.start(&key)?;
+    second.start(&key)?;
+    sleep(Duration::from_secs(3));
+    Ok((root, key, first, second))
+}
+
+/// Waits up to `within` for `done`.
+fn soon(within: Duration, mut done: impl FnMut() -> Tried<bool>) -> Tried<bool> {
+    let started = Instant::now();
+    while started.elapsed() < within {
+        if done()? {
+            return Ok(true);
+        }
+        sleep(Duration::from_millis(200));
+    }
+    Ok(false)
+}
+
+#[test]
+fn a_node_that_wakes_a_second_time_is_answered_at_once_too() -> Tried {
+    let (root, key, mut first, second) = two_running("wakes", "")?;
+    for wake in 0..2 {
+        first.stop()?;
+        // Long enough that its peer has stopped hearing it.
+        sleep(Duration::from_secs(12));
+        let id = format!("w{wake}");
+        Connection::open(&second.db)?.execute(
+            "INSERT INTO notes VALUES (?1, 'while asleep', '2026-05-01')",
+            [&id],
+        )?;
+        sleep(Duration::from_secs(1));
+        first.start(&key)?;
+        // Past the 1 s listen; well inside the 10 s of a resend to a peer
+        // not acknowledging, which is what a wazzup not heard would wait for.
+        let arrived = soon(Duration::from_secs(6), || {
+            Ok(first.rows()?.contains_key(&id))
+        })?;
+        assert!(arrived, "wake {wake}: {id} did not arrive at once");
+    }
+    let _ = fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn a_peer_owing_more_than_the_wire_says_so_and_how_to_catch_up() -> Tried {
+    let (root, key, mut first, second) = two_running("too-much", "mesh_wire = 1000\n")?;
+    first.stop()?;
+    let mut connection = Connection::open(&second.db)?;
+    let add = connection.transaction()?;
+    for row in 0..200 {
+        add.execute(
+            "INSERT INTO notes VALUES (?1, 'too many for the wire', '2026-05-01')",
+            [format!("m{row:05}")],
+        )?;
+    }
+    add.commit()?;
+    sleep(Duration::from_secs(2));
+    first.start(&key)?;
+    let said = soon(Duration::from_secs(10), || {
+        Ok(first
+            .printed()
+            .contains("says there is too much for the wire"))
+    })?;
+    assert!(said, "{}", first.printed());
+    assert!(first.printed().contains("smugglr retrieve") || first.printed().contains("retrieve "));
+    let _ = fs::remove_dir_all(&root);
+    Ok(())
+}
+
+/// NFR-SMUGGLR-005's run against the built binary: five nodes, one asleep for
+/// two thirds of the sunset, while rows are added, edited and deleted.
+#[test]
+fn five_nodes_with_one_asleep_for_two_thirds_of_the_sunset_lose_nothing() -> Tried {
+    const SUNSET: u64 = 30;
+    let root = std::env::temp_dir().join(format!("smugglr-rejoin-five-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root)?;
+    let ports = [
+        free_port()?,
+        free_port()?,
+        free_port()?,
+        free_port()?,
+        free_port()?,
+    ];
+    let key = root.join("mesh.key");
+    let made = Command::new(env!("CARGO_BIN_EXE_smugglr"))
+        .args(["mesh", "keygen", "--key-file"])
+        .arg(&key)
+        .stdout(Stdio::null())
+        .status()?;
+    assert!(made.success());
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o600))?;
+    let mut nodes = Vec::new();
+    for (at, port) in ports.iter().enumerate() {
+        let others: Vec<String> = ports
+            .iter()
+            .filter(|other| *other != port)
+            .map(|other| format!("127.0.0.1:{other}"))
+            .collect();
+        let mut node = Node::new(
+            &root,
+            &format!("n{at}"),
+            *port,
+            ports[(at + 1) % ports.len()],
+            &format!("graveyard = {SUNSET}\n"),
+        )?;
+        let config = node.dir.join("config/smugglr/config.toml");
+        let text = fs::read_to_string(&config)?;
+        let text = text
+            .lines()
+            .filter(|line| !line.starts_with("peers") && !line.starts_with("graveyard = 3600"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&config, format!("{text}\npeers = {others:?}\n"))?;
+        node.start(&key)?;
+        nodes.push(node);
+    }
+    sleep(Duration::from_secs(3));
+
+    nodes[4].stop()?;
+    let asleep = Instant::now();
+    let write = |at: usize, sql: &str| -> Tried {
+        Connection::open(&nodes[at].db)?.execute_batch(sql)?;
+        Ok(())
+    };
+    write(0, "INSERT INTO notes VALUES ('added', 'new', '2026-05-01')")?;
+    write(
+        1,
+        "UPDATE notes SET body = 'edited', updated_at = '2026-05-01' WHERE id = 'r00000'",
+    )?;
+    write(2, "DELETE FROM notes WHERE id = 'r00001'")?;
+    sleep(Duration::from_secs(SUNSET * 2 / 3).saturating_sub(asleep.elapsed()));
+    nodes[4].start(&key)?;
+
+    let others_agree = |node: &Node| -> Tried<bool> { Ok(node.rows()? == nodes[0].rows()?) };
+    let settled = soon(Duration::from_secs(SUNSET / 3), || {
+        let (first, last) = (nodes[0].rows()?, nodes[4].rows()?);
+        Ok(first == last
+            && first.contains_key("added")
+            && !first.contains_key("r00001")
+            && others_agree(&nodes[1])?
+            && others_agree(&nodes[2])?
+            && others_agree(&nodes[3])?)
+    })?;
+    let woken = nodes[4].rows()?;
+    assert!(
+        settled,
+        "added {:?}, edited {:?}, deleted row {:?}\n{}",
+        woken.get("added"),
+        woken.get("r00000"),
+        woken.get("r00001"),
+        nodes[4].printed()
+    );
+    assert_eq!(
+        woken.get("r00000").map(|(body, _)| body.as_str()),
+        Some("edited")
+    );
+    let _ = fs::remove_dir_all(&root);
+    Ok(())
+}

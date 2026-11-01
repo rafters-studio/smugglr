@@ -39,6 +39,7 @@ mod named;
 mod node;
 mod outbox;
 mod parts;
+mod wazzup;
 mod wire;
 
 use std::sync::Arc;
@@ -47,7 +48,7 @@ use smugglr_core::plan::SyncMode;
 use smugglr_core::steering::Steering;
 use smugglr_memory::Store;
 
-pub use node::{replay, run};
+pub use node::{remove, replay, run};
 
 /// The UDP port a node broadcasts and listens on when the config sets none.
 pub const PORT: u16 = 31337;
@@ -59,6 +60,9 @@ pub const K: u32 = 2;
 /// The most bytes a node's outbox holds when the backpressure setting is not
 /// given (FR-SMUGGLR-078 rev 14).
 pub const BACKPRESSURE: u64 = 6_000_000;
+
+/// What a wazzup is answered with before it is too much, when not set.
+pub const MESH_WIRE: u64 = 8_000_000;
 
 /// The most changes a node applies in one transaction, the chunk a direct
 /// sync writes in (#580).
@@ -79,6 +83,16 @@ pub enum Error {
     /// The node's socket could not be opened, or a datagram not sent.
     #[error("the mesh socket: {0}")]
     Socket(#[from] std::io::Error),
+    /// A node already runs under this node's name.
+    #[error(
+        "smugglr mesh: the name {0} is taken by a node already running; this node does not join"
+    )]
+    NameTaken(String),
+    /// A change under this node's name that it did not make arrived.
+    #[error(
+        "smugglr mesh: heard a change under the name {0} that this node did not make: two machines share the name, and this node stops"
+    )]
+    NameClash(String),
     /// The node holds no key.
     #[error("the mesh needs a shared key")]
     NoKey,
@@ -121,6 +135,9 @@ pub struct Settings {
     /// The largest value a row may hold to cross, below the place's own
     /// value limit (FR-SMUGGLR-071).
     pub max_value: u64,
+    /// The most bytes a wazzup is answered with before the answer is too
+    /// much, and the asker catches up by stash then retrieve.
+    pub mesh_wire: u64,
 }
 
 impl std::fmt::Debug for Settings {

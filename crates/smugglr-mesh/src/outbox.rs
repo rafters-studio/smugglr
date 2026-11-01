@@ -97,6 +97,10 @@ struct Entry {
     /// When it is next resent to a peer that has stopped acknowledging.
     resend_at: Instant,
     interval: Duration,
+    /// About the bytes it takes in its segment.
+    bytes: u64,
+    /// Its last target was taken off the mesh, so it can go.
+    owes_nobody: bool,
     /// For each peer that is acknowledging other changes, how many resends
     /// have gone to it on a guess and when the last went: each one doubles
     /// the wait before the next, for that peer alone.
@@ -167,6 +171,9 @@ pub(crate) struct Outbox {
     index_bytes: u64,
     /// A change has been acknowledged by every target since the last prune.
     settled: bool,
+    /// The changes found past their sunset at the start, not acknowledged by
+    /// the peers named, as the record says them (toy X).
+    expired: BTreeMap<String, Vec<String>>,
 }
 
 impl Outbox {
@@ -185,7 +192,9 @@ impl Outbox {
             acks: String::new(),
             index_bytes: 0,
             settled: false,
+            expired: BTreeMap::new(),
         };
+        let mut expired: HashMap<[u8; 32], (BTreeSet<String>, String)> = HashMap::new();
         let index: Vec<u64> = outbox
             .store
             .read(&outbox.index())?
@@ -201,6 +210,13 @@ impl Outbox {
                     continue;
                 };
                 if now > envelope.sunset {
+                    let said = format!(
+                        "{} {:?} (change {})",
+                        envelope.change.table,
+                        envelope.change.key,
+                        hex(&envelope.signature)
+                    );
+                    expired.insert(envelope.signature, (targets, said));
                     continue;
                 }
                 live += 1;
@@ -219,12 +235,24 @@ impl Outbox {
                 let change: [u8; 32] = unhex(value.get("c")?.as_str()?)?.try_into().ok()?;
                 Some((change, value.get("n")?.as_str()?.to_owned()))
             });
-            if let Some((change, node)) = parsed
-                && let Some(entry) = outbox.entries.get_mut(&change)
-            {
-                entry.acked.insert(node);
-                kept.push_str(line);
-                kept.push('\n');
+            if let Some((change, node)) = parsed {
+                if let Some((targets, _)) = expired.get_mut(&change) {
+                    // Kept while its segment is on disk, so the next start
+                    // does not name a peer that did acknowledge it.
+                    targets.remove(&node);
+                    kept.push_str(line);
+                    kept.push('\n');
+                }
+                if let Some(entry) = outbox.entries.get_mut(&change) {
+                    entry.acked.insert(node);
+                    kept.push_str(line);
+                    kept.push('\n');
+                }
+            }
+        }
+        for (targets, said) in expired.into_values() {
+            for peer in targets {
+                outbox.expired.entry(peer).or_default().push(said.clone());
             }
         }
         outbox.store.replace(&outbox.acks_file(), &kept)?;
@@ -240,6 +268,91 @@ impl Outbox {
 
     fn segment(&self, segment: u64) -> String {
         format!("{}/{segment:020}.jsonl", self.folder)
+    }
+
+    /// The changes found past their sunset at the start and not acknowledged,
+    /// by peer, once.
+    pub(crate) fn take_expired(&mut self) -> BTreeMap<String, Vec<String>> {
+        std::mem::take(&mut self.expired)
+    }
+
+    /// Every change still owed to a peer (to `only`, when named), for a
+    /// wazzup to ask about.
+    pub(crate) fn owed_changes(&mut self, only: Option<&str>) -> Result<Vec<Envelope>, Error> {
+        let mut changes: Vec<([u8; 32], u64)> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| {
+                only.map_or_else(
+                    || !entry.targets.is_subset(&entry.acked),
+                    |peer| entry.targets.contains(peer) && !entry.acked.contains(peer),
+                )
+            })
+            .map(|(change, entry)| (*change, entry.seq))
+            .collect();
+        changes.sort_unstable_by_key(|(_, seq)| *seq);
+        let mut out = Vec::with_capacity(changes.len());
+        for (change, _) in changes {
+            if let Some(envelope) = self.envelope(&change)? {
+                out.push(envelope);
+            }
+        }
+        Ok(out)
+    }
+
+    /// About the bytes of the changes owed to `peer`, to see whether they are
+    /// too much to answer a wazzup with.
+    pub(crate) fn owed_bytes(&self, peer: &str) -> u64 {
+        self.entries
+            .values()
+            .filter(|entry| entry.targets.contains(peer) && !entry.acked.contains(peer))
+            .map(|entry| entry.bytes)
+            .sum()
+    }
+
+    /// `change` is due to `peer` at once: a wazzup showed the peer needs it.
+    pub(crate) fn due_now(&mut self, change: &[u8; 32], peer: &str) {
+        if let Some(entry) = self.entries.get_mut(change)
+            && entry.sent
+            && entry.targets.contains(peer)
+            && !entry.acked.contains(peer)
+        {
+            entry.unsent_to.insert(peer.to_owned());
+        }
+    }
+
+    /// Everything owed to `peer` is due at once: it woke and asked. A change
+    /// `in_parts` is left out, since its parts have their own repair.
+    pub(crate) fn all_due_now(&mut self, peer: &str, in_parts: impl Fn(&[u8; 32]) -> bool) {
+        for (change, entry) in &mut self.entries {
+            if entry.sent
+                && entry.targets.contains(peer)
+                && !entry.acked.contains(peer)
+                && !in_parts(change)
+            {
+                entry.unsent_to.insert(peer.to_owned());
+            }
+        }
+    }
+
+    /// `peer` is gone for good: nothing is owed to it any more.
+    pub(crate) fn remove_target(&mut self, peer: &str) {
+        for entry in self.entries.values_mut() {
+            let held = entry.targets.remove(peer);
+            entry.unsent_to.remove(peer);
+            entry.acked.remove(peer);
+            entry.guesses.remove(peer);
+            entry.resent_by.remove(peer);
+            // Only a change it was owed: one made before any peer was heard
+            // still waits for its first target.
+            entry.owes_nobody |= held && entry.targets.is_empty();
+        }
+        self.settled = true;
+    }
+
+    /// Whether `change` is one the outbox holds.
+    pub(crate) fn holds(&self, change: &[u8; 32]) -> bool {
+        self.entries.contains_key(change)
     }
 
     /// Whether `change` is still owed to `peer`.
@@ -574,6 +687,7 @@ impl Outbox {
             .iter()
             .filter(|(_, entry)| {
                 now > entry.sunset
+                    || entry.owes_nobody
                     || (!entry.targets.is_empty() && entry.targets.is_subset(&entry.acked))
             })
             .map(|(change, _)| *change)
@@ -659,6 +773,8 @@ fn read_line(line: &str) -> Option<(Envelope, BTreeSet<String>)> {
 
 fn entry(segment: u64, envelope: &Envelope, targets: BTreeSet<String>) -> Entry {
     Entry {
+        bytes: line(envelope, &targets).len() as u64,
+        owes_nobody: false,
         segment,
         sunset: envelope.sunset,
         targets,
@@ -857,6 +973,27 @@ mod tests {
         assert_eq!(outbox.owed(PEER).map(|(count, _)| count), Some(1));
         outbox.ack(&[3; 32], PEER);
         assert_eq!(outbox.owed(PEER).map(|(count, _)| count), None);
+        Ok(())
+    }
+
+    #[test]
+    fn taking_a_node_off_lets_go_only_of_what_it_was_owed() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let dir = std::env::temp_dir().join(format!(
+            "smugglr-mesh-outbox-{}-removed",
+            std::process::id()
+        ));
+        let mut outbox = Outbox::open(Arc::new(Files::new(dir)), "outbox", 0)?;
+        outbox.add(&[envelope(1)], &BTreeSet::new())?;
+        outbox.add(&[envelope(3)], &BTreeSet::from([PEER.to_owned()]))?;
+        outbox.first_sends(2)?;
+        outbox.remove_target(PEER);
+        outbox.prune(0)?;
+        assert!(
+            outbox.holds(&[1; 32]),
+            "no peer yet: it still waits for one"
+        );
+        assert!(!outbox.holds(&[3; 32]), "owed to nobody now");
         Ok(())
     }
 

@@ -127,3 +127,35 @@ Feature: smugglr mesh as a command: its front ends, its node's name and port, it
     When a row holding a 2 MB value and then a small row are written on the first node
     Then the record names the 2 MB value as over the second node's limit
     And the second node holds the small row
+
+  @criterion-01a17503-2aaa-7282-89c3-a529885c94d5 @module-mesh
+  Scenario: a second node with a taken name does not join
+    Given a node named puck running smugglr mesh
+    When a second node also named puck starts smugglr mesh with the same key file
+    Then the second node exits without joining
+    And it says the name puck is taken
+
+  @criterion-01a17503-2aaa-7282-89c3-a536ccbe4266 @module-mesh
+  Scenario: a change under a node's own name that it did not make stops it
+    Given two nodes both named rzr that started out of reach of each other
+    When they come within reach and one writes a row
+    Then the other stops
+    And its record names the clash over the name rzr
+
+  @criterion-01a14bed-9a8e-76b2-a155-473319d47754 @module-mesh
+  Scenario: wazzup catches a sleeper up
+    Given three nodes running smugglr mesh, and one asleep while rows changed on the others, for less than the sunset
+    When it wakes and says wazzup
+    Then it holds the same rows as the others
+
+  @criterion-01a14bed-9a8e-76b2-a155-475bf7ee3f47 @module-mesh
+  Scenario: a node gone for good is taken off
+    Given three nodes running smugglr mesh, one of them gone for good with changes still unacknowledged by it
+    When a person runs smugglr mesh remove with that node
+    Then its peers no longer send those changes to it
+
+  @criterion-01a15061-2bcb-7fa3-a7fc-399685aa60dd @module-mesh
+  Scenario: a wazzup batch larger than one datagram
+    Given three nodes running smugglr mesh, one waking with more unacknowledged changes than fit one datagram
+    When it says wazzup and one part of its batch is lost
+    Then every part is answered, each datagram is at most about 1,200 bytes, and the lost part was sent again
