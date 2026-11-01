@@ -98,6 +98,8 @@ pub(crate) struct Front {
     relay: Slot<Arc<Relay>>,
     /// The scenario's turn on the machine, for one that floods it.
     turn: Slot<Arc<Turn>>,
+    /// The port a scenario's first node names for a node not yet started.
+    next_port: Slot<u16>,
 }
 
 #[fixture]
@@ -138,7 +140,21 @@ impl Front {
         front_end: FrontEnd,
         more: &str,
     ) -> Result<usize, String> {
-        let folder = world.folder()?.join(name);
+        self.start_as(world, [name, name], key, port, front_end, more)
+    }
+
+    /// Starts a node as [`Front::start_with`] does, in the folder `folder`
+    /// and on the machine `name`, so two can share a name.
+    fn start_as(
+        &self,
+        world: &World,
+        [folder, name]: [&str; 2],
+        key: &Path,
+        port: Option<u16>,
+        front_end: FrontEnd,
+        more: &str,
+    ) -> Result<usize, String> {
+        let folder = world.folder()?.join(folder);
         std::fs::create_dir_all(&folder).map_err(|err| err.to_string())?;
         let path = folder.join("node.db");
         Connection::open(&path)
@@ -209,6 +225,27 @@ impl Front {
         })
         .map_err(|()| format!("{name} did not look at its rows"))?;
         Ok(index)
+    }
+
+    /// Waits for node `index` to exit by itself, with a failing status.
+    fn exits(&self, index: usize) -> Result<(), String> {
+        let nodes = self.nodes();
+        let mut status = None;
+        let _ = wait(SOON, || {
+            let mut nodes = nodes.0.lock().unwrap_or_else(PoisonError::into_inner);
+            status = nodes
+                .get_mut(index)
+                .and_then(|node| node.child.try_wait().ok().flatten());
+            status.is_some()
+        });
+        match status {
+            Some(status) if !status.success() => Ok(()),
+            Some(status) => Err(format!("node {index} exited with {status}")),
+            None => Err(format!(
+                "node {index} is still running; it printed {:?}",
+                self.with(index, Node::printed).unwrap_or_default()
+            )),
+        }
     }
 
     /// Stops node `index`.
@@ -976,6 +1013,8 @@ struct Relay {
     port: u16,
     stop: AtomicBool,
     lossy: AtomicBool,
+    /// Pass nothing: the two nodes are out of reach of each other.
+    closed: AtomicBool,
     /// Lose the first copy of the change to the last row written.
     lose_last: AtomicBool,
     /// The change to the last row a scenario writes, apart from what the
@@ -1031,6 +1070,7 @@ impl Relay {
             port: socket.local_addr().map_err(|err| err.to_string())?.port(),
             stop: AtomicBool::new(false),
             lossy: AtomicBool::new(lossy),
+            closed: AtomicBool::new(false),
             lose_last: AtomicBool::new(false),
             last_row: Mutex::new(None),
             dropped: AtomicU64::new(0),
@@ -1072,8 +1112,9 @@ impl Relay {
                 // random one, so it never goes unseen.
                 let forced = relay.lose_last.load(Ordering::Relaxed)
                     && relay.last_first_copy(open_with(datagram, &seal).as_ref(), from_first);
-                let drop =
-                    forced || (relay.lossy.load(Ordering::Relaxed) && random.is_multiple_of(10));
+                let drop = forced
+                    || relay.closed.load(Ordering::Relaxed)
+                    || (relay.lossy.load(Ordering::Relaxed) && random.is_multiple_of(10));
                 if drop {
                     relay.dropped.fetch_add(1, Ordering::Relaxed);
                 } else {
@@ -1303,6 +1344,104 @@ fn two_on_a_relay_with(
     front.holds(1, "w0", "heard")?;
     front.sql(1, "INSERT INTO notes VALUES ('w1', 'heard')")?;
     front.holds(0, "w1", "heard")
+}
+
+#[given("a node named puck running smugglr mesh")]
+fn a_node_named_puck(world: &World, front: &Front) -> Result<(), String> {
+    let key = key_file(world, front, "mesh.key")?;
+    let ports = [free_port()?, free_port()?];
+    front.next_port.set(ports[1]);
+    front.key.set(key.clone());
+    let more = format!("peers = [\"127.0.0.1:{}\"]\n", ports[1]);
+    front.start_as(
+        world,
+        ["puck-one", "puck"],
+        &key,
+        Some(ports[0]),
+        FrontEnd::Mesh,
+        &more,
+    )?;
+    // Past the moment it listens for its own name being taken: it is running.
+    thread::sleep(Duration::from_secs(2));
+    Ok(())
+}
+
+#[when("a second node also named puck starts smugglr mesh with the same key file")]
+fn a_second_node_named_puck(world: &World, front: &Front) -> Result<(), String> {
+    let key = front.key.get().ok_or("no key file")?;
+    let first = front.with(0, |node| node.port)?;
+    let port = front.next_port.get().ok_or("no port")?;
+    let more = format!("peers = [\"127.0.0.1:{first}\"]\n");
+    front.start_as(
+        world,
+        ["puck-two", "puck"],
+        &key,
+        Some(port),
+        FrontEnd::Mesh,
+        &more,
+    )?;
+    Ok(())
+}
+
+#[then("the second node exits without joining")]
+fn the_second_exits(front: &Front) -> Result<(), String> {
+    front.exits(1)
+}
+
+#[then("it says the name puck is taken")]
+fn it_says_taken(front: &Front) -> Result<(), String> {
+    let said = front.with(1, Node::printed).unwrap_or_default();
+    if said.contains("the name puck is taken") {
+        Ok(())
+    } else {
+        Err(format!("it said {said:?}"))
+    }
+}
+
+#[given("two nodes both named rzr that started out of reach of each other")]
+fn two_named_rzr(world: &World, front: &Front) -> Result<(), String> {
+    let key = key_file(world, front, "mesh.key")?;
+    let line = key_lines(&key)?.pop().ok_or("the key file holds no key")?;
+    let ports = [free_port()?, free_port()?];
+    let relay = Relay::start(ports, &decode(&line)?, false)?;
+    relay.closed.store(true, Ordering::Relaxed);
+    let more = format!("peers = [\"127.0.0.1:{}\"]\n", relay.port);
+    front.relay.set(relay);
+    for (folder, port) in [("rzr-one", ports[0]), ("rzr-two", ports[1])] {
+        front.start_as(
+            world,
+            [folder, "rzr"],
+            &key,
+            Some(port),
+            FrontEnd::Mesh,
+            &more,
+        )?;
+    }
+    // Past the moment each listens for its name being taken.
+    thread::sleep(Duration::from_secs(2));
+    Ok(())
+}
+
+#[when("they come within reach and one writes a row")]
+fn within_reach_one_writes(front: &Front) -> Result<(), String> {
+    let relay = front.relay.get().ok_or("no relay")?;
+    relay.closed.store(false, Ordering::Relaxed);
+    front.sql(0, "INSERT INTO notes VALUES ('r1', 'made here')")
+}
+
+#[then("the other stops")]
+fn the_other_stops(front: &Front) -> Result<(), String> {
+    front.exits(1)
+}
+
+#[then("its record names the clash over the name rzr")]
+fn its_record_names_rzr(front: &Front) -> Result<(), String> {
+    let said = front.with(1, Node::printed).unwrap_or_default();
+    if said.contains("under the name rzr") {
+        Ok(())
+    } else {
+        Err(format!("it said {said:?}"))
+    }
 }
 
 #[given("two nodes running smugglr mesh that have heard each other")]

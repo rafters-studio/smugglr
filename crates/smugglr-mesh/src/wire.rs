@@ -56,6 +56,22 @@ pub(crate) enum Message {
         /// The node.
         sender: String,
     },
+    /// A node that has just started asks whether its name is free. `start`
+    /// is a random number made at that start, which tells two nodes of one
+    /// name apart.
+    Wazzup {
+        /// The node.
+        sender: String,
+        /// The start it speaks for.
+        start: u64,
+    },
+    /// The sender already runs under the name the wazzup of `start` carried.
+    NameTaken {
+        /// The node, and the name.
+        sender: String,
+        /// The start that asked.
+        start: u64,
+    },
     /// One change, from its maker or a node echoing it.
     Change {
         /// The node that sent this copy.
@@ -120,6 +136,8 @@ impl Message {
     pub(crate) fn sender(&self) -> &str {
         match self {
             Self::Announce { sender }
+            | Self::Wazzup { sender, .. }
+            | Self::NameTaken { sender, .. }
             | Self::Change { sender, .. }
             | Self::Ack { sender, .. }
             | Self::Part { sender, .. }
@@ -131,6 +149,12 @@ impl Message {
     fn to_json(&self) -> Value {
         match self {
             Self::Announce { sender } => json!({"t": "announce", "sender": sender}),
+            Self::Wazzup { sender, start } => {
+                json!({"t": "wazzup", "sender": sender, "start": start})
+            }
+            Self::NameTaken { sender, start } => {
+                json!({"t": "name-taken", "sender": sender, "start": start})
+            }
             Self::Change {
                 sender,
                 envelope,
@@ -194,6 +218,14 @@ impl Message {
         let sender = text("sender")?;
         match json.get("t")?.as_str()? {
             "announce" => Some(Self::Announce { sender }),
+            "wazzup" => Some(Self::Wazzup {
+                sender,
+                start: json.get("start")?.as_u64()?,
+            }),
+            "name-taken" => Some(Self::NameTaken {
+                sender,
+                start: json.get("start")?.as_u64()?,
+            }),
             "change" => Some(Self::Change {
                 sender,
                 envelope: Box::new(Envelope::from_json(json.get("envelope")?)?),

@@ -79,6 +79,16 @@ pub enum Error {
     /// The node's socket could not be opened, or a datagram not sent.
     #[error("the mesh socket: {0}")]
     Socket(#[from] std::io::Error),
+    /// A node already runs under this node's name.
+    #[error(
+        "smugglr mesh: the name {0} is taken by a node already running; this node does not join"
+    )]
+    NameTaken(String),
+    /// A change under this node's name that it did not make arrived.
+    #[error(
+        "smugglr mesh: heard a change under the name {0} that this node did not make: two machines share the name, and this node stops"
+    )]
+    NameClash(String),
     /// The node holds no key.
     #[error("the mesh needs a shared key")]
     NoKey,

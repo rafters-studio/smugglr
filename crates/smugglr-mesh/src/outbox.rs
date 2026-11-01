@@ -242,6 +242,11 @@ impl Outbox {
         format!("{}/{segment:020}.jsonl", self.folder)
     }
 
+    /// Whether `change` is one the outbox holds.
+    pub(crate) fn holds(&self, change: &[u8; 32]) -> bool {
+        self.entries.contains_key(change)
+    }
+
     /// Whether `change` is still owed to `peer`.
     pub(crate) fn owes(&self, change: &[u8; 32], peer: &str) -> bool {
         self.entries

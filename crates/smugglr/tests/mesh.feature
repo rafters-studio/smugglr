@@ -127,3 +127,17 @@ Feature: smugglr mesh as a command: its front ends, its node's name and port, it
     When a row holding a 2 MB value and then a small row are written on the first node
     Then the record names the 2 MB value as over the second node's limit
     And the second node holds the small row
+
+  @criterion-01a17503-2aaa-7282-89c3-a529885c94d5 @module-mesh
+  Scenario: a second node with a taken name does not join
+    Given a node named puck running smugglr mesh
+    When a second node also named puck starts smugglr mesh with the same key file
+    Then the second node exits without joining
+    And it says the name puck is taken
+
+  @criterion-01a17503-2aaa-7282-89c3-a536ccbe4266 @module-mesh
+  Scenario: a change under a node's own name that it did not make stops it
+    Given two nodes both named rzr that started out of reach of each other
+    When they come within reach and one writes a row
+    Then the other stops
+    And its record names the clash over the name rzr

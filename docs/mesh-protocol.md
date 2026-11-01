@@ -91,7 +91,7 @@ On a network that carries no broadcast (a layer-3 VPN such as WireGuard or Tails
 
 A node is named by its machine's name, as the `hostname` command gives it, or `COMPUTERNAME` on Windows. Every envelope it makes carries the name as its node. Renaming a machine makes it a new node to its peers.
 
-In 0.6.1 a node treats any message carrying its own name as its own and ignores it. Two machines with one name therefore do not sync with each other, and nothing says so. The checks that make the clash loud (a starting node refuses a taken name; a node that hears a change under its own name that it did not make stops and names the clash) are specified in FR-SMUGGLR-079 and are not built (#521). Give every node its own name.
+A node that starts listens for one second before it joins, and says a wazzup carrying its name and a random number made at that start. A node that has joined under that name answers that it is taken, and the starting node exits, saying which name clashed. Two nodes that start together both join, and the next check catches them. A node that hears a change under its own name that it did not make stops and names the clash: two machines with one name would acknowledge each other's changes and lose rows silently.
 
 ## Sending
 
