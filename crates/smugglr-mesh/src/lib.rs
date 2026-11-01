@@ -23,9 +23,9 @@
 //! The maker resends, unicast, to each peer that has not acknowledged,
 //! until every one has or the change's sunset passes: at once for a change a
 //! peer skipped while acknowledging later ones, after about two round trips
-//! to a peer that is acknowledging, never more than a quarter of what it
-//! sends, and on the 10 s to 160 s doubling only to a peer that has stopped
-//! (FR-SMUGGLR-078 rev 20). Its unacknowledged changes wait in an outbox in
+//! to a peer that is acknowledging and doubling with each try, never more
+//! than a quarter of what it sends, and on the 10 s to 160 s doubling to a
+//! peer that has stopped. Its unacknowledged changes wait in an outbox in
 //! smugglr's own files; at the backpressure line it takes no new ones until
 //! acknowledgements bring the outbox down, and it sends paced, the window
 //! shrinking only on congestion (RFC 8085).

@@ -62,6 +62,9 @@ struct Due {
     silent: bool,
     /// The copy is known lost, or its peer has had none: not a guess.
     sure: bool,
+    /// It is due to a peer that is acknowledging other changes, on a guess
+    /// that its copy was lost.
+    guess: bool,
 }
 
 /// A change due a resend, and the targets it is due to.
@@ -92,6 +95,9 @@ struct Entry {
     /// When it is next resent to a peer that has stopped acknowledging.
     resend_at: Instant,
     interval: Duration,
+    /// How many resends have gone on a guess to a peer that is acknowledging
+    /// other changes: each one doubles the wait before the next.
+    guesses: u32,
 }
 
 /// How a peer has been acknowledging this node's changes.
@@ -393,9 +399,9 @@ impl Outbox {
     }
 
     /// Up to `limit` changes due a resend at `now`, each with the targets
-    /// it is due to (FR-SMUGGLR-078 rev 20): at once to a peer that has
-    /// acknowledged changes sent after it; to a peer that is acknowledging,
-    /// after about two of its round trips, doubling with each try; and to a
+    /// it is due to: at once to a peer that has acknowledged changes sent
+    /// after it; to a peer that is acknowledging, after about two of its
+    /// round trips, doubling with each try up to [`LAST_RESEND`]; and to a
     /// peer that has stopped acknowledging, on the 10 s to 160 s doubling.
     /// A peer that `busy` says is taking in a change's parts is not due
     /// that change.
@@ -413,7 +419,7 @@ impl Outbox {
             if !entry.sent {
                 continue;
             }
-            let (mut to, mut silent, mut sure) = (Vec::new(), false, false);
+            let (mut to, mut silent, mut sure, mut guess) = (Vec::new(), false, false, false);
             for peer in entry.targets.difference(&entry.acked) {
                 if busy(change, peer) {
                     continue;
@@ -433,12 +439,12 @@ impl Outbox {
                         sure = true;
                     }
                     Some(timing) => {
-                        // Every two round trips, never doubling: the
-                        // doubling is only for a peer that has stopped
-                        // (FR-SMUGGLR-078 rev 20); the quarter cap is
-                        // what keeps resends from crowding out the rest.
-                        if now >= entry.last_sent + timing.wait() {
+                        // A peer that acknowledges others may be holding
+                        // this one, and a held change needs no copy to be
+                        // decided: each guess waits twice the last.
+                        if now >= entry.last_sent + backed_off(timing.wait(), entry.guesses) {
                             to.push(peer.clone());
+                            guess = true;
                         }
                     }
                     None => {
@@ -456,6 +462,7 @@ impl Outbox {
                     to,
                     silent,
                     sure,
+                    guess,
                 });
             }
         }
@@ -466,7 +473,11 @@ impl Outbox {
         due.truncate(limit);
         let latest = self.seq;
         for Due {
-            change, to, silent, ..
+            change,
+            to,
+            silent,
+            guess,
+            ..
         } in &due
         {
             let Some(entry) = self.entries.get_mut(change) else {
@@ -475,6 +486,9 @@ impl Outbox {
             if *silent {
                 entry.interval = (entry.interval * 2).min(LAST_RESEND);
                 entry.resend_at = now + entry.interval;
+            }
+            if *guess {
+                entry.guesses = entry.guesses.saturating_add(1);
             }
             entry.last_sent = now;
             entry.resent = true;
@@ -626,5 +640,129 @@ fn entry(segment: u64, envelope: &Envelope, targets: BTreeSet<String>) -> Entry 
         resent: false,
         resend_at: Instant::now(),
         interval: FIRST_RESEND,
+        guesses: 0,
+    }
+}
+
+/// `wait` doubled `guesses` times, never past [`LAST_RESEND`].
+fn backed_off(wait: Duration, guesses: u32) -> Duration {
+    wait.saturating_mul(1_u32.checked_shl(guesses).unwrap_or(u32::MAX))
+        .min(LAST_RESEND)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeSet, HashMap};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use smugglr_core::change::{Change, op};
+    use smugglr_core::envelope::{Envelope, VERSION};
+    use smugglr_core::shape::Stamp;
+    use smugglr_memory::Files;
+
+    use super::{LAST_RESEND, LONGEST, Outbox, Timing};
+
+    const PEER: &str = "peer";
+
+    fn envelope(n: u8) -> Envelope {
+        let (from, to) = (Some([n; 16]), Some([n + 1; 16]));
+        Envelope {
+            v: VERSION,
+            node: "here".to_owned(),
+            change: Change {
+                op: op(from, to),
+                table: "notes".to_owned(),
+                key: vec![n.to_string()],
+                from,
+                to,
+                values: Vec::new(),
+            },
+            targets: Vec::new(),
+            sunset: u64::MAX,
+            txn: None,
+            key_id: "key".to_owned(),
+            stamp: Stamp([0; 16]),
+            signature: [n; 32],
+        }
+    }
+
+    /// An outbox that has sent `count` changes to [`PEER`].
+    fn sent(name: &str, count: u8) -> Result<Outbox, Box<dyn std::error::Error>> {
+        let dir =
+            std::env::temp_dir().join(format!("smugglr-mesh-outbox-{}-{name}", std::process::id()));
+        let mut outbox = Outbox::open(Arc::new(Files::new(dir)), "outbox", 0)?;
+        let envelopes: Vec<Envelope> = (1..=count).map(envelope).collect();
+        outbox.add(&envelopes, &BTreeSet::from([PEER.to_owned()]))?;
+        outbox.first_sends(usize::from(count))?;
+        Ok(outbox)
+    }
+
+    /// [`PEER`] acknowledging others just now, up to the change `highest`.
+    fn acknowledging(now: Instant, highest: u64) -> HashMap<String, Timing> {
+        HashMap::from([(
+            PEER.to_owned(),
+            Timing {
+                round_trip: Duration::from_secs(1),
+                variation: Duration::ZERO,
+                last_ack: now,
+                highest,
+            },
+        )])
+    }
+
+    #[test]
+    fn a_change_resent_to_an_acknowledging_peer_waits_twice_as_long_each_time()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut outbox = sent("backs-off", 1)?;
+        let mut now = Instant::now();
+        let mut wait = LONGEST;
+        while wait < LAST_RESEND {
+            now += wait;
+            let timing = acknowledging(now, 0);
+            assert_eq!(outbox.resends(now, &timing, 10, |_, _| false)?.len(), 1);
+            wait *= 2;
+            let early = now
+                + wait
+                    .min(LAST_RESEND)
+                    .saturating_sub(Duration::from_millis(1));
+            let timing = acknowledging(early, 0);
+            assert_eq!(outbox.resends(early, &timing, 10, |_, _| false)?.len(), 0);
+        }
+        // The wait stops growing at the limit.
+        now += LAST_RESEND;
+        let timing = acknowledging(now, 0);
+        assert_eq!(outbox.resends(now, &timing, 10, |_, _| false)?.len(), 1);
+        now += LAST_RESEND;
+        let timing = acknowledging(now, 0);
+        assert_eq!(outbox.resends(now, &timing, 10, |_, _| false)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_skipped_change_is_resent_at_once_however_far_it_has_backed_off()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut outbox = sent("skipped", 1)?;
+        let mut now = Instant::now();
+        for guess in 0..6 {
+            now += LONGEST * 2_u32.pow(guess);
+            let timing = acknowledging(now, 0);
+            assert_eq!(outbox.resends(now, &timing, 10, |_, _| false)?.len(), 1);
+        }
+        // The peer has acknowledged changes sent after it: its copy is lost.
+        let timing = acknowledging(now, 100);
+        let due = outbox.resends(now, &timing, 10, |_, _| false)?;
+        assert_eq!(due.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn the_first_resend_still_comes_within_the_repair_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut outbox = sent("first", 1)?;
+        let now = Instant::now() + LONGEST;
+        let timing = acknowledging(now, 0);
+        assert_eq!(outbox.resends(now, &timing, 10, |_, _| false)?.len(), 1);
+        Ok(())
     }
 }
