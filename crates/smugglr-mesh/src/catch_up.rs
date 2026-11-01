@@ -171,18 +171,31 @@ pub(crate) struct Taking {
 }
 
 impl Taking {
-    pub(crate) fn new(peer: String, id: u64, bytes: u64, count: u64) -> Self {
-        Self {
+    /// A stash of `bytes` in `count` parts; `None` when the two do not agree,
+    /// or there is no room for it.
+    pub(crate) fn new(peer: String, id: u64, bytes: u64, count: u64) -> Option<Self> {
+        if count != parts_of(bytes) {
+            return None;
+        }
+        let size = usize::try_from(bytes).ok()?;
+        let parts = usize::try_from(count).ok()?;
+        let mut buffer = Vec::new();
+        buffer.try_reserve_exact(size).ok()?;
+        buffer.resize(size, 0);
+        let mut arrived = Vec::new();
+        arrived.try_reserve_exact(parts).ok()?;
+        arrived.resize(parts, false);
+        Some(Self {
             peer,
             id,
             count,
-            bytes: vec![0; usize::try_from(bytes).unwrap_or_default()],
-            arrived: vec![false; usize::try_from(count).unwrap_or_default()],
+            bytes: buffer,
+            arrived,
             have: 0,
             highest: 0,
             reported: None,
             heard_at: Instant::now(),
-        }
+        })
     }
 
     /// Takes in part `n`; a part out of range or of the wrong size is dropped.
@@ -265,7 +278,20 @@ mod tests {
         let bytes = stash(parts);
         let giving = Giving::new("sleeper".to_owned(), 7, bytes.clone());
         let taking = Taking::new("giver".to_owned(), 7, giving.len(), giving.count());
+        let taking = taking.unwrap_or_else(|| unreachable!("its sizes agree"));
         (giving, taking)
+    }
+
+    #[test]
+    fn a_stash_whose_sizes_do_not_agree_is_refused() {
+        let taking = |bytes, count| Taking::new("giver".to_owned(), 7, bytes, count).is_some();
+        assert!(taking(PART as u64 * 2, 2));
+        assert!(taking(1, 1));
+        assert!(taking(0, 1));
+        assert!(!taking(0, 0));
+        assert!(!taking(PART as u64 * 2, 3));
+        assert!(!taking(u64::MAX, 1));
+        assert!(!taking(u64::MAX, u64::MAX));
     }
 
     #[test]

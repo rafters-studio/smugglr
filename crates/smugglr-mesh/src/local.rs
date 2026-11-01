@@ -445,18 +445,44 @@ impl Local {
     /// Tells multi what this node last noted, as if it were a device's last
     /// stash: a mesh node never stashes, and a retrieve takes a whole blob's
     /// copy of each row not changed since, so a row deleted elsewhere does not
-    /// come back and a row edited here goes through `--sync-mode`.
+    /// come back and a row edited here goes through `--sync-mode`. A row with a
+    /// change in `owed`, oldest first, counts as changed here, from before
+    /// that change: nobody may have it yet, so a stash must not overwrite it.
     pub(crate) fn note_for_retrieve(
         &self,
         store: &dyn Store,
         address: &str,
         now: u64,
+        owed: &[Envelope],
     ) -> Result<(), Error> {
         let mut device = smugglr_memory::Device::open(store, address)?;
         device.stashed = true;
         device.baseline.clone_from(&self.baseline);
+        let mut seen = HashSet::new();
+        for envelope in owed {
+            let change = &envelope.change;
+            if !seen.insert((change.table.clone(), change.key.clone())) {
+                continue;
+            }
+            let noted = device.baseline.entry(change.table.clone()).or_default();
+            match change.from {
+                Some(from) => drop(noted.insert(change.key.clone(), from)),
+                None => drop(noted.remove(&change.key)),
+            }
+        }
         device.save(store, now)?;
         Ok(())
+    }
+
+    /// The delete envelopes still inside their sunset, which a stash carries so
+    /// a node taking it holds their tombstones: a late insert of one of those
+    /// keys must not bring the row back there.
+    pub(crate) fn live_tombstones(&self, now: u64) -> Vec<Envelope> {
+        self.tombstones
+            .values()
+            .filter(|tombstone| now <= tombstone.sunset)
+            .cloned()
+            .collect()
     }
 
     /// Notes what a retrieve of the whole `blob` left: each row that now holds

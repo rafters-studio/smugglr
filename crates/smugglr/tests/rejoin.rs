@@ -371,6 +371,8 @@ fn a_node_back_past_the_sunset_catches_up_and_keeps_its_own_edit() -> Tried {
     // Edited here while away, further on than anything: it must survive. Left
     // alone here and deleted there: it must not come back.
     edit(&first.db, 0..1, "kept here", "2026-09-01")?;
+    // Deleted here while away: it must stay deleted, here and there.
+    Connection::open(&first.db)?.execute("DELETE FROM notes WHERE id = 'r00003'", [])?;
     edit(&second.db, 1..2, "edited there", "2026-05-01")?;
     Connection::open(&second.db)?.execute("DELETE FROM notes WHERE id = 'r00002'", [])?;
     Connection::open(&second.db)?.execute(
@@ -406,6 +408,7 @@ fn a_node_back_past_the_sunset_catches_up_and_keeps_its_own_edit() -> Tried {
     );
     assert!(here.contains_key("there"));
     assert!(!here.contains_key("r00002"), "a deleted row came back");
+    assert!(!here.contains_key("r00003"), "a row deleted here came back");
     let _ = fs::remove_dir_all(&root);
     Ok(())
 }

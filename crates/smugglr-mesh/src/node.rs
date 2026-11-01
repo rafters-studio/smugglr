@@ -33,6 +33,7 @@ use chacha20poly1305::aead::OsRng;
 use chacha20poly1305::aead::rand_core::RngCore;
 use smugglr_core::envelope::Envelope;
 use smugglr_core::hex::{hex, unhex};
+use smugglr_core::record::Status;
 use smugglr_core::row_hash::row_hash;
 use smugglr_place::Place;
 use socket2::{Domain, Protocol, Socket, Type};
@@ -699,7 +700,11 @@ impl Node<'_> {
             // Room in the outbox as soon as acknowledgements make it.
             self.outbox.prune(now())?;
         }
-        self.look(place)?;
+        // Not while a stash is expected: a row changed while away must still
+        // read as changed when the stash is taken, or it is overwritten.
+        if !self.stashes.on_its_way() {
+            self.look(place)?;
+        }
         self.send_due()?;
         if self.unopened > 0
             && self
@@ -998,9 +1003,15 @@ impl Node<'_> {
                     .as_ref()
                     .is_some_and(|(peer, accepted, _)| *peer == sender && *accepted == id);
                 if ours && self.stashes.taking.is_none() {
-                    println!("smugglr mesh: taking a stash of {bytes} bytes from {sender}");
                     self.stashes.accepted = None;
-                    self.stashes.taking = Some(Taking::new(sender, id, bytes, count));
+                    self.stashes.taking = Taking::new(sender.clone(), id, bytes, count);
+                    if self.stashes.taking.is_some() {
+                        println!("smugglr mesh: taking a stash of {bytes} bytes from {sender}");
+                    } else {
+                        println!(
+                            "smugglr mesh: refused a stash from {sender}: {bytes} bytes in {count} parts"
+                        );
+                    }
                 }
             }
             Message::StashPart { id, n, data, .. } => {
@@ -1160,8 +1171,10 @@ impl Node<'_> {
     /// The text of a whole stash of this node's database.
     fn make_stash(&self, place: &mut dyn Place) -> Result<Vec<u8>, Error> {
         let settings = self.multi_settings(self.sign[0]);
-        let blob = smugglr_multi::stash(place, &settings, true, |_| Ok(()))
+        let mut blob = smugglr_multi::stash(place, &settings, true, |_| Ok(()))
             .map_err(|err| Error::Shape(err.to_string()))?;
+        blob.graveyard.extend(self.local.live_tombstones(now()));
+        blob.sign(&self.sign[0]);
         Ok(blob.to_json().into_bytes())
     }
 
@@ -1216,13 +1229,25 @@ impl Node<'_> {
             .and_then(|blob| self.sign.iter().find(|key| blob.verify(key)).copied());
         let (Some(blob), Some(key)) = (blob, signed) else {
             println!("smugglr mesh: the stash from {peer} does not check; asking again");
+            self.stashes.asking_since = None;
             return Ok(());
         };
+        let owed = self.outbox.owed_changes(None)?;
         self.local
-            .note_for_retrieve(&*self.settings.store, place.address(), now())?;
+            .note_for_retrieve(&*self.settings.store, place.address(), now(), &owed)?;
         let settings = self.multi_settings(key);
         let record = smugglr_multi::retrieve(place, std::slice::from_ref(&blob), &settings, &[])
             .map_err(|err| Error::Shape(err.to_string()))?;
+        // Rows stopped by `--sync-mode` are named by the retrieve and stay as
+        // they are. Anything worse took nothing, so it is asked for again.
+        if !matches!(record.status, Status::Done | Status::StoppedInPart) {
+            println!(
+                "smugglr mesh: the stash from {peer} was not taken ({:?}); asking again",
+                record.status
+            );
+            self.stashes.asking_since = None;
+            return Ok(());
+        }
         self.local.took_stash(place, &blob)?;
         self.stashes.wants = false;
         self.since = now();
