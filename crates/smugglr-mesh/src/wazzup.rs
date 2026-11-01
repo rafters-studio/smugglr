@@ -12,9 +12,10 @@ use smugglr_core::hex::hex;
 use crate::wire::{Line, RowNow};
 
 /// About the most bytes of lines one wazzup part carries, so the part sealed
-/// stays under the 1,200 bytes that are never fragmented, and so does its
-/// answer, whose lines are no larger than the lines asked about.
-const PART: usize = 900;
+/// stays under the 1,200 bytes that are never fragmented. Its answer stays
+/// there too: an answered line takes about 72 bytes, and an asked line at
+/// least about 60.
+const PART: usize = 800;
 
 /// How often a part a peer has not answered is said again.
 pub(crate) const ASK_AGAIN: Duration = Duration::from_secs(1);
@@ -61,8 +62,11 @@ pub(crate) enum Settled {
 /// `mine` being this node's row hash now.
 ///
 /// Holding the row this node holds settles it too, beyond FR-SMUGGLR-079: two
-/// nodes that met a conflict and agree have nothing left to send, and such a
-/// change otherwise stays owed until its sunset (seen live 2026-11-01).
+/// nodes that agree have nothing left to send. That covers two more cases: a
+/// conflict both sides decided alike, which otherwise stays owed until its
+/// sunset; and an insert since deleted here, whose peer holds no row either.
+/// Sent to that peer, the insert would bring back a row whose delete is
+/// already settled.
 pub(crate) fn settle(
     (from, to): (Option<[u8; 16]>, Option<[u8; 16]>),
     mine: Option<[u8; 16]>,
@@ -76,7 +80,7 @@ pub(crate) fn settle(
     if to.is_some() && answer.last_from == Some(to) {
         return Settled::Has;
     }
-    if answer.hash.is_some() && answer.hash == mine {
+    if answer.hash == mine {
         return Settled::Has;
     }
     // For an insert, behind means it never saw the key: a peer with no row
@@ -257,7 +261,7 @@ mod tests {
 
     #[test]
     fn a_peer_that_never_saw_an_insert_is_sent_it() {
-        assert_eq!(settle((None, T), None, &answer(None, None)), Settled::Send);
+        assert_eq!(settle((None, T), T, &answer(None, None)), Settled::Send);
     }
 
     #[test]
@@ -267,7 +271,7 @@ mod tests {
             Settled::Has
         );
         assert_eq!(
-            settle((None, T), None, &answer(None, Some(OTHER))),
+            settle((None, T), Some([9; 16]), &answer(None, Some(OTHER))),
             Settled::Named
         );
     }
@@ -283,8 +287,19 @@ mod tests {
     }
 
     #[test]
-    fn two_empty_rows_prove_nothing_about_who_holds_what() {
-        assert_eq!(settle((F, T), None, &answer(None, Some(F))), Settled::Named);
+    fn an_insert_since_deleted_here_is_not_sent_to_a_peer_that_never_saw_it() {
+        // Inserted then deleted while the peer slept: its delete is settled
+        // by the peer holding no row, so the insert must not bring it back.
+        assert_eq!(settle((None, T), None, &answer(None, None)), Settled::Has);
+        assert_eq!(settle((T, None), None, &answer(None, None)), Settled::Has);
+    }
+
+    #[test]
+    fn a_row_here_and_none_there_proves_nothing() {
+        assert_eq!(
+            settle((F, T), Some([9; 16]), &answer(None, Some(F))),
+            Settled::Named
+        );
     }
 
     #[test]

@@ -255,3 +255,89 @@ fn two_nodes_apart_settle_on_one_row_each_and_drain() -> Tried {
     let _ = fs::remove_dir_all(&root);
     Ok(())
 }
+
+/// Two nodes that have noted their rows and heard each other, the second's
+/// config carrying `second_more`.
+fn two_running(name: &str, second_more: &str) -> Tried<(PathBuf, PathBuf, Node, Node)> {
+    let root = std::env::temp_dir().join(format!("smugglr-rejoin-{name}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root)?;
+    let (first_port, second_port) = (free_port()?, free_port()?);
+    let mut first = Node::new(&root, "first", first_port, second_port, "")?;
+    let mut second = Node::new(&root, "second", second_port, first_port, second_more)?;
+    let key = root.join("mesh.key");
+    let made = Command::new(env!("CARGO_BIN_EXE_smugglr"))
+        .args(["mesh", "keygen", "--key-file"])
+        .arg(&key)
+        .stdout(Stdio::null())
+        .status()?;
+    assert!(made.success());
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o600))?;
+    first.start(&key)?;
+    second.start(&key)?;
+    sleep(Duration::from_secs(3));
+    Ok((root, key, first, second))
+}
+
+/// Waits up to `within` for `done`.
+fn soon(within: Duration, mut done: impl FnMut() -> Tried<bool>) -> Tried<bool> {
+    let started = Instant::now();
+    while started.elapsed() < within {
+        if done()? {
+            return Ok(true);
+        }
+        sleep(Duration::from_millis(200));
+    }
+    Ok(false)
+}
+
+#[test]
+fn a_node_that_wakes_a_second_time_is_answered_at_once_too() -> Tried {
+    let (root, key, mut first, second) = two_running("wakes", "")?;
+    for wake in 0..2 {
+        first.stop()?;
+        // Long enough that its peer has stopped hearing it.
+        sleep(Duration::from_secs(12));
+        let id = format!("w{wake}");
+        Connection::open(&second.db)?.execute(
+            "INSERT INTO notes VALUES (?1, 'while asleep', '2026-05-01')",
+            [&id],
+        )?;
+        sleep(Duration::from_secs(1));
+        first.start(&key)?;
+        // Past the 1 s listen; well inside the 10 s of a resend to a peer
+        // not acknowledging, which is what a wazzup not heard would wait for.
+        let arrived = soon(Duration::from_secs(6), || {
+            Ok(first.rows()?.contains_key(&id))
+        })?;
+        assert!(arrived, "wake {wake}: {id} did not arrive at once");
+    }
+    let _ = fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn a_peer_owing_more_than_the_wire_says_so_and_how_to_catch_up() -> Tried {
+    let (root, key, mut first, second) = two_running("too-much", "mesh_wire = 1000\n")?;
+    first.stop()?;
+    let mut connection = Connection::open(&second.db)?;
+    let add = connection.transaction()?;
+    for row in 0..200 {
+        add.execute(
+            "INSERT INTO notes VALUES (?1, 'too many for the wire', '2026-05-01')",
+            [format!("m{row:05}")],
+        )?;
+    }
+    add.commit()?;
+    sleep(Duration::from_secs(2));
+    first.start(&key)?;
+    let said = soon(Duration::from_secs(10), || {
+        Ok(first
+            .printed()
+            .contains("says there is too much for the wire"))
+    })?;
+    assert!(said, "{}", first.printed());
+    assert!(first.printed().contains("smugglr retrieve") || first.printed().contains("retrieve "));
+    let _ = fs::remove_dir_all(&root);
+    Ok(())
+}

@@ -227,8 +227,8 @@ impl Front {
         Ok(index)
     }
 
-    /// Whether a scenario woke a sleeping node.
-    pub(crate) fn woke_a_sleeper(&self) -> bool {
+    /// Whether the scenario runs mesh nodes.
+    pub(crate) fn runs_mesh_nodes(&self) -> bool {
         self.nodes.get().is_some()
     }
 
@@ -1184,11 +1184,6 @@ impl Relay {
         self.seen.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Whether `message` is the first copy the relay sees of the change to
-    /// the last row a scenario writes, which the relay then loses so its
-    /// repair shows. It is the first the relay sees, not the maker's first
-    /// send: the system may drop that before the relay reads it, and the
-    /// change then first reaches the relay as a resend.
     /// Notes a wazzup's part from the first node or an answer to one, and
     /// whether this datagram is the first copy of part 1, which it loses.
     fn note_wazzup(&self, message: Option<&Value>, from_first: bool, len: usize) -> bool {
@@ -1218,6 +1213,11 @@ impl Relay {
         }
     }
 
+    /// Whether `message` is the first copy the relay sees of the change to
+    /// the last row a scenario writes, which the relay then loses so its
+    /// repair shows. It is the first the relay sees, not the maker's first
+    /// send: the system may drop that before the relay reads it, and the
+    /// change then first reaches the relay as a resend.
     fn last_first_copy(&self, message: Option<&Value>, from_first: bool) -> bool {
         let Some(message) = message.filter(|_| from_first) else {
             return false;

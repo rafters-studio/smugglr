@@ -334,12 +334,14 @@ impl Outbox {
     /// `peer` is gone for good: nothing is owed to it any more.
     pub(crate) fn remove_target(&mut self, peer: &str) {
         for entry in self.entries.values_mut() {
-            entry.targets.remove(peer);
+            let held = entry.targets.remove(peer);
             entry.unsent_to.remove(peer);
             entry.acked.remove(peer);
             entry.guesses.remove(peer);
             entry.resent_by.remove(peer);
-            entry.owes_nobody |= entry.targets.is_empty();
+            // Only a change it was owed: one made before any peer was heard
+            // still waits for its first target.
+            entry.owes_nobody |= held && entry.targets.is_empty();
         }
         self.settled = true;
     }
@@ -967,6 +969,27 @@ mod tests {
         assert_eq!(outbox.owed(PEER).map(|(count, _)| count), Some(1));
         outbox.ack(&[3; 32], PEER);
         assert_eq!(outbox.owed(PEER).map(|(count, _)| count), None);
+        Ok(())
+    }
+
+    #[test]
+    fn taking_a_node_off_lets_go_only_of_what_it_was_owed() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let dir = std::env::temp_dir().join(format!(
+            "smugglr-mesh-outbox-{}-removed",
+            std::process::id()
+        ));
+        let mut outbox = Outbox::open(Arc::new(Files::new(dir)), "outbox", 0)?;
+        outbox.add(&[envelope(1)], &BTreeSet::new())?;
+        outbox.add(&[envelope(3)], &BTreeSet::from([PEER.to_owned()]))?;
+        outbox.first_sends(2)?;
+        outbox.remove_target(PEER);
+        outbox.prune(0)?;
+        assert!(
+            outbox.holds(&[1; 32]),
+            "no peer yet: it still waits for one"
+        );
+        assert!(!outbox.holds(&[3; 32]), "owed to nobody now");
         Ok(())
     }
 

@@ -91,7 +91,7 @@ On a network that carries no broadcast (a layer-3 VPN such as WireGuard or Tails
 
 A node is named by its machine's name, as the `hostname` command gives it, or `COMPUTERNAME` on Windows. Every envelope it makes carries the name as its node. Renaming a machine makes it a new node to its peers.
 
-A node that starts listens for one second before it joins, and says a wazzup carrying its name and a random number made at that start. A node that has joined under that name answers that it is taken, and the starting node exits, saying which name clashed. Two nodes that start together both join, and the next check catches them. A node that hears a change under its own name that it did not make stops and names the clash: two machines with one name would acknowledge each other's changes and lose rows silently.
+A node that starts listens for one second before it joins, and says a wazzup carrying its name and a random number made at that start. A node that has joined under that name answers that it is taken, and the starting node exits, saying which name clashed. Two nodes that start together both join, and the next check catches them. A node that hears a change under its own name that it did not make stops and names the clash: two machines with one name would acknowledge each other's changes and lose rows silently. The check covers a change sent directly by a machine of that name. A third node's echo of such a change goes unnoticed, because a late echo of the node's own change looks the same.
 
 ## Sending
 
@@ -140,7 +140,7 @@ Every change a node drops is kept, envelope and values, in a dropped log in smug
 
 ## The record
 
-A node prints one line for each of these, to its standard output: it started (node, port and the `key_id` it signs with); a burst applied, with the count, the table, the makers and the keys; a change holding, with why; a change stopped or dropped, once however often a copy arrives; a send window halved, with why; changes that arrived only as a resend because the first copy was lost; changes resent that a peer had not acknowledged, at most once a minute, counting one for each time a change was resent since the last such line, so one change resent twice counts as two and the count is not of distinct changes or of datagrams; a peer that owes acknowledgements and has given none for 5 minutes, naming the peer, how long, how many changes and when it was last heard, repeated every 10 minutes while that lasts, and a line when it acknowledges again; a row too large for one datagram; and a datagram that did not open. A change refused for a key the node does not hold, or for a table whose shape differs here, goes to standard error.
+A node prints one line for each of these, to its standard output: it started (node, port and the `key_id` it signs with); a burst applied, with the count, the table, the makers and the keys; a change holding, with why; a change stopped or dropped, once however often a copy arrives; a send window halved, with why; changes that arrived only as a resend because the first copy was lost; changes resent that a peer had not acknowledged, at most once a minute, counting one for each time a change was resent since the last such line, so one change resent twice counts as two and the count is not of distinct changes or of datagrams; a peer that owes acknowledgements and has given none for 5 minutes, naming the peer, how long, how many changes and when it was last heard, repeated every 10 minutes while that lasts, and a line when it acknowledges again; a row too large for one datagram; a peer's rows that settle nothing about changes it has not acknowledged, grouped by peer; a peer saying there is too much for the wire, with how to catch up; a node taken off the mesh, or heard again after that; and a datagram that did not open. A taken name or a clash over the name goes to standard error as the node stops. A change refused for a key the node does not hold, or for a table whose shape differs here, goes to standard error.
 
 ## Waking
 
@@ -148,7 +148,7 @@ Every run a node notes when it last ran. A node that starts after being away lon
 
     smugglr mesh: this node has been away 3 days, longer than the sunset (12 hours); changes made meanwhile may not reach it. Catch up with: smugglr stash <a peer's place> <dir> --key-file <path> --node <name> --whole, then smugglr retrieve ./node.db <dir> --key-file <path> --node <name>
 
-That is all a waking node does in 0.6.1. Past the sunset the changes it missed are dead, so the person catches up with stash then retrieve.
+Past the sunset the changes it missed are dead, so the person catches up with stash then retrieve, and the node's next start says wazzup.
 
 A node inside the sunset catches up by wazzup (FR-SMUGGLR-079):
 
@@ -162,7 +162,7 @@ A node inside the sunset catches up by wazzup (FR-SMUGGLR-079):
 
 ## Leaving
 
-Any node can leave and the rest go on. A node that stops acknowledging is resent to on the 10 to 160 second doubling until the sunset. A node gone for good stays a target, and its peers keep its changes, until a person runs `smugglr mesh remove <node> --key-file <path>`. Each peer that hears it, directly or from another peer, stops owing that node anything, until that node next starts and says wazzup.
+Any node can leave and the rest go on. A node that stops acknowledging is resent to on the 10 to 160 second doubling until the sunset. A node gone for good stays a target, and its peers keep its changes, until a person runs `smugglr mesh remove <node> --key-file <path>`. Each peer that hears it, directly or from another peer, stops owing that node anything, until that node is next heard.
 
 ## Clocks
 

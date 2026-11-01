@@ -219,7 +219,7 @@ pub fn run(place: &mut dyn Place, settings: &Settings, stop: &AtomicBool) -> Res
     let removed_file = format!("{folder}/removed.json");
     let removed = removed_nodes(settings, &removed_file)?;
     let local = Local::open(place, settings, &folder, now())?;
-    let outbox = Outbox::open(settings.store.clone(), &format!("{folder}/outbox"), now())?;
+    let outbox = open_outbox(settings, &folder, &removed)?;
     let mut node = Node {
         settings,
         socket,
@@ -341,6 +341,20 @@ fn say_if_past_sunset(settings: &Settings, ran: &str, place: &str) -> Result<boo
     Ok(true)
 }
 
+/// The node's outbox, owing nothing to a node taken off the mesh: each
+/// segment keeps the targets it was written with.
+fn open_outbox(
+    settings: &Settings,
+    folder: &str,
+    removed: &BTreeSet<String>,
+) -> Result<Outbox, Error> {
+    let mut outbox = Outbox::open(settings.store.clone(), &format!("{folder}/outbox"), now())?;
+    for node in removed {
+        outbox.remove_target(node);
+    }
+    Ok(outbox)
+}
+
 /// When the node last ran, in seconds since the epoch; 0 when it never has.
 fn last_ran(settings: &Settings, ran: &str) -> Result<u64, Error> {
     Ok(settings
@@ -363,6 +377,7 @@ fn removed_nodes(settings: &Settings, file: &str) -> Result<BTreeSet<String>, Er
 #[derive(Debug)]
 struct Wazzup {
     peer: String,
+    start: u64,
     id: u64,
     n: u64,
     count: u64,
@@ -511,8 +526,9 @@ struct Node<'a> {
     /// where the database can be read.
     wazzups: Vec<Wazzup>,
     answers: Vec<Answer>,
-    /// The wazzup each peer last woke this node's resends with.
-    woken_by: HashMap<String, u64>,
+    /// The wazzup each peer last woke this node's resends with: its start,
+    /// since ids begin again at each start, and its id.
+    woken_by: HashMap<String, (u64, u64)>,
     told_too_much: bool,
     /// The nodes a person has taken off the mesh.
     removed: BTreeSet<String>,
@@ -947,6 +963,7 @@ impl Node<'_> {
     fn answer_wazzup(&mut self, place: &mut dyn Place, wazzup: Wazzup) -> Result<(), Error> {
         let Wazzup {
             peer,
+            start,
             id,
             n,
             count,
@@ -959,7 +976,7 @@ impl Node<'_> {
         } else {
             self.local.rows_now(place, &lines)?
         };
-        if !too_much && self.woken_by.insert(peer.clone(), id) != Some(id) {
+        if !too_much && self.woken_by.insert(peer.clone(), (start, id)) != Some((start, id)) {
             let sending = &self.sending;
             self.outbox
                 .all_due_now(&peer, |change| sending.sends(change));
@@ -994,14 +1011,15 @@ impl Node<'_> {
             self.told_too_much_by(&peer, place.address())?;
             return Ok(());
         }
-        if !self.asking[at].answered(&peer, n) {
-            return Ok(());
-        }
         let part = self.asking[at]
             .parts
             .get(usize::try_from(n).unwrap_or(usize::MAX))
             .cloned()
             .unwrap_or_default();
+        // An answer that does not match its part is asked for again.
+        if rows.len() != part.len() || !self.asking[at].answered(&peer, n) {
+            return Ok(());
+        }
         let lines: Vec<Line> = part.iter().map(|one| one.line.clone()).collect();
         let mine = self.local.rows_now(place, &lines)?;
         for ((asked, row), here) in part.iter().zip(&rows).zip(&mine) {
@@ -1099,6 +1117,7 @@ impl Node<'_> {
         match message {
             Message::Wazzup {
                 sender,
+                start,
                 id,
                 n,
                 count,
@@ -1106,6 +1125,7 @@ impl Node<'_> {
                 ..
             } if id != NAME_ONLY => self.wazzups.push(Wazzup {
                 peer: sender,
+                start,
                 id,
                 n,
                 count,
@@ -1128,14 +1148,12 @@ impl Node<'_> {
         }
     }
 
-    /// Notes that `sender` was heard at `from`; `false` when it is a node
-    /// taken off the mesh, and what it said is ignored.
-    fn note_sender(&mut self, sender: &str, message: &Message, from: SocketAddr) -> bool {
+    /// Notes that `sender` was heard at `from`.
+    fn note_sender(&mut self, sender: &str, message: &Message, from: SocketAddr) {
         if self.removed.contains(sender) {
-            // A node taken off the mesh stays off until it says it is back.
-            if !matches!(message, Message::Wazzup { .. }) {
-                return false;
-            }
+            // A node heard again is not gone after all, and its changes must
+            // not be lost for a person's mistake or a laptop that slept.
+            println!("smugglr mesh: {sender} was taken off the mesh and is heard again");
             self.removed.remove(sender);
             self.save_removed();
         }
@@ -1155,7 +1173,6 @@ impl Node<'_> {
             self.outbox.heard(sender);
             self.sending.heard(sender);
         }
-        true
     }
 
     /// Takes in one message from another node; a change it does not have
@@ -1170,9 +1187,7 @@ impl Node<'_> {
             self.hear_own_name(&message, from);
             return;
         }
-        if !self.note_sender(&sender, &message, from) {
-            return;
-        }
+        self.note_sender(&sender, &message, from);
         match message {
             Message::Announce { .. } | Message::NameTaken { .. } | Message::Remove { .. } => {}
             message @ (Message::Wazzup { .. } | Message::Answer { .. }) => self.queue(message),
@@ -1730,7 +1745,11 @@ impl Node<'_> {
                 self.silent.insert(peer.clone(), (since, now));
                 // A peer still heard is holding something: ask it, so what
                 // its rows prove is settled with nobody watching.
-                if self.still_heard(&peer) {
+                let asked = self
+                    .asking
+                    .iter()
+                    .any(|wazzup| wazzup.only.as_deref() == Some(&peer));
+                if self.still_heard(&peer) && !asked {
                     self.ask(Some(peer))?;
                 }
             }

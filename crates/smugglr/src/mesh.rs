@@ -49,7 +49,7 @@ backpressure setting, 6 MB when not set.
 keygen writes a new key at the end of the key file, making the file when
 there is none; appending a key rotates to it. remove <node> --key-file
 <path> tells the mesh a node is gone for good, so peers stop owing it
-changes; the node rejoins when it next starts.";
+changes; a node heard again is back.";
 
 /// Runs `smugglr mesh` with `args`, until the process is stopped.
 pub(crate) fn run(args: &[String]) -> ExitCode {
