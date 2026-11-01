@@ -24,6 +24,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -37,6 +38,7 @@ use smugglr_place::Place;
 use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::local::{Local, limit, refuse};
+use crate::named::{keep_resolved, literal};
 use crate::outbox::{Acked, Outbox, Timing};
 use crate::parts::{Piece, Receiving, Sending};
 use crate::wire::{ACKS, DATAGRAM, Id, Message, Range, decode, encode, open, seal, sealed_len};
@@ -158,6 +160,7 @@ pub fn run(place: &mut dyn Place, settings: &Settings, stop: &AtomicBool) -> Res
     }
     let socket = bind(settings.port)?;
     let reader = socket.try_clone()?;
+    let named = Mutex::new(literal(&settings.peers));
     let folder = folder(place);
     let ran = format!("{folder}/ran");
     if let Some(away) = away(settings, &ran)? {
@@ -182,6 +185,7 @@ pub fn run(place: &mut dyn Place, settings: &Settings, stop: &AtomicBool) -> Res
         counted: Instant::now(),
         addresses: HashMap::new(),
         heard_at: HashMap::new(),
+        named: &named,
         silent: HashMap::new(),
         keys: HashMap::new(),
         own: own_address(settings.port).into_iter().collect(),
@@ -204,6 +208,9 @@ pub fn run(place: &mut dyn Place, settings: &Settings, stop: &AtomicBool) -> Res
     let (tx, rx) = mpsc::channel();
     let reading = AtomicBool::new(true);
     std::thread::scope(|scope| {
+        if !settings.peers.is_empty() {
+            scope.spawn(|| keep_resolved(&settings.peers, &named, &reading, ANNOUNCE));
+        }
         scope.spawn(|| {
             let mut buffer = vec![0; 65_536];
             while reading.load(Ordering::Relaxed) {
@@ -360,6 +367,8 @@ struct Node<'a> {
     addresses: HashMap<String, SocketAddr>,
     /// When each peer was last heard, by anything it sent.
     heard_at: HashMap<String, Instant>,
+    /// What the peers setting's names resolve to now.
+    named: &'a Mutex<Vec<SocketAddr>>,
     /// Each peer the record has named as silent: since when, and when it
     /// last said so.
     silent: HashMap<String, (Instant, Instant)>,
@@ -591,8 +600,13 @@ impl Node<'_> {
         };
         // A lost announcement is said again at the next.
         let _ = self.send(&announce, (self.to, 0));
-        for peer in &self.settings.peers {
-            let _ = self.send(&announce, (*peer, 0));
+        let named = self
+            .named
+            .lock()
+            .map(|named| named.clone())
+            .unwrap_or_default();
+        for peer in named {
+            let _ = self.send(&announce, (peer, 0));
         }
     }
 

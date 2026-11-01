@@ -26,7 +26,7 @@ Scope: designed and tested for up to 50 nodes. Acknowledgements grow with the no
 | `--replay <change hash>` | flag | none | decide a dropped change again and exit (below) |
 | `--sync-mode stop\|last` | flag | `stop` | what happens to a row changed here and in a change; `source` and `target` are for two places and are refused |
 | `port` | config | 31337 | the UDP port a node broadcasts and listens on |
-| `peers` | config | none | addresses to announce to on a network with no broadcast: `host` or `host:port`, the mesh port when none is given |
+| `peers` | config | none | hosts to announce to on a network with no broadcast: `host` or `host:port`, the mesh port when none is given, a name looked up again at each announcement |
 | `backpressure` | config | 6 MB | the most the outbox holds, in bytes or text such as `"6 MB"` |
 | `graveyard` | config | 12 hours | seconds a change is carried; sets each sunset |
 | `mesh_wire` | config | 8 MB | the line past which a waking node catches up by stash then retrieve. Not read in 0.6.1 (#521) |
@@ -85,7 +85,7 @@ Broadcast is for finding peers and unicast is for talking to them. A node announ
 
 A node learns a peer's address from the source of its datagrams, never from its name. There is no member list, no discovery service and nothing to join: the shared key decides whether a datagram is for you.
 
-On a network that carries no broadcast (a layer-3 VPN such as WireGuard or Tailscale, a cloud network) the `peers` setting is how nodes find each other. Name each peer in the other's config. Two nodes on one machine on different ports do the same with loopback addresses.
+On a network that carries no broadcast (a layer-3 VPN such as WireGuard or Tailscale, a cloud network) the `peers` setting is how nodes find each other. Name each peer in the other's config, by host name where its address changes: a name is looked up over the system's resolver, which covers mDNS, for each announcement, so a moved peer hears the next one. A name that does not resolve costs that announcement, and the record names it once until it resolves again. Two nodes on one machine on different ports do the same with loopback addresses.
 
 ## Names
 
