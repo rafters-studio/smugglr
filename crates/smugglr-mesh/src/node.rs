@@ -87,6 +87,9 @@ const JOIN: Duration = Duration::from_secs(1);
 /// How often a starting node says its wazzup, so one lost copy costs nothing.
 const WAZZUP_EVERY: Duration = Duration::from_millis(300);
 
+/// How often a node notes that it is running.
+const NOTE_RAN: Duration = Duration::from_secs(1);
+
 /// The id of the wazzups a node says while it listens for its name being
 /// taken, which ask after nothing else.
 const NAME_ONLY: u64 = 0;
@@ -204,6 +207,7 @@ pub fn remove(settings: &Settings, node: &str) -> Result<(), Error> {
 /// # Errors
 /// When the node holds no key, its socket cannot be opened, or its place or
 /// what smugglr keeps for it cannot be read or written.
+#[allow(clippy::too_many_lines)] // Most of it is the one list of a node's fields.
 pub fn run(place: &mut dyn Place, settings: &Settings, stop: &AtomicBool) -> Result<(), Error> {
     // The newest key signs and seals; the one before it is still accepted.
     let held = &settings.keys[settings.keys.len().saturating_sub(2)..];
@@ -249,6 +253,7 @@ pub fn run(place: &mut dyn Place, settings: &Settings, stop: &AtomicBool) -> Res
         wazzups: Vec::new(),
         answers: Vec::new(),
         woken_by: HashMap::new(),
+        noted_ran: None,
         stashes: Stashes {
             wants: past_sunset,
             ..Stashes::default()
@@ -557,6 +562,7 @@ struct Node<'a> {
     /// The wazzup each peer last woke this node's resends with: its start,
     /// since ids begin again at each start, and its id.
     woken_by: HashMap<String, (u64, u64)>,
+    noted_ran: Option<Instant>,
     /// The stashes this node wants, is giving and is taking.
     stashes: Stashes,
     /// The peers that have said too much, each named once.
@@ -663,6 +669,14 @@ impl Node<'_> {
                 }
             );
             self.lost = 0;
+        }
+        if self.noted_ran.is_none_or(|at| at.elapsed() >= NOTE_RAN) {
+            // When the node last ran, for the next start to know how long it
+            // was away. Noted this often because a node that thinks it was
+            // inside the sunset asks for no stash, and what it missed stays
+            // different without a word; a write that fails only costs that.
+            self.noted_ran = Some(Instant::now());
+            let _ = self.settings.store.replace(&self.ran, &now().to_string());
         }
         if self.outbox.settled() {
             // Room in the outbox as soon as acknowledgements make it.
@@ -813,9 +827,6 @@ impl Node<'_> {
     /// peers setting.
     fn announce(&mut self) {
         self.announced = Some(Instant::now());
-        // When the node last ran, for the next start to know how long it
-        // was away; a write that fails only costs that message.
-        let _ = self.settings.store.replace(&self.ran, &now().to_string());
         let announce = Message::Announce {
             sender: self.settings.node.clone(),
         };
@@ -1031,6 +1042,18 @@ impl Node<'_> {
                 .taking
                 .as_ref()
                 .map(|taking| taking.peer.clone());
+            // It may be lost, and its maker waits to hear it: said a few times.
+            if let (Some(peer), Some(taking)) = (&peer, &self.stashes.taking) {
+                let done = Message::StashHave {
+                    sender: self.settings.node.clone(),
+                    id: taking.id,
+                    have: u64::MAX,
+                    missing: Vec::new(),
+                };
+                for _ in 0..3 {
+                    let _ = self.send(&done, self.address(peer));
+                }
+            }
             self.take_stash(place, &bytes, peer.as_deref().unwrap_or_default())?;
             self.stashes.taking = None;
         } else if self.stashes.taking.as_ref().is_some_and(Taking::gone_quiet) {

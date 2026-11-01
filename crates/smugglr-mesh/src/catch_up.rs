@@ -120,6 +120,12 @@ impl Giving {
             let end = (*end).min(self.next);
             self.missing.extend(*start..end);
         }
+        // Everything has gone and nothing is reported missing, yet not all
+        // has arrived: the last parts were lost, and the receiver cannot tell
+        // parts it never heard of from parts that were never sent.
+        if self.missing.is_empty() && self.next >= self.count() && self.have < self.count() {
+            self.missing.extend(self.have..self.count());
+        }
         self.window = if self.missing.is_empty() {
             self.window.saturating_add(8).min(MOST_WINDOW)
         } else {
@@ -283,8 +289,20 @@ mod tests {
     }
 
     #[test]
+    fn the_last_parts_lost_are_sent_again() {
+        let (mut giving, mut taking) = pair(20);
+        for n in giving.due(usize::MAX) {
+            if n < 17 {
+                taking.take(n, giving.part(n));
+            }
+        }
+        giving.heard(taking.have, &taking.missing());
+        assert_eq!(giving.due(usize::MAX), [17, 18, 19]);
+    }
+
+    #[test]
     fn the_window_grows_while_nothing_is_lost_and_halves_when_something_is() {
-        let (mut giving, _) = pair(10);
+        let (mut giving, _) = pair(10_000);
         giving.next = 10;
         giving.heard(1, &[]);
         assert!(giving.window > FIRST_WINDOW);
