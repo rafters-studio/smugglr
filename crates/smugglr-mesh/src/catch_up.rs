@@ -14,6 +14,17 @@ use crate::wire::{RANGES, Range};
 /// How often a node that needs a stash says so.
 pub(crate) const WANT_AGAIN: Duration = Duration::from_secs(5);
 
+/// How long a node asks for a stash with no offer before it carries on: no
+/// peer is up to date, so none can help.
+pub(crate) const NO_OFFER: Duration = Duration::from_secs(60);
+
+/// How often a node repeats that it took up an offer, until the stash is ready.
+pub(crate) const ACCEPT_AGAIN: Duration = Duration::from_secs(1);
+
+/// The most changes a node holds back while a stash is on its way; past it the
+/// oldest goes, and its maker's resend brings it again.
+pub(crate) const HELD_BACK: usize = 20_000;
+
 /// How often the receiver says what it has.
 const REPORT: Duration = Duration::from_millis(100);
 

@@ -37,7 +37,7 @@ use smugglr_core::row_hash::row_hash;
 use smugglr_place::Place;
 use socket2::{Domain, Protocol, Socket, Type};
 
-use crate::catch_up::{GIVE_UP, Giving, Taking, WANT_AGAIN};
+use crate::catch_up::{ACCEPT_AGAIN, GIVE_UP, Giving, HELD_BACK, NO_OFFER, Taking, WANT_AGAIN};
 use crate::local::{Local, limit, refuse};
 use crate::named::{keep_resolved, literal, resolve_now};
 use crate::outbox::{Acked, Outbox, Timing};
@@ -398,12 +398,22 @@ struct Stashes {
     said_wanted: Option<Instant>,
     /// The offer it took up and when, until the stash is ready.
     accepted: Option<(String, u64, Instant)>,
+    said_accept: Option<Instant>,
+    /// When it began asking.
+    asking_since: Option<Instant>,
     /// What it offered each peer, and when.
     offered: HashMap<String, (u64, Instant)>,
     /// The stashes peers took up, to make where the database can be read.
     to_give: Vec<(String, u64)>,
     giving: Vec<Giving>,
     taking: Option<Taking>,
+}
+
+impl Stashes {
+    /// A stash is expected: changes arriving now must wait for it.
+    fn on_its_way(&self) -> bool {
+        self.wants || self.taking.is_some()
+    }
 }
 
 /// One part of a peer's wazzup, to answer.
@@ -650,7 +660,14 @@ impl Node<'_> {
             return Ok(());
         }
         batch.append(&mut self.arrived_joining);
-        if !batch.is_empty() {
+        if self.stashes.on_its_way() {
+            // The stash is older than these: applied now, they would be
+            // overwritten by it, or a row they delete brought back. They go
+            // over the stash once it is in, and are not acknowledged till then.
+            self.arrived_joining = batch;
+            let over = self.arrived_joining.len().saturating_sub(HELD_BACK);
+            self.arrived_joining.drain(..over);
+        } else if !batch.is_empty() {
             self.apply(place, batch)?;
         }
         self.joined(place)?;
@@ -1059,19 +1076,41 @@ impl Node<'_> {
         } else if self.stashes.taking.as_ref().is_some_and(Taking::gone_quiet) {
             println!("smugglr mesh: a stash stopped arriving; asking again");
             self.stashes.taking = None;
+            self.stashes.asking_since = None;
         }
         Ok(())
     }
 
     /// Says this node needs a stash, while it does and nothing is on its way.
     fn ask_for_stash(&mut self) {
-        if self
-            .stashes
-            .accepted
-            .as_ref()
-            .is_some_and(|(_, _, at)| at.elapsed() >= GIVE_UP)
+        if let Some((peer, id, at)) = self.stashes.accepted.clone() {
+            if at.elapsed() >= GIVE_UP {
+                self.stashes.accepted = None;
+            } else if self
+                .stashes
+                .said_accept
+                .is_none_or(|said| said.elapsed() >= ACCEPT_AGAIN)
+            {
+                // It may have been lost, and the offer's maker is waiting.
+                self.stashes.said_accept = Some(Instant::now());
+                let accept = Message::StashAccept {
+                    sender: self.settings.node.clone(),
+                    id,
+                };
+                let _ = self.send(&accept, self.address(&peer));
+            }
+        }
+        let asked_since = *self.stashes.asking_since.get_or_insert_with(Instant::now);
+        if self.stashes.wants
+            && self.stashes.accepted.is_none()
+            && self.stashes.taking.is_none()
+            && asked_since.elapsed() >= NO_OFFER
         {
-            self.stashes.accepted = None;
+            println!(
+                "smugglr mesh: no peer offered a stash; going on without one, and what changed \
+                 while away may stay different"
+            );
+            self.stashes.wants = false;
         }
         let waiting = self.stashes.taking.is_some() || self.stashes.accepted.is_some();
         if !self.stashes.wants
@@ -1367,6 +1406,7 @@ impl Node<'_> {
             return Ok(());
         }
         self.stashes.wants = true;
+        self.stashes.asking_since = None;
         println!(
             "smugglr mesh: {peer} says there is too much for the wire. Catch up with: smugglr \
              stash <a peer's place> <dir> --key-file <path> --node <name> --whole, then smugglr \
