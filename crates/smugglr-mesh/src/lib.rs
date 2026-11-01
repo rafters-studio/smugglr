@@ -2,7 +2,7 @@
 //! charge (FR-SMUGGLR-078).
 //!
 //! [`run`] runs one node until it is told to stop. A node announces itself
-//! by broadcast, and to the addresses in its peers setting on a network
+//! by broadcast, and to the names in its peers setting on a network
 //! that carries no broadcast; a node's peers are the nodes it hears under
 //! the shared key, at the addresses their datagrams come from. There is no
 //! member list.
@@ -35,12 +35,12 @@
 //! written out; a key is named only by its `key_id`.
 
 mod local;
+mod named;
 mod node;
 mod outbox;
 mod parts;
 mod wire;
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use smugglr_core::plan::SyncMode;
@@ -117,7 +117,7 @@ pub struct Settings {
     pub backpressure: u64,
     /// Addresses to announce to besides the broadcast, for a network that
     /// carries no broadcast.
-    pub peers: Vec<SocketAddr>,
+    pub peers: Vec<String>,
     /// The largest value a row may hold to cross, below the place's own
     /// value limit (FR-SMUGGLR-071).
     pub max_value: u64,

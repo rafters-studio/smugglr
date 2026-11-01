@@ -9,7 +9,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::sync::Arc;
@@ -32,7 +32,8 @@ Keeps <place> in step with every node on the local network that holds the
 same key, until stopped. A node is named by its machine's name, and
 broadcasts and listens on the UDP port the config's port setting names,
 31337 when not set; on a network that carries no broadcast, the config's
-peers setting names addresses to announce to (peers = [\"10.0.0.2\"]).
+peers setting names hosts to announce to (peers = [\"desktop.local\"]),
+looked up again at each announcement, so a host can change address.
 Changes not yet acknowledged wait in an outbox of at most the config's
 backpressure setting, 6 MB when not set.
   --key-file <path>        the shared key: one base64 key per line, newest
@@ -168,28 +169,23 @@ fn parse(args: &[String]) -> Result<(String, Settings, Option<String>), Refusal>
             k: K,
             backpressure: config.backpressure.unwrap_or(BACKPRESSURE),
             max_value: config.max_value.unwrap_or(DEFAULT_MAX_VALUE),
-            peers: peers(&config.peers, config.port.unwrap_or(PORT)).map_err(Refusal::Usage)?,
+            peers: peers(&config.peers, config.port.unwrap_or(PORT)),
         },
         replay,
     ))
 }
 
-/// The addresses the peers setting names: each `host` or `host:port`, the
-/// mesh `port` when none is given.
-fn peers(written: &[String], port: u16) -> Result<Vec<SocketAddr>, String> {
+/// The peers setting as the node looks each up: `host:port`, the mesh `port`
+/// when none is written.
+fn peers(written: &[String], port: u16) -> Vec<String> {
     written
         .iter()
         .map(|peer| {
-            let with_port = if peer.parse::<SocketAddr>().is_ok() || peer.contains(':') {
+            if peer.parse::<SocketAddr>().is_ok() || peer.contains(':') {
                 peer.clone()
             } else {
                 format!("{peer}:{port}")
-            };
-            with_port
-                .to_socket_addrs()
-                .ok()
-                .and_then(|mut addresses| addresses.find(SocketAddr::is_ipv4))
-                .ok_or_else(|| format!("peers: {peer} is not an address smugglr can reach"))
+            }
         })
         .collect()
 }

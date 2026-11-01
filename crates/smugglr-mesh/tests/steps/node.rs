@@ -357,7 +357,7 @@ impl Net {
             ignore: Vec::new(),
             k: K,
             backpressure,
-            peers: vec![self.relay.address()?],
+            peers: vec![self.relay.address()?.to_string()],
             max_value: smugglr_core::weight::DEFAULT_MAX_VALUE,
         };
         let mut node = Node {

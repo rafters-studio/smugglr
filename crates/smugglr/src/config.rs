@@ -11,7 +11,7 @@
 //! "modified"`); and `graveyard`, the seconds a change is carried and a
 //! delete's tombstone kept (FR-SMUGGLR-076); and `port`, the UDP port
 //! smugglr mesh broadcasts and listens on, and `backpressure`, the most its
-//! outbox holds, in bytes or text like `max_wire`, and `peers`, addresses a
+//! outbox holds, in bytes or text like `max_wire`, and `peers`, hosts a
 //! mesh node announces itself to on a network that carries no broadcast
 //! (FR-SMUGGLR-078); and `max_value`, the largest value a row may hold to
 //! move, in bytes or text like `max_wire` (FR-SMUGGLR-071). Other settings
