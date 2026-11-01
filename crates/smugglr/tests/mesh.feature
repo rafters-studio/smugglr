@@ -141,3 +141,21 @@ Feature: smugglr mesh as a command: its front ends, its node's name and port, it
     When they come within reach and one writes a row
     Then the other stops
     And its record names the clash over the name rzr
+
+  @criterion-01a14bed-9a8e-76b2-a155-473319d47754 @module-mesh
+  Scenario: wazzup catches a sleeper up
+    Given three nodes running smugglr mesh, and one asleep while rows changed on the others, for less than the sunset
+    When it wakes and says wazzup
+    Then it holds the same rows as the others
+
+  @criterion-01a14bed-9a8e-76b2-a155-475bf7ee3f47 @module-mesh
+  Scenario: a node gone for good is taken off
+    Given three nodes running smugglr mesh, one of them gone for good with changes still unacknowledged by it
+    When a person runs smugglr mesh remove with that node
+    Then its peers no longer send those changes to it
+
+  @criterion-01a15061-2bcb-7fa3-a7fc-399685aa60dd @module-mesh
+  Scenario: a wazzup batch larger than one datagram
+    Given three nodes running smugglr mesh, one waking with more unacknowledged changes than fit one datagram
+    When it says wazzup and one part of its batch is lost
+    Then every part is answered, each datagram is at most about 1,200 bytes, and the lost part was sent again

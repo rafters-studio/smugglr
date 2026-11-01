@@ -48,6 +48,9 @@ pub struct Config {
     pub peers: Vec<String>,
     /// The largest value a row may hold to move; `None` when not set, 2 MB.
     pub max_value: Option<u64>,
+    /// The most a wazzup is answered with before it is too much; `None`
+    /// when not set, 8 MB.
+    pub mesh_wire: Option<u64>,
 }
 
 /// The config as the file holds it, before its settings are checked.
@@ -58,6 +61,7 @@ struct File {
     max_wire: Option<toml::Value>,
     backpressure: Option<toml::Value>,
     max_value: Option<toml::Value>,
+    mesh_wire: Option<toml::Value>,
     #[serde(default)]
     peers: Vec<String>,
     graveyard: Option<u64>,
@@ -138,6 +142,7 @@ fn parse(text: &str) -> Result<Config, Problem> {
     let max_wire = size("max_wire", file.max_wire)?;
     let backpressure = size("backpressure", file.backpressure)?;
     let max_value = size("max_value", file.max_value)?;
+    let mesh_wire = size("mesh_wire", file.mesh_wire)?;
     let tables = file
         .tables
         .into_iter()
@@ -155,6 +160,7 @@ fn parse(text: &str) -> Result<Config, Problem> {
         backpressure,
         peers: file.peers,
         max_value,
+        mesh_wire,
     })
 }
 

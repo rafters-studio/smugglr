@@ -36,6 +36,11 @@ fn lookup(name: &str) -> Option<SocketAddr> {
     name.to_socket_addrs().ok()?.find(SocketAddr::is_ipv4)
 }
 
+/// What `named` resolve to at this moment; those that do not are left out.
+pub(crate) fn resolve_now(named: &[String]) -> Vec<SocketAddr> {
+    named.iter().filter_map(|name| lookup(name)).collect()
+}
+
 /// The addresses among `named` that need no lookup, so a node can announce
 /// to them from its first moment.
 pub(crate) fn literal(named: &[String]) -> Vec<SocketAddr> {

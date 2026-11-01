@@ -29,7 +29,7 @@ Scope: designed and tested for up to 50 nodes. Acknowledgements grow with the no
 | `peers` | config | none | hosts to announce to on a network with no broadcast: `host` or `host:port`, the mesh port when none is given, a name looked up again at each announcement |
 | `backpressure` | config | 6 MB | the most the outbox holds, in bytes or text such as `"6 MB"` |
 | `graveyard` | config | 12 hours | seconds a change is carried; sets each sunset |
-| `mesh_wire` | config | 8 MB | the line past which a waking node catches up by stash then retrieve. Not read in 0.6.1 (#521) |
+| `mesh_wire` | config | 8 MB | the line past which a waking node is told to catch up by stash then retrieve |
 
 `smugglr mesh ./node.db --key-file ./mesh.key` and `smugglr sync ./node.db --sync-type mesh --key-file ./mesh.key` are the same command and join the same mesh.
 
@@ -150,16 +150,19 @@ Every run a node notes when it last ran. A node that starts after being away lon
 
 That is all a waking node does in 0.6.1. Past the sunset the changes it missed are dead, so the person catches up with stash then retrieve.
 
-**Specified, not built (#521).** FR-SMUGGLR-079 makes the catch-up automatic:
+A node inside the sunset catches up by wazzup (FR-SMUGGLR-079):
 
-- A node that wakes says wazzup with its last-seen time, and its peers answer with what changed since, or, when that is over the `mesh_wire` setting (8 MB when not set, apart from `max_wire`), with a status code for too much, after which the node catches up by stash then retrieve.
-- A node whose last-seen time is past the sunset does not ask for changes. The first awake, up-to-date node that hears it makes the stash, the sleeper retrieves it, then says wazzup with the stash's time to pick up what changed meanwhile.
-- The wazzup carries a batch of `(key, to)` for each of the node's own changes a peer has not acknowledged, and each answer carries, per listed key, the peer's current hash and last applied `from`. From the answers the node settles each change peer by peer: a peer at the change's `to` has it; a peer at its `from` that is behind is sent the change with a fresh sunset; a peer whose last applied `from` equals the change's `to` built on it; anything else stays named in the record, grouped by peer, and nothing stops. Nothing past its sunset is resent blind: only this check, which has the peer's answer, sends one.
-- A batch is split into numbered parts that each fit one datagram, each answered and matched by its id and resent until answered.
+- Once it has joined, a node says wazzup with its last-seen time. Each peer that hears it makes everything it owes that node due at once. When that is over the `mesh_wire` setting (8 MB when not set, apart from `max_wire`), the peer answers with a status for too much instead, and the record says how to catch up by stash then retrieve.
+- The wazzup carries a batch of `(key, to)` for each of the node's own changes a peer has not acknowledged, and each answer carries, per listed key, the peer's current hash and last applied `from`. From the answers the node settles each change peer by peer. A peer at the change's `to` has it. A peer whose last applied `from` equals a real `to` built on it. A peer holding the row this node holds has nothing owed. A peer at the change's `from` that is behind (for an insert, one that never saw the key) is sent the change. Anything else stays named in the record, grouped by peer, with each change's hash, and nothing stops.
+- A batch is split into numbered parts that each fit one datagram, each answered and matched by its id and resent until answered. A batch over `mesh_wire` sends only its first part, whose count is enough to be told it is too much.
+- A node that names a peer as having stopped acknowledging, and still hears it, says the same check to that peer, so a change held on a running node is settled with nobody watching.
+- A node back past the sunset does not ask for changes: it names every own change not acknowledged, grouped by peer, and the record says how to catch up.
+
+**Specified, not built (#521).** FR-SMUGGLR-079 has the first awake, up-to-date node that hears a sleeper make the stash, and the sleeper retrieve it. Nothing yet carries that stash between nodes, so a person runs the two commands the record names.
 
 ## Leaving
 
-Any node can leave and the rest go on. A node that stops acknowledging is resent to on the 10 to 160 second doubling until the sunset. A node gone for good stays a target, and its peers keep its changes, until a person runs `smugglr mesh remove <node>`. That command is specified and not built (#521): in 0.6.1 `smugglr mesh remove` is refused as a usage error, and a gone node stops being a target only when the sunset passes.
+Any node can leave and the rest go on. A node that stops acknowledging is resent to on the 10 to 160 second doubling until the sunset. A node gone for good stays a target, and its peers keep its changes, until a person runs `smugglr mesh remove <node> --key-file <path>`. Each peer that hears it, directly or from another peer, stops owing that node anything, until that node next starts and says wazzup.
 
 ## Clocks
 

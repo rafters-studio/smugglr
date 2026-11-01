@@ -48,6 +48,77 @@ fn id_of(json: &Value) -> Option<Id> {
     Some((from, to))
 }
 
+/// One change a wazzup asks about: its row and its `to`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Line {
+    pub(crate) table: String,
+    pub(crate) key: Vec<String>,
+    pub(crate) to: Option<[u8; 16]>,
+}
+
+impl Line {
+    /// About the bytes the line takes on the wire.
+    pub(crate) fn size(&self) -> usize {
+        self.to_json().to_string().len()
+    }
+
+    fn to_json(&self) -> Value {
+        json!({"t": self.table, "k": self.key, "to": hash_json(self.to)})
+    }
+
+    fn from_json(json: &Value) -> Option<Self> {
+        Some(Self {
+            table: json.get("t")?.as_str()?.to_owned(),
+            key: json
+                .get("k")?
+                .as_array()?
+                .iter()
+                .map(|column| column.as_str().map(str::to_owned))
+                .collect::<Option<_>>()?,
+            to: hash_of(json.get("to")?)?,
+        })
+    }
+}
+
+/// A peer's answer about one line of a wazzup: the row's hash now, and the
+/// `from` of the last change applied to it (`None` when none has been).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::option_option)] // No change applied differs from one from no row.
+pub(crate) struct RowNow {
+    pub(crate) hash: Option<[u8; 16]>,
+    pub(crate) last_from: Option<Option<[u8; 16]>>,
+}
+
+impl RowNow {
+    fn to_json(self) -> Value {
+        match self.last_from {
+            Some(from) => json!([hash_json(self.hash), hash_json(from)]),
+            None => json!([hash_json(self.hash)]),
+        }
+    }
+
+    fn from_json(json: &Value) -> Option<Self> {
+        let hash = hash_of(json.get(0)?)?;
+        let last_from = match json.get(1) {
+            Some(from) => Some(hash_of(from)?),
+            None => None,
+        };
+        Some(Self { hash, last_from })
+    }
+}
+
+fn hash_json(hash: Option<[u8; 16]>) -> Value {
+    hash.map_or(Value::Null, |hash| json!(hex(&hash)))
+}
+
+#[allow(clippy::option_option)] // Not a hash, unlike the hash of no row.
+fn hash_of(json: &Value) -> Option<Option<[u8; 16]>> {
+    match json {
+        Value::Null => Some(None),
+        text => Some(Some(unhex(text.as_str()?)?.try_into().ok()?)),
+    }
+}
+
 /// One message between nodes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Message {
@@ -56,14 +127,45 @@ pub(crate) enum Message {
         /// The node.
         sender: String,
     },
-    /// A node that has just started asks whether its name is free. `start`
+    /// A node asks after its changes, and whether its name is free. `start`
     /// is a random number made at that start, which tells two nodes of one
-    /// name apart.
+    /// name apart. A batch too large for one datagram goes as numbered parts.
     Wazzup {
         /// The node.
         sender: String,
         /// The start it speaks for.
         start: u64,
+        /// When the node last ran, in seconds since the epoch.
+        since: u64,
+        /// Which wazzup this part belongs to.
+        id: u64,
+        /// The part's number, from 0.
+        n: u64,
+        /// How many parts the wazzup has.
+        count: u64,
+        /// This part's changes a peer has not acknowledged.
+        lines: Vec<Line>,
+    },
+    /// A peer answers part `n` of a wazzup: one [`RowNow`] for each line.
+    Answer {
+        /// The peer.
+        sender: String,
+        /// The wazzup.
+        id: u64,
+        /// The part.
+        n: u64,
+        /// What changed since, or the batch, is more than the wire should
+        /// carry: the asker catches up by stash then retrieve.
+        too_much: bool,
+        /// One for each line of the part, in order.
+        rows: Vec<RowNow>,
+    },
+    /// A person has taken a node off the mesh for good.
+    Remove {
+        /// Who says so.
+        sender: String,
+        /// The node taken off.
+        node: String,
     },
     /// The sender already runs under the name the wazzup of `start` carried.
     NameTaken {
@@ -137,6 +239,8 @@ impl Message {
         match self {
             Self::Announce { sender }
             | Self::Wazzup { sender, .. }
+            | Self::Answer { sender, .. }
+            | Self::Remove { sender, .. }
             | Self::NameTaken { sender, .. }
             | Self::Change { sender, .. }
             | Self::Ack { sender, .. }
@@ -149,8 +253,26 @@ impl Message {
     fn to_json(&self) -> Value {
         match self {
             Self::Announce { sender } => json!({"t": "announce", "sender": sender}),
-            Self::Wazzup { sender, start } => {
-                json!({"t": "wazzup", "sender": sender, "start": start})
+            Self::Wazzup { .. } => self.wazzup_json(),
+            Self::Answer {
+                sender,
+                id,
+                n,
+                too_much,
+                rows,
+            } => {
+                let rows: Vec<Value> = rows.iter().map(|row| row.to_json()).collect();
+                json!({
+                    "t": "answer",
+                    "sender": sender,
+                    "id": id,
+                    "n": n,
+                    "too_much": too_much,
+                    "rows": rows,
+                })
+            }
+            Self::Remove { sender, node } => {
+                json!({"t": "remove", "sender": sender, "node": node})
             }
             Self::NameTaken { sender, start } => {
                 json!({"t": "name-taken", "sender": sender, "start": start})
@@ -213,6 +335,32 @@ impl Message {
         }
     }
 
+    fn wazzup_json(&self) -> Value {
+        let Self::Wazzup {
+            sender,
+            start,
+            since,
+            id,
+            n,
+            count,
+            lines,
+        } = self
+        else {
+            return Value::Null;
+        };
+        let lines: Vec<Value> = lines.iter().map(Line::to_json).collect();
+        json!({
+            "t": "wazzup",
+            "sender": sender,
+            "start": start,
+            "since": since,
+            "id": id,
+            "n": n,
+            "count": count,
+            "lines": lines,
+        })
+    }
+
     fn from_json(json: &Value) -> Option<Self> {
         let text = |name: &str| json.get(name)?.as_str().map(str::to_owned);
         let sender = text("sender")?;
@@ -221,6 +369,32 @@ impl Message {
             "wazzup" => Some(Self::Wazzup {
                 sender,
                 start: json.get("start")?.as_u64()?,
+                since: json.get("since")?.as_u64()?,
+                id: json.get("id")?.as_u64()?,
+                n: json.get("n")?.as_u64()?,
+                count: json.get("count")?.as_u64()?,
+                lines: json
+                    .get("lines")?
+                    .as_array()?
+                    .iter()
+                    .map(Line::from_json)
+                    .collect::<Option<_>>()?,
+            }),
+            "answer" => Some(Self::Answer {
+                sender,
+                id: json.get("id")?.as_u64()?,
+                n: json.get("n")?.as_u64()?,
+                too_much: json.get("too_much")?.as_bool()?,
+                rows: json
+                    .get("rows")?
+                    .as_array()?
+                    .iter()
+                    .map(RowNow::from_json)
+                    .collect::<Option<_>>()?,
+            }),
+            "remove" => Some(Self::Remove {
+                sender,
+                node: text("node")?,
             }),
             "name-taken" => Some(Self::NameTaken {
                 sender,
@@ -323,7 +497,52 @@ pub(crate) fn open(datagram: &[u8], keys: &[[u8; 32]]) -> Option<(Message, usize
 
 #[cfg(test)]
 mod tests {
-    use super::{Message, open, seal};
+    use super::{Line, Message, RowNow, open, seal};
+
+    #[test]
+    fn a_wazzup_and_its_answer_open_as_they_were_sealed() {
+        let lines = vec![
+            Line {
+                table: "notes".to_owned(),
+                key: vec!["'1'".to_owned()],
+                to: Some([2; 16]),
+            },
+            Line {
+                table: "notes".to_owned(),
+                key: vec!["'2'".to_owned()],
+                to: None,
+            },
+        ];
+        let wazzup = Message::Wazzup {
+            sender: "puck".to_owned(),
+            start: u64::MAX,
+            since: 7,
+            id: 3,
+            n: 0,
+            count: 1,
+            lines,
+        };
+        let answer = Message::Answer {
+            sender: "rzr".to_owned(),
+            id: 3,
+            n: 0,
+            too_much: false,
+            rows: vec![
+                RowNow {
+                    hash: Some([2; 16]),
+                    last_from: None,
+                },
+                RowNow {
+                    hash: None,
+                    last_from: Some(None),
+                },
+            ],
+        };
+        for message in [wazzup, answer] {
+            let datagram = seal(&message, &[1; 32]);
+            assert_eq!(open(&datagram, &[[1; 32]]), Some((message, 0)));
+        }
+    }
 
     fn ack() -> Message {
         Message::Ack {

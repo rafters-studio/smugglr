@@ -19,7 +19,7 @@ use smugglr::Config;
 use smugglr_core::envelope::GRAVEYARD;
 use smugglr_core::plan::SyncMode;
 use smugglr_core::weight::DEFAULT_MAX_VALUE;
-use smugglr_mesh::{BACKPRESSURE, K, PORT, Settings, key_id, new_key};
+use smugglr_mesh::{BACKPRESSURE, K, MESH_WIRE, PORT, Settings, key_id, new_key};
 
 use crate::cli::{STOPPED, USAGE};
 
@@ -47,7 +47,9 @@ backpressure setting, 6 MB when not set.
                            this hash again, with a fresh sunset, overriding
                            its drop; print what came of it and exit
 keygen writes a new key at the end of the key file, making the file when
-there is none; appending a key rotates to it.";
+there is none; appending a key rotates to it. remove <node> --key-file
+<path> tells the mesh a node is gone for good, so peers stop owing it
+changes; the node rejoins when it next starts.";
 
 /// Runs `smugglr mesh` with `args`, until the process is stopped.
 pub(crate) fn run(args: &[String]) -> ExitCode {
@@ -57,6 +59,9 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
     }
     if args.first().is_some_and(|arg| arg == "keygen") {
         return keygen(&args[1..]);
+    }
+    if args.first().is_some_and(|arg| arg == "remove") {
+        return remove(&args[1..]);
     }
     let (place, settings, replay) = match parse(args) {
         Ok(parsed) => parsed,
@@ -98,6 +103,28 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
     );
     match smugglr_mesh::run(place.as_mut(), &settings, &AtomicBool::new(false)) {
         Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("{err}");
+            ExitCode::from(STOPPED)
+        }
+    }
+}
+
+/// `smugglr mesh remove <node> --key-file <path>`: tells the mesh `node` is
+/// gone for good. The node's name takes the place a database takes in `parse`.
+fn remove(args: &[String]) -> ExitCode {
+    let (node, settings, _) = match parse(args) {
+        Ok(parsed) => parsed,
+        Err(Refusal::Usage(err) | Refusal::Key(err)) => {
+            eprintln!("{err}\n{HELP}");
+            return ExitCode::from(USAGE);
+        }
+    };
+    match smugglr_mesh::remove(&settings, &node) {
+        Ok(()) => {
+            println!("smugglr mesh: told the mesh {node} is gone for good");
+            ExitCode::SUCCESS
+        }
         Err(err) => {
             eprintln!("{err}");
             ExitCode::from(STOPPED)
@@ -169,6 +196,7 @@ fn parse(args: &[String]) -> Result<(String, Settings, Option<String>), Refusal>
             k: K,
             backpressure: config.backpressure.unwrap_or(BACKPRESSURE),
             max_value: config.max_value.unwrap_or(DEFAULT_MAX_VALUE),
+            mesh_wire: config.mesh_wire.unwrap_or(MESH_WIRE),
             peers: peers(&config.peers, config.port.unwrap_or(PORT)),
         },
         replay,

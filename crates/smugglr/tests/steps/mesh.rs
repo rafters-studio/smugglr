@@ -227,6 +227,17 @@ impl Front {
         Ok(index)
     }
 
+    /// Whether a scenario woke a sleeping node.
+    pub(crate) fn woke_a_sleeper(&self) -> bool {
+        self.nodes.get().is_some()
+    }
+
+    /// Waits for the woken node to hold what changed while it slept.
+    pub(crate) fn sleeper_holds_what_changed(&self) -> Result<(), String> {
+        self.holds(2, "s0", "while asleep")?;
+        self.holds(2, "s1", "while asleep")
+    }
+
     /// Waits for node `index` to exit by itself, with a failing status.
     fn exits(&self, index: usize) -> Result<(), String> {
         let nodes = self.nodes();
@@ -1005,6 +1016,19 @@ struct Seen {
     parts_acked: BTreeMap<u64, Instant>,
 }
 
+/// What a relay saw of the first node's wazzups.
+#[derive(Debug, Default)]
+struct WazzupsSeen {
+    /// How many parts the batch has.
+    parts: u64,
+    /// The largest datagram of a part.
+    largest: usize,
+    /// How many copies of each part passed.
+    copies: BTreeMap<u64, u64>,
+    /// The parts the second node answered.
+    answered: BTreeSet<u64>,
+}
+
 /// Stands between two nodes on a network that carries no broadcast: each
 /// node's peers setting names the relay, and the relay passes each node's
 /// datagrams to the other, unicast, dropping one in ten while `lossy` is set.
@@ -1015,6 +1039,9 @@ struct Relay {
     lossy: AtomicBool,
     /// Pass nothing: the two nodes are out of reach of each other.
     closed: AtomicBool,
+    /// Watch the first node's wazzups, and lose the first copy of its part 1.
+    watching_wazzups: AtomicBool,
+    wazzups: Mutex<WazzupsSeen>,
     /// Lose the first copy of the change to the last row written.
     lose_last: AtomicBool,
     /// The change to the last row a scenario writes, apart from what the
@@ -1071,6 +1098,8 @@ impl Relay {
             stop: AtomicBool::new(false),
             lossy: AtomicBool::new(lossy),
             closed: AtomicBool::new(false),
+            watching_wazzups: AtomicBool::new(false),
+            wazzups: Mutex::default(),
             lose_last: AtomicBool::new(false),
             last_row: Mutex::new(None),
             dropped: AtomicU64::new(0),
@@ -1112,7 +1141,10 @@ impl Relay {
                 // random one, so it never goes unseen.
                 let forced = relay.lose_last.load(Ordering::Relaxed)
                     && relay.last_first_copy(open_with(datagram, &seal).as_ref(), from_first);
+                let lost_part = relay.watching_wazzups.load(Ordering::Relaxed)
+                    && relay.note_wazzup(open_with(datagram, &seal).as_ref(), from_first, len);
                 let drop = forced
+                    || lost_part
                     || relay.closed.load(Ordering::Relaxed)
                     || (relay.lossy.load(Ordering::Relaxed) && random.is_multiple_of(10));
                 if drop {
@@ -1157,6 +1189,35 @@ impl Relay {
     /// repair shows. It is the first the relay sees, not the maker's first
     /// send: the system may drop that before the relay reads it, and the
     /// change then first reaches the relay as a resend.
+    /// Notes a wazzup's part from the first node or an answer to one, and
+    /// whether this datagram is the first copy of part 1, which it loses.
+    fn note_wazzup(&self, message: Option<&Value>, from_first: bool, len: usize) -> bool {
+        let Some(message) = message else {
+            return false;
+        };
+        let number = |name: &str| message.get(name).and_then(Value::as_u64);
+        let mut seen = self.wazzups.lock().unwrap_or_else(PoisonError::into_inner);
+        match message.get("t").and_then(Value::as_str) {
+            Some("wazzup") if from_first && number("id").is_some_and(|id| id > 0) => {
+                let Some(n) = number("n") else {
+                    return false;
+                };
+                seen.parts = number("count").unwrap_or_default();
+                seen.largest = seen.largest.max(len);
+                let copies = seen.copies.entry(n).or_default();
+                *copies += 1;
+                n == 1 && *copies == 1
+            }
+            Some("answer") if !from_first => {
+                if let Some(n) = number("n") {
+                    seen.answered.insert(n);
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
     fn last_first_copy(&self, message: Option<&Value>, from_first: bool) -> bool {
         let Some(message) = message.filter(|_| from_first) else {
             return false;
@@ -1344,6 +1405,177 @@ fn two_on_a_relay_with(
     front.holds(1, "w0", "heard")?;
     front.sql(1, "INSERT INTO notes VALUES ('w1', 'heard')")?;
     front.holds(0, "w1", "heard")
+}
+
+#[given(
+    "three nodes running smugglr mesh, and one asleep while rows changed on the others, for less than the sunset"
+)]
+fn one_of_three_asleep(world: &World, front: &Front) -> Result<(), String> {
+    three_nodes(world, front)?;
+    front.stop(2)?;
+    front.sql(0, "INSERT INTO notes VALUES ('s0', 'while asleep')")?;
+    front.sql(1, "INSERT INTO notes VALUES ('s1', 'while asleep')")?;
+    front.holds(1, "s0", "while asleep")?;
+    front.holds(0, "s1", "while asleep")
+}
+
+fn three_nodes(world: &World, front: &Front) -> Result<(), String> {
+    let key = key_file(world, front, "mesh.key")?;
+    front.key.set(key.clone());
+    start_named(
+        world,
+        front,
+        &[
+            ("one", &key, FrontEnd::Mesh),
+            ("two", &key, FrontEnd::Mesh),
+            ("three", &key, FrontEnd::Mesh),
+        ],
+        "",
+    )?;
+    // Past the moment each listens for its name being taken, and each heard.
+    front.sql(0, "INSERT INTO notes VALUES ('h0', 'heard')")?;
+    front.holds(1, "h0", "heard")?;
+    front.holds(2, "h0", "heard")
+}
+
+#[when("it wakes and says wazzup")]
+fn it_wakes(front: &Front) -> Result<(), String> {
+    front.restart(2)
+}
+
+#[given(
+    "three nodes running smugglr mesh, one of them gone for good with changes still unacknowledged by it"
+)]
+fn one_of_three_gone(world: &World, front: &Front) -> Result<(), String> {
+    three_nodes(world, front)?;
+    front.stop(2)?;
+    front.sql(0, "INSERT INTO notes VALUES ('g0', 'after it left')")?;
+    front.holds(1, "g0", "after it left")
+}
+
+#[when("a person runs smugglr mesh remove with that node")]
+fn a_person_removes(front: &Front) -> Result<(), String> {
+    let key = front.key.get().ok_or("no key file")?;
+    let path = front.with(0, |node| node.path.clone())?;
+    let folder = path.parent().ok_or("no folder")?;
+    let output = Command::new(env!("CARGO_BIN_EXE_smugglr"))
+        .args(["mesh", "remove", "three", "--key-file"])
+        .arg(&key)
+        .env("XDG_CONFIG_HOME", folder.join("config"))
+        .output()
+        .map_err(|err| err.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "remove failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+}
+
+#[then("its peers no longer send those changes to it")]
+fn peers_stop_sending(front: &Front) -> Result<(), String> {
+    for index in 0..2 {
+        front.prints(index, "three is taken off the mesh")?;
+    }
+    let path = front.with(0, |node| node.path.clone())?;
+    let folder = path
+        .parent()
+        .ok_or("no folder")?
+        .join("config/smugglr/mesh");
+    let segments = || -> usize {
+        std::fs::read_dir(&folder)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .flat_map(|entry| {
+                std::fs::read_dir(entry.path().join("outbox"))
+                    .into_iter()
+                    .flatten()
+            })
+            .flatten()
+            .filter(|file| file.file_name().to_string_lossy().starts_with('0'))
+            .count()
+    };
+    wait(SOON, || segments() == 0).map_err(|()| format!("{} segments still owed", segments()))
+}
+
+#[given(
+    "three nodes running smugglr mesh, one waking with more unacknowledged changes than fit one datagram"
+)]
+fn one_waking_with_a_batch(world: &World, front: &Front) -> Result<(), String> {
+    let key = key_file(world, front, "mesh.key")?;
+    let line = key_lines(&key)?.pop().ok_or("the key file holds no key")?;
+    let ports = [free_port()?, free_port()?, free_port()?];
+    let relay = Relay::start([ports[0], ports[1]], &decode(&line)?, false)?;
+    let through = format!("peers = [\"127.0.0.1:{}\"]\n", relay.port);
+    let waker = format!(
+        "peers = [\"127.0.0.1:{}\", \"127.0.0.1:{}\"]\n",
+        relay.port, ports[2]
+    );
+    let third = format!("peers = [\"127.0.0.1:{}\"]\n", ports[0]);
+    front.relay.set(relay.clone());
+    front.start_with(world, "waker", &key, Some(ports[0]), FrontEnd::Mesh, &waker)?;
+    front.start_with(
+        world,
+        "peer",
+        &key,
+        Some(ports[1]),
+        FrontEnd::Mesh,
+        &through,
+    )?;
+    front.start_with(world, "third", &key, Some(ports[2]), FrontEnd::Mesh, &third)?;
+    front.sql(0, "INSERT INTO notes VALUES ('h0', 'heard')")?;
+    front.holds(1, "h0", "heard")?;
+    front.holds(2, "h0", "heard")?;
+    // Both peers away, so the node's changes stay unacknowledged.
+    front.stop(1)?;
+    front.stop(2)?;
+    let values: Vec<String> = (0..200)
+        .map(|row| format!("('b{row:04}', 'owed')"))
+        .collect();
+    front.sql(0, &format!("INSERT INTO notes VALUES {}", values.join(",")))?;
+    thread::sleep(Duration::from_secs(2));
+    front.stop(0)?;
+    front.restart(1)?;
+    front.restart(2)?;
+    thread::sleep(Duration::from_secs(2));
+    Ok(())
+}
+
+#[when("it says wazzup and one part of its batch is lost")]
+fn it_says_wazzup_losing_a_part(front: &Front) -> Result<(), String> {
+    let relay = front.relay.get().ok_or("no relay")?;
+    relay.watching_wazzups.store(true, Ordering::Relaxed);
+    front.restart(0)
+}
+
+#[then(
+    "every part is answered, each datagram is at most about 1,200 bytes, and the lost part was sent again"
+)]
+fn every_part_answered(front: &Front) -> Result<(), String> {
+    let relay = front.relay.get().ok_or("no relay")?;
+    let done = || {
+        let seen = relay.wazzups.lock().unwrap_or_else(PoisonError::into_inner);
+        seen.parts > 1 && seen.answered.len() as u64 == seen.parts
+    };
+    let result = wait(Duration::from_secs(30), done);
+    let seen = relay.wazzups.lock().unwrap_or_else(PoisonError::into_inner);
+    result.map_err(|()| {
+        format!(
+            "{} parts, answered {:?}, copies {:?}",
+            seen.parts, seen.answered, seen.copies
+        )
+    })?;
+    if seen.largest > 1_300 {
+        return Err(format!("a part took {} bytes", seen.largest));
+    }
+    let lost = seen.copies.get(&1).copied().unwrap_or_default();
+    if lost < 2 {
+        return Err(format!("part 1 passed {lost} times"));
+    }
+    Ok(())
 }
 
 #[given("a node named puck running smugglr mesh")]

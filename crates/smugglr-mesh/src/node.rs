@@ -38,10 +38,13 @@ use smugglr_place::Place;
 use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::local::{Local, limit, refuse};
-use crate::named::{keep_resolved, literal};
+use crate::named::{keep_resolved, literal, resolve_now};
 use crate::outbox::{Acked, Outbox, Timing};
 use crate::parts::{Piece, Receiving, Sending};
-use crate::wire::{ACKS, DATAGRAM, Id, Message, Range, decode, encode, open, seal, sealed_len};
+use crate::wazzup::{ASK_AGAIN, Asked, Asking, Settled, named_line, settle};
+use crate::wire::{
+    ACKS, DATAGRAM, Id, Line, Message, Range, RowNow, decode, encode, open, seal, sealed_len,
+};
 use crate::{CHUNK, Error, Settings, sealing, signing};
 
 /// How long a node waits for a datagram before it looks at its clocks.
@@ -82,6 +85,10 @@ const JOIN: Duration = Duration::from_secs(1);
 
 /// How often a starting node says its wazzup, so one lost copy costs nothing.
 const WAZZUP_EVERY: Duration = Duration::from_millis(300);
+
+/// The id of the wazzups a node says while it listens for its name being
+/// taken, which ask after nothing else.
+const NAME_ONLY: u64 = 0;
 
 /// How long this node remembers a change it sent, to tell its own from a
 /// change under its name that another machine made.
@@ -158,6 +165,39 @@ fn folder(place: &dyn Place) -> String {
     format!("mesh/{}", hex(&row_hash(&["mesh", place.address()])))
 }
 
+/// Tells the mesh that `node` is gone for good: peers stop owing it changes.
+/// Said a few times, since a datagram can be lost and a peer's first hearing
+/// passes it on.
+///
+/// # Errors
+/// When the mesh holds no key, or no socket can be opened to say it from.
+pub fn remove(settings: &Settings, node: &str) -> Result<(), Error> {
+    let key = settings.keys.last().ok_or(Error::NoKey)?;
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.set_broadcast(true)?;
+    let datagram = seal(
+        &Message::Remove {
+            sender: "smugglr mesh remove".to_owned(),
+            node: node.to_owned(),
+        },
+        &sealing(key),
+    );
+    let mut to = vec![
+        SocketAddr::from(([255, 255, 255, 255], settings.port)),
+        SocketAddr::from(([127, 0, 0, 1], settings.port)),
+    ];
+    to.extend(resolve_now(&settings.peers));
+    for _ in 0..3 {
+        for to in &to {
+            // A network that carries no broadcast refuses that send, and the
+            // peers named here are told anyway.
+            let _ = socket.send_to(&datagram, to);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(())
+}
+
 /// Runs the node whose database is `place` until `stop` is set.
 ///
 /// # Errors
@@ -174,9 +214,10 @@ pub fn run(place: &mut dyn Place, settings: &Settings, stop: &AtomicBool) -> Res
     let named = Arc::new(Mutex::new(literal(&settings.peers)));
     let folder = folder(place);
     let ran = format!("{folder}/ran");
-    if let Some(away) = away(settings, &ran)? {
-        println!("{}", catch_up(away, settings, place.address()));
-    }
+    let since = last_ran(settings, &ran)?;
+    let past_sunset = say_if_past_sunset(settings, &ran, place.address())?;
+    let removed_file = format!("{folder}/removed.json");
+    let removed = removed_nodes(settings, &removed_file)?;
     let local = Local::open(place, settings, &folder, now())?;
     let outbox = Outbox::open(settings.store.clone(), &format!("{folder}/outbox"), now())?;
     let mut node = Node {
@@ -200,6 +241,16 @@ pub fn run(place: &mut dyn Place, settings: &Settings, stop: &AtomicBool) -> Res
         joining_until: Instant::now() + JOIN,
         said_wazzup: None,
         arrived_joining: Vec::new(),
+        since,
+        asking: Vec::new(),
+        last_ask: 0,
+        ask_on_joining: !past_sunset,
+        wazzups: Vec::new(),
+        answers: Vec::new(),
+        woken_by: HashMap::new(),
+        told_too_much: false,
+        removed,
+        removed_file,
         clash: None,
         made: HashMap::new(),
         named: named.clone(),
@@ -278,6 +329,54 @@ fn bind(port: u16) -> std::io::Result<UdpSocket> {
     let socket: UdpSocket = socket.into();
     socket.set_read_timeout(Some(TICK))?;
     Ok(socket)
+}
+
+/// Whether this node comes back past the sunset; it says so, and how to catch
+/// up.
+fn say_if_past_sunset(settings: &Settings, ran: &str, place: &str) -> Result<bool, Error> {
+    let Some(away) = away(settings, ran)? else {
+        return Ok(false);
+    };
+    println!("{}", catch_up(away, settings, place));
+    Ok(true)
+}
+
+/// When the node last ran, in seconds since the epoch; 0 when it never has.
+fn last_ran(settings: &Settings, ran: &str) -> Result<u64, Error> {
+    Ok(settings
+        .store
+        .read(ran)?
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or_default())
+}
+
+/// The nodes a person has taken off the mesh.
+fn removed_nodes(settings: &Settings, file: &str) -> Result<BTreeSet<String>, Error> {
+    Ok(settings
+        .store
+        .read(file)?
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default())
+}
+
+/// One part of a peer's wazzup, to answer.
+#[derive(Debug)]
+struct Wazzup {
+    peer: String,
+    id: u64,
+    n: u64,
+    count: u64,
+    lines: Vec<Line>,
+}
+
+/// A peer's answer to a part of this node's wazzup.
+#[derive(Debug)]
+struct Answer {
+    peer: String,
+    id: u64,
+    n: u64,
+    too_much: bool,
+    rows: Vec<RowNow>,
 }
 
 /// Whether the record should name a peer silent for `quiet`, last named
@@ -400,6 +499,24 @@ struct Node<'a> {
     said_wazzup: Option<Instant>,
     /// What arrived while it listened, to apply once it joins.
     arrived_joining: Vec<(String, Envelope)>,
+    /// When it last ran before this start, in seconds since the epoch.
+    since: u64,
+    /// The wazzups under way, and the id of the last one begun.
+    asking: Vec<Asking>,
+    last_ask: u64,
+    /// It still owes its first wazzup. A node back past the sunset does not
+    /// ask: its changes are dead (toy X), and it catches up by stash first.
+    ask_on_joining: bool,
+    /// Parts of peers' wazzups to answer, and answers to its own, to take in
+    /// where the database can be read.
+    wazzups: Vec<Wazzup>,
+    answers: Vec<Answer>,
+    /// The wazzup each peer last woke this node's resends with.
+    woken_by: HashMap<String, u64>,
+    told_too_much: bool,
+    /// The nodes a person has taken off the mesh.
+    removed: BTreeSet<String>,
+    removed_file: String,
     /// Why this node must stop: its name belongs to another.
     clash: Option<Error>,
     /// The changes it sent lately, which may yet come back to it.
@@ -483,6 +600,7 @@ impl Node<'_> {
         if !batch.is_empty() {
             self.apply(place, batch)?;
         }
+        self.joined(place)?;
         for (maker, ack) in self.receiving.acks(&self.settings.node) {
             // A lost acknowledgement of parts is covered by the maker's
             // resend and the next acknowledgement's missing parts.
@@ -524,7 +642,7 @@ impl Node<'_> {
             self.said_unopened = Some(Instant::now());
         }
         if self.announced.is_none_or(|at| at.elapsed() >= ANNOUNCE) {
-            self.say_silence(Instant::now());
+            self.say_silence(Instant::now())?;
             self.announce();
         }
         if self.tidied.elapsed() >= TIDY {
@@ -706,12 +824,259 @@ impl Node<'_> {
         let wazzup = Message::Wazzup {
             sender: self.settings.node.clone(),
             start: self.start,
+            since: self.since,
+            id: NAME_ONLY,
+            n: 0,
+            count: 1,
+            lines: Vec::new(),
         };
         // A lost wazzup is said again.
         let _ = self.send(&wazzup, (self.to, 0));
         for peer in self.named_addresses() {
             let _ = self.send(&wazzup, (peer, 0));
         }
+    }
+
+    /// The wazzup's work, on a node that has joined: its own first wazzup,
+    /// what peers asked, what they answered, and parts still unanswered.
+    fn joined(&mut self, place: &mut dyn Place) -> Result<(), Error> {
+        for (peer, named) in self.outbox.take_expired() {
+            println!("{}", named_line(&peer, &named));
+        }
+        if self.ask_on_joining {
+            self.ask_on_joining = false;
+            self.ask(None)?;
+        }
+        for wazzup in std::mem::take(&mut self.wazzups) {
+            self.answer_wazzup(place, wazzup)?;
+        }
+        for answer in std::mem::take(&mut self.answers) {
+            self.take_answer(place, answer)?;
+        }
+        self.say_parts();
+        Ok(())
+    }
+
+    /// Begins a wazzup about the changes owed: to `only`, or to every peer.
+    fn ask(&mut self, only: Option<String>) -> Result<(), Error> {
+        let asked = self
+            .outbox
+            .owed_changes(only.as_deref())?
+            .iter()
+            .map(Asked::of)
+            .collect();
+        self.last_ask += 1;
+        self.asking.push(Asking::new(self.last_ask, asked, only));
+        Ok(())
+    }
+
+    /// Says each part a peer it asks has not answered, at most every
+    /// [`ASK_AGAIN`]; a wazzup ends once no peer that is still heard owes an
+    /// answer.
+    fn say_parts(&mut self) {
+        let mut asking = std::mem::take(&mut self.asking);
+        asking.retain_mut(|wazzup| {
+            if wazzup.last_said.is_some_and(|at| at.elapsed() < ASK_AGAIN) {
+                return true;
+            }
+            let first = wazzup.last_said.is_none();
+            wazzup.last_said = Some(Instant::now());
+            // A batch over the line is not sent: its first part carries the
+            // count, and that is enough to be told it is too much.
+            let limit =
+                usize::try_from(self.settings.mesh_wire / DATAGRAM as u64).unwrap_or(usize::MAX);
+            let count = wazzup.parts.len();
+            let sendable = if count > limit { 1 } else { count };
+            let mut owing = false;
+            let peers: Vec<String> = self
+                .peers
+                .iter()
+                .filter(|peer| wazzup.asks(peer) && self.still_heard(peer))
+                .cloned()
+                .collect();
+            for peer in &peers {
+                let unanswered = wazzup.unanswered(peer);
+                owing |= !unanswered.is_empty();
+                let to = self.address(peer);
+                for n in unanswered {
+                    if usize::try_from(n).is_ok_and(|n| n < sendable) {
+                        let _ = self.send(&self.wazzup_part(wazzup, n), to);
+                    }
+                }
+            }
+            if first && wazzup.only.is_none() {
+                // Peers not heard yet are told by whoever can hear.
+                let mut to = vec![self.to];
+                to.extend(self.named_addresses());
+                for n in 0..sendable {
+                    for to in &to {
+                        let _ = self.send(&self.wazzup_part(wazzup, n as u64), (*to, 0));
+                    }
+                }
+            }
+            owing || first
+        });
+        self.asking.append(&mut asking);
+    }
+
+    fn wazzup_part(&self, wazzup: &Asking, n: u64) -> Message {
+        let lines = wazzup
+            .parts
+            .get(usize::try_from(n).unwrap_or(usize::MAX))
+            .map(|part| part.iter().map(|one| one.line.clone()).collect())
+            .unwrap_or_default();
+        Message::Wazzup {
+            sender: self.settings.node.clone(),
+            start: self.start,
+            since: self.since,
+            id: wazzup.id,
+            n,
+            count: wazzup.parts.len() as u64,
+            lines,
+        }
+    }
+
+    fn still_heard(&self, peer: &str) -> bool {
+        self.heard_at
+            .get(peer)
+            .is_some_and(|at| at.elapsed() < HEARD_WITHIN)
+    }
+
+    /// Answers one part of a peer's wazzup from the rows here, and on its
+    /// first part makes what that peer is owed due at once.
+    fn answer_wazzup(&mut self, place: &mut dyn Place, wazzup: Wazzup) -> Result<(), Error> {
+        let Wazzup {
+            peer,
+            id,
+            n,
+            count,
+            lines,
+        } = wazzup;
+        let too_much = count.saturating_mul(DATAGRAM as u64) > self.settings.mesh_wire
+            || self.outbox.owed_bytes(&peer) > self.settings.mesh_wire;
+        let rows = if too_much {
+            Vec::new()
+        } else {
+            self.local.rows_now(place, &lines)?
+        };
+        if !too_much && self.woken_by.insert(peer.clone(), id) != Some(id) {
+            self.outbox.all_due_now(&peer);
+        }
+        let answer = Message::Answer {
+            sender: self.settings.node.clone(),
+            id,
+            n,
+            too_much,
+            rows,
+        };
+        // A lost answer is asked for again.
+        let _ = self.send(&answer, self.address(&peer));
+        Ok(())
+    }
+
+    /// Settles what one answer proves, and names the rest once the peer has
+    /// answered every part.
+    fn take_answer(&mut self, place: &mut dyn Place, answer: Answer) -> Result<(), Error> {
+        let Answer {
+            peer,
+            id,
+            n,
+            too_much,
+            rows,
+        } = answer;
+        let Some(at) = self.asking.iter().position(|wazzup| wazzup.id == id) else {
+            return Ok(());
+        };
+        if too_much {
+            self.asking[at].answered_all(&peer);
+            self.told_too_much_by(&peer, place.address())?;
+            return Ok(());
+        }
+        if !self.asking[at].answered(&peer, n) {
+            return Ok(());
+        }
+        let part = self.asking[at]
+            .parts
+            .get(usize::try_from(n).unwrap_or(usize::MAX))
+            .cloned()
+            .unwrap_or_default();
+        let lines: Vec<Line> = part.iter().map(|one| one.line.clone()).collect();
+        let mine = self.local.rows_now(place, &lines)?;
+        for ((asked, row), here) in part.iter().zip(&rows).zip(&mine) {
+            match settle((asked.from, asked.line.to), here.hash, row) {
+                Settled::Has => {
+                    if let Some(acked) = self.outbox.ack(&asked.signature, &peer) {
+                        self.acked(&peer, acked);
+                    }
+                }
+                Settled::Send => self.outbox.due_now(&asked.signature, &peer),
+                Settled::Named => self.asking[at].name(&peer, asked),
+            }
+        }
+        if let Some(line) = self.asking[at].take_named(&peer) {
+            println!("{line}");
+        }
+        Ok(())
+    }
+
+    /// A peer says there is too much for the wire: the record says how to
+    /// catch up, once, and names what this node has not had acknowledged.
+    fn told_too_much_by(&mut self, peer: &str, place: &str) -> Result<(), Error> {
+        if self.told_too_much {
+            return Ok(());
+        }
+        self.told_too_much = true;
+        println!(
+            "smugglr mesh: {peer} says there is too much for the wire. Catch up with: smugglr \
+             stash <a peer's place> <dir> --key-file <path> --node <name> --whole, then smugglr \
+             retrieve {place} <dir> --key-file <path> --node {}",
+            self.settings.node
+        );
+        let named: Vec<String> = self
+            .outbox
+            .owed_changes(Some(peer))?
+            .iter()
+            .map(|envelope| {
+                format!(
+                    "{} {:?} (change {})",
+                    envelope.change.table,
+                    envelope.change.key,
+                    hex(&envelope.signature)
+                )
+            })
+            .collect();
+        if !named.is_empty() {
+            println!("{}", named_line(peer, &named));
+        }
+        Ok(())
+    }
+
+    /// A person has taken `node` off the mesh: nothing more is owed to it,
+    /// and the peers are told, once.
+    fn hear_remove(&mut self, node: &str) {
+        if !self.removed.insert(node.to_owned()) {
+            return;
+        }
+        self.outbox.remove_target(node);
+        self.peers.remove(node);
+        self.silent.remove(node);
+        self.save_removed();
+        println!("smugglr mesh: {node} is taken off the mesh; nothing more is owed to it");
+        let remove = Message::Remove {
+            sender: self.settings.node.clone(),
+            node: node.to_owned(),
+        };
+        let to: BTreeSet<(SocketAddr, usize)> = self.destinations();
+        for to in to {
+            let _ = self.send(&remove, to);
+        }
+    }
+
+    fn save_removed(&self) {
+        let text = serde_json::json!(self.removed).to_string();
+        // A failed write costs this only after a restart, when the node is
+        // told again or a person says it again.
+        let _ = self.settings.store.replace(&self.removed_file, &text);
     }
 
     /// What the peers setting names now.
@@ -722,16 +1087,55 @@ impl Node<'_> {
             .unwrap_or_default()
     }
 
-    /// Takes in one message from another node; a change it does not have
-    /// yet joins `batch`.
-    fn hear(&mut self, message: Message, from: SocketAddr, batch: &mut Vec<(String, Envelope)>) {
-        let sender = message.sender().to_owned();
-        if sender == self.settings.node {
-            self.hear_own_name(&message, from);
-            return;
+    /// Keeps a wazzup's part, or an answer to one, for where the database
+    /// can be read. The first copies of a start, before it joins, ask only
+    /// after the name.
+    fn queue(&mut self, message: Message) {
+        match message {
+            Message::Wazzup {
+                sender,
+                id,
+                n,
+                count,
+                lines,
+                ..
+            } if id != NAME_ONLY => self.wazzups.push(Wazzup {
+                peer: sender,
+                id,
+                n,
+                count,
+                lines,
+            }),
+            Message::Answer {
+                sender,
+                id,
+                n,
+                too_much,
+                rows,
+            } => self.answers.push(Answer {
+                peer: sender,
+                id,
+                n,
+                too_much,
+                rows,
+            }),
+            _ => {}
         }
-        self.heard_at.insert(sender.clone(), Instant::now());
-        let moved = self.addresses.insert(sender.clone(), from) != Some(from);
+    }
+
+    /// Notes that `sender` was heard at `from`; `false` when it is a node
+    /// taken off the mesh, and what it said is ignored.
+    fn note_sender(&mut self, sender: &str, message: &Message, from: SocketAddr) -> bool {
+        if self.removed.contains(sender) {
+            // A node taken off the mesh stays off until it says it is back.
+            if !matches!(message, Message::Wazzup { .. }) {
+                return false;
+            }
+            self.removed.remove(sender);
+            self.save_removed();
+        }
+        self.heard_at.insert(sender.to_owned(), Instant::now());
+        let moved = self.addresses.insert(sender.to_owned(), from) != Some(from);
         if moved && matches!(message, Message::Announce { .. } | Message::Wazzup { .. }) {
             // A peer heard for the first time, or at a new address, hears
             // this node back, so each knows the other.
@@ -739,15 +1143,34 @@ impl Node<'_> {
                 &Message::Announce {
                     sender: self.settings.node.clone(),
                 },
-                self.address(&sender),
+                self.address(sender),
             );
         }
-        if self.peers.insert(sender.clone()) {
-            self.outbox.heard(&sender);
-            self.sending.heard(&sender);
+        if self.peers.insert(sender.to_owned()) {
+            self.outbox.heard(sender);
+            self.sending.heard(sender);
+        }
+        true
+    }
+
+    /// Takes in one message from another node; a change it does not have
+    /// yet joins `batch`.
+    fn hear(&mut self, message: Message, from: SocketAddr, batch: &mut Vec<(String, Envelope)>) {
+        if let Message::Remove { node, .. } = &message {
+            self.hear_remove(&node.clone());
+            return;
+        }
+        let sender = message.sender().to_owned();
+        if sender == self.settings.node {
+            self.hear_own_name(&message, from);
+            return;
+        }
+        if !self.note_sender(&sender, &message, from) {
+            return;
         }
         match message {
-            Message::Announce { .. } | Message::Wazzup { .. } | Message::NameTaken { .. } => {}
+            Message::Announce { .. } | Message::NameTaken { .. } | Message::Remove { .. } => {}
+            message @ (Message::Wazzup { .. } | Message::Answer { .. }) => self.queue(message),
             Message::Part {
                 sender,
                 id,
@@ -1278,7 +1701,7 @@ impl Node<'_> {
 
     /// Names each peer that owes acknowledgements and has given none for
     /// [`SILENCE`], at most every [`SAY_SILENCE`] while that lasts.
-    fn say_silence(&mut self, now: Instant) {
+    fn say_silence(&mut self, now: Instant) -> Result<(), Error> {
         let peers: Vec<String> = self.peers.iter().cloned().collect();
         for peer in peers {
             let Some((count, oldest)) = self.outbox.owed(&peer) else {
@@ -1299,9 +1722,15 @@ impl Node<'_> {
                     "{}",
                     silence_line(&peer, now.duration_since(since), count, heard)
                 );
-                self.silent.insert(peer, (since, now));
+                self.silent.insert(peer.clone(), (since, now));
+                // A peer still heard is holding something: ask it, so what
+                // its rows prove is settled with nobody watching.
+                if self.still_heard(&peer) {
+                    self.ask(Some(peer))?;
+                }
             }
         }
+        Ok(())
     }
 
     /// Notes `changes` resent, and says so at most once a minute.
