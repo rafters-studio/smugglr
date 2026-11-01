@@ -356,6 +356,19 @@ impl Outbox {
             .count()
     }
 
+    /// How many sent changes `peer` still owes an acknowledgement, and when
+    /// the oldest of them went out; `None` when it owes none.
+    pub(crate) fn owed(&self, peer: &str) -> Option<(usize, Instant)> {
+        let mut owed = self.entries.values().filter(|entry| {
+            entry.sent && entry.targets.contains(peer) && !entry.acked.contains(peer)
+        });
+        let oldest = owed.next()?.sent_at;
+        let (count, oldest) = owed.fold((1, oldest), |(count, oldest), entry| {
+            (count + 1, oldest.min(entry.sent_at))
+        });
+        Some((count, oldest))
+    }
+
     /// Up to `limit` changes not yet sent, oldest first, now counted sent.
     pub(crate) fn first_sends(&mut self, limit: usize) -> Result<Vec<Envelope>, Error> {
         let mut out = Vec::new();
@@ -830,6 +843,20 @@ mod tests {
         outbox.first_sends(1)?;
         let later = Instant::now() + HELD_PAST;
         assert_eq!(outbox.in_flight(later, |_| true), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_peer_owes_only_the_changes_it_has_not_acknowledged()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut outbox = sent("owed", 3)?;
+        assert_eq!(outbox.owed(PEER).map(|(count, _)| count), Some(3));
+        assert_eq!(outbox.owed("other").map(|(count, _)| count), None);
+        outbox.ack(&[1; 32], PEER);
+        outbox.ack(&[2; 32], PEER);
+        assert_eq!(outbox.owed(PEER).map(|(count, _)| count), Some(1));
+        outbox.ack(&[3; 32], PEER);
+        assert_eq!(outbox.owed(PEER).map(|(count, _)| count), None);
         Ok(())
     }
 
