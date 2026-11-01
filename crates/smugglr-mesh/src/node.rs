@@ -248,7 +248,7 @@ pub fn run(place: &mut dyn Place, settings: &Settings, stop: &AtomicBool) -> Res
         wazzups: Vec::new(),
         answers: Vec::new(),
         woken_by: HashMap::new(),
-        told_too_much: false,
+        told_too_much: BTreeSet::new(),
         removed,
         removed_file,
         clash: None,
@@ -529,7 +529,8 @@ struct Node<'a> {
     /// The wazzup each peer last woke this node's resends with: its start,
     /// since ids begin again at each start, and its id.
     woken_by: HashMap<String, (u64, u64)>,
-    told_too_much: bool,
+    /// The peers that have said too much, each named once.
+    told_too_much: BTreeSet<String>,
     /// The nodes a person has taken off the mesh.
     removed: BTreeSet<String>,
     removed_file: String,
@@ -897,12 +898,13 @@ impl Node<'_> {
             }
             let first = wazzup.last_said.is_none();
             wazzup.last_said = Some(Instant::now());
-            // A batch over the line is not sent: its first part carries the
-            // count, and that is enough to be told it is too much.
+            // A batch over this node's line goes first as one part, whose
+            // count is enough to be told it is too much. A peer that answers
+            // it instead has a larger line, and gets the rest.
             let limit =
                 usize::try_from(self.settings.mesh_wire / DATAGRAM as u64).unwrap_or(usize::MAX);
             let count = wazzup.parts.len();
-            let sendable = if count > limit { 1 } else { count };
+            let over = count > limit;
             let mut owing = false;
             let peers: Vec<String> = self
                 .peers
@@ -914,8 +916,9 @@ impl Node<'_> {
                 let unanswered = wazzup.unanswered(peer);
                 owing |= !unanswered.is_empty();
                 let to = self.address(peer);
+                let first_only = over && !wazzup.heard_from(peer);
                 for n in unanswered {
-                    if usize::try_from(n).is_ok_and(|n| n < sendable) {
+                    if !first_only || n == 0 {
                         let _ = self.send(&self.wazzup_part(wazzup, n), to);
                     }
                 }
@@ -924,7 +927,7 @@ impl Node<'_> {
                 // Peers not heard yet are told by whoever can hear.
                 let mut to = vec![self.to];
                 to.extend(self.named_addresses());
-                for n in 0..sendable {
+                for n in 0..if over { 1 } else { count } {
                     for to in &to {
                         let _ = self.send(&self.wazzup_part(wazzup, n as u64), (*to, 0));
                     }
@@ -1045,10 +1048,9 @@ impl Node<'_> {
     /// A peer says there is too much for the wire: the record says how to
     /// catch up, once, and names what this node has not had acknowledged.
     fn told_too_much_by(&mut self, peer: &str, place: &str) -> Result<(), Error> {
-        if self.told_too_much {
+        if !self.told_too_much.insert(peer.to_owned()) {
             return Ok(());
         }
-        self.told_too_much = true;
         println!(
             "smugglr mesh: {peer} says there is too much for the wire. Catch up with: smugglr \
              stash <a peer's place> <dir> --key-file <path> --node <name> --whole, then smugglr \

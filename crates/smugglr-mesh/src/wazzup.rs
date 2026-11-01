@@ -141,6 +141,13 @@ impl Asking {
         self.only.as_deref().is_none_or(|only| only == peer)
     }
 
+    /// Whether `peer` has answered any part: it has not said too much.
+    pub(crate) fn heard_from(&self, peer: &str) -> bool {
+        self.answered
+            .get(peer)
+            .is_some_and(|parts| !parts.is_empty())
+    }
+
     /// The parts `peer` has not answered.
     pub(crate) fn unanswered(&self, peer: &str) -> Vec<u64> {
         let answered = self.answered.get(peer);

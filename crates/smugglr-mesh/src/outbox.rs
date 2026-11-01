@@ -237,7 +237,11 @@ impl Outbox {
             });
             if let Some((change, node)) = parsed {
                 if let Some((targets, _)) = expired.get_mut(&change) {
+                    // Kept while its segment is on disk, so the next start
+                    // does not name a peer that did acknowledge it.
                     targets.remove(&node);
+                    kept.push_str(line);
+                    kept.push('\n');
                 }
                 if let Some(entry) = outbox.entries.get_mut(&change) {
                     entry.acked.insert(node);
