@@ -317,10 +317,15 @@ impl Outbox {
         }
     }
 
-    /// Everything owed to `peer` is due at once: it woke and asked.
-    pub(crate) fn all_due_now(&mut self, peer: &str) {
-        for entry in self.entries.values_mut() {
-            if entry.sent && entry.targets.contains(peer) && !entry.acked.contains(peer) {
+    /// Everything owed to `peer` is due at once: it woke and asked. A change
+    /// `in_parts` is left out, since its parts have their own repair.
+    pub(crate) fn all_due_now(&mut self, peer: &str, in_parts: impl Fn(&[u8; 32]) -> bool) {
+        for (change, entry) in &mut self.entries {
+            if entry.sent
+                && entry.targets.contains(peer)
+                && !entry.acked.contains(peer)
+                && !in_parts(change)
+            {
                 entry.unsent_to.insert(peer.to_owned());
             }
         }

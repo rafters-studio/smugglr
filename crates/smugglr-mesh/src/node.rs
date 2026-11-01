@@ -960,7 +960,9 @@ impl Node<'_> {
             self.local.rows_now(place, &lines)?
         };
         if !too_much && self.woken_by.insert(peer.clone(), id) != Some(id) {
-            self.outbox.all_due_now(&peer);
+            let sending = &self.sending;
+            self.outbox
+                .all_due_now(&peer, |change| sending.sends(change));
         }
         let answer = Message::Answer {
             sender: self.settings.node.clone(),
@@ -1009,7 +1011,10 @@ impl Node<'_> {
                         self.acked(&peer, acked);
                     }
                 }
-                Settled::Send => self.outbox.due_now(&asked.signature, &peer),
+                Settled::Send if !self.sending.sends(&asked.signature) => {
+                    self.outbox.due_now(&asked.signature, &peer);
+                }
+                Settled::Send => {}
                 Settled::Named => self.asking[at].name(&peer, asked),
             }
         }
