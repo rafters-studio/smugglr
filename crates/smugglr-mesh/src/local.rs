@@ -983,12 +983,18 @@ mod tests {
         let f = hash(&row("f", "1"));
         node.edit_here("mine", "2")?;
         let theirs = node.signed(Some(f), row("theirs", "3"));
-        let table = node.local.table("notes").cloned().ok_or("no table")?;
-        // The write is guarded on the row as the decision read it: the guard
-        // that a move since then fails.
-        let mut stale = theirs.change.clone();
-        stale.from = Some(hash(&row("gone", "9")));
-        assert_eq!(node.place.write(&table, &[stale])?.len(), 0);
+        // The guard the decision read, which a move since then no longer meets.
+        let stale = Some(hash(&row("gone", "9")));
+        let (mut applied, mut moves) = (Applied::default(), Vec::new());
+        node.local.write(
+            &mut node.place,
+            "notes",
+            &[(&theirs, stale)],
+            &mut applied,
+            &mut moves,
+        )?;
+        assert_eq!(applied.waiting.len(), 1);
+        assert_eq!(moves.len(), 0);
         assert_eq!(node.body()?, "mine");
         Ok(())
     }
