@@ -62,9 +62,9 @@ struct Due {
     silent: bool,
     /// The copy is known lost, or its peer has had none: not a guess.
     sure: bool,
-    /// It is due to a peer that is acknowledging other changes, on a guess
-    /// that its copy was lost.
-    guess: bool,
+    /// The peers it is due to on a guess that their copy was lost: each is
+    /// acknowledging other changes.
+    guessed: Vec<String>,
 }
 
 /// A change due a resend, and the targets it is due to.
@@ -84,8 +84,6 @@ struct Entry {
     /// The change's place in the order of first sends.
     seq: u64,
     sent_at: Instant,
-    /// When it last went out, first send or resend.
-    last_sent: Instant,
     /// For each peer it has been resent to, the last first send by then: a
     /// peer that acknowledges changes sent after that has skipped the resend
     /// too, so it is resent at once again.
@@ -95,9 +93,10 @@ struct Entry {
     /// When it is next resent to a peer that has stopped acknowledging.
     resend_at: Instant,
     interval: Duration,
-    /// How many resends have gone on a guess to a peer that is acknowledging
-    /// other changes: each one doubles the wait before the next.
-    guesses: u32,
+    /// For each peer that is acknowledging other changes, how many resends
+    /// have gone to it on a guess and when the last went: each one doubles
+    /// the wait before the next, for that peer alone.
+    guesses: HashMap<String, (u32, Instant)>,
 }
 
 /// How a peer has been acknowledging this node's changes.
@@ -360,7 +359,6 @@ impl Outbox {
                 entry.sent = true;
                 entry.seq = self.seq;
                 entry.sent_at = now;
-                entry.last_sent = now;
                 entry.resend_at = now + entry.interval;
             }
             out.push(envelope);
@@ -419,7 +417,8 @@ impl Outbox {
             if !entry.sent {
                 continue;
             }
-            let (mut to, mut silent, mut sure, mut guess) = (Vec::new(), false, false, false);
+            let (mut to, mut silent, mut sure) = (Vec::new(), false, false);
+            let mut guessed = Vec::new();
             for peer in entry.targets.difference(&entry.acked) {
                 if busy(change, peer) {
                     continue;
@@ -442,9 +441,14 @@ impl Outbox {
                         // A peer that acknowledges others may be holding
                         // this one, and a held change needs no copy to be
                         // decided: each guess waits twice the last.
-                        if now >= entry.last_sent + backed_off(timing.wait(), entry.guesses) {
+                        let (tries, since) = entry
+                            .guesses
+                            .get(peer)
+                            .copied()
+                            .unwrap_or((0, entry.sent_at));
+                        if now >= since + backed_off(timing.wait(), tries) {
                             to.push(peer.clone());
-                            guess = true;
+                            guessed.push(peer.clone());
                         }
                     }
                     None => {
@@ -462,7 +466,7 @@ impl Outbox {
                     to,
                     silent,
                     sure,
-                    guess,
+                    guessed,
                 });
             }
         }
@@ -476,7 +480,7 @@ impl Outbox {
             change,
             to,
             silent,
-            guess,
+            guessed,
             ..
         } in &due
         {
@@ -487,10 +491,12 @@ impl Outbox {
                 entry.interval = (entry.interval * 2).min(LAST_RESEND);
                 entry.resend_at = now + entry.interval;
             }
-            if *guess {
-                entry.guesses = entry.guesses.saturating_add(1);
+            for peer in guessed {
+                let guesses = entry.guesses.get(peer).map_or(0, |(guesses, _)| *guesses);
+                entry
+                    .guesses
+                    .insert(peer.clone(), (guesses.saturating_add(1), now));
             }
-            entry.last_sent = now;
             entry.resent = true;
             for peer in to {
                 entry.unsent_to.remove(peer);
@@ -635,12 +641,11 @@ fn entry(segment: u64, envelope: &Envelope, targets: BTreeSet<String>) -> Entry 
         sent: false,
         seq: 0,
         sent_at: Instant::now(),
-        last_sent: Instant::now(),
         resent_by: HashMap::new(),
         resent: false,
         resend_at: Instant::now(),
         interval: FIRST_RESEND,
-        guesses: 0,
+        guesses: HashMap::new(),
     }
 }
 
@@ -753,6 +758,30 @@ mod tests {
         let timing = acknowledging(now, 100);
         let due = outbox.resends(now, &timing, 10, |_, _| false)?;
         assert_eq!(due.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn one_peers_backing_off_does_not_delay_another_peers_first_resend()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut outbox = sent("two-peers", 1)?;
+        let mut now = Instant::now();
+        for guess in 0..6 {
+            now += LONGEST * 2_u32.pow(guess);
+            let timing = acknowledging(now, 0);
+            assert_eq!(outbox.resends(now, &timing, 10, |_, _| false)?.len(), 1);
+        }
+        outbox.heard("other");
+        let mut timing = acknowledging(now, 0);
+        timing.insert("other".to_owned(), timing[PEER]);
+        // Its first copy, owed since it was heard.
+        let due = outbox.resends(now, &timing, 10, |_, _| false)?;
+        assert_eq!(due[0].1, ["other"]);
+        let at = now + LONGEST;
+        let mut timing = acknowledging(at, 0);
+        timing.insert("other".to_owned(), timing[PEER]);
+        let due = outbox.resends(at, &timing, 10, |_, _| false)?;
+        assert_eq!(due[0].1, ["other"]);
         Ok(())
     }
 
