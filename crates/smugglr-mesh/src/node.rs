@@ -24,9 +24,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chacha20poly1305::aead::OsRng;
@@ -160,7 +160,7 @@ pub fn run(place: &mut dyn Place, settings: &Settings, stop: &AtomicBool) -> Res
     }
     let socket = bind(settings.port)?;
     let reader = socket.try_clone()?;
-    let named = Mutex::new(literal(&settings.peers));
+    let named = Arc::new(Mutex::new(literal(&settings.peers)));
     let folder = folder(place);
     let ran = format!("{folder}/ran");
     if let Some(away) = away(settings, &ran)? {
@@ -185,7 +185,7 @@ pub fn run(place: &mut dyn Place, settings: &Settings, stop: &AtomicBool) -> Res
         counted: Instant::now(),
         addresses: HashMap::new(),
         heard_at: HashMap::new(),
-        named: &named,
+        named: named.clone(),
         silent: HashMap::new(),
         keys: HashMap::new(),
         own: own_address(settings.port).into_iter().collect(),
@@ -207,10 +207,11 @@ pub fn run(place: &mut dyn Place, settings: &Settings, stop: &AtomicBool) -> Res
     };
     let (tx, rx) = mpsc::channel();
     let reading = AtomicBool::new(true);
+    let resolving = Arc::new(AtomicBool::new(true));
+    if !settings.peers.is_empty() {
+        keep_resolved(settings.peers.clone(), named, resolving.clone(), ANNOUNCE);
+    }
     std::thread::scope(|scope| {
-        if !settings.peers.is_empty() {
-            scope.spawn(|| keep_resolved(&settings.peers, &named, &reading, ANNOUNCE));
-        }
         scope.spawn(|| {
             let mut buffer = vec![0; 65_536];
             while reading.load(Ordering::Relaxed) {
@@ -231,6 +232,7 @@ pub fn run(place: &mut dyn Place, settings: &Settings, stop: &AtomicBool) -> Res
             }
         }
         reading.store(false, Ordering::Relaxed);
+        resolving.store(false, Ordering::Relaxed);
     });
     Ok(())
 }
@@ -368,7 +370,7 @@ struct Node<'a> {
     /// When each peer was last heard, by anything it sent.
     heard_at: HashMap<String, Instant>,
     /// What the peers setting's names resolve to now.
-    named: &'a Mutex<Vec<SocketAddr>>,
+    named: Arc<Mutex<Vec<SocketAddr>>>,
     /// Each peer the record has named as silent: since when, and when it
     /// last said so.
     silent: HashMap<String, (Instant, Instant)>,

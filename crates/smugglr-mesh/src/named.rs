@@ -5,8 +5,8 @@
 
 use std::collections::BTreeSet;
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// The addresses `named` have now, and the record's lines for those that
@@ -43,27 +43,30 @@ pub(crate) fn literal(named: &[String]) -> Vec<SocketAddr> {
 }
 
 /// Keeps `found` at what `named` resolve to, every `every`, until `running`
-/// turns false.
+/// turns false. The thread is left to end by itself, so a lookup that blocks
+/// never holds up a node that is stopping.
 pub(crate) fn keep_resolved(
-    named: &[String],
-    found: &Mutex<Vec<SocketAddr>>,
-    running: &AtomicBool,
+    named: Vec<String>,
+    found: Arc<Mutex<Vec<SocketAddr>>>,
+    running: Arc<AtomicBool>,
     every: Duration,
 ) {
-    let mut failing = BTreeSet::new();
-    while running.load(Ordering::Relaxed) {
-        let (addresses, lines) = resolve(named, &mut failing, lookup);
-        for line in lines {
-            println!("{line}");
+    std::thread::spawn(move || {
+        let mut failing = BTreeSet::new();
+        while running.load(Ordering::Relaxed) {
+            let (addresses, lines) = resolve(&named, &mut failing, lookup);
+            for line in lines {
+                println!("{line}");
+            }
+            if let Ok(mut found) = found.lock() {
+                *found = addresses;
+            }
+            let looked = Instant::now();
+            while running.load(Ordering::Relaxed) && looked.elapsed() < every {
+                std::thread::sleep(Duration::from_millis(100));
+            }
         }
-        if let Ok(mut found) = found.lock() {
-            *found = addresses;
-        }
-        let looked = Instant::now();
-        while running.load(Ordering::Relaxed) && looked.elapsed() < every {
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }
+    });
 }
 
 #[cfg(test)]
