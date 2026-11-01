@@ -29,6 +29,9 @@ use crate::{Error, Settings};
 /// A table's row, by its table and key.
 type Row = (String, Key);
 
+/// A change to write, and the hash the row must hold for it to land.
+type Writing<'a> = (&'a Envelope, Option<[u8; 16]>);
+
 /// What a look for the node's own changes found.
 #[derive(Debug, Default)]
 pub(crate) struct Changes {
@@ -512,14 +515,11 @@ impl Local {
         let mut applied = Applied::default();
         let (mut moves, mut tombstones): (Vec<Envelope>, Vec<Envelope>) = (Vec::new(), Vec::new());
         let mut dropped = Vec::new();
-        let mut writing: BTreeMap<String, Vec<&Envelope>> = BTreeMap::new();
+        let mut applying = Vec::new();
         for (envelope, arrival) in envelopes.iter().zip(arrivals) {
             let change = &envelope.change;
             match arrival {
-                Arrival::Apply => writing
-                    .entry(change.table.clone())
-                    .or_default()
-                    .push(envelope),
+                Arrival::Apply => applying.push(envelope),
                 Arrival::Skip => {
                     if change.to.is_none() {
                         tombstones.push(envelope.clone());
@@ -573,7 +573,7 @@ impl Local {
                 ),
             }
         }
-        for (name, envelopes) in writing {
+        for (name, envelopes) in guarded(applying, here) {
             self.write(place, &name, &envelopes, &mut applied, &mut moves)?;
         }
         if replayed {
@@ -601,35 +601,42 @@ impl Local {
         Ok(applied)
     }
 
-    /// Writes `envelopes`, all to the table `name`, in one transaction, and
-    /// notes in `applied` and `moves` what landed.
+    /// Writes `envelopes`, all to the table `name`, in one transaction, each
+    /// over the row as its guard reads, and notes in `applied` and `moves`
+    /// what landed.
     fn write(
         &mut self,
         place: &mut dyn Place,
         name: &str,
-        envelopes: &[&Envelope],
+        envelopes: &[Writing],
         applied: &mut Applied,
         moves: &mut Vec<Envelope>,
     ) -> Result<(), Error> {
         let Some(table) = self.tables.get(name).cloned() else {
             return Ok(());
         };
-        let changes: Vec<Change> = envelopes.iter().map(|e| e.change.clone()).collect();
+        let changes: Vec<Change> = envelopes
+            .iter()
+            .map(|(envelope, guard)| Change {
+                op: op(*guard, envelope.change.to),
+                from: *guard,
+                ..envelope.change.clone()
+            })
+            .collect();
         let landed: BTreeSet<Key> = place.write(&table, &changes)?.into_iter().collect();
         let read_back = read_back(place, &table, &landed)?;
+        for envelope in misread(envelopes, &landed, &read_back) {
+            println!(
+                "smugglr mesh: a change to {name} {:?} from {} reads back as {}, not {}",
+                envelope.change.key,
+                envelope.node,
+                short(read_back.get(&envelope.change.key).copied()),
+                short(envelope.change.to)
+            );
+        }
         let (mut makers, mut keys, mut count) = (BTreeSet::new(), BTreeSet::new(), 0);
-        for &envelope in envelopes {
+        for &(envelope, _) in envelopes {
             if landed.contains(&envelope.change.key) {
-                let now_here = read_back.get(&envelope.change.key).copied();
-                if now_here != envelope.change.to {
-                    println!(
-                        "smugglr mesh: a change to {name} {:?} from {} reads back as {}, not {}",
-                        envelope.change.key,
-                        envelope.node,
-                        short(now_here),
-                        short(envelope.change.to)
-                    );
-                }
                 self.held.remove(&envelope.signature);
                 moves.push(envelope.clone());
                 applied.has.push(envelope.signature);
@@ -720,6 +727,50 @@ fn read_back(
         .collect())
 }
 
+/// `applying`, in order and by table, each with the hash its row must hold
+/// for it to land: the row as `here` reads it, or as the change before it
+/// leaves it. A conflict `--sync-mode last` keeps is written over the row
+/// here, which is not at the change's `from`; a row that moves after the read
+/// still fails the write's guard.
+fn guarded<'a>(
+    applying: Vec<&'a Envelope>,
+    here: impl Fn(&Change) -> Here,
+) -> BTreeMap<String, Vec<Writing<'a>>> {
+    let mut at: HashMap<Row, Option<[u8; 16]>> = HashMap::new();
+    let mut writing: BTreeMap<String, Vec<Writing<'a>>> = BTreeMap::new();
+    for envelope in applying {
+        let change = &envelope.change;
+        let row = (change.table.clone(), change.key.clone());
+        let guard = at.get(&row).copied().unwrap_or_else(|| here(change).hash);
+        at.insert(row, change.to);
+        writing
+            .entry(change.table.clone())
+            .or_default()
+            .push((envelope, guard));
+    }
+    writing
+}
+
+/// The changes among `envelopes` whose rows do not read as they should, of
+/// the keys that `landed`. The read comes after the whole burst, so only a
+/// key's last change should read back as its `to`.
+fn misread<'a>(
+    envelopes: &[Writing<'a>],
+    landed: &BTreeSet<Key>,
+    read_back: &HashMap<Key, [u8; 16]>,
+) -> Vec<&'a Envelope> {
+    let last: HashMap<&Key, &'a Envelope> = envelopes
+        .iter()
+        .map(|&(envelope, _)| (&envelope.change.key, envelope))
+        .collect();
+    last.into_iter()
+        .filter(|(key, envelope)| {
+            landed.contains(*key) && read_back.get(*key).copied() != envelope.change.to
+        })
+        .map(|(_, envelope)| envelope)
+        .collect()
+}
+
 /// A row hash as the record shows it: its first 8 bytes, or "absent".
 fn short(hash: Option<[u8; 16]>) -> String {
     hash.map_or_else(|| "absent".to_owned(), |hash| hex(&hash[..8]))
@@ -737,4 +788,235 @@ fn stamp(table: &Table) -> Stamp {
         })
         .collect();
     Stamp::of(&columns)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeSet, HashMap};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use rusqlite::Connection;
+    use smugglr_core::change::{Change, op};
+    use smugglr_core::envelope::{Envelope, VERSION};
+    use smugglr_core::plan::SyncMode;
+    use smugglr_core::row_hash::row_hash;
+    use smugglr_core::shape::Stamp;
+    use smugglr_core::steering::Steering;
+    use smugglr_memory::Files;
+    use smugglr_place::LocalFile;
+
+    use super::{Applied, Local, misread, stamp};
+    use crate::{BACKPRESSURE, Error, K, Settings};
+
+    const SIGN: [u8; 32] = [7; 32];
+    const NOW: u64 = 1_000;
+    const ID: &str = "'1'";
+
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    /// A row's `quote()` text: its key, its body and its steering value.
+    fn row(body: &str, updated: &str) -> Vec<String> {
+        vec![ID.to_owned(), format!("'{body}'"), format!("'{updated}'")]
+    }
+
+    fn hash(values: &[String]) -> [u8; 16] {
+        let columns: Vec<&str> = values.iter().map(String::as_str).collect();
+        row_hash(&columns)
+    }
+
+    /// A node whose database holds one row at `row("f", "1")`, and has noted
+    /// it, under `--sync-mode last` steered by `updated`.
+    struct Node {
+        place: LocalFile,
+        settings: Settings,
+        local: Local,
+        path: std::path::PathBuf,
+    }
+
+    impl Node {
+        fn new() -> Result<Self, Box<dyn std::error::Error>> {
+            let dir = std::env::temp_dir().join(format!(
+                "smugglr-mesh-local-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir)?;
+            let path = dir.join("node.db");
+            Connection::open(&path)?.execute_batch(
+                "CREATE TABLE notes (id TEXT PRIMARY KEY, body TEXT, updated TEXT);
+                 INSERT INTO notes VALUES ('1', 'f', '1');",
+            )?;
+            let settings = Settings {
+                store: Arc::new(Files::new(dir.join("kept"))),
+                keys: vec![[1; 32]],
+                node: "here".to_owned(),
+                port: 0,
+                graveyard: 600,
+                sync_mode: SyncMode::Last,
+                steering: Steering {
+                    all: Some("updated".to_owned()),
+                    ..Steering::default()
+                },
+                ignore: Vec::new(),
+                k: K,
+                backpressure: BACKPRESSURE,
+                peers: Vec::new(),
+                max_value: u64::MAX,
+            };
+            let mut place = LocalFile::open(&path)?;
+            let local = Local::open(&mut place, &settings, "node", NOW)?;
+            Ok(Self {
+                place,
+                settings,
+                local,
+                path,
+            })
+        }
+
+        /// A program on this machine edits the row, and the node finds it.
+        fn edit_here(
+            &mut self,
+            body: &str,
+            updated: &str,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            self.write_outside(body, updated)?;
+            let found =
+                self.local
+                    .changes(&mut self.place, &self.settings, &SIGN, NOW, u64::MAX, |_| 0)?;
+            self.local.keep(&found.found)?;
+            Ok(())
+        }
+
+        fn write_outside(&self, body: &str, updated: &str) -> rusqlite::Result<usize> {
+            Connection::open(&self.path)?
+                .execute("UPDATE notes SET body = ?1, updated = ?2", [body, updated])
+        }
+
+        fn signed(&self, from: Option<[u8; 16]>, values: Vec<String>) -> Envelope {
+            let to = Some(hash(&values));
+            let mut envelope = Envelope {
+                v: VERSION,
+                node: "peer".to_owned(),
+                change: Change {
+                    op: op(from, to),
+                    table: "notes".to_owned(),
+                    key: vec![ID.to_owned()],
+                    from,
+                    to,
+                    values,
+                },
+                targets: Vec::new(),
+                sunset: NOW + 600,
+                txn: None,
+                key_id: smugglr_multi::key_id(&SIGN),
+                stamp: self.local.table("notes").map_or(Stamp([0; 16]), stamp),
+                signature: [0; 32],
+            };
+            envelope.sign(&SIGN);
+            envelope
+        }
+
+        fn take(&mut self, envelopes: &[Envelope]) -> Result<Applied, Error> {
+            self.local
+                .apply(&mut self.place, &self.settings, &SIGN, envelopes, NOW)
+        }
+
+        fn body(&self) -> rusqlite::Result<String> {
+            Connection::open(&self.path)?.query_row("SELECT body FROM notes", [], |row| row.get(0))
+        }
+    }
+
+    type Tried = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn a_conflict_kept_under_last_lands_and_its_next_copy_is_a_repeat() -> Tried {
+        let mut node = Node::new()?;
+        let f = hash(&row("f", "1"));
+        node.edit_here("mine", "2")?;
+        let theirs = node.signed(Some(f), row("theirs", "3"));
+
+        let applied = node.take(std::slice::from_ref(&theirs))?;
+        assert_eq!(applied.wrote, [theirs.signature]);
+        assert_eq!(applied.waiting.len(), 0);
+        assert_eq!(node.body()?, "theirs");
+
+        let again = node.take(std::slice::from_ref(&theirs))?;
+        assert_eq!(again.has, [theirs.signature]);
+        assert_eq!(again.wrote.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_conflict_not_further_on_leaves_the_row_here() -> Tried {
+        let mut node = Node::new()?;
+        let f = hash(&row("f", "1"));
+        node.edit_here("mine", "3")?;
+        let theirs = node.signed(Some(f), row("theirs", "2"));
+
+        let applied = node.take(std::slice::from_ref(&theirs))?;
+        assert_eq!(applied.has, [theirs.signature]);
+        assert_eq!(applied.wrote.len(), 0);
+        assert_eq!(applied.waiting.len(), 0);
+        assert_eq!(node.body()?, "mine");
+        Ok(())
+    }
+
+    #[test]
+    fn a_kept_conflict_then_its_next_change_in_one_burst_both_land() -> Tried {
+        let mut node = Node::new()?;
+        let f = hash(&row("f", "1"));
+        node.edit_here("mine", "2")?;
+        let first = node.signed(Some(f), row("first", "3"));
+        let second = node.signed(first.change.to, row("second", "4"));
+
+        let applied = node.take(&[first.clone(), second.clone()])?;
+        assert_eq!(applied.wrote, [first.signature, second.signature]);
+        assert_eq!(applied.waiting.len(), 0);
+        assert_eq!(node.body()?, "second");
+        Ok(())
+    }
+
+    #[test]
+    fn a_row_that_moved_since_it_was_read_is_held_not_overwritten() -> Tried {
+        let mut node = Node::new()?;
+        let f = hash(&row("f", "1"));
+        node.edit_here("mine", "2")?;
+        let theirs = node.signed(Some(f), row("theirs", "3"));
+        // The guard the decision read, which a move since then no longer meets.
+        let stale = Some(hash(&row("gone", "9")));
+        let (mut applied, mut moves) = (Applied::default(), Vec::new());
+        node.local.write(
+            &mut node.place,
+            "notes",
+            &[(&theirs, stale)],
+            &mut applied,
+            &mut moves,
+        )?;
+        assert_eq!(applied.waiting.len(), 1);
+        assert_eq!(moves.len(), 0);
+        assert_eq!(node.body()?, "mine");
+        Ok(())
+    }
+
+    #[test]
+    fn only_a_keys_last_change_in_a_burst_should_read_back_as_its_to() -> Tried {
+        let node = Node::new()?;
+        let first = node.signed(None, row("first", "2"));
+        let second = node.signed(first.change.to, row("second", "3"));
+        let burst = [(&first, None), (&second, first.change.to)];
+        let key = vec![ID.to_owned()];
+        let landed = BTreeSet::from([key.clone()]);
+
+        let settled = HashMap::from([(key.clone(), hash(&row("second", "3")))]);
+        assert_eq!(misread(&burst, &landed, &settled).len(), 0);
+
+        let other = HashMap::from([(key, hash(&row("other", "4")))]);
+        let wrong: Vec<[u8; 32]> = misread(&burst, &landed, &other)
+            .iter()
+            .map(|envelope| envelope.signature)
+            .collect();
+        assert_eq!(wrong, [second.signature]);
+        Ok(())
+    }
 }
