@@ -804,7 +804,7 @@ mod tests {
     use smugglr_core::shape::Stamp;
     use smugglr_core::steering::Steering;
     use smugglr_memory::Files;
-    use smugglr_place::{LocalFile, Place};
+    use smugglr_place::LocalFile;
 
     use super::{Applied, Local, misread, stamp};
     use crate::{BACKPRESSURE, Error, K, Settings};
