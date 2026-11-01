@@ -67,6 +67,13 @@ const ANNOUNCE: Duration = Duration::from_secs(10);
 /// A peer heard within this long is awake: three of its announcements.
 const HEARD_WITHIN: Duration = Duration::from_secs(30);
 
+/// A peer that owes acknowledgements and has given none for this long is
+/// named in the record.
+const SILENCE: Duration = Duration::from_secs(5 * 60);
+
+/// How often the record names a peer while its silence lasts.
+const SAY_SILENCE: Duration = Duration::from_secs(10 * 60);
+
 /// How often at most the record names resends, or datagrams that did not
 /// open.
 const SAY_EVERY: Duration = Duration::from_secs(60);
@@ -175,6 +182,7 @@ pub fn run(place: &mut dyn Place, settings: &Settings, stop: &AtomicBool) -> Res
         counted: Instant::now(),
         addresses: HashMap::new(),
         heard_at: HashMap::new(),
+        silent: HashMap::new(),
         keys: HashMap::new(),
         own: own_address(settings.port).into_iter().collect(),
         heard: HashMap::new(),
@@ -238,6 +246,26 @@ fn bind(port: u16) -> std::io::Result<UdpSocket> {
     let socket: UdpSocket = socket.into();
     socket.set_read_timeout(Some(TICK))?;
     Ok(socket)
+}
+
+/// Whether the record should name a peer silent for `quiet`, last named
+/// `said` ago.
+fn silence_due(quiet: Duration, said: Option<Duration>) -> bool {
+    quiet >= SILENCE && said.is_none_or(|said| said >= SAY_SILENCE)
+}
+
+/// The record's line for a silent peer. `heard` is how long ago it last sent
+/// anything: a peer still heard is holding changes, one not heard is away.
+fn silence_line(peer: &str, quiet: Duration, count: usize, heard: Option<Duration>) -> String {
+    let changes = if count == 1 { "change" } else { "changes" };
+    let heard = heard.map_or_else(
+        || "not heard since this node started".to_owned(),
+        |heard| format!("last heard {} ago", span(heard.as_secs())),
+    );
+    format!(
+        "smugglr mesh: {peer} has acknowledged nothing for {}; {count} {changes} owed to it, {heard}",
+        span(quiet.as_secs())
+    )
 }
 
 /// A change this node has heard.
@@ -332,6 +360,9 @@ struct Node<'a> {
     addresses: HashMap<String, SocketAddr>,
     /// When each peer was last heard, by anything it sent.
     heard_at: HashMap<String, Instant>,
+    /// Each peer the record has named as silent: since when, and when it
+    /// last said so.
+    silent: HashMap<String, (Instant, Instant)>,
     /// Which sealing key opened each peer's last datagram.
     keys: HashMap<String, usize>,
     /// This machine's addresses, as the node's own broadcasts come from.
@@ -435,6 +466,7 @@ impl Node<'_> {
             self.said_unopened = Some(Instant::now());
         }
         if self.announced.is_none_or(|at| at.elapsed() >= ANNOUNCE) {
+            self.say_silence(Instant::now());
             self.announce();
         }
         if self.tidied.elapsed() >= TIDY {
@@ -833,6 +865,12 @@ impl Node<'_> {
     /// on a first acknowledgement; the peer's round trip is measured, and a
     /// round trip far beyond it is acknowledgements slowing.
     fn acked(&mut self, peer: &str, acked: Acked) {
+        if let Some((since, _)) = self.silent.remove(peer) {
+            println!(
+                "smugglr mesh: {peer} is acknowledging again after {}",
+                span(since.elapsed().as_secs())
+            );
+        }
         if acked.first {
             self.window.acked();
         }
@@ -1110,6 +1148,34 @@ impl Node<'_> {
         Ok(Some((resent, changes)))
     }
 
+    /// Names each peer that owes acknowledgements and has given none for
+    /// [`SILENCE`], at most every [`SAY_SILENCE`] while that lasts.
+    fn say_silence(&mut self, now: Instant) {
+        let peers: Vec<String> = self.peers.iter().cloned().collect();
+        for peer in peers {
+            let Some((count, oldest)) = self.outbox.owed(&peer) else {
+                self.silent.remove(&peer);
+                continue;
+            };
+            let since = self
+                .timing
+                .get(&peer)
+                .map_or(oldest, |timing| timing.last_ack.max(oldest));
+            let said = self.silent.get(&peer).map(|(_, said)| *said);
+            if silence_due(
+                now.duration_since(since),
+                said.map(|at| now.duration_since(at)),
+            ) {
+                let heard = self.heard_at.get(&peer).map(|at| now.duration_since(*at));
+                println!(
+                    "{}",
+                    silence_line(&peer, now.duration_since(since), count, heard)
+                );
+                self.silent.insert(peer, (since, now));
+            }
+        }
+    }
+
     /// Notes `changes` resent, and says so at most once a minute.
     fn say_resent(&mut self, changes: usize, instant: Instant) {
         self.resent_unsaid += changes;
@@ -1258,8 +1324,34 @@ fn echo_wait() -> Duration {
 mod tests {
     use std::collections::BTreeSet;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::time::Duration;
 
-    use super::{span, unicast};
+    use super::{SAY_SILENCE, SILENCE, silence_due, silence_line, span, unicast};
+
+    #[test]
+    fn a_peer_is_named_after_the_silence_and_then_only_at_a_slow_rate() {
+        let second = Duration::from_secs(1);
+        assert!(!silence_due(SILENCE.saturating_sub(second), None));
+        assert!(silence_due(SILENCE, None));
+        assert!(!silence_due(
+            SILENCE * 2,
+            Some(SAY_SILENCE.saturating_sub(second))
+        ));
+        assert!(silence_due(SILENCE * 2, Some(SAY_SILENCE)));
+    }
+
+    #[test]
+    fn the_silence_line_names_the_peer_how_long_and_how_many() {
+        let hour = Duration::from_secs(3_600);
+        assert_eq!(
+            silence_line("rzr", hour * 32, 32, Some(Duration::from_secs(4))),
+            "smugglr mesh: rzr has acknowledged nothing for 1 day; 32 changes owed to it, last heard 4 seconds ago"
+        );
+        assert_eq!(
+            silence_line("rzr", hour, 1, None),
+            "smugglr mesh: rzr has acknowledged nothing for 1 hour; 1 change owed to it, not heard since this node started"
+        );
+    }
 
     #[test]
     fn a_span_reads_in_its_largest_whole_unit() {
