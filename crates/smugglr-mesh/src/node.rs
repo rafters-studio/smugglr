@@ -922,6 +922,12 @@ impl Node<'_> {
             self.ask_on_joining = false;
             self.ask(None)?;
         }
+        // With a stash on its way the rows here are about to change: answered
+        // now, an empty row settles a delete the stash then undoes. The asker
+        // says each part again until it is answered.
+        if self.stashes.on_its_way() {
+            self.wazzups.clear();
+        }
         for wazzup in std::mem::take(&mut self.wazzups) {
             self.answer_wazzup(place, wazzup)?;
         }
