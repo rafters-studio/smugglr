@@ -128,7 +128,7 @@ A node decides each envelope in this order, the same order `smugglr-core` uses f
 6. The change's `to` is the `from` of the last change applied to this key: the row has already moved past it, so it is skipped, not held. Without this rule, a late copy that arrived after the row moved on would wait forever.
 7. Otherwise hold it until its `from` appears or its sunset passes. A held change dropped at its sunset is named in the record.
 
-A conflict follows `--sync-mode`: `stop` (the default) names the row; `last` keeps the copy whose steering column is further on.
+A conflict follows `--sync-mode`: `stop` (the default) names the row; `last` keeps the copy whose steering column is further on. A kept copy is written over the row here, so the write is guarded on the row as the node read it, not on the change's `from`. A row that moves after that read is held and decided again.
 
 A change past its sunset is ignored on arrival.
 
