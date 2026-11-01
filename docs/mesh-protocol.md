@@ -29,7 +29,7 @@ Scope: designed and tested for up to 50 nodes. Acknowledgements grow with the no
 | `peers` | config | none | hosts to announce to on a network with no broadcast: `host` or `host:port`, the mesh port when none is given, a name looked up again at each announcement |
 | `backpressure` | config | 6 MB | the most the outbox holds, in bytes or text such as `"6 MB"` |
 | `graveyard` | config | 12 hours | seconds a change is carried; sets each sunset |
-| `mesh_wire` | config | 8 MB | the line past which a waking node is told to catch up by stash then retrieve |
+| `mesh_wire` | config | 8 MB | the line past which a waking node catches up by a stash, which then travels past this line |
 
 `smugglr mesh ./node.db --key-file ./mesh.key` and `smugglr sync ./node.db --sync-type mesh --key-file ./mesh.key` are the same command and join the same mesh.
 
@@ -78,6 +78,8 @@ A message goes as one datagram and is never fragmented. An acknowledgement names
 | ack | receiver to maker, unicast | the maker's name and up to 14 change hashes |
 | wazzup | waking node | its last-seen time, and a batch of `(key, to)` for each of its own changes a peer has not acknowledged. Not built (#521) |
 | wazzup answer | each peer to the waking node | what changed since, or the too-much status; one line per listed key. Not built (#521) |
+| stash wanted, offer, accept, ready | a node that needs a stash and a peer that can make one | who it is for, an id, and the stash's size in bytes and parts |
+| stash part, stash have | the maker to the node, and back | one numbered part; what has arrived and what is missing |
 
 ## Finding peers
 
@@ -140,7 +142,7 @@ Every change a node drops is kept, envelope and values, in a dropped log in smug
 
 ## The record
 
-A node prints one line for each of these, to its standard output: it started (node, port and the `key_id` it signs with); a burst applied, with the count, the table, the makers and the keys; a change holding, with why; a change stopped or dropped, once however often a copy arrives; a send window halved, with why; changes that arrived only as a resend because the first copy was lost; changes resent that a peer had not acknowledged, at most once a minute, counting one for each time a change was resent since the last such line, so one change resent twice counts as two and the count is not of distinct changes or of datagrams; a peer that owes acknowledgements and has given none for 5 minutes, naming the peer, how long, how many changes and when it was last heard, repeated every 10 minutes while that lasts, and a line when it acknowledges again; a row too large for one datagram; a peer's rows that settle nothing about changes it has not acknowledged, grouped by peer; a peer saying there is too much for the wire, with how to catch up; a node taken off the mesh, or heard again after that; and a datagram that did not open. A taken name or a clash over the name goes to standard error as the node stops. A change refused for a key the node does not hold, or for a table whose shape differs here, goes to standard error.
+A node prints one line for each of these, to its standard output: it started (node, port and the `key_id` it signs with); a burst applied, with the count, the table, the makers and the keys; a change holding, with why; a change stopped or dropped, once however often a copy arrives; a send window halved, with why; changes that arrived only as a resend because the first copy was lost; changes resent that a peer had not acknowledged, at most once a minute, counting one for each time a change was resent since the last such line, so one change resent twice counts as two and the count is not of distinct changes or of datagrams; a peer that owes acknowledgements and has given none for 5 minutes, naming the peer, how long, how many changes and when it was last heard, repeated every 10 minutes while that lasts, and a line when it acknowledges again; a row too large for one datagram; a peer's rows that settle nothing about changes it has not acknowledged, grouped by peer; a peer saying there is too much for the wire, with the commands a person could use; a node taken off the mesh, or heard again after that; a stash given, taken, stopped or that did not check, and caught up by one; and a datagram that did not open. A taken name or a clash over the name goes to standard error as the node stops. A change refused for a key the node does not hold, or for a table whose shape differs here, goes to standard error.
 
 ## Waking
 
@@ -148,7 +150,7 @@ Every run a node notes when it last ran. A node that starts after being away lon
 
     smugglr mesh: this node has been away 3 days, longer than the sunset (12 hours); changes made meanwhile may not reach it. Catch up with: smugglr stash <a peer's place> <dir> --key-file <path> --node <name> --whole, then smugglr retrieve ./node.db <dir> --key-file <path> --node <name>
 
-Past the sunset the changes it missed are dead, so the person catches up with stash then retrieve, and the node's next start says wazzup.
+Past the sunset the changes it missed are dead, so it catches up by a stash from a peer, as below; a person can also run the two commands.
 
 A node inside the sunset catches up by wazzup (FR-SMUGGLR-079):
 
@@ -158,7 +160,7 @@ A node inside the sunset catches up by wazzup (FR-SMUGGLR-079):
 - A node that names a peer as having stopped acknowledging, and still hears it, says the same check to that peer, so a change held on a running node is settled with nobody watching.
 - A node back past the sunset does not ask for changes: it names every own change not acknowledged, grouped by peer, and the record says how to catch up.
 
-**Specified, not built (#521).** FR-SMUGGLR-079 has the first awake, up-to-date node that hears a sleeper make the stash, and the sleeper retrieve it. Nothing yet carries that stash between nodes, so a person runs the two commands the record names.
+A node that needs a stash, because it came back past the sunset or a peer said too much, says so. The first awake, up-to-date node that hears it offers one, and makes it once the offer is taken up: a whole stash of its database, signed. The stash travels over the mesh itself, as numbered sealed parts of one datagram each, paced by a window that grows while nothing is lost and halves when something is, with the receiver saying what it has and what it misses, and only what it misses resent. No new port or firewall rule is needed, so it works wherever the mesh does; `mesh_wire` decides that a node catches up this way, not how much the catch-up may carry. The node checks the stash's signature, retrieves it, and says wazzup for what changed since. A row not changed here since the node last noted it takes the stash's copy, so a row deleted elsewhere does not come back; a row changed here goes through `--sync-mode`, and if it stays different it goes out as the node's own change. The node holds a stash in memory while it travels, on both sides.
 
 ## Leaving
 

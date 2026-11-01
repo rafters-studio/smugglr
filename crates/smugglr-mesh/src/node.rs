@@ -37,6 +37,7 @@ use smugglr_core::row_hash::row_hash;
 use smugglr_place::Place;
 use socket2::{Domain, Protocol, Socket, Type};
 
+use crate::catch_up::{GIVE_UP, Giving, Taking, WANT_AGAIN};
 use crate::local::{Local, limit, refuse};
 use crate::named::{keep_resolved, literal, resolve_now};
 use crate::outbox::{Acked, Outbox, Timing};
@@ -248,6 +249,10 @@ pub fn run(place: &mut dyn Place, settings: &Settings, stop: &AtomicBool) -> Res
         wazzups: Vec::new(),
         answers: Vec::new(),
         woken_by: HashMap::new(),
+        stashes: Stashes {
+            wants: past_sunset,
+            ..Stashes::default()
+        },
         told_too_much: BTreeSet::new(),
         removed,
         removed_file,
@@ -275,10 +280,7 @@ pub fn run(place: &mut dyn Place, settings: &Settings, stop: &AtomicBool) -> Res
     };
     let (tx, rx) = mpsc::channel();
     let reading = AtomicBool::new(true);
-    let resolving = Arc::new(AtomicBool::new(true));
-    if !settings.peers.is_empty() {
-        keep_resolved(settings.peers.clone(), named, resolving.clone(), ANNOUNCE);
-    }
+    let resolving = start_resolving(settings, named);
     let mut ended = Ok(());
     std::thread::scope(|scope| {
         scope.spawn(|| {
@@ -331,6 +333,16 @@ fn bind(port: u16) -> std::io::Result<UdpSocket> {
     Ok(socket)
 }
 
+/// Starts keeping the peers setting's names resolved in `named`, until the
+/// flag it gives turns false.
+fn start_resolving(settings: &Settings, named: Arc<Mutex<Vec<SocketAddr>>>) -> Arc<AtomicBool> {
+    let resolving = Arc::new(AtomicBool::new(true));
+    if !settings.peers.is_empty() {
+        keep_resolved(settings.peers.clone(), named, resolving.clone(), ANNOUNCE);
+    }
+    resolving
+}
+
 /// Whether this node comes back past the sunset; it says so, and how to catch
 /// up.
 fn say_if_past_sunset(settings: &Settings, ran: &str, place: &str) -> Result<bool, Error> {
@@ -371,6 +383,22 @@ fn removed_nodes(settings: &Settings, file: &str) -> Result<BTreeSet<String>, Er
         .read(file)?
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_default())
+}
+
+/// What a node is doing about stashes.
+#[derive(Debug, Default)]
+struct Stashes {
+    /// It needs one, and when it last said so.
+    wants: bool,
+    said_wanted: Option<Instant>,
+    /// The offer it took up and when, until the stash is ready.
+    accepted: Option<(String, u64, Instant)>,
+    /// What it offered each peer, and when.
+    offered: HashMap<String, (u64, Instant)>,
+    /// The stashes peers took up, to make where the database can be read.
+    to_give: Vec<(String, u64)>,
+    giving: Vec<Giving>,
+    taking: Option<Taking>,
 }
 
 /// One part of a peer's wazzup, to answer.
@@ -529,6 +557,8 @@ struct Node<'a> {
     /// The wazzup each peer last woke this node's resends with: its start,
     /// since ids begin again at each start, and its id.
     woken_by: HashMap<String, (u64, u64)>,
+    /// The stashes this node wants, is giving and is taking.
+    stashes: Stashes,
     /// The peers that have said too much, each named once.
     told_too_much: BTreeSet<String>,
     /// The nodes a person has taken off the mesh.
@@ -871,7 +901,269 @@ impl Node<'_> {
             self.take_answer(place, answer)?;
         }
         self.say_parts();
+        self.tend_stashes(place)
+    }
+
+    /// Takes a message about a stash.
+    fn hear_stash(&mut self, message: Message) {
+        match message {
+            Message::StashWanted { sender } => {
+                // Only a node that is itself up to date can help.
+                let able = !self.stashes.wants
+                    && self.stashes.taking.is_none()
+                    && Instant::now() >= self.joining_until;
+                let offered = self.stashes.offered.get(&sender);
+                if able && offered.is_none_or(|(_, at)| at.elapsed() >= WANT_AGAIN) {
+                    let id = OsRng.next_u64();
+                    self.stashes
+                        .offered
+                        .insert(sender.clone(), (id, Instant::now()));
+                    let offer = Message::StashOffer {
+                        sender: self.settings.node.clone(),
+                        to: sender.clone(),
+                        id,
+                    };
+                    let _ = self.send(&offer, self.address(&sender));
+                }
+            }
+            Message::StashOffer { sender, to, id } => {
+                if to == self.settings.node
+                    && self.stashes.wants
+                    && self.stashes.taking.is_none()
+                    && self.stashes.accepted.is_none()
+                {
+                    self.stashes.accepted = Some((sender.clone(), id, Instant::now()));
+                    let accept = Message::StashAccept {
+                        sender: self.settings.node.clone(),
+                        id,
+                    };
+                    let _ = self.send(&accept, self.address(&sender));
+                }
+            }
+            Message::StashAccept { sender, id } => {
+                if self
+                    .stashes
+                    .offered
+                    .get(&sender)
+                    .is_some_and(|(made, _)| *made == id)
+                    && !self.stashes.giving.iter().any(|giving| giving.id == id)
+                    && !self.stashes.to_give.iter().any(|(_, giving)| *giving == id)
+                {
+                    self.stashes.to_give.push((sender, id));
+                }
+            }
+            Message::StashReady {
+                sender,
+                id,
+                bytes,
+                count,
+            } => {
+                let ours = self
+                    .stashes
+                    .accepted
+                    .as_ref()
+                    .is_some_and(|(peer, accepted, _)| *peer == sender && *accepted == id);
+                if ours && self.stashes.taking.is_none() {
+                    println!("smugglr mesh: taking a stash of {bytes} bytes from {sender}");
+                    self.stashes.accepted = None;
+                    self.stashes.taking = Some(Taking::new(sender, id, bytes, count));
+                }
+            }
+            Message::StashPart { id, n, data, .. } => {
+                if let Some(taking) = self
+                    .stashes
+                    .taking
+                    .as_mut()
+                    .filter(|taking| taking.id == id)
+                {
+                    taking.take(n, &data);
+                }
+            }
+            Message::StashHave {
+                id, have, missing, ..
+            } => {
+                if let Some(giving) = self
+                    .stashes
+                    .giving
+                    .iter_mut()
+                    .find(|giving| giving.id == id)
+                {
+                    giving.heard(have, &missing);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A stash's work on each turn: asking for one, making those taken up,
+    /// sending what is due, and taking in one that has arrived.
+    fn tend_stashes(&mut self, place: &mut dyn Place) -> Result<(), Error> {
+        self.ask_for_stash();
+        for (peer, id) in std::mem::take(&mut self.stashes.to_give) {
+            let bytes = self.make_stash(place)?;
+            println!(
+                "smugglr mesh: giving {peer} a stash of {} bytes",
+                bytes.len()
+            );
+            self.stashes.giving.push(Giving::new(peer, id, bytes));
+        }
+        self.send_stashes()?;
+        if let Some(taking) = self.stashes.taking.as_mut()
+            && let Some((have, missing)) = taking.report_due()
+        {
+            let report = Message::StashHave {
+                sender: self.settings.node.clone(),
+                id: taking.id,
+                have,
+                missing,
+            };
+            let peer = taking.peer.clone();
+            let _ = self.send(&report, self.address(&peer));
+        }
+        let arrived = self
+            .stashes
+            .taking
+            .as_ref()
+            .and_then(|taking| taking.whole().map(<[u8]>::to_vec));
+        if let Some(bytes) = arrived {
+            let peer = self
+                .stashes
+                .taking
+                .as_ref()
+                .map(|taking| taking.peer.clone());
+            self.take_stash(place, &bytes, peer.as_deref().unwrap_or_default())?;
+            self.stashes.taking = None;
+        } else if self.stashes.taking.as_ref().is_some_and(Taking::gone_quiet) {
+            println!("smugglr mesh: a stash stopped arriving; asking again");
+            self.stashes.taking = None;
+        }
         Ok(())
+    }
+
+    /// Says this node needs a stash, while it does and nothing is on its way.
+    fn ask_for_stash(&mut self) {
+        if self
+            .stashes
+            .accepted
+            .as_ref()
+            .is_some_and(|(_, _, at)| at.elapsed() >= GIVE_UP)
+        {
+            self.stashes.accepted = None;
+        }
+        let waiting = self.stashes.taking.is_some() || self.stashes.accepted.is_some();
+        if !self.stashes.wants
+            || waiting
+            || self
+                .stashes
+                .said_wanted
+                .is_some_and(|at| at.elapsed() < WANT_AGAIN)
+        {
+            return;
+        }
+        self.stashes.said_wanted = Some(Instant::now());
+        let wanted = Message::StashWanted {
+            sender: self.settings.node.clone(),
+        };
+        // A lost one is said again.
+        let _ = self.send(&wanted, (self.to, 0));
+        for peer in self.named_addresses() {
+            let _ = self.send(&wanted, (peer, 0));
+        }
+        for peer in &self.peers {
+            let _ = self.send(&wanted, self.address(peer));
+        }
+    }
+
+    /// How a stash here is made and taken: multi's own rules.
+    fn multi_settings(&self, key: [u8; 32]) -> smugglr_multi::Settings {
+        smugglr_multi::Settings {
+            store: self.settings.store.clone(),
+            key,
+            node: self.settings.node.clone(),
+            targets: Vec::new(),
+            graveyard: self.settings.graveyard,
+            now: now(),
+            sync_mode: self.settings.sync_mode,
+            steering: self.settings.steering.clone(),
+            ignore: self.settings.ignore.clone(),
+        }
+    }
+
+    /// The text of a whole stash of this node's database.
+    fn make_stash(&self, place: &mut dyn Place) -> Result<Vec<u8>, Error> {
+        let settings = self.multi_settings(self.sign[0]);
+        let blob = smugglr_multi::stash(place, &settings, true, |_| Ok(()))
+            .map_err(|err| Error::Shape(err.to_string()))?;
+        Ok(blob.to_json().into_bytes())
+    }
+
+    /// Sends each stash what is due; one the peer has whole ends with a check
+    /// on what that peer is owed, since its rows have just changed.
+    fn send_stashes(&mut self) -> Result<(), Error> {
+        let mut giving = std::mem::take(&mut self.stashes.giving);
+        let mut done = Vec::new();
+        giving.retain_mut(|stash| {
+            if stash.ready_due() {
+                let ready = Message::StashReady {
+                    sender: self.settings.node.clone(),
+                    id: stash.id,
+                    bytes: stash.len(),
+                    count: stash.count(),
+                };
+                let _ = self.send(&ready, self.address(&stash.peer));
+            }
+            let to = self.address(&stash.peer);
+            for n in stash.due(PER_TICK) {
+                let part = Message::StashPart {
+                    sender: self.settings.node.clone(),
+                    id: stash.id,
+                    n,
+                    data: stash.part(n).to_vec(),
+                };
+                let _ = self.send(&part, to);
+            }
+            if stash.done() {
+                done.push(stash.peer.clone());
+                return false;
+            }
+            !stash.gone_quiet()
+        });
+        self.stashes.giving.append(&mut giving);
+        for peer in done {
+            println!("smugglr mesh: {peer} has its stash");
+            self.ask(Some(peer))?;
+        }
+        Ok(())
+    }
+
+    /// Takes a stash that has arrived whole: checks its maker's signature,
+    /// retrieves it, notes what that left, then says wazzup for what changed
+    /// since it was made.
+    fn take_stash(&mut self, place: &mut dyn Place, bytes: &[u8], peer: &str) -> Result<(), Error> {
+        let blob = std::str::from_utf8(bytes)
+            .ok()
+            .and_then(smugglr_multi::Blob::from_json);
+        let signed = blob
+            .as_ref()
+            .and_then(|blob| self.sign.iter().find(|key| blob.verify(key)).copied());
+        let (Some(blob), Some(key)) = (blob, signed) else {
+            println!("smugglr mesh: the stash from {peer} does not check; asking again");
+            return Ok(());
+        };
+        self.local
+            .note_for_retrieve(&*self.settings.store, place.address(), now())?;
+        let settings = self.multi_settings(key);
+        let record = smugglr_multi::retrieve(place, std::slice::from_ref(&blob), &settings, &[])
+            .map_err(|err| Error::Shape(err.to_string()))?;
+        self.local.took_stash(place, &blob)?;
+        self.stashes.wants = false;
+        self.since = now();
+        println!(
+            "smugglr mesh: caught up by a stash from {peer}: {} rows, retrieve {:?}",
+            blob.changes.len(),
+            record.status
+        );
+        self.ask(None)
     }
 
     /// Begins a wazzup about the changes owed: to `only`, or to every peer.
@@ -1051,6 +1343,7 @@ impl Node<'_> {
         if !self.told_too_much.insert(peer.to_owned()) {
             return Ok(());
         }
+        self.stashes.wants = true;
         println!(
             "smugglr mesh: {peer} says there is too much for the wire. Catch up with: smugglr \
              stash <a peer's place> <dir> --key-file <path> --node <name> --whole, then smugglr \
@@ -1192,6 +1485,12 @@ impl Node<'_> {
         self.note_sender(&sender, &message, from);
         match message {
             Message::Announce { .. } | Message::NameTaken { .. } | Message::Remove { .. } => {}
+            message @ (Message::StashWanted { .. }
+            | Message::StashOffer { .. }
+            | Message::StashAccept { .. }
+            | Message::StashReady { .. }
+            | Message::StashPart { .. }
+            | Message::StashHave { .. }) => self.hear_stash(message),
             message @ (Message::Wazzup { .. } | Message::Answer { .. }) => self.queue(message),
             Message::Part {
                 sender,

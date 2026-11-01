@@ -34,6 +34,7 @@
 //! the shared key, so one key never serves two jobs. No key is ever
 //! written out; a key is named only by its `key_id`.
 
+mod catch_up;
 mod local;
 mod named;
 mod node;
