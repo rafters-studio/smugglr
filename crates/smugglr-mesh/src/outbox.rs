@@ -46,6 +46,10 @@ const SHORTEST: Duration = Duration::from_millis(50);
 /// is repaired well within a second on a local network (FR-SMUGGLR-078).
 const LONGEST: Duration = Duration::from_millis(300);
 
+/// A change sent this long ago, to peers still being heard, is taken as held
+/// and leaves the window: a peer that is merely slow answers well within it.
+const HELD_PAST: Duration = Duration::from_secs(30);
+
 /// The acks file is rewritten only once it holds at least this many bytes.
 const COMPACT: u64 = 64 * 1024;
 
@@ -335,11 +339,20 @@ impl Outbox {
         self.unsent.len()
     }
 
-    /// How many changes have been sent and acknowledged by no peer yet.
-    pub(crate) fn in_flight(&self) -> usize {
+    /// How many changes have been sent and acknowledged by no peer yet, less
+    /// those past [`HELD_PAST`] whose every target `heard` says is still
+    /// being heard: those peers are holding them, so changes behind them can
+    /// go. A sleeper is not heard, so its changes go on counting.
+    pub(crate) fn in_flight(&self, now: Instant, heard: impl Fn(&str) -> bool) -> usize {
         self.entries
             .values()
             .filter(|entry| entry.sent && entry.acked.is_empty())
+            .filter(|entry| {
+                let held = now.duration_since(entry.sent_at) >= HELD_PAST
+                    && !entry.targets.is_empty()
+                    && entry.targets.iter().all(|peer| heard(peer));
+                !held
+            })
             .count()
     }
 
@@ -666,7 +679,7 @@ mod tests {
     use smugglr_core::shape::Stamp;
     use smugglr_memory::Files;
 
-    use super::{LAST_RESEND, LONGEST, Outbox, Timing};
+    use super::{HELD_PAST, LAST_RESEND, LONGEST, Outbox, Timing};
 
     const PEER: &str = "peer";
 
@@ -782,6 +795,41 @@ mod tests {
         timing.insert("other".to_owned(), timing[PEER]);
         let due = outbox.resends(at, &timing, 10, |_, _| false)?;
         assert_eq!(due[0].1, ["other"]);
+        Ok(())
+    }
+
+    #[test]
+    fn changes_a_heard_peer_has_held_past_the_age_leave_the_window()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let outbox = sent("held", 4)?;
+        let now = Instant::now();
+        assert_eq!(outbox.in_flight(now, |_| true), 4);
+        let later = now + HELD_PAST;
+        assert_eq!(outbox.in_flight(later, |_| true), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn changes_to_a_peer_no_longer_heard_stay_in_the_window()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let outbox = sent("asleep", 4)?;
+        let later = Instant::now() + HELD_PAST;
+        assert_eq!(outbox.in_flight(later, |_| false), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn a_change_owed_to_no_peer_yet_stays_in_the_window() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let dir = std::env::temp_dir().join(format!(
+            "smugglr-mesh-outbox-{}-no-peer",
+            std::process::id()
+        ));
+        let mut outbox = Outbox::open(Arc::new(Files::new(dir)), "outbox", 0)?;
+        outbox.add(&[envelope(1)], &BTreeSet::new())?;
+        outbox.first_sends(1)?;
+        let later = Instant::now() + HELD_PAST;
+        assert_eq!(outbox.in_flight(later, |_| true), 1);
         Ok(())
     }
 
