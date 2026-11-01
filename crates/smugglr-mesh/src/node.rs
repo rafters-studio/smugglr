@@ -64,6 +64,9 @@ const LARGEST: f64 = 1_000.0;
 /// started since, learns its address.
 const ANNOUNCE: Duration = Duration::from_secs(10);
 
+/// A peer heard within this long is awake: three of its announcements.
+const HEARD_WITHIN: Duration = Duration::from_secs(30);
+
 /// How often at most the record names resends, or datagrams that did not
 /// open.
 const SAY_EVERY: Duration = Duration::from_secs(60);
@@ -171,6 +174,7 @@ pub fn run(place: &mut dyn Place, settings: &Settings, stop: &AtomicBool) -> Res
         resent: std::cell::Cell::new(0),
         counted: Instant::now(),
         addresses: HashMap::new(),
+        heard_at: HashMap::new(),
         keys: HashMap::new(),
         own: own_address(settings.port).into_iter().collect(),
         heard: HashMap::new(),
@@ -326,6 +330,8 @@ struct Node<'a> {
     counted: Instant,
     /// Each peer's address, as its last datagram came from.
     addresses: HashMap<String, SocketAddr>,
+    /// When each peer was last heard, by anything it sent.
+    heard_at: HashMap<String, Instant>,
     /// Which sealing key opened each peer's last datagram.
     keys: HashMap<String, usize>,
     /// This machine's addresses, as the node's own broadcasts come from.
@@ -567,6 +573,7 @@ impl Node<'_> {
             self.own.insert(from.ip());
             return;
         }
+        self.heard_at.insert(sender.clone(), Instant::now());
         let moved = self.addresses.insert(sender.clone(), from) != Some(from);
         if moved && matches!(message, Message::Announce { .. }) {
             // A peer heard for the first time, or at a new address, hears
@@ -966,12 +973,22 @@ impl Node<'_> {
         Ok(())
     }
 
+    /// How many of the node's changes hold a place in the window.
+    fn in_flight(&self) -> usize {
+        let now = Instant::now();
+        self.outbox.in_flight(now, |peer| {
+            self.heard_at
+                .get(peer)
+                .is_some_and(|at| now.duration_since(*at) < HEARD_WITHIN)
+        })
+    }
+
     /// How many first sends, of changes or parts, the window has room for,
     /// `sent` datagrams already gone this tick.
     fn room(&self, sent: usize) -> usize {
         self.window
             .whole()
-            .saturating_sub(self.outbox.in_flight() + self.sending.in_flight())
+            .saturating_sub(self.in_flight() + self.sending.in_flight())
             .min(PER_TICK.saturating_sub(sent))
     }
 
