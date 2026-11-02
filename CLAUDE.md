@@ -26,3 +26,17 @@ Acceptance criteria are Gherkin scenarios, one per criterion, tagged
   `.feature` file. Each crate with a runner has a `build.rs` that prints
   `cargo::rerun-if-changed=tests`, so adding or removing a file rebuilds the
   runner. A new crate's runner needs the same `build.rs`.
+
+## Merging
+
+The merge queue does not wait for the test jobs: its required checks are only the fast ones, so a PR can merge with its tests still running, and main goes red after. Before `legion pr merge`, run `gh pr checks <n>` and enqueue only when `test (ubuntu-latest)`, `test (macos-latest)` and `test (windows-latest)` have passed on the PR's head.
+
+The scenario `the mesh port is a setting` fails on a machine where another program holds UDP 31337, until #605. That is not your change.
+
+## Traces
+
+A defect's issue traces to a requirement with the criteria it serves, `- FR-SMUGGLR-078 [criteria: <id>, <id>]`, so `legion verify` judges only those; a bare trace asks for every criterion of the requirement. The ids are under `verification.criteria` in `legion document view <id> --json`, not at the top of the document. With none that fit, use `- None -- <why>` and verify against the issue's own criteria.
+
+## The mesh sweep
+
+A change to how a mesh node decides, settles, resends or catches up runs `xtask/sweep` before its PR, and the PR carries the table. Silent rows and rows back must be 0. See xtask/sweep/README.md. Two-node tests do not find what it finds.
