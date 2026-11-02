@@ -317,12 +317,12 @@ fn a_node_that_wakes_a_second_time_is_answered_at_once_too() -> Tried {
 }
 
 #[test]
-fn a_peer_owing_more_than_the_wire_says_so_and_how_to_catch_up() -> Tried {
+fn a_node_told_too_much_catches_up_by_a_stash_over_the_mesh() -> Tried {
     let (root, key, mut first, second) = two_running("too-much", "mesh_wire = 1000\n")?;
     first.stop()?;
     let mut connection = Connection::open(&second.db)?;
     let add = connection.transaction()?;
-    for row in 0..200 {
+    for row in 0..2_000 {
         add.execute(
             "INSERT INTO notes VALUES (?1, 'too many for the wire', '2026-05-01')",
             [format!("m{row:05}")],
@@ -331,13 +331,109 @@ fn a_peer_owing_more_than_the_wire_says_so_and_how_to_catch_up() -> Tried {
     add.commit()?;
     sleep(Duration::from_secs(2));
     first.start(&key)?;
-    let said = soon(Duration::from_secs(10), || {
-        Ok(first
-            .printed()
-            .contains("says there is too much for the wire"))
+    let caught_up = soon(Duration::from_secs(30), || {
+        Ok(first.printed().contains("caught up by a stash"))
     })?;
-    assert!(said, "{}", first.printed());
-    assert!(first.printed().contains("smugglr retrieve") || first.printed().contains("retrieve "));
+    assert!(caught_up, "{}", first.printed());
+    assert!(
+        first
+            .printed()
+            .contains("says there is too much for the wire")
+    );
+    let same = soon(Duration::from_secs(20), || {
+        Ok(first.rows()? == second.rows()?)
+    })?;
+    assert!(same, "{}\n{}", first.printed(), second.printed());
+    // What it took is not sent back as its own changes, and the peer's
+    // changes settle against the rows that now agree.
+    let drained = soon(Duration::from_secs(30), || {
+        Ok(first.outbox_segments()? == 0 && second.outbox_segments()? == 0)
+    })?;
+    assert!(
+        drained,
+        "outboxes {} and {}\n{}\n{}",
+        first.outbox_segments()?,
+        second.outbox_segments()?,
+        first.printed(),
+        second.printed()
+    );
+    let _ = fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn a_database_over_the_line_offers_no_stash_and_says_so() -> Tried {
+    let (root, key, mut first, second) =
+        two_running("over-the-line", "mesh_wire = 1000\nstash_max = 1000\n")?;
+    first.stop()?;
+    let mut connection = Connection::open(&second.db)?;
+    let add = connection.transaction()?;
+    for row in 0..500 {
+        add.execute(
+            "INSERT INTO notes VALUES (?1, 'too many for the wire', '2026-05-01')",
+            [format!("m{row:05}")],
+        )?;
+    }
+    add.commit()?;
+    sleep(Duration::from_secs(2));
+    first.start(&key)?;
+    let said = soon(Duration::from_secs(15), || {
+        Ok(second.printed().contains("over stash_max"))
+    })?;
+    assert!(said, "{}\n{}", first.printed(), second.printed());
+    assert!(!second.printed().contains("giving first a stash"));
+    let _ = fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn a_node_back_past_the_sunset_catches_up_and_keeps_its_own_edit() -> Tried {
+    let (root, key, mut first, second) = two_running("sunset", "")?;
+    let config = first.dir.join("config/smugglr/config.toml");
+    let text = fs::read_to_string(&config)?.replace("graveyard = 3600", "graveyard = 4");
+    fs::write(config, text)?;
+    first.stop()?;
+    // Edited here while away, further on than anything: it must survive. Left
+    // alone here and deleted there: it must not come back.
+    edit(&first.db, 0..1, "kept here", "2026-09-01")?;
+    // Deleted here while away: it must stay deleted, here and there.
+    Connection::open(&first.db)?.execute("DELETE FROM notes WHERE id = 'r00003'", [])?;
+    edit(&second.db, 1..2, "edited there", "2026-05-01")?;
+    Connection::open(&second.db)?.execute("DELETE FROM notes WHERE id = 'r00002'", [])?;
+    Connection::open(&second.db)?.execute(
+        "INSERT INTO notes VALUES ('there', 'new there', '2026-05-01')",
+        [],
+    )?;
+    sleep(Duration::from_secs(6));
+    first.start(&key)?;
+    let caught_up = soon(Duration::from_secs(30), || {
+        Ok(first.printed().contains("caught up by a stash"))
+    })?;
+    assert!(caught_up, "{}\n{}", first.printed(), second.printed());
+    assert!(first.printed().contains("longer than the sunset"));
+    let settled = soon(Duration::from_secs(30), || {
+        let (here, there) = (first.rows()?, second.rows()?);
+        Ok(here == there
+            && here
+                .get("r00000")
+                .is_some_and(|(body, _)| body == "kept here"))
+    })?;
+    let (here, there) = (first.rows()?, second.rows()?);
+    assert!(
+        settled,
+        "r00000 here {:?} there {:?}\n{}\n{}",
+        here.get("r00000"),
+        there.get("r00000"),
+        first.printed(),
+        second.printed()
+    );
+    assert_eq!(
+        here.get("r00001").map(|(body, _)| body.as_str()),
+        Some("edited there")
+    );
+    assert!(here.contains_key("there"));
+    assert!(!here.contains_key("r00002"), "a deleted row came back");
+    assert!(!here.contains_key("r00003"), "a row deleted here came back");
     let _ = fs::remove_dir_all(&root);
     Ok(())
 }

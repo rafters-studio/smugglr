@@ -19,7 +19,7 @@ use smugglr::Config;
 use smugglr_core::envelope::GRAVEYARD;
 use smugglr_core::plan::SyncMode;
 use smugglr_core::weight::DEFAULT_MAX_VALUE;
-use smugglr_mesh::{BACKPRESSURE, K, MESH_WIRE, PORT, Settings, key_id, new_key};
+use smugglr_mesh::{BACKPRESSURE, K, MESH_WIRE, PORT, STASH_MAX, Settings, key_id, new_key};
 
 use crate::cli::{STOPPED, USAGE};
 
@@ -197,6 +197,7 @@ fn parse(args: &[String]) -> Result<(String, Settings, Option<String>), Refusal>
             backpressure: config.backpressure.unwrap_or(BACKPRESSURE),
             max_value: config.max_value.unwrap_or(DEFAULT_MAX_VALUE),
             mesh_wire: config.mesh_wire.unwrap_or(MESH_WIRE),
+            stash_max: config.stash_max.unwrap_or(STASH_MAX),
             peers: peers(&config.peers, config.port.unwrap_or(PORT)),
         },
         replay,

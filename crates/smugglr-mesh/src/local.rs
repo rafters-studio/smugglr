@@ -442,6 +442,91 @@ impl Local {
         Ok(here)
     }
 
+    /// Tells multi what this node last noted, as if it were a device's last
+    /// stash: a mesh node never stashes, and a retrieve takes a whole blob's
+    /// copy of each row not changed since, so a row deleted elsewhere does not
+    /// come back and a row edited here goes through `--sync-mode`. A row with a
+    /// change in `owed`, oldest first, counts as changed here, from before
+    /// that change: nobody may have it yet, so a stash must not overwrite it.
+    pub(crate) fn note_for_retrieve(
+        &self,
+        store: &dyn Store,
+        address: &str,
+        now: u64,
+        owed: &[Envelope],
+    ) -> Result<(), Error> {
+        let mut device = smugglr_memory::Device::open(store, address)?;
+        device.stashed = true;
+        device.baseline.clone_from(&self.baseline);
+        let mut seen = HashSet::new();
+        for envelope in owed {
+            let change = &envelope.change;
+            if !seen.insert((change.table.clone(), change.key.clone())) {
+                continue;
+            }
+            let noted = device.baseline.entry(change.table.clone()).or_default();
+            match change.from {
+                Some(from) => drop(noted.insert(change.key.clone(), from)),
+                None => drop(noted.remove(&change.key)),
+            }
+        }
+        device.save(store, now)?;
+        Ok(())
+    }
+
+    /// The delete envelopes still inside their sunset, which a stash carries so
+    /// a node taking it holds their tombstones: a late insert of one of those
+    /// keys must not bring the row back there.
+    pub(crate) fn live_tombstones(&self, now: u64) -> Vec<Envelope> {
+        self.tombstones
+            .values()
+            .filter(|tombstone| now <= tombstone.sunset)
+            .cloned()
+            .collect()
+    }
+
+    /// Notes what a retrieve of the whole `blob` left: each row that now holds
+    /// the blob's copy, or that neither holds, is as last noted, so the node
+    /// does not send it to the mesh as its own change. A row it kept apart
+    /// from the blob stays different from what was noted, and goes out.
+    pub(crate) fn took_stash(
+        &mut self,
+        place: &mut dyn Place,
+        blob: &smugglr_multi::Blob,
+    ) -> Result<(), Error> {
+        let mut theirs: BTreeMap<&str, BTreeMap<&Key, Option<[u8; 16]>>> = BTreeMap::new();
+        for envelope in &blob.changes {
+            let change = &envelope.change;
+            theirs
+                .entry(&change.table)
+                .or_default()
+                .insert(&change.key, change.to);
+        }
+        let tables: Vec<Table> = self.tables.values().cloned().collect();
+        for table in &tables {
+            let now: Hashes = place.hashes(table)?.into_iter().collect();
+            let empty = BTreeMap::new();
+            let theirs = theirs.get(table.name.as_str()).unwrap_or(&empty);
+            let noted = self.baseline.entry(table.name.clone()).or_default();
+            let known: BTreeSet<Key> = noted.keys().chain(now.keys()).cloned().collect();
+            for key in known {
+                let here = now.get(&key).copied();
+                if here != theirs.get(&key).copied().flatten() {
+                    continue;
+                }
+                match here {
+                    Some(hash) => drop(noted.insert(key.clone(), hash)),
+                    None => drop(noted.remove(&key)),
+                }
+                self.last_from.remove(&(table.name.clone(), key));
+            }
+        }
+        for tombstone in &blob.graveyard {
+            self.remember_tombstone(tombstone);
+        }
+        self.rewrite()
+    }
+
     /// Each of `lines`' rows as it is here, for a wazzup's answer, in order.
     pub(crate) fn rows_now(
         &self,
@@ -898,6 +983,7 @@ mod tests {
                 k: K,
                 backpressure: BACKPRESSURE,
                 mesh_wire: 8_000_000,
+                stash_max: 64_000_000,
                 peers: Vec::new(),
                 max_value: u64::MAX,
             };

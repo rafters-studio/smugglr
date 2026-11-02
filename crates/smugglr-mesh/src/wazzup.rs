@@ -64,14 +64,19 @@ pub(crate) enum Settled {
 /// Holding the row this node holds settles it too, beyond FR-SMUGGLR-079: two
 /// nodes that agree have nothing left to send. That covers two more cases: a
 /// conflict both sides decided alike, which otherwise stays owed until its
-/// sunset; and an insert since deleted here, whose peer holds no row either.
-/// Sent to that peer, the insert would bring back a row whose delete is
-/// already settled.
+/// sunset; and an insert since deleted here, whose peer holds no row either,
+/// and is sent the delete instead.
 pub(crate) fn settle(
     (from, to): (Option<[u8; 16]>, Option<[u8; 16]>),
     mine: Option<[u8; 16]>,
     answer: &RowNow,
 ) -> Settled {
+    // No row does not prove a delete was heard: a peer that never saw the row
+    // holds no tombstone, and another node's late insert would then bring the
+    // row back. The delete is sent, which leaves the tombstone.
+    if to.is_none() && answer.hash.is_none() {
+        return Settled::Send;
+    }
     if answer.hash == to {
         return Settled::Has;
     }
@@ -298,7 +303,15 @@ mod tests {
         // Inserted then deleted while the peer slept: its delete is settled
         // by the peer holding no row, so the insert must not bring it back.
         assert_eq!(settle((None, T), None, &answer(None, None)), Settled::Has);
-        assert_eq!(settle((T, None), None, &answer(None, None)), Settled::Has);
+    }
+
+    #[test]
+    fn a_delete_is_sent_to_a_peer_with_no_row_so_it_keeps_the_tombstone() {
+        assert_eq!(settle((T, None), None, &answer(None, None)), Settled::Send);
+        assert_eq!(
+            settle((T, None), None, &answer(None, Some(F))),
+            Settled::Send
+        );
     }
 
     #[test]

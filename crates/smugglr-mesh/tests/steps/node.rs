@@ -359,6 +359,7 @@ impl Net {
             backpressure,
             peers: vec![self.relay.address()?.to_string()],
             mesh_wire: 8_000_000,
+            stash_max: 64_000_000,
             max_value: smugglr_core::weight::DEFAULT_MAX_VALUE,
         };
         let mut node = Node {

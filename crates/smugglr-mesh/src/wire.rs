@@ -160,6 +160,60 @@ pub(crate) enum Message {
         /// One for each line of the part, in order.
         rows: Vec<RowNow>,
     },
+    /// A node needs a stash: it is back past the sunset, or was told too much.
+    StashWanted {
+        /// The node.
+        sender: String,
+    },
+    /// A peer can make `to` a stash.
+    StashOffer {
+        /// The peer.
+        sender: String,
+        /// The node it is for.
+        to: String,
+        /// Which stash.
+        id: u64,
+    },
+    /// A node takes up an offer of a stash.
+    StashAccept {
+        /// The node.
+        sender: String,
+        /// The stash.
+        id: u64,
+    },
+    /// The stash is made: how large it is, and how many parts it takes.
+    StashReady {
+        /// The peer.
+        sender: String,
+        /// The stash.
+        id: u64,
+        /// Its bytes.
+        bytes: u64,
+        /// Its parts.
+        count: u64,
+    },
+    /// One part of a stash.
+    StashPart {
+        /// The peer making it.
+        sender: String,
+        /// The stash.
+        id: u64,
+        /// The part's number, from 0.
+        n: u64,
+        /// The part's bytes.
+        data: Vec<u8>,
+    },
+    /// What a node has of a stash: every part below `have`, but `missing`.
+    StashHave {
+        /// The node.
+        sender: String,
+        /// The stash.
+        id: u64,
+        /// Every part below this has arrived, but for `missing`.
+        have: u64,
+        /// The parts it misses, at most [`RANGES`] runs.
+        missing: Vec<Range>,
+    },
     /// A person has taken a node off the mesh for good.
     Remove {
         /// Who says so.
@@ -241,6 +295,12 @@ impl Message {
             | Self::Wazzup { sender, .. }
             | Self::Answer { sender, .. }
             | Self::Remove { sender, .. }
+            | Self::StashWanted { sender }
+            | Self::StashOffer { sender, .. }
+            | Self::StashAccept { sender, .. }
+            | Self::StashReady { sender, .. }
+            | Self::StashPart { sender, .. }
+            | Self::StashHave { sender, .. }
             | Self::NameTaken { sender, .. }
             | Self::Change { sender, .. }
             | Self::Ack { sender, .. }
@@ -274,6 +334,12 @@ impl Message {
             Self::Remove { sender, node } => {
                 json!({"t": "remove", "sender": sender, "node": node})
             }
+            Self::StashWanted { .. }
+            | Self::StashOffer { .. }
+            | Self::StashAccept { .. }
+            | Self::StashReady { .. }
+            | Self::StashPart { .. }
+            | Self::StashHave { .. } => self.stash_json(),
             Self::NameTaken { sender, start } => {
                 json!({"t": "name-taken", "sender": sender, "start": start})
             }
@@ -335,6 +401,43 @@ impl Message {
         }
     }
 
+    fn stash_json(&self) -> Value {
+        match self {
+            Self::StashWanted { sender } => json!({"t": "stash-wanted", "sender": sender}),
+            Self::StashOffer { sender, to, id } => {
+                json!({"t": "stash-offer", "sender": sender, "to": to, "id": id})
+            }
+            Self::StashAccept { sender, id } => {
+                json!({"t": "stash-accept", "sender": sender, "id": id})
+            }
+            Self::StashReady {
+                sender,
+                id,
+                bytes,
+                count,
+            } => {
+                json!({"t": "stash-ready", "sender": sender, "id": id, "bytes": bytes, "count": count})
+            }
+            Self::StashPart {
+                sender,
+                id,
+                n,
+                data,
+            } => {
+                json!({"t": "stash-part", "sender": sender, "id": id, "n": n, "data": base64(data)})
+            }
+            Self::StashHave {
+                sender,
+                id,
+                have,
+                missing,
+            } => {
+                json!({"t": "stash-have", "sender": sender, "id": id, "have": have, "missing": missing})
+            }
+            _ => Value::Null,
+        }
+    }
+
     fn wazzup_json(&self) -> Value {
         let Self::Wazzup {
             sender,
@@ -359,6 +462,46 @@ impl Message {
             "count": count,
             "lines": lines,
         })
+    }
+
+    fn stash_from_json(kind: &str, sender: String, json: &Value) -> Option<Self> {
+        let text = |name: &str| json.get(name)?.as_str().map(str::to_owned);
+        match kind {
+            "stash-wanted" => Some(Self::StashWanted { sender }),
+            "stash-offer" => Some(Self::StashOffer {
+                sender,
+                to: text("to")?,
+                id: json.get("id")?.as_u64()?,
+            }),
+            "stash-accept" => Some(Self::StashAccept {
+                sender,
+                id: json.get("id")?.as_u64()?,
+            }),
+            "stash-ready" => Some(Self::StashReady {
+                sender,
+                id: json.get("id")?.as_u64()?,
+                bytes: json.get("bytes")?.as_u64()?,
+                count: json.get("count")?.as_u64()?,
+            }),
+            "stash-part" => Some(Self::StashPart {
+                sender,
+                id: json.get("id")?.as_u64()?,
+                n: json.get("n")?.as_u64()?,
+                data: unbase64(json.get("data")?.as_str()?)?,
+            }),
+            "stash-have" => Some(Self::StashHave {
+                sender,
+                id: json.get("id")?.as_u64()?,
+                have: json.get("have")?.as_u64()?,
+                missing: json
+                    .get("missing")?
+                    .as_array()?
+                    .iter()
+                    .map(|range| Some((range.get(0)?.as_u64()?, range.get(1)?.as_u64()?)))
+                    .collect::<Option<_>>()?,
+            }),
+            _ => None,
+        }
     }
 
     fn from_json(json: &Value) -> Option<Self> {
@@ -396,6 +539,7 @@ impl Message {
                 sender,
                 node: text("node")?,
             }),
+            kind if kind.starts_with("stash-") => Self::stash_from_json(kind, sender, json),
             "name-taken" => Some(Self::NameTaken {
                 sender,
                 start: json.get("start")?.as_u64()?,

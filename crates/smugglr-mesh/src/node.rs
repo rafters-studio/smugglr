@@ -33,10 +33,14 @@ use chacha20poly1305::aead::OsRng;
 use chacha20poly1305::aead::rand_core::RngCore;
 use smugglr_core::envelope::Envelope;
 use smugglr_core::hex::{hex, unhex};
+use smugglr_core::record::Status;
 use smugglr_core::row_hash::row_hash;
 use smugglr_place::Place;
 use socket2::{Domain, Protocol, Socket, Type};
 
+use crate::catch_up::{
+    ACCEPT_AGAIN, GIVE_UP, Giving, HELD_BACK, MOST_FAILED, NO_OFFER, Taking, WANT_AGAIN,
+};
 use crate::local::{Local, limit, refuse};
 use crate::named::{keep_resolved, literal, resolve_now};
 use crate::outbox::{Acked, Outbox, Timing};
@@ -85,6 +89,9 @@ const JOIN: Duration = Duration::from_secs(1);
 
 /// How often a starting node says its wazzup, so one lost copy costs nothing.
 const WAZZUP_EVERY: Duration = Duration::from_millis(300);
+
+/// How often a node notes that it is running.
+const NOTE_RAN: Duration = Duration::from_secs(1);
 
 /// The id of the wazzups a node says while it listens for its name being
 /// taken, which ask after nothing else.
@@ -203,6 +210,7 @@ pub fn remove(settings: &Settings, node: &str) -> Result<(), Error> {
 /// # Errors
 /// When the node holds no key, its socket cannot be opened, or its place or
 /// what smugglr keeps for it cannot be read or written.
+#[allow(clippy::too_many_lines)] // Most of it is the one list of a node's fields.
 pub fn run(place: &mut dyn Place, settings: &Settings, stop: &AtomicBool) -> Result<(), Error> {
     // The newest key signs and seals; the one before it is still accepted.
     let held = &settings.keys[settings.keys.len().saturating_sub(2)..];
@@ -248,6 +256,12 @@ pub fn run(place: &mut dyn Place, settings: &Settings, stop: &AtomicBool) -> Res
         wazzups: Vec::new(),
         answers: Vec::new(),
         woken_by: HashMap::new(),
+        noted_ran: None,
+        place_address: place.address().to_owned(),
+        stashes: Stashes {
+            wants: past_sunset,
+            ..Stashes::default()
+        },
         told_too_much: BTreeSet::new(),
         removed,
         removed_file,
@@ -275,10 +289,7 @@ pub fn run(place: &mut dyn Place, settings: &Settings, stop: &AtomicBool) -> Res
     };
     let (tx, rx) = mpsc::channel();
     let reading = AtomicBool::new(true);
-    let resolving = Arc::new(AtomicBool::new(true));
-    if !settings.peers.is_empty() {
-        keep_resolved(settings.peers.clone(), named, resolving.clone(), ANNOUNCE);
-    }
+    let resolving = start_resolving(settings, named);
     let mut ended = Ok(());
     std::thread::scope(|scope| {
         scope.spawn(|| {
@@ -331,6 +342,16 @@ fn bind(port: u16) -> std::io::Result<UdpSocket> {
     Ok(socket)
 }
 
+/// Starts keeping the peers setting's names resolved in `named`, until the
+/// flag it gives turns false.
+fn start_resolving(settings: &Settings, named: Arc<Mutex<Vec<SocketAddr>>>) -> Arc<AtomicBool> {
+    let resolving = Arc::new(AtomicBool::new(true));
+    if !settings.peers.is_empty() {
+        keep_resolved(settings.peers.clone(), named, resolving.clone(), ANNOUNCE);
+    }
+    resolving
+}
+
 /// Whether this node comes back past the sunset; it says so, and how to catch
 /// up.
 fn say_if_past_sunset(settings: &Settings, ran: &str, place: &str) -> Result<bool, Error> {
@@ -371,6 +392,35 @@ fn removed_nodes(settings: &Settings, file: &str) -> Result<BTreeSet<String>, Er
         .read(file)?
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_default())
+}
+
+/// What a node is doing about stashes.
+#[derive(Debug, Default)]
+struct Stashes {
+    /// It needs one, and when it last said so.
+    wants: bool,
+    said_wanted: Option<Instant>,
+    /// The offer it took up and when, until the stash is ready.
+    accepted: Option<(String, u64, Instant)>,
+    said_accept: Option<Instant>,
+    /// Stashes in a row that arrived and were not taken.
+    failed: u32,
+    said_too_large: bool,
+    /// When it began asking.
+    asking_since: Option<Instant>,
+    /// What it offered each peer, and when.
+    offered: HashMap<String, (u64, Instant)>,
+    /// The stashes peers took up, to make where the database can be read.
+    to_give: Vec<(String, u64)>,
+    giving: Vec<Giving>,
+    taking: Option<Taking>,
+}
+
+impl Stashes {
+    /// A stash is expected: changes arriving now must wait for it.
+    fn on_its_way(&self) -> bool {
+        self.wants || self.taking.is_some()
+    }
 }
 
 /// One part of a peer's wazzup, to answer.
@@ -529,6 +579,11 @@ struct Node<'a> {
     /// The wazzup each peer last woke this node's resends with: its start,
     /// since ids begin again at each start, and its id.
     woken_by: HashMap<String, (u64, u64)>,
+    noted_ran: Option<Instant>,
+    /// Where the database is, to read its size.
+    place_address: String,
+    /// The stashes this node wants, is giving and is taking.
+    stashes: Stashes,
     /// The peers that have said too much, each named once.
     told_too_much: BTreeSet<String>,
     /// The nodes a person has taken off the mesh.
@@ -614,7 +669,14 @@ impl Node<'_> {
             return Ok(());
         }
         batch.append(&mut self.arrived_joining);
-        if !batch.is_empty() {
+        if self.stashes.on_its_way() {
+            // The stash is older than these: applied now, they would be
+            // overwritten by it, or a row they delete brought back. They go
+            // over the stash once it is in, and are not acknowledged till then.
+            self.arrived_joining = batch;
+            let over = self.arrived_joining.len().saturating_sub(HELD_BACK);
+            self.arrived_joining.drain(..over);
+        } else if !batch.is_empty() {
             self.apply(place, batch)?;
         }
         self.joined(place)?;
@@ -634,11 +696,23 @@ impl Node<'_> {
             );
             self.lost = 0;
         }
+        if self.noted_ran.is_none_or(|at| at.elapsed() >= NOTE_RAN) {
+            // When the node last ran, for the next start to know how long it
+            // was away. Noted this often because a node that thinks it was
+            // inside the sunset asks for no stash, and what it missed stays
+            // different without a word; a write that fails only costs that.
+            self.noted_ran = Some(Instant::now());
+            let _ = self.settings.store.replace(&self.ran, &now().to_string());
+        }
         if self.outbox.settled() {
             // Room in the outbox as soon as acknowledgements make it.
             self.outbox.prune(now())?;
         }
-        self.look(place)?;
+        // Not while a stash is expected: a row changed while away must still
+        // read as changed when the stash is taken, or it is overwritten.
+        if !self.stashes.on_its_way() {
+            self.look(place)?;
+        }
         self.send_due()?;
         if self.unopened > 0
             && self
@@ -783,9 +857,6 @@ impl Node<'_> {
     /// peers setting.
     fn announce(&mut self) {
         self.announced = Some(Instant::now());
-        // When the node last ran, for the next start to know how long it
-        // was away; a write that fails only costs that message.
-        let _ = self.settings.store.replace(&self.ran, &now().to_string());
         let announce = Message::Announce {
             sender: self.settings.node.clone(),
         };
@@ -864,6 +935,12 @@ impl Node<'_> {
             self.ask_on_joining = false;
             self.ask(None)?;
         }
+        // With a stash on its way the rows here are about to change: answered
+        // now, an empty row settles a delete the stash then undoes. The asker
+        // says each part again until it is answered.
+        if self.stashes.on_its_way() {
+            self.wazzups.clear();
+        }
         for wazzup in std::mem::take(&mut self.wazzups) {
             self.answer_wazzup(place, wazzup)?;
         }
@@ -871,7 +948,362 @@ impl Node<'_> {
             self.take_answer(place, answer)?;
         }
         self.say_parts();
+        self.tend_stashes(place)
+    }
+
+    /// Takes a message about a stash.
+    fn hear_stash(&mut self, message: Message) {
+        match message {
+            Message::StashWanted { sender } => {
+                // Only a node that is itself up to date can help.
+                let able = !self.stashes.wants
+                    && self.stashes.taking.is_none()
+                    && Instant::now() >= self.joining_until;
+                let offered = self.stashes.offered.get(&sender);
+                let due = offered.is_none_or(|(_, at)| at.elapsed() >= WANT_AGAIN);
+                if able && due && !self.store_too_large_to_stash(&sender) {
+                    let id = OsRng.next_u64();
+                    self.stashes
+                        .offered
+                        .insert(sender.clone(), (id, Instant::now()));
+                    let offer = Message::StashOffer {
+                        sender: self.settings.node.clone(),
+                        to: sender.clone(),
+                        id,
+                    };
+                    let _ = self.send(&offer, self.address(&sender));
+                }
+            }
+            Message::StashOffer { sender, to, id } => {
+                if to == self.settings.node
+                    && self.stashes.wants
+                    && self.stashes.taking.is_none()
+                    && self.stashes.accepted.is_none()
+                {
+                    self.stashes.accepted = Some((sender.clone(), id, Instant::now()));
+                    let accept = Message::StashAccept {
+                        sender: self.settings.node.clone(),
+                        id,
+                    };
+                    let _ = self.send(&accept, self.address(&sender));
+                }
+            }
+            Message::StashAccept { sender, id } => {
+                if self
+                    .stashes
+                    .offered
+                    .get(&sender)
+                    .is_some_and(|(made, _)| *made == id)
+                    && !self.stashes.giving.iter().any(|giving| giving.id == id)
+                    && !self.stashes.to_give.iter().any(|(_, giving)| *giving == id)
+                {
+                    self.stashes.to_give.push((sender, id));
+                }
+            }
+            Message::StashReady {
+                sender,
+                id,
+                bytes,
+                count,
+            } => {
+                let ours = self
+                    .stashes
+                    .accepted
+                    .as_ref()
+                    .is_some_and(|(peer, accepted, _)| *peer == sender && *accepted == id);
+                if ours && self.stashes.taking.is_none() {
+                    self.stashes.accepted = None;
+                    self.stashes.taking = Taking::new(sender.clone(), id, bytes, count);
+                    if self.stashes.taking.is_some() {
+                        println!("smugglr mesh: taking a stash of {bytes} bytes from {sender}");
+                    } else {
+                        println!(
+                            "smugglr mesh: refused a stash from {sender}: {bytes} bytes in {count} parts"
+                        );
+                    }
+                }
+            }
+            Message::StashPart { id, n, data, .. } => {
+                if let Some(taking) = self
+                    .stashes
+                    .taking
+                    .as_mut()
+                    .filter(|taking| taking.id == id)
+                {
+                    taking.take(n, &data);
+                }
+            }
+            Message::StashHave {
+                id, have, missing, ..
+            } => {
+                if let Some(giving) = self
+                    .stashes
+                    .giving
+                    .iter_mut()
+                    .find(|giving| giving.id == id)
+                {
+                    giving.heard(have, &missing);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A stash's work on each turn: asking for one, making those taken up,
+    /// sending what is due, and taking in one that has arrived.
+    fn tend_stashes(&mut self, place: &mut dyn Place) -> Result<(), Error> {
+        self.ask_for_stash();
+        for (peer, id) in std::mem::take(&mut self.stashes.to_give) {
+            let bytes = self.make_stash(place)?;
+            println!(
+                "smugglr mesh: giving {peer} a stash of {} bytes",
+                bytes.len()
+            );
+            self.stashes.giving.push(Giving::new(peer, id, bytes));
+        }
+        self.send_stashes()?;
+        if let Some(taking) = self.stashes.taking.as_mut()
+            && let Some((have, missing)) = taking.report_due()
+        {
+            let report = Message::StashHave {
+                sender: self.settings.node.clone(),
+                id: taking.id,
+                have,
+                missing,
+            };
+            let peer = taking.peer.clone();
+            let _ = self.send(&report, self.address(&peer));
+        }
+        let arrived = self
+            .stashes
+            .taking
+            .as_ref()
+            .and_then(|taking| taking.whole().map(<[u8]>::to_vec));
+        if let Some(bytes) = arrived {
+            let peer = self
+                .stashes
+                .taking
+                .as_ref()
+                .map(|taking| taking.peer.clone());
+            // It may be lost, and its maker waits to hear it: said a few times.
+            if let (Some(peer), Some(taking)) = (&peer, &self.stashes.taking) {
+                let done = Message::StashHave {
+                    sender: self.settings.node.clone(),
+                    id: taking.id,
+                    have: u64::MAX,
+                    missing: Vec::new(),
+                };
+                for _ in 0..3 {
+                    let _ = self.send(&done, self.address(peer));
+                }
+            }
+            self.take_stash(place, &bytes, peer.as_deref().unwrap_or_default())?;
+            self.stashes.taking = None;
+        } else if self.stashes.taking.as_ref().is_some_and(Taking::gone_quiet) {
+            println!("smugglr mesh: a stash stopped arriving; asking again");
+            self.stashes.taking = None;
+            self.stashes.asking_since = None;
+        }
         Ok(())
+    }
+
+    /// Whether this node's database is over the line for a stash, which it
+    /// says once. A stash is held in memory at about 16 times the database, so
+    /// offering one could take down a machine that is working. The node that
+    /// asked goes on without it: its peers' resends still reach it, and a
+    /// person can run the two commands. A place that is not a file has no size
+    /// to read, and is offered.
+    fn store_too_large_to_stash(&mut self, sender: &str) -> bool {
+        let Ok(file) = std::fs::metadata(&self.place_address) else {
+            return false;
+        };
+        let large = file.len() > self.settings.stash_max;
+        if large && !self.stashes.said_too_large {
+            self.stashes.said_too_large = true;
+            println!(
+                "smugglr mesh: {sender} needs a stash, and this database of {} bytes is over \
+                 stash_max ({}), so none is offered; run smugglr stash and smugglr retrieve by \
+                 hand if it does not catch up",
+                file.len(),
+                self.settings.stash_max
+            );
+        }
+        large
+    }
+
+    /// A stash arrived and was not taken: asked for again, up to a point.
+    fn stash_not_taken(&mut self) {
+        self.stashes.failed += 1;
+        self.stashes.asking_since = None;
+        if self.stashes.failed >= MOST_FAILED {
+            println!(
+                "smugglr mesh: {MOST_FAILED} stashes in a row were not taken; going on without \
+                 one, and what changed while away may stay different"
+            );
+            self.stashes.wants = false;
+        }
+    }
+
+    /// Says this node needs a stash, while it does and nothing is on its way.
+    fn ask_for_stash(&mut self) {
+        if let Some((peer, id, at)) = self.stashes.accepted.clone() {
+            if at.elapsed() >= GIVE_UP {
+                self.stashes.accepted = None;
+            } else if self
+                .stashes
+                .said_accept
+                .is_none_or(|said| said.elapsed() >= ACCEPT_AGAIN)
+            {
+                // It may have been lost, and the offer's maker is waiting.
+                self.stashes.said_accept = Some(Instant::now());
+                let accept = Message::StashAccept {
+                    sender: self.settings.node.clone(),
+                    id,
+                };
+                let _ = self.send(&accept, self.address(&peer));
+            }
+        }
+        let asked_since = *self.stashes.asking_since.get_or_insert_with(Instant::now);
+        if self.stashes.wants
+            && self.stashes.accepted.is_none()
+            && self.stashes.taking.is_none()
+            && asked_since.elapsed() >= NO_OFFER
+        {
+            println!(
+                "smugglr mesh: no peer offered a stash; going on without one, and what changed \
+                 while away may stay different"
+            );
+            self.stashes.wants = false;
+        }
+        let waiting = self.stashes.taking.is_some() || self.stashes.accepted.is_some();
+        if !self.stashes.wants
+            || waiting
+            || self
+                .stashes
+                .said_wanted
+                .is_some_and(|at| at.elapsed() < WANT_AGAIN)
+        {
+            return;
+        }
+        self.stashes.said_wanted = Some(Instant::now());
+        let wanted = Message::StashWanted {
+            sender: self.settings.node.clone(),
+        };
+        // A lost one is said again.
+        let _ = self.send(&wanted, (self.to, 0));
+        for peer in self.named_addresses() {
+            let _ = self.send(&wanted, (peer, 0));
+        }
+        for peer in &self.peers {
+            let _ = self.send(&wanted, self.address(peer));
+        }
+    }
+
+    /// How a stash here is made and taken: multi's own rules.
+    fn multi_settings(&self, key: [u8; 32]) -> smugglr_multi::Settings {
+        smugglr_multi::Settings {
+            store: self.settings.store.clone(),
+            key,
+            node: self.settings.node.clone(),
+            targets: Vec::new(),
+            graveyard: self.settings.graveyard,
+            now: now(),
+            sync_mode: self.settings.sync_mode,
+            steering: self.settings.steering.clone(),
+            ignore: self.settings.ignore.clone(),
+        }
+    }
+
+    /// The text of a whole stash of this node's database.
+    fn make_stash(&self, place: &mut dyn Place) -> Result<Vec<u8>, Error> {
+        let settings = self.multi_settings(self.sign[0]);
+        let mut blob = smugglr_multi::stash(place, &settings, true, |_| Ok(()))
+            .map_err(|err| Error::Shape(err.to_string()))?;
+        blob.graveyard.extend(self.local.live_tombstones(now()));
+        blob.sign(&self.sign[0]);
+        Ok(blob.to_json().into_bytes())
+    }
+
+    /// Sends each stash what is due; one the peer has whole ends with a check
+    /// on what that peer is owed, since its rows have just changed.
+    fn send_stashes(&mut self) -> Result<(), Error> {
+        let mut giving = std::mem::take(&mut self.stashes.giving);
+        let mut done = Vec::new();
+        giving.retain_mut(|stash| {
+            if stash.ready_due() {
+                let ready = Message::StashReady {
+                    sender: self.settings.node.clone(),
+                    id: stash.id,
+                    bytes: stash.len(),
+                    count: stash.count(),
+                };
+                let _ = self.send(&ready, self.address(&stash.peer));
+            }
+            let to = self.address(&stash.peer);
+            for n in stash.due(PER_TICK) {
+                let part = Message::StashPart {
+                    sender: self.settings.node.clone(),
+                    id: stash.id,
+                    n,
+                    data: stash.part(n).to_vec(),
+                };
+                let _ = self.send(&part, to);
+            }
+            if stash.done() {
+                done.push(stash.peer.clone());
+                return false;
+            }
+            !stash.gone_quiet()
+        });
+        self.stashes.giving.append(&mut giving);
+        for peer in done {
+            println!("smugglr mesh: {peer} has its stash");
+            self.ask(Some(peer))?;
+        }
+        Ok(())
+    }
+
+    /// Takes a stash that has arrived whole: checks its maker's signature,
+    /// retrieves it, notes what that left, then says wazzup for what changed
+    /// since it was made.
+    fn take_stash(&mut self, place: &mut dyn Place, bytes: &[u8], peer: &str) -> Result<(), Error> {
+        let blob = std::str::from_utf8(bytes)
+            .ok()
+            .and_then(smugglr_multi::Blob::from_json);
+        let signed = blob
+            .as_ref()
+            .and_then(|blob| self.sign.iter().find(|key| blob.verify(key)).copied());
+        let (Some(blob), Some(key)) = (blob, signed) else {
+            println!("smugglr mesh: the stash from {peer} does not check");
+            self.stash_not_taken();
+            return Ok(());
+        };
+        let owed = self.outbox.owed_changes(None)?;
+        self.local
+            .note_for_retrieve(&*self.settings.store, place.address(), now(), &owed)?;
+        let settings = self.multi_settings(key);
+        let record = smugglr_multi::retrieve(place, std::slice::from_ref(&blob), &settings, &[])
+            .map_err(|err| Error::Shape(err.to_string()))?;
+        // Rows stopped by `--sync-mode` are named by the retrieve and stay as
+        // they are. Anything worse took nothing, so it is asked for again.
+        if !matches!(record.status, Status::Done | Status::StoppedInPart) {
+            println!(
+                "smugglr mesh: the stash from {peer} was not taken ({:?})",
+                record.status
+            );
+            self.stash_not_taken();
+            return Ok(());
+        }
+        self.local.took_stash(place, &blob)?;
+        self.stashes.wants = false;
+        self.stashes.failed = 0;
+        self.since = now();
+        println!(
+            "smugglr mesh: caught up by a stash from {peer}: {} rows, retrieve {:?}",
+            blob.changes.len(),
+            record.status
+        );
+        self.ask(None)
     }
 
     /// Begins a wazzup about the changes owed: to `only`, or to every peer.
@@ -1051,6 +1483,8 @@ impl Node<'_> {
         if !self.told_too_much.insert(peer.to_owned()) {
             return Ok(());
         }
+        self.stashes.wants = true;
+        self.stashes.asking_since = None;
         println!(
             "smugglr mesh: {peer} says there is too much for the wire. Catch up with: smugglr \
              stash <a peer's place> <dir> --key-file <path> --node <name> --whole, then smugglr \
@@ -1192,6 +1626,12 @@ impl Node<'_> {
         self.note_sender(&sender, &message, from);
         match message {
             Message::Announce { .. } | Message::NameTaken { .. } | Message::Remove { .. } => {}
+            message @ (Message::StashWanted { .. }
+            | Message::StashOffer { .. }
+            | Message::StashAccept { .. }
+            | Message::StashReady { .. }
+            | Message::StashPart { .. }
+            | Message::StashHave { .. }) => self.hear_stash(message),
             message @ (Message::Wazzup { .. } | Message::Answer { .. }) => self.queue(message),
             Message::Part {
                 sender,

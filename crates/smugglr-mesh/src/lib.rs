@@ -34,6 +34,7 @@
 //! the shared key, so one key never serves two jobs. No key is ever
 //! written out; a key is named only by its `key_id`.
 
+mod catch_up;
 mod local;
 mod named;
 mod node;
@@ -63,6 +64,9 @@ pub const BACKPRESSURE: u64 = 6_000_000;
 
 /// What a wazzup is answered with before it is too much, when not set.
 pub const MESH_WIRE: u64 = 8_000_000;
+
+/// The largest database a node offers a stash of, when not set.
+pub const STASH_MAX: u64 = 64_000_000;
 
 /// The most changes a node applies in one transaction, the chunk a direct
 /// sync writes in (#580).
@@ -138,6 +142,9 @@ pub struct Settings {
     /// The most bytes a wazzup is answered with before the answer is too
     /// much, and the asker catches up by stash then retrieve.
     pub mesh_wire: u64,
+    /// The largest database a node offers a stash of. A stash is held in
+    /// memory on both sides, at about 16 times the database.
+    pub stash_max: u64,
 }
 
 impl std::fmt::Debug for Settings {
