@@ -28,6 +28,12 @@ const STALLED: Duration = Duration::from_secs(1);
 /// not resent to it whole: its parts are on their way.
 const BUSY: Duration = Duration::from_secs(1);
 
+/// How long after a peer acknowledged the last of a change's parts it may take
+/// to decide the change, before the change is sent whole again. On a loaded
+/// machine a decision can take far longer than a resend's guess, and sending
+/// it whole again throws away a transfer that arrived.
+const DECIDING: Duration = Duration::from_secs(5);
+
 /// The shortest wait before a part named missing is resent again.
 const AGAIN: Duration = Duration::from_millis(50);
 
@@ -237,10 +243,14 @@ impl Sending {
         self.outs.iter().any(|out| {
             out.change == *change
                 && out.peers.get(peer).is_some_and(|state| {
-                    state.acked_count < out.count
-                        && state
-                            .since
-                            .is_some_and(|since| now.duration_since(since) < BUSY)
+                    let patience = if state.acked_count < out.count {
+                        BUSY
+                    } else {
+                        DECIDING
+                    };
+                    state
+                        .since
+                        .is_some_and(|since| now.duration_since(since) < patience)
                 })
         })
     }
@@ -615,7 +625,7 @@ mod tests {
     use std::collections::BTreeSet;
     use std::time::Instant;
 
-    use super::{Bits, PART, Receiving, Sending, ranges};
+    use super::{BUSY, Bits, DECIDING, PART, Receiving, Sending, ranges};
 
     #[test]
     fn gaps_and_ranges_name_part_numbers_in_runs() {
@@ -629,6 +639,23 @@ mod tests {
             ranges(vec![6, 5, 1, 2, 2, 9]),
             vec![(1, 3), (5, 7), (9, 10)]
         );
+    }
+
+    #[test]
+    fn a_change_with_every_part_acknowledged_has_time_to_be_decided() {
+        let now = Instant::now();
+        let mut big = Sending::default();
+        let id = (None, [3; 16]);
+        big.start(
+            [4; 32],
+            id,
+            vec![0; PART * 2],
+            &BTreeSet::from(["b".to_owned()]),
+        );
+        assert_eq!(big.firsts(10, now).len(), 2);
+        big.ack("b", &id, &[(0, 2)], &[], now);
+        assert!(big.busy(&[4; 32], "b", now + BUSY + BUSY));
+        assert!(!big.busy(&[4; 32], "b", now + DECIDING));
     }
 
     #[test]

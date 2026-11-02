@@ -813,7 +813,10 @@ impl Node<'_> {
     fn resend_room(&self) -> usize {
         let (sent, resent) = (self.sent.get(), self.resent.get());
         let others = sent.saturating_sub(resent);
-        usize::try_from((others / 3).saturating_sub(resent)).unwrap_or(usize::MAX)
+        // About 24% of the total, just under the quarter: the counts halve and
+        // round, and aiming at the line goes over it by a datagram. No lower: a
+        // flood at 10% loss needs nearly all of it to repair within a second.
+        usize::try_from((others * 8 / 25).saturating_sub(resent)).unwrap_or(usize::MAX)
     }
 
     fn change(
