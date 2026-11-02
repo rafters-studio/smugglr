@@ -38,7 +38,9 @@ use smugglr_core::row_hash::row_hash;
 use smugglr_place::Place;
 use socket2::{Domain, Protocol, Socket, Type};
 
-use crate::catch_up::{ACCEPT_AGAIN, GIVE_UP, Giving, HELD_BACK, NO_OFFER, Taking, WANT_AGAIN};
+use crate::catch_up::{
+    ACCEPT_AGAIN, GIVE_UP, Giving, HELD_BACK, MOST_FAILED, NO_OFFER, Taking, WANT_AGAIN,
+};
 use crate::local::{Local, limit, refuse};
 use crate::named::{keep_resolved, literal, resolve_now};
 use crate::outbox::{Acked, Outbox, Timing};
@@ -255,6 +257,7 @@ pub fn run(place: &mut dyn Place, settings: &Settings, stop: &AtomicBool) -> Res
         answers: Vec::new(),
         woken_by: HashMap::new(),
         noted_ran: None,
+        place_address: place.address().to_owned(),
         stashes: Stashes {
             wants: past_sunset,
             ..Stashes::default()
@@ -400,6 +403,9 @@ struct Stashes {
     /// The offer it took up and when, until the stash is ready.
     accepted: Option<(String, u64, Instant)>,
     said_accept: Option<Instant>,
+    /// Stashes in a row that arrived and were not taken.
+    failed: u32,
+    said_too_large: bool,
     /// When it began asking.
     asking_since: Option<Instant>,
     /// What it offered each peer, and when.
@@ -574,6 +580,8 @@ struct Node<'a> {
     /// since ids begin again at each start, and its id.
     woken_by: HashMap<String, (u64, u64)>,
     noted_ran: Option<Instant>,
+    /// Where the database is, to read its size.
+    place_address: String,
     /// The stashes this node wants, is giving and is taking.
     stashes: Stashes,
     /// The peers that have said too much, each named once.
@@ -952,7 +960,8 @@ impl Node<'_> {
                     && self.stashes.taking.is_none()
                     && Instant::now() >= self.joining_until;
                 let offered = self.stashes.offered.get(&sender);
-                if able && offered.is_none_or(|(_, at)| at.elapsed() >= WANT_AGAIN) {
+                let due = offered.is_none_or(|(_, at)| at.elapsed() >= WANT_AGAIN);
+                if able && due && !self.store_too_large_to_stash(&sender) {
                     let id = OsRng.next_u64();
                     self.stashes
                         .offered
@@ -1098,6 +1107,43 @@ impl Node<'_> {
         Ok(())
     }
 
+    /// Whether this node's database is over the line for a stash, which it
+    /// says once. A stash is held in memory at about 16 times the database, so
+    /// offering one could take down a machine that is working. The node that
+    /// asked goes on without it: its peers' resends still reach it, and a
+    /// person can run the two commands. A place that is not a file has no size
+    /// to read, and is offered.
+    fn store_too_large_to_stash(&mut self, sender: &str) -> bool {
+        let Ok(file) = std::fs::metadata(&self.place_address) else {
+            return false;
+        };
+        let large = file.len() > self.settings.stash_max;
+        if large && !self.stashes.said_too_large {
+            self.stashes.said_too_large = true;
+            println!(
+                "smugglr mesh: {sender} needs a stash, and this database of {} bytes is over \
+                 stash_max ({}), so none is offered; run smugglr stash and smugglr retrieve by \
+                 hand if it does not catch up",
+                file.len(),
+                self.settings.stash_max
+            );
+        }
+        large
+    }
+
+    /// A stash arrived and was not taken: asked for again, up to a point.
+    fn stash_not_taken(&mut self) {
+        self.stashes.failed += 1;
+        self.stashes.asking_since = None;
+        if self.stashes.failed >= MOST_FAILED {
+            println!(
+                "smugglr mesh: {MOST_FAILED} stashes in a row were not taken; going on without \
+                 one, and what changed while away may stay different"
+            );
+            self.stashes.wants = false;
+        }
+    }
+
     /// Says this node needs a stash, while it does and nothing is on its way.
     fn ask_for_stash(&mut self) {
         if let Some((peer, id, at)) = self.stashes.accepted.clone() {
@@ -1228,8 +1274,8 @@ impl Node<'_> {
             .as_ref()
             .and_then(|blob| self.sign.iter().find(|key| blob.verify(key)).copied());
         let (Some(blob), Some(key)) = (blob, signed) else {
-            println!("smugglr mesh: the stash from {peer} does not check; asking again");
-            self.stashes.asking_since = None;
+            println!("smugglr mesh: the stash from {peer} does not check");
+            self.stash_not_taken();
             return Ok(());
         };
         let owed = self.outbox.owed_changes(None)?;
@@ -1242,14 +1288,15 @@ impl Node<'_> {
         // they are. Anything worse took nothing, so it is asked for again.
         if !matches!(record.status, Status::Done | Status::StoppedInPart) {
             println!(
-                "smugglr mesh: the stash from {peer} was not taken ({:?}); asking again",
+                "smugglr mesh: the stash from {peer} was not taken ({:?})",
                 record.status
             );
-            self.stashes.asking_since = None;
+            self.stash_not_taken();
             return Ok(());
         }
         self.local.took_stash(place, &blob)?;
         self.stashes.wants = false;
+        self.stashes.failed = 0;
         self.since = now();
         println!(
             "smugglr mesh: caught up by a stash from {peer}: {} rows, retrieve {:?}",

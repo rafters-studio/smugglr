@@ -362,6 +362,31 @@ fn a_node_told_too_much_catches_up_by_a_stash_over_the_mesh() -> Tried {
 }
 
 #[test]
+fn a_database_over_the_line_offers_no_stash_and_says_so() -> Tried {
+    let (root, key, mut first, second) =
+        two_running("over-the-line", "mesh_wire = 1000\nstash_max = 1000\n")?;
+    first.stop()?;
+    let mut connection = Connection::open(&second.db)?;
+    let add = connection.transaction()?;
+    for row in 0..500 {
+        add.execute(
+            "INSERT INTO notes VALUES (?1, 'too many for the wire', '2026-05-01')",
+            [format!("m{row:05}")],
+        )?;
+    }
+    add.commit()?;
+    sleep(Duration::from_secs(2));
+    first.start(&key)?;
+    let said = soon(Duration::from_secs(15), || {
+        Ok(second.printed().contains("over stash_max"))
+    })?;
+    assert!(said, "{}\n{}", first.printed(), second.printed());
+    assert!(!second.printed().contains("giving first a stash"));
+    let _ = fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
 fn a_node_back_past_the_sunset_catches_up_and_keeps_its_own_edit() -> Tried {
     let (root, key, mut first, second) = two_running("sunset", "")?;
     let config = first.dir.join("config/smugglr/config.toml");
