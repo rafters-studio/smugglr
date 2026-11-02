@@ -983,6 +983,7 @@ mod tests {
                 k: K,
                 backpressure: BACKPRESSURE,
                 mesh_wire: 8_000_000,
+                stash_max: 64_000_000,
                 peers: Vec::new(),
                 max_value: u64::MAX,
             };

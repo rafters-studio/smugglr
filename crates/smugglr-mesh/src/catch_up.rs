@@ -25,6 +25,10 @@ pub(crate) const ACCEPT_AGAIN: Duration = Duration::from_secs(1);
 /// oldest goes, and its maker's resend brings it again.
 pub(crate) const HELD_BACK: usize = 20_000;
 
+/// How many stashes in a row may arrive and not be taken before a node stops
+/// asking: another would take the same way, and each costs a whole transfer.
+pub(crate) const MOST_FAILED: u32 = 3;
+
 /// How often the receiver says what it has.
 const REPORT: Duration = Duration::from_millis(100);
 

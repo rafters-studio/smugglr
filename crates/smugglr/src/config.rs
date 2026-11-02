@@ -51,6 +51,9 @@ pub struct Config {
     /// The most a wazzup is answered with before it is too much; `None`
     /// when not set, 8 MB.
     pub mesh_wire: Option<u64>,
+    /// The largest database a mesh node offers a stash of; `None` when not
+    /// set, 64 MB.
+    pub stash_max: Option<u64>,
 }
 
 /// The config as the file holds it, before its settings are checked.
@@ -62,6 +65,7 @@ struct File {
     backpressure: Option<toml::Value>,
     max_value: Option<toml::Value>,
     mesh_wire: Option<toml::Value>,
+    stash_max: Option<toml::Value>,
     #[serde(default)]
     peers: Vec<String>,
     graveyard: Option<u64>,
@@ -143,6 +147,7 @@ fn parse(text: &str) -> Result<Config, Problem> {
     let backpressure = size("backpressure", file.backpressure)?;
     let max_value = size("max_value", file.max_value)?;
     let mesh_wire = size("mesh_wire", file.mesh_wire)?;
+    let stash_max = size("stash_max", file.stash_max)?;
     let tables = file
         .tables
         .into_iter()
@@ -161,6 +166,7 @@ fn parse(text: &str) -> Result<Config, Problem> {
         peers: file.peers,
         max_value,
         mesh_wire,
+        stash_max,
     })
 }
 
