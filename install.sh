@@ -57,7 +57,7 @@ resolve_version() {
   fi
 
   local latest
-  latest="$(curl -fsSL -o /dev/null -w '%{url_effective}' "https://github.com/${REPO}/releases/latest")" ||
+  latest="$(curl --proto '=https' --tlsv1.2 -fsSL -o /dev/null -w '%{url_effective}' "https://github.com/${REPO}/releases/latest")" ||
     fail "could not reach github.com to find the latest release for ${TARGET}"
   VERSION="${latest##*/}"
   case "${VERSION}" in
@@ -68,7 +68,7 @@ resolve_version() {
 
 download() {
   local url="$1" output="$2" status
-  status="$(curl -sSL -o "${output}" -w '%{http_code}' "${url}")" ||
+  status="$(curl --proto '=https' --tlsv1.2 -sSL -o "${output}" -w '%{http_code}' "${url}")" ||
     fail "could not download ${url} for ${TARGET}"
   case "${status}" in
     200) ;;
