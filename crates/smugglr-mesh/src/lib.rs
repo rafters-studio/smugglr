@@ -52,7 +52,7 @@ use smugglr_memory::Store;
 pub use node::{remove, replay, run};
 
 /// The UDP port a node broadcasts and listens on when the config sets none.
-pub const PORT: u16 = 31337;
+pub const PORT: u16 = 31415;
 
 /// How many more copies of a change a node may hear in its echo wait before
 /// it no longer echoes the change, unless set.

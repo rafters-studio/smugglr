@@ -208,7 +208,7 @@ impl Front {
             path,
             out,
             err,
-            port: port.unwrap_or(31337),
+            port: port.unwrap_or(31415),
             child,
             command,
         });
@@ -535,12 +535,12 @@ fn exchanges_on(world: &World, front: &Front, index: usize, port: u16) -> Result
     front.holds_within(index, &back, "heard", Duration::from_secs(30))
 }
 
-#[then("the first sends and listens on UDP port 31337")]
-fn the_first_on_31337(world: &World, front: &Front) -> Result<(), String> {
-    if front.with(0, |node| node.port)? != 31337 {
+#[then("the first sends and listens on UDP port 31415")]
+fn the_first_on_31415(world: &World, front: &Front) -> Result<(), String> {
+    if front.with(0, |node| node.port)? != 31415 {
         return Err("the first node was not started without a port".to_owned());
     }
-    exchanges_on(world, front, 0, 31337)
+    exchanges_on(world, front, 0, 31415)
 }
 
 #[then("the second sends and listens on UDP port 40000")]

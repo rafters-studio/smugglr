@@ -31,7 +31,7 @@ Acceptance criteria are Gherkin scenarios, one per criterion, tagged
 
 The merge queue does not wait for the test jobs: its required checks are only the fast ones, so a PR can merge with its tests still running, and main goes red after. Before `legion pr merge`, run `gh pr checks <n>` and enqueue only when `test (ubuntu-latest)`, `test (macos-latest)` and `test (windows-latest)` have passed on the PR's head.
 
-The scenario `the mesh port is a setting` fails on a machine where another program holds UDP 31337, until #605. That is not your change.
+The scenario `the mesh port is a setting` runs a node on the real default port, so it fails on a machine where another program holds UDP 31415. Puck and rzr run the live legion mesh on that port, so it fails on both while the mesh runs. That is not your change; CI runs it clean.
 
 ## Traces
 

@@ -40,7 +40,7 @@ pub struct Config {
     pub steering: Steering,
     /// The graveyard window in seconds; `None` when not set, 12 hours.
     pub graveyard: Option<u64>,
-    /// The mesh's UDP port; `None` when not set, 31337.
+    /// The mesh's UDP port; `None` when not set, 31415.
     pub port: Option<u16>,
     /// The most bytes the mesh's outbox holds; `None` when not set, 6 MB.
     pub backpressure: Option<u64>,

@@ -17,7 +17,7 @@ Feature: smugglr mesh as a command: its front ends, its node's name and port, it
   Scenario: the mesh port is a setting
     Given one node with no port setting and one node with port set to 40000
     When each node starts smugglr mesh
-    Then the first sends and listens on UDP port 31337
+    Then the first sends and listens on UDP port 31415
     And the second sends and listens on UDP port 40000
 
   @criterion-01a175e5-f67e-7e00-87b3-8096ec5c0eda @module-mesh
