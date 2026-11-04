@@ -31,7 +31,7 @@ const HELP: &str = "usage: smugglr mesh <place> --key-file <path> [--sync-mode s
 Keeps <place> in step with every node on the local network that holds the
 same key, until stopped. A node is named by its machine's name, and
 broadcasts and listens on the UDP port the config's port setting names,
-31337 when not set; on a network that carries no broadcast, the config's
+31415 when not set; on a network that carries no broadcast, the config's
 peers setting names hosts to announce to (peers = [\"desktop.local\"]),
 looked up again at each announcement, so a host can change address.
 Changes not yet acknowledged wait in an outbox of at most the config's

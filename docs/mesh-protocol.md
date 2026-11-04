@@ -25,7 +25,7 @@ Scope: designed and tested for up to 50 nodes. Acknowledgements grow with the no
 | `--key-file <path>` | flag | none, required | the shared key file (below) |
 | `--replay <change hash>` | flag | none | decide a dropped change again and exit (below) |
 | `--sync-mode stop\|last` | flag | `stop` | what happens to a row changed here and in a change; `source` and `target` are for two places and are refused |
-| `port` | config | 31337 | the UDP port a node broadcasts and listens on |
+| `port` | config | 31415 | the UDP port a node broadcasts and listens on |
 | `peers` | config | none | hosts to announce to on a network with no broadcast: `host` or `host:port`, the mesh port when none is given, a name looked up again at each announcement |
 | `backpressure` | config | 6 MB | the most the outbox holds, in bytes or text such as `"6 MB"` |
 | `graveyard` | config | 12 hours | seconds a change is carried; sets each sunset |

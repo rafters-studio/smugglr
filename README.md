@@ -314,7 +314,7 @@ n1|back again
 
 | setting | default | what it does |
 | --- | --- | --- |
-| `port` | 31337 | the UDP port a node broadcasts and listens on |
+| `port` | 31415 | the UDP port a node broadcasts and listens on |
 | `peers` | none | addresses to announce to, `host` or `host:port` |
 | `backpressure` | 6 MB | the most the outbox of unacknowledged changes holds; at the line the node takes no new changes in until acknowledgements bring it down |
 | `graveyard` | 12 hours | seconds a change is carried; sets each change's sunset |
