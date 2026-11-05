@@ -6,7 +6,7 @@ smugglr is not a database. It moves rows between databases and keeps its own mem
 
 ## Install
 
-The GitHub release for tag v0.6.1 (https://github.com/rafters-studio/smugglr/releases) carries one archive per target: `smugglr-<target>.tar.gz` for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin` and `aarch64-apple-darwin`, and `smugglr-x86_64-pc-windows-msvc.zip` for Windows. smugglr publishes no checksum file.
+The GitHub release for tag v0.6.2 (https://github.com/rafters-studio/smugglr/releases) carries one archive per target: `smugglr-<target>.tar.gz` for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin` and `aarch64-apple-darwin`, and `smugglr-x86_64-pc-windows-msvc.zip` for Windows. smugglr publishes no checksum file.
 
 With `install.sh`, on Linux and macOS, x86_64 or aarch64:
 
@@ -14,12 +14,12 @@ With `install.sh`, on Linux and macOS, x86_64 or aarch64:
 curl -fsSL https://raw.githubusercontent.com/rafters-studio/smugglr/main/install.sh | bash
 ```
 
-It installs the latest release's binary to `~/.local/bin/smugglr`, and says how to add that directory to `PATH` when it is not on it. `SMUGGLR_VERSION=v0.6.1 bash install.sh` installs that tag.
+It installs the latest release's binary to `~/.local/bin/smugglr`, and says how to add that directory to `PATH` when it is not on it. `SMUGGLR_VERSION=v0.6.2 bash install.sh` installs that tag.
 
 From source:
 
 ```
-cargo install --git https://github.com/rafters-studio/smugglr --tag v0.6.1 smugglr
+cargo install --git https://github.com/rafters-studio/smugglr --tag v0.6.2 smugglr
 ```
 
 ## First sync
@@ -124,6 +124,10 @@ op run --environment=<id> -- smugglr sync ./shop.db d1://shop
 ```
 
 Before it reads a row, smugglr checks that both places hold the same tables with the same columns. A difference stops the run and writes nothing. Tables a sync should not touch in a shared database go in the config's `ignore` list, and the check skips them. `sqlite_*` and D1's `_cf_*` tables are ignored without being listed. `--table` limits which tables move, not which are checked.
+
+D1 refuses any query whose result is over 50 MB, and smugglr reads each table of a D1 database in one query. A table whose rows come to more than 50 MB of text stops the sync with D1's own message, `D1 query result exceeded the maximum response size limit of 50 MB`, exit 3, and nothing is written. Until smugglr reads D1 in pages, put such a table in the config's `ignore` list and move it another way.
+
+`smugglr sync <local> <place> --migratr [dir]` carries a migratr migration from a local database to a place: it runs the migration locally and stops for a check, then a second run carries it and syncs. `smugglr sync --help` describes it, and `docs/integer-keys.md` says what happens to a table keyed `INTEGER PRIMARY KEY` written in two places.
 
 ## Config
 
@@ -321,13 +325,11 @@ n1|back again
 
 Designed and tested for up to 50 nodes. Clocks should agree to within one twelfth of the sunset.
 
-### Not in 0.6.1
+### Not in 0.6.2
 
-- Automatic catch-up past the sunset (#521). A node away longer than the sunset prints the commands above; the person runs `smugglr stash` and `smugglr retrieve`.
-- `smugglr mesh remove` (#521). A node gone for good stops being a target when the sunset passes.
 - Retiring the previous key. A node accepts the key before the newest with no end date; nothing removes it but taking it out of the key file.
-- A loud name clash (#521). Two machines with one name ignore each other and nothing says so.
-- The `mesh_wire` setting, which belongs to the automatic catch-up.
+
+The outputs above were pasted from 0.6.1. Since then a large row crosses the mesh in parts (#600), a node away past the sunset takes a stash from a peer over the mesh (#630), `smugglr mesh remove` and the name check are built (#628), and `smugglr mesh --help` describes them. This section is being rewritten for them.
 
 ## Sync types not built yet
 
