@@ -91,7 +91,7 @@ impl Transport for Post {
 }
 
 /// One statement and its parameters.
-type Statement = (String, Vec<Json>);
+pub type Statement = (String, Vec<Json>);
 
 impl HttpSql {
     /// The service at `url`. Nothing is sent until the place is read.
@@ -143,14 +143,20 @@ impl HttpSql {
     }
 
     /// Runs one statement and returns its rows.
-    fn query(&self, sql: &str, params: &[Json]) -> Result<Vec<Vec<Json>>, Error> {
+    ///
+    /// # Errors
+    /// When the service cannot be reached or refuses the statement.
+    pub fn query(&self, sql: &str, params: &[Json]) -> Result<Vec<Vec<Json>>, Error> {
         let result = self.post(&json!({"sql": sql, "params": params}))?;
         self.rows_of(&result)
     }
 
     /// Runs the statements as one batch, in one transaction when `atomic`,
     /// and returns each one's result.
-    fn batch(&self, statements: &[Statement], atomic: bool) -> Result<Vec<Json>, Error> {
+    ///
+    /// # Errors
+    /// When the service cannot be reached or refuses a statement.
+    pub fn batch(&self, statements: &[Statement], atomic: bool) -> Result<Vec<Json>, Error> {
         if statements.is_empty() {
             return Ok(Vec::new());
         }

@@ -5,7 +5,8 @@
 //! The stand-in keeps D1's quirks that smugglr must meet: a bearer token;
 //! databases found by a name filter that also matches other names; every
 //! parameter text only; integers back as plain JSON numbers; its own
-//! `_cf_*` tables not to be read. It runs a batch as one transaction, which
+//! `_cf_*` tables not to be read; foreign keys always on, whatever a pragma
+//! says; temp tables refused. It runs a batch as one transaction, which
 //! is the stand-in's own assumption, not D1's documented behaviour (d1.rs).
 //! Before a release the @hosted scenario runs against the real service with
 //! credentials.
@@ -163,11 +164,17 @@ fn raw(path: &str, body: &Json) -> Result<Json, String> {
         let named = params
             .iter()
             .any(|param| param.as_str().is_some_and(|text| text.starts_with("_cf_")));
-        if sql.contains("\"_cf_") || named {
+        let temp = sql.to_ascii_uppercase().contains("CREATE TEMP");
+        if sql.contains("\"_cf_") || named || temp {
             return Err(format!("not authorized: SQLITE_AUTH: {sql}"));
         }
     }
     let connection = Connection::open(path).map_err(|err| err.to_string())?;
+    // On for the whole batch: inside the transaction below, a pragma turning
+    // foreign keys off has no effect, as on D1.
+    connection
+        .pragma_update(None, "foreign_keys", true)
+        .map_err(|err| err.to_string())?;
     let sql = |text: &str| {
         connection
             .execute_batch(text)
@@ -244,7 +251,12 @@ fn emit(value: Value) -> Json {
 
 /// Makes the SQLite file `file` running `sql`, serves it as the D1 database
 /// `name`, and has smugglr reach it; returns the place's address.
-fn d1(world: &World, name: &str, file: &str, sql: &str) -> Result<(String, String), String> {
+pub(crate) fn d1(
+    world: &World,
+    name: &str,
+    file: &str,
+    sql: &str,
+) -> Result<(String, String), String> {
     let path = world.place(file, sql)?;
     let api = serve_d1(name, &path)?;
     world.env.set(vec![

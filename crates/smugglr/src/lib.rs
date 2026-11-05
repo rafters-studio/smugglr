@@ -6,6 +6,7 @@
 //! [`Config`] reads the person's config, as the CLI does.
 
 pub mod config;
+pub mod migratr;
 
 pub use config::Config;
 pub use smugglr_sync::{Error, Options, SyncType, sync};

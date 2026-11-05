@@ -22,6 +22,10 @@ smugglr-sync = { path = "crates/smugglr-sync", version = "0.6.1" }
 # function on the connection, where the data lives.
 rusqlite = { version = "0.40", features = ["bundled", "functions"] }
 thiserror = "2"
+# The migrations `smugglr sync --migratr` carries (smugglr, the CLI): the
+# release that says whether a migration rebuilds, records one without running
+# it, and reads a schema through anything that can run SQL.
+migratr = "0.1.4"
 # The mesh (smugglr-mesh): each datagram sealed with XChaCha20-Poly1305
 # under a key derived from the shared key, with a fresh random 24-byte nonce
 # (FR-SMUGGLR-078 rev 11); `getrandom` gives the nonces, the echo waits and

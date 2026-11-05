@@ -35,7 +35,8 @@ pub(crate) fn self_keyed<E>(
 }
 
 /// A name as a quoted SQL identifier.
-pub(crate) fn ident(name: &str) -> String {
+#[must_use]
+pub fn ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 

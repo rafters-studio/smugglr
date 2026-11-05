@@ -34,6 +34,10 @@ pub(crate) struct World {
     pub(crate) lines: Slot<Vec<(f64, String)>>,
     /// What a program's call to `smugglr::sync` returned.
     pub(crate) called: Slot<Result<smugglr_core::record::Record, smugglr::Error>>,
+    /// What a `--migratr` run saw of its places before it ran: (local, place).
+    pub(crate) carried: Slot<(String, String)>,
+    /// What the first `--migratr` run said, kept past the runs after it.
+    pub(crate) first_said: Slot<String>,
     /// The variables smugglr runs with, beside `XDG_CONFIG_HOME`: a hosted
     /// place's credentials and where its API stands in.
     pub(crate) env: Slot<Vec<(String, String)>>,

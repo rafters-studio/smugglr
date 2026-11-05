@@ -14,8 +14,9 @@
 //! outbox holds, in bytes or text like `max_wire`, and `peers`, hosts a
 //! mesh node announces itself to on a network that carries no broadcast
 //! (FR-SMUGGLR-078); and `max_value`, the largest value a row may hold to
-//! move, in bytes or text like `max_wire` (FR-SMUGGLR-071). Other settings
-//! are left alone.
+//! move, in bytes or text like `max_wire` (FR-SMUGGLR-071); and `[migratr]`,
+//! its `dir` of migrations and whether it is `safe` (FR-SMUGGLR-083). Other
+//! settings are left alone.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -54,6 +55,18 @@ pub struct Config {
     /// The largest database a mesh node offers a stash of; `None` when not
     /// set, 64 MB.
     pub stash_max: Option<u64>,
+    /// What `--migratr` reads.
+    pub migratr: Migratr,
+}
+
+/// The `[migratr]` section.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct Migratr {
+    /// The migrations directory, when `--migratr` names none.
+    pub dir: Option<PathBuf>,
+    /// The first sync, the snapshot, its verification and the comparison
+    /// before a rebuild; `None` when not set, on.
+    pub safe: Option<bool>,
 }
 
 /// The config as the file holds it, before its settings are checked.
@@ -73,6 +86,8 @@ struct File {
     steering: Option<String>,
     #[serde(default)]
     tables: BTreeMap<String, TableFile>,
+    #[serde(default)]
+    migratr: Migratr,
 }
 
 /// One table's settings as the file holds them.
@@ -167,6 +182,7 @@ fn parse(text: &str) -> Result<Config, Problem> {
         max_value,
         mesh_wire,
         stash_max,
+        migratr: file.migratr,
     })
 }
 
@@ -298,6 +314,20 @@ mod tests {
         let max_value = |text| parse(text).ok().map(|config| config.max_value);
         assert_eq!(max_value("max_value = \"1 MB\""), Some(Some(1_000_000)));
         assert_eq!(max_value(""), Some(None));
+    }
+
+    #[test]
+    fn the_migratr_section_is_read() {
+        let migratr = parse("[migratr]\ndir = \"db/migrations\"\nsafe = false\n")
+            .ok()
+            .map(|config| config.migratr);
+        assert_eq!(
+            migratr,
+            Some(super::Migratr {
+                dir: Some(PathBuf::from("db/migrations")),
+                safe: Some(false),
+            })
+        );
     }
 
     #[test]

@@ -1,10 +1,13 @@
 //! The command line: `smugglr sync <source> <target>` and its flags
 //! (FR-SMUGGLR-059).
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+use ::migratr::Executor;
+use smugglr::migratr::{self, Finish, Request};
 use smugglr::{Config, Options, SyncType, sync};
 use smugglr_core::plan::SyncMode;
 use smugglr_core::record::{Record, Status};
@@ -27,7 +30,7 @@ const WATCH_SECONDS: u64 = 60;
 
 const HELP: &str = "usage: smugglr sync <source> <target> [--dryrun] [--json] \
      [--sync-type direct|mesh] [--sync-mode stop|source|target|last] [--table <name>]... \
-     [--watch [seconds]]
+     [--watch [seconds]] [--migratr [dir]]
 
 The first place named is the source, the second the target.
   --dryrun                 show what the sync would do; write nothing
@@ -43,7 +46,24 @@ The first place named is the source, the second the target.
                            steering column (named in config) is further on
   --table <name>           limit the run to this table; repeatable
   --watch [seconds]        rerun every given number of seconds, 60 when none
-                           is given, until stopped";
+                           is given, until stopped
+  --migratr [dir]          carry migrations from the source, a local database,
+                           to the target. The directory comes from here or from
+                           dir under [migratr] in the config. With migrations
+                           pending locally, a run syncs the places, takes and
+                           verifies a snapshot, migrates the local database and
+                           stops so you can check it. Run again, it applies to
+                           the target what the target's ledger lacks and syncs
+                           rows. A migration that has not run locally never
+                           reaches a place. --migratr takes neither --watch nor
+                           --table.
+                           safe under [migratr], true by default, is the first
+                           sync, the snapshot, its verification and the
+                           comparison before a rebuild; false skips them.
+                           A rebuild does not lock the target: the app must not
+                           write during a rebuild.
+                           The snapshot, kept until the final sync is in step,
+                           is the way back.";
 
 /// A `smugglr sync` command line.
 #[derive(Debug, Default)]
@@ -51,6 +71,10 @@ struct Sync {
     places: Vec<String>,
     json: bool,
     options: Options,
+    /// `--migratr`.
+    migratr: bool,
+    /// The directory `--migratr` names, if any.
+    migrations: Option<PathBuf>,
 }
 
 /// Runs the command line `args` (without the program name).
@@ -136,9 +160,20 @@ fn parse(args: &[String]) -> Result<Sync, String> {
                 }
                 command.options.watch = Some(Duration::from_secs(seconds.unwrap_or(WATCH_SECONDS)));
             }
+            "--migratr" => command.migratr = true,
             flag if flag.starts_with("--") => return Err(format!("unknown flag {flag}")),
+            // Once the two places are named, a word after --migratr is its
+            // directory.
+            dir if command.migratr && command.migrations.is_none() && command.places.len() == 2 => {
+                command.migrations = Some(PathBuf::from(dir));
+            }
             place => command.places.push(place.to_owned()),
         }
+    }
+    // A watch would rerun straight past the check a first run stops for, and
+    // a limited run could not say the places are in step.
+    if command.migratr && (command.options.watch.is_some() || !command.options.tables.is_empty()) {
+        return Err("--migratr takes neither --watch nor --table".to_owned());
     }
     // source and target work with direct and hub only (FR-SMUGGLR-059).
     if let Some(kind) = unbuilt {
@@ -181,9 +216,11 @@ fn sync_once(command: &Sync) -> ExitCode {
         .config_dir
         .clone()
         .or_else(smugglr_memory::config_dir);
-    if let Some(dir) = dir {
-        match Config::load(&dir) {
+    let mut settings = smugglr::config::Migratr::default();
+    if let Some(dir) = &dir {
+        match Config::load(dir) {
             Ok(config) => {
+                settings = config.migratr;
                 options.ignore = config.ignore;
                 options.max_wire = config.max_wire;
                 options.max_value = config.max_value;
@@ -204,6 +241,21 @@ fn sync_once(command: &Sync) -> ExitCode {
         Ok(places) => places,
         Err(err) => return usage(&err.to_string()),
     };
+    if command.migratr {
+        let Some(migrations) = command.migrations.clone().or(settings.dir) else {
+            return usage("--migratr needs a directory, here or as dir under [migratr]");
+        };
+        options.config_dir = dir;
+        let request = Request {
+            source: command.places[0].clone(),
+            target: command.places[1].clone(),
+            dir: migrations,
+            safe: settings.safe != Some(false),
+            options,
+        };
+        drop((source, target));
+        return carry_command(&request, command.json);
+    }
     match sync(source.as_mut(), target.as_mut(), &options) {
         Ok(record) => {
             print_record(&record, command.json);
@@ -227,6 +279,45 @@ fn sync_once(command: &Sync) -> ExitCode {
     }
 }
 
+/// One `--migratr` run, and what it did as an exit status: 0 done (or a
+/// preview), 3 stopped with nothing changed, 4 changed something and not
+/// done, a first run stopped for its check among them, 5 too much for the
+/// wire.
+fn carry_command(request: &Request, json: bool) -> ExitCode {
+    match migratr::carry(request, &|local, name| local.snapshot(name)) {
+        Ok(outcome) => {
+            for line in &outcome.said {
+                if json {
+                    eprintln!("{line}");
+                } else {
+                    println!("{line}");
+                }
+            }
+            if let Some(record) = &outcome.record {
+                print_record(record, json);
+            }
+            match (outcome.finish, &outcome.record) {
+                (Finish::Done, _) => ExitCode::SUCCESS,
+                // Never from the record's status: a preview's is success.
+                (Finish::Stopped, Some(record)) if record.status == Status::TooMuch => {
+                    ExitCode::from(TOO_MUCH)
+                }
+                (Finish::Stopped, Some(record)) if record.wrote() => ExitCode::from(NOT_DONE),
+                (Finish::Stopped, _) => ExitCode::from(STOPPED),
+                (Finish::Check | Finish::NotDone, _) => ExitCode::from(NOT_DONE),
+            }
+        }
+        Err(err @ migratr::Error::Stop(_)) => {
+            eprintln!("{err}");
+            ExitCode::from(STOPPED)
+        }
+        Err(err @ migratr::Error::NotDone(_)) => {
+            eprintln!("{err}");
+            ExitCode::from(NOT_DONE)
+        }
+    }
+}
+
 pub(crate) fn print_record(record: &Record, json: bool) {
     if json {
         println!("{}", record.json());
@@ -245,5 +336,43 @@ pub(crate) fn exit(record: &Record) -> ExitCode {
         Status::TooMuch => ExitCode::from(TOO_MUCH),
         Status::Stopped | Status::StoppedInPart if record.wrote() => ExitCode::from(NOT_DONE),
         Status::Stopped | Status::StoppedInPart => ExitCode::from(STOPPED),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HELP, parse};
+
+    #[test]
+    fn help_says_what_migratr_does_what_safe_does_and_the_way_back() {
+        for said in [
+            "--migratr [dir]",
+            "safe under [migratr]",
+            "must not\n                           write during a rebuild",
+            "is the way back",
+        ] {
+            assert!(HELP.contains(said), "{said}");
+        }
+    }
+
+    fn args(line: &str) -> Vec<String> {
+        line.split(' ').map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn a_word_after_migratr_is_its_directory_once_two_places_are_named() {
+        let named = parse(&args("a b --migratr db"));
+        assert_eq!(
+            named.ok().and_then(|sync| sync.migrations),
+            Some("db".into())
+        );
+        let places = parse(&args("--migratr a b"));
+        assert_eq!(places.ok().map(|sync| sync.migrations), Some(None));
+    }
+
+    #[test]
+    fn migratr_takes_neither_watch_nor_table() {
+        assert!(parse(&args("a b --migratr --watch")).is_err());
+        assert!(parse(&args("a b --migratr --table notes")).is_err());
     }
 }

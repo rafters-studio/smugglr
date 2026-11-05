@@ -28,6 +28,7 @@ pub use d1::D1;
 pub use http_sql::{HttpSql, Transport};
 #[cfg(feature = "native")]
 pub use local_file::LocalFile;
+pub use queries::ident;
 
 /// What a place says when it cannot do what was asked.
 #[derive(Debug, thiserror::Error)]
@@ -211,19 +212,37 @@ const OTHER_ENGINES: &[&str] = &[
 /// and the place's own error when it cannot be opened.
 #[cfg(feature = "native")]
 pub fn open(address: &str) -> Result<Box<dyn Place>, Error> {
+    match file_path(address) {
+        Some(path) => Ok(Box::new(LocalFile::open(path)?)),
+        None => Ok(Box::new(service(address)?)),
+    }
+}
+
+/// The file an address names, if it names one.
+#[must_use]
+pub fn file_path(address: &str) -> Option<&str> {
     match address.split_once("://") {
-        None => Ok(Box::new(LocalFile::open(address)?)),
-        Some(("file", path)) => Ok(Box::new(LocalFile::open(path)?)),
-        Some((scheme, name)) if scheme.eq_ignore_ascii_case("d1") => Ok(Box::new(D1::open(name)?)),
-        Some((scheme, _))
-            if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") =>
-        {
-            Ok(Box::new(HttpSql::open(address)))
-        }
-        Some((scheme, _)) if OTHER_ENGINES.contains(&scheme.to_ascii_lowercase().as_str()) => {
-            Err(Error::OtherEngine)
-        }
-        Some((scheme, _)) => Err(Error::Unreachable(scheme.to_owned())),
+        None => Some(address),
+        Some(("file", path)) => Some(path),
+        Some(_) => None,
+    }
+}
+
+/// The service an address names that is not a file.
+///
+/// # Errors
+/// As [`open`] says.
+#[cfg(feature = "native")]
+pub fn service(address: &str) -> Result<HttpSql, Error> {
+    let (scheme, name) = address.split_once("://").unwrap_or(("", address));
+    if scheme.eq_ignore_ascii_case("d1") {
+        D1::open(name)
+    } else if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
+        Ok(HttpSql::open(address))
+    } else if OTHER_ENGINES.contains(&scheme.to_ascii_lowercase().as_str()) {
+        Err(Error::OtherEngine)
+    } else {
+        Err(Error::Unreachable(scheme.to_owned()))
     }
 }
 
