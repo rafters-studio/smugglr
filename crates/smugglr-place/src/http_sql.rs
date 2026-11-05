@@ -62,24 +62,9 @@ pub trait Transport: std::fmt::Debug {
 /// An HTTP POST to the service's URL.
 #[cfg(feature = "native")]
 #[derive(Debug)]
-pub(crate) struct Post {
+struct Post {
     url: String,
     agent: ureq::Agent,
-}
-
-#[cfg(feature = "native")]
-impl Post {
-    /// An HTTP POST to `url`.
-    pub(crate) fn to(url: &str) -> Self {
-        let agent = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .build()
-            .into();
-        Self {
-            url: url.to_owned(),
-            agent,
-        }
-    }
 }
 
 #[cfg(feature = "native")]
@@ -106,14 +91,25 @@ impl Transport for Post {
 }
 
 /// One statement and its parameters.
-type Statement = (String, Vec<Json>);
+/// A statement and its parameters.
+pub type Statement = (String, Vec<Json>);
 
 impl HttpSql {
     /// The service at `url`. Nothing is sent until the place is read.
     #[cfg(feature = "native")]
     #[must_use]
     pub fn open(url: &str) -> Self {
-        Self::through(url, Box::new(Post::to(url)))
+        let agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .into();
+        Self::through(
+            url,
+            Box::new(Post {
+                url: url.to_owned(),
+                agent,
+            }),
+        )
     }
 
     /// The service at `address`, reached through `transport`. Nothing is
@@ -148,14 +144,20 @@ impl HttpSql {
     }
 
     /// Runs one statement and returns its rows.
-    fn query(&self, sql: &str, params: &[Json]) -> Result<Vec<Vec<Json>>, Error> {
+    ///
+    /// # Errors
+    /// When the service cannot be reached or refuses the statement.
+    pub fn query(&self, sql: &str, params: &[Json]) -> Result<Vec<Vec<Json>>, Error> {
         let result = self.post(&json!({"sql": sql, "params": params}))?;
         self.rows_of(&result)
     }
 
     /// Runs the statements as one batch, in one transaction when `atomic`,
     /// and returns each one's result.
-    fn batch(&self, statements: &[Statement], atomic: bool) -> Result<Vec<Json>, Error> {
+    ///
+    /// # Errors
+    /// When the service cannot be reached or refuses a statement.
+    pub fn batch(&self, statements: &[Statement], atomic: bool) -> Result<Vec<Json>, Error> {
         if statements.is_empty() {
             return Ok(Vec::new());
         }

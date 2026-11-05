@@ -100,11 +100,6 @@ impl D1 {
     /// [`Error::Missing`], naming the variable, when the account id or the
     /// token is not set.
     pub fn open(name: &str) -> Result<HttpSql, Error> {
-        Ok(Self::from_env(name)?.place())
-    }
-
-    /// The adapter for the database `name`, set up as [`D1::open`] says.
-    pub(crate) fn from_env(name: &str) -> Result<Self, Error> {
         let var = |var: &'static str| match std::env::var(var) {
             Ok(value) if !value.is_empty() => Ok(value),
             _ => Err(Error::Missing {
@@ -118,7 +113,7 @@ impl D1 {
             .ok()
             .filter(|api| !api.is_empty())
             .unwrap_or_else(|| DEFAULT_API.to_owned());
-        Ok(Self::new(name, &account, &token, &api))
+        Ok(Self::new(name, &account, &token, &api).place())
     }
 
     /// The adapter for the database `name` in `account`, reached with

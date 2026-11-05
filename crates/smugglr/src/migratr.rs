@@ -22,16 +22,17 @@ use std::fmt::Display;
 use std::path::{Path, PathBuf};
 
 use migratr::{
-    AtomicError, ColumnInfo, Executor, ForeignKeyInfo, LedgerRow, Migration, Op, RusqliteExecutor,
-    SchemaObject, SchemaSnapshot, TableInfo, load_dir, rebuild_tables, record_applied, up,
+    AtomicError, Executor, LedgerRow, Migration, Op, RusqliteExecutor, SchemaSnapshot, SqlReader,
+    TableInfo, load_dir, read_ledger_through, read_schema_through, rebuild_tables, record_applied,
+    up,
 };
 use rusqlite::{Connection, OpenFlags};
-use serde_json::{Value as Json, json};
+use serde_json::Value as Json;
 use smugglr_core::ignore::Ignore;
 use smugglr_core::plan::{Hashes, SyncMode};
 use smugglr_core::record::{Record, Status, Table as TablePart};
 use smugglr_memory::Memory;
-use smugglr_place::{Key, Place, Table, Transport};
+use smugglr_place::{HttpSql, Key, Place, Table, file_path, ident};
 use smugglr_sync::{Options, sync};
 
 /// migratr's ledger, which cannot sync: its key is handed out by the database.
@@ -102,7 +103,7 @@ type Snapshot = dyn Fn(&mut RusqliteExecutor, &str) -> Result<Option<PathBuf>, r
 /// [`Error::Stop`] when the run refuses or cannot go on, and
 /// [`Error::NotDone`] when that happens once the place may have changed.
 pub fn carry(request: &Request, take: &Snapshot) -> Result<Outcome, Error> {
-    let Some(path) = file_path(&request.source) else {
+    let Some(path) = file_path(&request.source).map(Path::new) else {
         return Err(Error::Stop(format!(
             "--migratr carries from a local database, and {} is not one",
             request.source
@@ -118,19 +119,11 @@ pub fn carry(request: &Request, take: &Snapshot) -> Result<Outcome, Error> {
         target: smugglr_place::open(&request.target).map_err(stop)?,
         said: Vec::new(),
     };
-    if let Some(transport) = smugglr_place::transport(&request.target).map_err(stop)? {
-        return run.go(&mut Hosted { transport });
-    }
-    let target = file_path(&request.target).ok_or_else(|| stop(&request.target))?;
-    run.go(&mut RusqliteExecutor::new(open_file(target)?))
-}
-
-/// The file an address names, if it names one.
-fn file_path(address: &str) -> Option<&Path> {
-    match address.split_once("://") {
-        None => Some(Path::new(address)),
-        Some(("file", path)) => Some(Path::new(path)),
-        Some(_) => None,
+    match file_path(&request.target) {
+        Some(target) => run.go(&mut RusqliteExecutor::new(open_file(Path::new(target))?)),
+        None => run.go(&mut Hosted(
+            smugglr_place::service(&request.target).map_err(stop)?,
+        )),
     }
 }
 
@@ -934,7 +927,7 @@ impl Rebuild {
         let mut statements: Vec<String> = self
             .drop
             .iter()
-            .map(|table| format!("DROP TABLE \"{}\"", table.replace('"', "\"\"")))
+            .map(|table| format!("DROP TABLE {}", ident(table)))
             .collect();
         statements.extend(self.objects.iter().cloned());
         let mut ledger = Dry::new(place);
@@ -988,142 +981,33 @@ impl<E: Executor> Executor for Dry<'_, E> {
     }
 }
 
-/// A service that speaks HTTP-SQL, as migratr's [`Executor`]. A statement goes
-/// through the place's own [`Transport`]; nothing here knows which service it
-/// is.
+/// A service that speaks HTTP-SQL, as migratr's [`Executor`]. Nothing here
+/// knows which service it is.
 #[derive(Debug)]
-struct Hosted {
-    transport: Box<dyn Transport>,
-}
+struct Hosted(HttpSql);
 
-impl Hosted {
-    fn send(&self, request: &Json) -> Result<Json, smugglr_place::Error> {
-        let failed = smugglr_place::Error::Adapter;
-        let (succeeded, envelope) = self.transport.send(request).map_err(failed)?;
-        if succeeded {
-            Ok(envelope)
-        } else {
-            let message = envelope["error"]["message"]
-                .as_str()
-                .map_or_else(|| envelope.to_string(), str::to_owned);
-            Err(failed(message))
-        }
+impl SqlReader for Hosted {
+    type Error = smugglr_place::Error;
+
+    fn rows(&mut self, sql: &str) -> Result<Vec<Vec<Json>>, Self::Error> {
+        self.0.query(sql, &[])
     }
 
-    fn rows(&self, sql: &str, params: &[Json]) -> Result<Vec<Vec<Json>>, smugglr_place::Error> {
-        let answer = self.send(&json!({"sql": sql, "params": params}))?;
-        answer["rows"]
-            .as_array()
-            .map(|rows| {
-                rows.iter()
-                    .filter_map(|row| row.as_array().cloned())
-                    .collect()
-            })
-            .ok_or_else(|| smugglr_place::Error::Adapter(format!("no rows from {sql}")))
+    fn malformed(&self, what: &str) -> Self::Error {
+        smugglr_place::Error::Adapter(format!("{}: {what}", self.0.address()))
     }
-}
-
-fn text(row: &[Json], at: usize) -> String {
-    row.get(at).and_then(Json::as_str).unwrap_or("").to_owned()
-}
-
-fn maybe_text(row: &[Json], at: usize) -> Option<String> {
-    row.get(at).and_then(Json::as_str).map(str::to_owned)
-}
-
-fn number(row: &[Json], at: usize) -> i64 {
-    row.get(at).and_then(Json::as_i64).unwrap_or(0)
 }
 
 impl Executor for Hosted {
     type Error = smugglr_place::Error;
 
     fn read_schema(&mut self) -> Result<SchemaSnapshot, Self::Error> {
-        let own = Ignore::new(self.transport.own_tables().iter().copied());
-        let objects: Vec<SchemaObject> = self
-            .rows(
-                "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY rowid",
-                &[],
-            )?
-            .iter()
-            .map(|row| SchemaObject {
-                kind: text(row, 0),
-                name: text(row, 1),
-                tbl_name: text(row, 2),
-                sql: maybe_text(row, 3),
-            })
-            .filter(|object| !own.ignores(&object.tbl_name))
-            .collect();
-        let mut tables = Vec::new();
-        for object in objects
-            .iter()
-            .filter(|o| o.kind == "table" && !o.name.starts_with("sqlite_"))
-        {
-            let name = json!(object.name);
-            let columns = self
-                .rows(
-                    "SELECT cid, name, type, \"notnull\", dflt_value, pk, hidden \
-                     FROM pragma_table_xinfo(?1)",
-                    std::slice::from_ref(&name),
-                )?
-                .iter()
-                .map(|row| ColumnInfo {
-                    cid: number(row, 0),
-                    name: text(row, 1),
-                    decl_type: text(row, 2),
-                    not_null: number(row, 3) != 0,
-                    default_value: maybe_text(row, 4),
-                    pk: number(row, 5),
-                    hidden: number(row, 6),
-                })
-                .collect();
-            let foreign_keys = self
-                .rows(
-                    "SELECT id, seq, \"table\", \"from\", \"to\", on_update, on_delete, \"match\" \
-                     FROM pragma_foreign_key_list(?1)",
-                    std::slice::from_ref(&name),
-                )?
-                .iter()
-                .map(|row| ForeignKeyInfo {
-                    id: number(row, 0),
-                    seq: number(row, 1),
-                    table: text(row, 2),
-                    from: text(row, 3),
-                    to: maybe_text(row, 4),
-                    on_update: text(row, 5),
-                    on_delete: text(row, 6),
-                    match_clause: text(row, 7),
-                })
-                .collect();
-            tables.push(TableInfo {
-                name: object.name.clone(),
-                columns,
-                foreign_keys,
-            });
-        }
-        Ok(SchemaSnapshot { objects, tables })
+        let own = Ignore::new(self.0.own_tables().iter().copied());
+        read_schema_through(self, |table| own.ignores(table))
     }
 
     fn read_ledger(&mut self) -> Result<Vec<LedgerRow>, Self::Error> {
-        let held = self.rows(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1",
-            &[json!(LEDGER)],
-        )?;
-        if held.is_empty() {
-            return Ok(Vec::new());
-        }
-        Ok(self
-            .rows(
-                &format!("SELECT version, name, checksum FROM {LEDGER} ORDER BY version"),
-                &[],
-            )?
-            .iter()
-            .map(|row| LedgerRow {
-                version: u64::try_from(number(row, 0)).unwrap_or(0),
-                name: text(row, 1),
-                checksum: text(row, 2),
-            })
-            .collect())
+        read_ledger_through(self)
     }
 
     fn run_atomic(
@@ -1140,11 +1024,12 @@ impl Executor for Hosted {
                 ),
             ));
         }
-        let batch: Vec<Json> = statements
+        let batch: Vec<_> = statements
             .iter()
-            .map(|sql| json!({"sql": sql, "params": []}))
+            .map(|sql| (sql.clone(), Vec::new()))
             .collect();
-        self.send(&json!({"batch": batch, "atomic": true}))
+        self.0
+            .batch(&batch, true)
             .map(drop)
             .map_err(AtomicError::outside_statements)
     }

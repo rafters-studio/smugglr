@@ -95,7 +95,9 @@ fn with_migratr(world: &World, more: &[&str]) -> Result<Output, String> {
 /// failed setup.
 fn first_run(world: &World) -> Result<(), String> {
     let output = with_migratr(world, &[])?;
-    if said(world)?.contains("run the command again") {
+    let first = said(world)?;
+    world.first_said.set(first.clone());
+    if first.contains("run the command again") {
         Ok(())
     } else {
         Err(format!(
@@ -763,8 +765,10 @@ fn nothing_dropped(world: &World) -> Result<(), String> {
 
 #[then("no snapshot is taken")]
 fn no_snapshot(world: &World) -> Result<(), String> {
-    if snapshot(world)?.exists() {
-        Err("a snapshot was taken".to_owned())
+    // The file alone proves nothing: a run that reaches in step deletes it.
+    let first = world.first_said.get().ok_or("no first run")?;
+    if first.contains("snapshot:") || snapshot(world)?.exists() {
+        Err(format!("a snapshot was taken: {first}"))
     } else {
         Ok(())
     }
