@@ -35,8 +35,9 @@ use smugglr_memory::Memory;
 use smugglr_place::{HttpSql, Key, Place, Table, file_path, ident};
 use smugglr_sync::{Options, sync};
 
-/// migratr's ledger, which cannot sync: its key is handed out by the database.
-const LEDGER: &str = "_migratr_migrations";
+/// migratr's ledger, which no sync touches: it is written here, as part of a
+/// migration.
+const LEDGER: &str = smugglr_core::ignore::MIGRATR_LEDGER;
 
 /// One `--migratr` run.
 #[derive(Debug, Clone)]
@@ -308,14 +309,12 @@ impl Run<'_> {
             .collect()
     }
 
-    /// The options a sync runs with: the ledger is left out, because each
-    /// run writes it on the place itself. Under safe, with the place found
-    /// unchanged since the snapshot, the local database's rows are kept: every
-    /// difference came from it.
+    /// The options a sync runs with. Under safe, with the place found
+    /// unchanged since the snapshot, the local database's rows are kept in the
+    /// default mode: every difference came from it.
     fn options(&self) -> Options {
         let mut options = self.request.options.clone();
-        options.ignore.push(LEDGER.to_owned());
-        if self.local_wins {
+        if self.local_wins && options.sync_mode == SyncMode::Stop {
             options.sync_mode = SyncMode::Source;
         }
         options

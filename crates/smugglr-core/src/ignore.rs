@@ -1,15 +1,20 @@
 //! Ignored tables (FR-SMUGGLR-066): smugglr never reads, writes, hashes or
 //! sends them.
 //!
-//! Always ignored: SQLite's own `sqlite_*` tables. The person lists more,
+//! Always ignored: SQLite's own `sqlite_*` tables, and migratr's ledger,
+//! which says what ran on its own database and is written only by a
+//! migration, so a copy from another database is wrong. The person lists more,
 //! with simple wildcards: `*` stands for any run of characters, `?` for any
 //! one. Names match as SQLite
 //! matches them, without regard to ASCII case.
 
 use std::collections::BTreeSet;
 
+/// migratr's ledger: which migrations ran on its database.
+pub const MIGRATR_LEDGER: &str = "_migratr_migrations";
+
 /// The tables smugglr always ignores.
-pub const ALWAYS: &[&str] = &["sqlite_*"];
+pub const ALWAYS: &[&str] = &["sqlite_*", MIGRATR_LEDGER];
 
 /// Which tables a run ignores: those smugglr always ignores, and those the
 /// person lists.
@@ -111,6 +116,7 @@ mod tests {
     fn sqlite_tables_are_always_ignored() {
         let ignore = Ignore::default();
         assert!(ignore.ignores("sqlite_sequence"));
+        assert!(ignore.ignores("_migratr_migrations"));
         assert!(ignore.ignores("sqlite_stat1"));
         assert!(!ignore.ignores("notes"));
         assert!(!ignore.ignores("app_sqlite_cache"));
