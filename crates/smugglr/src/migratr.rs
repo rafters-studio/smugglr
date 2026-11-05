@@ -120,6 +120,7 @@ pub fn carry(request: &Request, take: &Snapshot) -> Result<Outcome, Error> {
         target: smugglr_place::open(&request.target).map_err(stop)?,
         said: Vec::new(),
         local_wins: false,
+        ignore: Ignore::new(request.options.ignore.clone()),
     };
     match file_path(&request.target) {
         Some(target) => run.go(&mut RusqliteExecutor::new(open_file(Path::new(target))?)),
@@ -156,10 +157,11 @@ fn snapshot_path(local: &Path) -> PathBuf {
 fn differing(
     a: &mut dyn Place,
     b: &mut dyn Place,
+    ignore: &Ignore,
 ) -> Result<Vec<(String, Key)>, smugglr_place::Error> {
     let (ours, theirs) = (a.tables()?, b.tables()?);
     let mut names: BTreeSet<&String> = ours.iter().chain(&theirs).map(|t| &t.name).collect();
-    names.retain(|name| name.as_str() != LEDGER);
+    names.retain(|name| !ignore.ignores(name));
     let hashes = |place: &mut dyn Place, tables: &[Table], name: &str| {
         Ok::<_, smugglr_place::Error>(match tables.iter().find(|t| t.name == name) {
             Some(table) if !table.columns.is_empty() => {
@@ -215,6 +217,9 @@ struct Run<'a> {
     /// The place was found unchanged since the snapshot, so the local
     /// database's rows win the final sync.
     local_wins: bool,
+    /// The tables no sync reads or writes: the config's ignore list, with
+    /// SQLite's own and the ledger.
+    ignore: Ignore,
 }
 
 impl Run<'_> {
@@ -262,7 +267,7 @@ impl Run<'_> {
         let tables = self.target.tables().map_err(stop)?;
         let empty = tables
             .iter()
-            .all(|t| t.name == LEDGER || t.columns.is_empty());
+            .all(|t| self.ignore.ignores(&t.name) || t.columns.is_empty());
         let mut adopted = Vec::new();
         if there.is_empty() && !empty {
             let Some(at) = self.place_at(place, &ran)? else {
@@ -403,7 +408,7 @@ impl Run<'_> {
             .map_err(stop)?
             .ok_or_else(|| stop("the local database cannot be copied"))?;
         let mut copy = smugglr_place::open(&taken.display().to_string()).map_err(stop)?;
-        let differ = differing(self.source.as_mut(), copy.as_mut()).map_err(stop)?;
+        let differ = differing(self.source.as_mut(), copy.as_mut(), &self.ignore).map_err(stop)?;
         drop(copy);
         if let Some(row) = differ.first() {
             let _ = std::fs::remove_file(&taken);
@@ -425,11 +430,11 @@ impl Run<'_> {
         ran: &[Migration],
     ) -> Result<Option<usize>, Error> {
         let schema = place.read_schema().map_err(stop)?;
-        let wanted = shape_of(&self.local.read_schema().map_err(stop)?);
+        let wanted = shape_of(&self.local.read_schema().map_err(stop)?, &self.ignore);
         for at in (0..=ran.len()).rev() {
             let mut copy = empty_copy(&schema)?;
             if up(&mut copy, &ran[at..], None).is_ok()
-                && shape_of(&copy.read_schema().map_err(stop)?) == wanted
+                && shape_of(&copy.read_schema().map_err(stop)?, &self.ignore) == wanted
             {
                 return Ok(Some(at));
             }
@@ -534,6 +539,12 @@ impl Run<'_> {
         let (before, from) = behind.split_at(at);
         no_raw_sql(from)?;
         let closed = closure(&named_tables(from), &[&schema, &local]);
+        if let Some(table) = closed.iter().find(|table| self.ignore.ignores(table)) {
+            return Err(Error::Stop(format!(
+                "A rebuild would drop {table}, which the config's ignore list keeps smugglr \
+                 from reading or writing, so its rows could not come back. Nothing was dropped."
+            )));
+        }
         let plan = Rebuild::new(&closed, &schema, &local);
         if !plan.drop.is_empty()
             && let Some(table) = in_a_cycle(&closed, &[&schema, &local])
@@ -583,7 +594,7 @@ impl Run<'_> {
             return Ok(());
         }
         let mut held = smugglr_place::open(&self.snapshot.display().to_string()).map_err(stop)?;
-        let differ = differing(held.as_mut(), self.target.as_mut()).map_err(stop)?;
+        let differ = differing(held.as_mut(), self.target.as_mut(), &self.ignore).map_err(stop)?;
         if differ.is_empty() {
             self.local_wins = true;
             return Ok(());
@@ -720,11 +731,11 @@ type TableShape = (Vec<String>, BTreeSet<String>, usize);
 /// Each table's shape, without the ledger. More than a sync compares: a
 /// migration can change a table and leave its columns' names and types as
 /// they were, and such a place has not run it.
-fn shape_of(schema: &SchemaSnapshot) -> BTreeMap<String, TableShape> {
+fn shape_of(schema: &SchemaSnapshot, ignore: &Ignore) -> BTreeMap<String, TableShape> {
     schema
         .tables
         .iter()
-        .filter(|table| table.name != LEDGER && !table.name.starts_with("sqlite_"))
+        .filter(|table| !ignore.ignores(&table.name))
         .map(|table| {
             let columns = table.columns.iter().map(|c| format!("{c:?}")).collect();
             let keys = table
