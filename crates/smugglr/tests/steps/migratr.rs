@@ -9,7 +9,7 @@ use migratr::{Executor, RusqliteExecutor, load_dir, up};
 use rstest_bdd_macros::{given, then, when};
 use rusqlite::Connection;
 use serde_json::Value;
-use smugglr::migratr::{Request, carry, take_snapshot};
+use smugglr::migratr::{Request, carry};
 use smugglr_core::plan::SyncMode;
 use smugglr_sync::Options;
 
@@ -229,7 +229,7 @@ fn run_in_process(world: &World) -> Result<(), String> {
         },
     };
     let differing = |local: &mut RusqliteExecutor, name: &str| {
-        let taken = take_snapshot(local, name)?;
+        let taken = local.snapshot(name)?;
         if let Some(path) = &taken {
             Connection::open(path)?.execute_batch("UPDATE notes SET body = 'other'")?;
         }

@@ -6,6 +6,7 @@ use std::process::ExitCode;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+use ::migratr::Executor;
 use smugglr::migratr::{self, Finish, Request};
 use smugglr::{Config, Options, SyncType, sync};
 use smugglr_core::plan::SyncMode;
@@ -282,7 +283,7 @@ fn sync_once(command: &Sync) -> ExitCode {
 /// preview), 3 stopped with nothing changed, 4 changed something and not
 /// done, a first run stopped for its check among them.
 fn carry_command(request: &Request, json: bool) -> ExitCode {
-    match migratr::carry(request, &migratr::take_snapshot) {
+    match migratr::carry(request, &|local, name| local.snapshot(name)) {
         Ok(outcome) => {
             for line in &outcome.said {
                 if json {

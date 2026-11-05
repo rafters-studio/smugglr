@@ -93,19 +93,8 @@ fn stop(err: impl Display) -> Error {
 }
 
 /// What takes the snapshot: a consistent copy of the local database, named
-/// `file_name`, beside it.
-pub type Snapshot = dyn Fn(&mut RusqliteExecutor, &str) -> Result<Option<PathBuf>, rusqlite::Error>;
-
-/// Takes the snapshot as migratr's executor does.
-///
-/// # Errors
-/// When the copy cannot be written.
-pub fn take_snapshot(
-    local: &mut RusqliteExecutor,
-    file_name: &str,
-) -> Result<Option<PathBuf>, rusqlite::Error> {
-    local.snapshot(file_name)
-}
+/// by the second argument, beside it.
+type Snapshot = dyn Fn(&mut RusqliteExecutor, &str) -> Result<Option<PathBuf>, rusqlite::Error>;
 
 /// Runs `request`, with `take` taking any snapshot.
 ///
@@ -567,8 +556,18 @@ impl Run<'_> {
         };
         let local = self.local.read_schema().map_err(stop)?;
         let (before, from) = behind.split_at(at);
+        no_raw_sql(from)?;
         let closed = closure(&named_tables(from), &[&schema, &local]);
         let plan = Rebuild::new(&closed, &schema, &local);
+        if !plan.drop.is_empty()
+            && let Some(table) = in_a_cycle(&closed, &[&schema, &local])
+        {
+            return Err(Error::Stop(format!(
+                "A rebuild would drop {table}, and its rows might not come back: it references \
+                 itself, alone or through other tables, and rows are sent one table at a time \
+                 with foreign keys on. Nothing was dropped."
+            )));
+        }
         self.may_drop(&plan, &closed)?;
         let to = before.last().map(|m| m.version);
         if self.request.options.dryrun {
@@ -758,6 +757,51 @@ fn first_rebuild(schema: &SchemaSnapshot, behind: &[Migration]) -> Result<Option
         up(&mut copy, &behind[..=at], None).map_err(stop)?;
     }
     Ok(None)
+}
+
+/// From the first rebuild on, migrations are recorded and not run, and raw SQL
+/// cannot be seen into, so its work would be lost behind a true-looking ledger.
+fn no_raw_sql(migrations: &[Migration]) -> Result<(), Error> {
+    match migrations
+        .iter()
+        .find(|m| m.up.iter().any(|op| matches!(op, Op::RawSql { .. })))
+    {
+        Some(migration) => Err(Error::Stop(format!(
+            "Migration {}_{} holds raw SQL at or after a rebuild, which smugglr cannot carry, so \
+             nothing changed on the place. Carry the rebuild in a run of its own, before any \
+             migration with raw SQL, and keep raw SQL out of a migration that rebuilds.",
+            migration.version, migration.name
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// A table of `tables` that references itself, directly or through others, in
+/// any of `schemas`.
+fn in_a_cycle<'a>(tables: &'a BTreeSet<String>, schemas: &[&SchemaSnapshot]) -> Option<&'a String> {
+    let parents = |name: &str| -> Vec<String> {
+        schemas
+            .iter()
+            .flat_map(|schema| &schema.tables)
+            .filter(|table| table.name.eq_ignore_ascii_case(name))
+            .flat_map(|table| &table.foreign_keys)
+            .map(|key| key.table.to_ascii_lowercase())
+            .collect()
+    };
+    tables.iter().find(|table| {
+        let start = table.to_ascii_lowercase();
+        let mut seen = BTreeSet::new();
+        let mut waiting = parents(&start);
+        while let Some(parent) = waiting.pop() {
+            if parent == start {
+                return true;
+            }
+            if seen.insert(parent.clone()) {
+                waiting.extend(parents(&parent));
+            }
+        }
+        false
+    })
 }
 
 /// The tables `migrations` name.
