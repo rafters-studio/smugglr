@@ -27,6 +27,8 @@ static NEXT: AtomicUsize = AtomicUsize::new(0);
 /// migrations `files` in a directory.
 struct Pair {
     folder: PathBuf,
+    /// Tables the config ignores.
+    ignore: Vec<String>,
 }
 
 impl Pair {
@@ -37,7 +39,10 @@ impl Pair {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = std::fs::remove_dir_all(&folder);
-        let pair = Self { folder };
+        let pair = Self {
+            folder,
+            ignore: Vec::new(),
+        };
         assert!(std::fs::create_dir_all(pair.folder.join("migrations")).is_ok());
         // Apart, as a database and a place are: migratr names the snapshot it
         // takes of each by the second, in a folder beside the database.
@@ -63,8 +68,21 @@ impl Pair {
     fn options(&self) -> Options {
         Options {
             config_dir: Some(self.folder.join("config")),
+            ignore: self.ignore.clone(),
             ..Options::default()
         }
+    }
+
+    /// The place gains a table only it holds, with rows, that the config
+    /// ignores.
+    fn ignoring(mut self, sql: &str, table: &str) -> Self {
+        let connection = Connection::open(self.path("there/place.db"));
+        assert!(
+            connection.is_ok_and(|c| c.execute_batch(sql).is_ok()),
+            "{sql}"
+        );
+        self.ignore.push(table.to_owned());
+        self
     }
 
     fn path(&self, name: &str) -> String {
@@ -210,4 +228,56 @@ fn a_foreign_key_cycle_stops_before_anything_is_dropped() {
     let was = pair.place_schema();
     stopped(&pair, pair.carry_twice(), &["would drop"], &was);
     assert_eq!(pair.count("there/place.db", "child"), 1);
+}
+
+/// A migration that adds a column, needing no rebuild.
+const ADD_TAG: &str = r#"{"up": [{"op": "add_column", "table": "parent",
+    "column": {"name": "tag", "type": "TEXT"}}]}"#;
+
+const KEPT_AWAY: &str = "CREATE TABLE kept_away (id TEXT PRIMARY KEY, v TEXT); \
+     INSERT INTO kept_away VALUES ('k1', 'one'), ('k2', 'two');";
+
+#[test]
+fn a_place_holding_an_ignored_table_is_matched_and_carried_without_it() {
+    let pair = Pair::new(PARENT, &[(&format!("{VERSION}_add_tag.json"), ADD_TAG)])
+        .ignoring(KEPT_AWAY, "kept_away");
+    let finish = pair.carry_twice().map(|outcome| outcome.finish);
+    assert_eq!(finish.map_err(|err| err.to_string()), Ok(Finish::Done));
+    assert!(
+        pair.place_schema()
+            .iter()
+            .any(|sql| sql.contains("\"tag\""))
+    );
+    assert_eq!(pair.count("there/place.db", "kept_away"), 2);
+}
+
+#[test]
+fn under_safe_a_change_to_an_ignored_table_does_not_stop_a_carry() {
+    let pair = Pair::new(PARENT, &[(&format!("{VERSION}_add_tag.json"), ADD_TAG)])
+        .ignoring(KEPT_AWAY, "kept_away");
+    assert_eq!(
+        pair.carry().map(|outcome| outcome.finish).ok(),
+        Some(Finish::Check)
+    );
+    let changed = Connection::open(pair.path("there/place.db"))
+        .and_then(|c| c.execute_batch("UPDATE kept_away SET v = 'changed' WHERE id = 'k1'"));
+    assert!(changed.is_ok());
+    let finish = pair.carry().map(|outcome| outcome.finish);
+    assert_eq!(finish.map_err(|err| err.to_string()), Ok(Finish::Done));
+}
+
+#[test]
+fn a_rebuild_whose_table_an_ignored_table_references_stops_before_anything_is_dropped() {
+    let pair = Pair::new(PARENT, &[(&format!("{VERSION}_drop.json"), DROP_CODE)]).ignoring(
+        "CREATE TABLE kept_away (id TEXT PRIMARY KEY, p TEXT REFERENCES parent(id)); \
+         INSERT INTO kept_away VALUES ('k1', 'p1');",
+        "kept_away",
+    );
+    assert_eq!(
+        pair.carry().map(|outcome| outcome.finish).ok(),
+        Some(Finish::Check)
+    );
+    let was = pair.place_schema();
+    stopped(&pair, pair.carry(), &["kept_away", "ignore"], &was);
+    assert_eq!(pair.count("there/place.db", "kept_away"), 1);
 }
