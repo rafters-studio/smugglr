@@ -227,6 +227,31 @@ pub fn open(address: &str) -> Result<Box<dyn Place>, Error> {
     }
 }
 
+/// How to reach the service an address names, for a caller that sends its
+/// own HTTP-SQL: an HTTP POST, or the service's adapter. `None` for a local
+/// file, which has no service.
+///
+/// # Errors
+/// As [`open`] says, except that a file is not opened.
+#[cfg(feature = "native")]
+pub fn transport(address: &str) -> Result<Option<Box<dyn Transport>>, Error> {
+    match address.split_once("://") {
+        None | Some(("file", _)) => Ok(None),
+        Some((scheme, name)) if scheme.eq_ignore_ascii_case("d1") => {
+            Ok(Some(Box::new(D1::from_env(name)?)))
+        }
+        Some((scheme, _))
+            if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") =>
+        {
+            Ok(Some(Box::new(http_sql::Post::to(address))))
+        }
+        Some((scheme, _)) if OTHER_ENGINES.contains(&scheme.to_ascii_lowercase().as_str()) => {
+            Err(Error::OtherEngine)
+        }
+        Some((scheme, _)) => Err(Error::Unreachable(scheme.to_owned())),
+    }
+}
+
 #[cfg(all(test, feature = "native"))]
 mod tests {
     use super::{Error, open};

@@ -62,9 +62,24 @@ pub trait Transport: std::fmt::Debug {
 /// An HTTP POST to the service's URL.
 #[cfg(feature = "native")]
 #[derive(Debug)]
-struct Post {
+pub(crate) struct Post {
     url: String,
     agent: ureq::Agent,
+}
+
+#[cfg(feature = "native")]
+impl Post {
+    /// An HTTP POST to `url`.
+    pub(crate) fn to(url: &str) -> Self {
+        let agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .into();
+        Self {
+            url: url.to_owned(),
+            agent,
+        }
+    }
 }
 
 #[cfg(feature = "native")]
@@ -98,17 +113,7 @@ impl HttpSql {
     #[cfg(feature = "native")]
     #[must_use]
     pub fn open(url: &str) -> Self {
-        let agent = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .build()
-            .into();
-        Self::through(
-            url,
-            Box::new(Post {
-                url: url.to_owned(),
-                agent,
-            }),
-        )
+        Self::through(url, Box::new(Post::to(url)))
     }
 
     /// The service at `address`, reached through `transport`. Nothing is

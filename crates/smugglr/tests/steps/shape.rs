@@ -128,6 +128,9 @@ fn run_stopped(world: &World) -> Result<(), String> {
 
 #[then("neither place has changed")]
 fn nothing_changed(world: &World) -> Result<(), String> {
+    if world.carried.get().is_some() {
+        return crate::migratr::neither_changed(world);
+    }
     // The run reached the places and said what it did, or refused for want
     // of a steering column, so nothing changing is its doing, not a failure
     // to start.

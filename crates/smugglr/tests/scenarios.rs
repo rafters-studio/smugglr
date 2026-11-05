@@ -11,6 +11,8 @@ mod d1;
 mod http_sql;
 #[path = "steps/mesh.rs"]
 mod mesh;
+#[path = "steps/migratr.rs"]
+mod migratr;
 #[path = "steps/multi.rs"]
 mod multi;
 #[path = "steps/world.rs"]
