@@ -297,8 +297,9 @@ fn carry_command(request: &Request, json: bool) -> ExitCode {
             }
             match (outcome.finish, &outcome.record) {
                 (Finish::Done, _) => ExitCode::SUCCESS,
-                (Finish::Stopped, Some(record)) => exit(record),
-                (Finish::Stopped, None) => ExitCode::from(STOPPED),
+                // Never from the record's status: a preview's is success.
+                (Finish::Stopped, Some(record)) if record.wrote() => ExitCode::from(NOT_DONE),
+                (Finish::Stopped, _) => ExitCode::from(STOPPED),
                 (Finish::Check | Finish::NotDone, _) => ExitCode::from(NOT_DONE),
             }
         }

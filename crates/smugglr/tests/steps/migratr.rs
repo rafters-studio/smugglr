@@ -578,7 +578,13 @@ fn place_new_row(world: &World) -> Result<(), String> {
 
 #[then("the run says in step")]
 fn says_in_step(world: &World) -> Result<(), String> {
-    says(world, "in step")
+    // A whole line: "not in step" holds the same words.
+    let text = said(world)?;
+    if text.lines().any(|line| line == "in step") {
+        Ok(())
+    } else {
+        Err(format!("the run did not end in step: {text}"))
+    }
 }
 
 #[then("the run stops naming the version")]
@@ -826,7 +832,7 @@ fn text_table_in_step(world: &World) -> Result<(), String> {
 
 #[then("the run says in step for the rest")]
 fn in_step_for_the_rest(world: &World) -> Result<(), String> {
-    says(world, "in step")
+    says_in_step(world)
 }
 
 #[then("the run stops naming the child table")]

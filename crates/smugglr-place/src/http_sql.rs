@@ -91,7 +91,6 @@ impl Transport for Post {
 }
 
 /// One statement and its parameters.
-/// A statement and its parameters.
 pub type Statement = (String, Vec<Json>);
 
 impl HttpSql {

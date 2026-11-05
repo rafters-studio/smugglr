@@ -672,7 +672,12 @@ impl Run<'_> {
         let options = self.options()?;
         let record = self.sync(&options)?;
         if self.request.options.dryrun {
-            return Ok(self.outcome(Finish::Done, Some(record)));
+            let finish = if would_stop(&record) {
+                Finish::Stopped
+            } else {
+                Finish::Done
+            };
+            return Ok(self.outcome(finish, Some(record)));
         }
         if in_step(&record) {
             if self.snapshot.exists() {
