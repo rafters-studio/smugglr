@@ -1,6 +1,9 @@
 //! A retrieve's cost grows linearly with the rows it writes (#577): a whole
-//! blob of twice the rows takes less than three times as long to retrieve
-//! into an empty place.
+//! blob of ten times the rows takes less than thirty times as long to
+//! retrieve into an empty place. Linear is about ten, a scan per row a
+//! hundred, so a runner's noise cannot cross the line between them. The
+//! smaller retrieve runs three times and counts its quickest, since noise
+//! only ever slows a run.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -60,14 +63,17 @@ fn time_whole_retrieve(rows: u32) -> Result<Duration, Box<dyn std::error::Error>
 }
 
 #[test]
-fn a_whole_retrieve_twice_as_big_takes_less_than_three_times_as_long()
+fn a_whole_retrieve_ten_times_as_big_takes_less_than_thirty_times_as_long()
 -> Result<(), Box<dyn std::error::Error>> {
-    let smaller = time_whole_retrieve(200_000)?;
-    let larger = time_whole_retrieve(400_000)?;
-    println!("200,000 rows took {smaller:?}, 400,000 rows took {larger:?}");
+    let mut smaller = time_whole_retrieve(20_000)?;
+    for _ in 0..2 {
+        smaller = smaller.min(time_whole_retrieve(20_000)?);
+    }
+    let larger = time_whole_retrieve(200_000)?;
+    println!("20,000 rows took {smaller:?}, 200,000 rows took {larger:?}");
     assert!(
-        larger < smaller * 3,
-        "200,000 rows took {smaller:?}, 400,000 rows took {larger:?}"
+        larger < smaller * 30,
+        "20,000 rows took {smaller:?}, 200,000 rows took {larger:?}"
     );
     Ok(())
 }
