@@ -6,6 +6,68 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-11-05
+
+The D1 schema release. `smugglr sync <local> <place> --migratr [dir]` carries
+a migratr migration from a local database to a place such as D1, with no
+wrangler: the first run syncs, snapshots the local database, checks the
+snapshot, runs the migration locally and stops for the person to check it; the
+second run carries it and syncs. Tested against real D1 with an added column,
+a rebuild of a table with two tables beneath it, and a place that changed
+during the check. Patch release: direct sync, the stash blob, the memory
+format and the mesh wire are unchanged.
+
+### Added
+
+- `--migratr [dir]` and a `[migratr]` config section holding `dir` and `safe`
+  (#639). With `safe` on, the default, a place that changed since the snapshot
+  stops the carry and names the rows, and nothing changes on it. A migration
+  that rebuilds a table drops and makes again that table and every table that
+  references it on the place, then sends their rows with the local database
+  winning. A place with tables and no ledger, whose shape matches, has its
+  ledger recorded and runs nothing. A stopped run exits non-zero.
+- A table keyed `INTEGER PRIMARY KEY` syncs (#641). The record names it once
+  with a link to `docs/integer-keys.md`, which draws what two places handing
+  out the same key do to each other. Under `--sync-mode last` such a table
+  still stops.
+- A mesh row too large for one datagram crosses in parts, and every sync names
+  a value over the limit (#600).
+- `smugglr mesh remove <node>`, the name check, and the batch check (#628). A
+  node away past the sunset takes a stash from a peer over the mesh (#630).
+
+### Changed
+
+- `_migratr_migrations` is ignored by every sync, without being listed. A
+  database's ledger is written only by the migrations it ran (#642).
+- After a carry the place's ledger holds the local database's `applied_at`
+  values, so the two ledgers match (#642).
+- An edit made to the local database during the check reaches the place on
+  the carry (#642).
+- The mesh's default port is 31415 (#605).
+
+### Fixed
+
+- A place holding tables the config ignores matched no local shape, so every
+  `--migratr` carry stopped. The checks now leave out what the sync leaves
+  out, and a rebuild that would drop an ignored table stops first (#644).
+- `install.sh` is back, for the archives the release publishes (#636).
+- A whole retrieve decides a row changed here and in the blob by
+  `--sync-mode`, and names it (#608).
+- Mesh: a conflict kept under `--sync-mode last` lands (#613); a change resent
+  to an acknowledging peer backs off (#617); changes a heard peer holds leave
+  the send window (#616); the record names a peer that stopped acknowledging
+  (#615); a peer named by host name is looked up at each announcement (#621);
+  a change with every part acknowledged has time to be decided (#632).
+
+### Known limits
+
+- D1 refuses a query result over 50 MB, and smugglr reads a D1 table in one
+  query, so a table whose rows come to more than that stops the sync with exit
+  3 and nothing written. Ignore it and move it another way until reads come in
+  pages.
+- A rebuild of a table that a table in the ignore list references stops before
+  anything is dropped.
+
 ## [0.6.1] - 2026-10-26
 
 The mesh release. `smugglr mesh <place> --key-file <path>` keeps a SQLite
