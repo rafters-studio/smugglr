@@ -3,7 +3,8 @@
 //! retrieve into an empty place. Linear is about ten, a scan per row a
 //! hundred, so a runner's noise cannot cross the line between them. The
 //! smaller retrieve runs three times and counts its quickest, since noise
-//! only ever slows a run.
+//! only ever slows a run. The larger has thirty times that to finish, so a
+//! scan per row fails within seconds instead of running for hours.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -69,11 +70,22 @@ fn a_whole_retrieve_ten_times_as_big_takes_less_than_thirty_times_as_long()
     for _ in 0..2 {
         smaller = smaller.min(time_whole_retrieve(20_000)?);
     }
-    let larger = time_whole_retrieve(200_000)?;
-    println!("20,000 rows took {smaller:?}, 200,000 rows took {larger:?}");
-    assert!(
-        larger < smaller * 30,
-        "20,000 rows took {smaller:?}, 200,000 rows took {larger:?}"
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let took = time_whole_retrieve(200_000).map_err(|err| err.to_string());
+        let _ = sender.send(took);
+    });
+    let Ok(larger) = receiver.recv_timeout(smaller * 30) else {
+        return Err(format!(
+            "200,000 rows had not been retrieved after {:?}, thirty times the {smaller:?} \
+             20,000 took",
+            smaller * 30
+        )
+        .into());
+    };
+    println!(
+        "20,000 rows took {smaller:?}, 200,000 rows took {:?}",
+        larger?
     );
     Ok(())
 }
