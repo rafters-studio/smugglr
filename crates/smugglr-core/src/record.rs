@@ -13,7 +13,7 @@ use serde::{Serialize, Serializer};
 
 use crate::change::Op;
 use crate::envelope::Envelope;
-use crate::plan::{Plan, Side};
+use crate::plan::{Plan, Side, SyncMode};
 use crate::shape::Mismatch;
 use crate::weight::{Weight, over_limit};
 
@@ -27,11 +27,22 @@ pub const NOT_READ_BACK: &str = "smugglr wrote these rows and read them back dif
      what it wrote, so the run is not done. Something in the place changes rows as they are \
      written.";
 
-/// Why a table stops when its database hands out its own keys
-/// (FR-SMUGGLR-069).
+/// Why a table stops under `--sync-mode last` when its database hands out its
+/// own keys (FR-SMUGGLR-069).
 pub const SELF_KEYED: &str = "This table's database hands out its own keys (INTEGER PRIMARY \
      KEY), so two places would hand out the same key to different rows and one would erase the \
      other. smugglr does no re-sequencing. Any random, unique key, such as UUIDv7, lets it sync.";
+
+/// Why a row of such a table stops when both places handed out its key
+/// (FR-SMUGGLR-069).
+pub const SELF_KEYED_CLASH: &str = "Both places handed out these keys to different rows: the \
+     table's database hands out its own keys (INTEGER PRIMARY KEY). smugglr stops rather than \
+     choose, and does no re-sequencing. A random, unique key, such as UUIDv7, lets two writers \
+     sync.";
+
+/// The page that shows why a key the database hands out makes a mess.
+pub const SELF_KEYED_PAGE: &str =
+    "https://github.com/rafters-studio/smugglr/blob/main/docs/integer-keys.md";
 
 /// Why a row stops when an edit was made to it after it was deleted
 /// elsewhere (FR-SMUGGLR-076).
@@ -105,6 +116,10 @@ pub struct Record {
     pub tables: BTreeMap<String, Table>,
     /// The tables the run ignored, in either place, each named once.
     pub ignored: BTreeSet<String>,
+    /// The tables it synced whose database hands out their keys, each named
+    /// once (FR-SMUGGLR-069).
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    pub self_keyed: BTreeSet<String>,
     /// The shapes of the places differ: the run stopped before any row was
     /// read (FR-SMUGGLR-070).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -299,6 +314,7 @@ impl Record {
             why: None,
             tables,
             ignored,
+            self_keyed: BTreeSet::new(),
             shape: None,
             dropped: Vec::new(),
             targets_remaining: None,
@@ -321,6 +337,7 @@ impl Record {
             why: None,
             tables: BTreeMap::new(),
             ignored,
+            self_keyed: BTreeSet::new(),
             shape: Some(ShapeStop {
                 why: mismatch.why(),
                 mismatch,
@@ -345,6 +362,7 @@ impl Record {
             why: Some(why),
             tables: BTreeMap::new(),
             ignored,
+            self_keyed: BTreeSet::new(),
             shape: None,
             dropped: Vec::new(),
             targets_remaining: None,
@@ -521,8 +539,34 @@ pub fn edit_versus_delete(keys: Vec<Vec<String>>) -> Table {
     }
 }
 
-/// The record of a table whose database hands out its own keys: stopped,
-/// with no rows read.
+/// Whether a table whose database hands out its own keys stops under `mode`:
+/// only under `--sync-mode last`, where nobody chooses between two rows
+/// (FR-SMUGGLR-069).
+#[must_use]
+pub fn self_keyed_stops(mode: SyncMode) -> bool {
+    mode == SyncMode::Last
+}
+
+/// A table's part as [`table`] makes it, for a table whose database hands
+/// out its own keys: a row both places changed is a key both handed out.
+#[must_use]
+pub fn self_keyed_table(plan: &Plan, dryrun: bool) -> Table {
+    match table(plan, dryrun) {
+        Table::Stopped {
+            rows,
+            not_read_back,
+            ..
+        } => Table::Stopped {
+            rows,
+            not_read_back,
+            why: SELF_KEYED_CLASH.to_owned(),
+        },
+        other => other,
+    }
+}
+
+/// The record of a table whose database hands out its own keys, under
+/// `--sync-mode last`.
 #[must_use]
 pub fn self_keyed() -> Table {
     Table::Stopped {
@@ -530,6 +574,21 @@ pub fn self_keyed() -> Table {
         not_read_back: Vec::new(),
         why: SELF_KEYED.to_owned(),
     }
+}
+
+/// A line naming `tables` after `label`, then `after`; nothing when there
+/// are none.
+fn names(
+    f: &mut fmt::Formatter<'_>,
+    label: &str,
+    tables: &BTreeSet<String>,
+    after: &str,
+) -> fmt::Result {
+    if tables.is_empty() {
+        return Ok(());
+    }
+    let named: Vec<&str> = tables.iter().map(String::as_str).collect();
+    writeln!(f, "  {label}: {}{after}", named.join(", "))
 }
 
 /// `text` for a terminal: each control character escaped, so a table or key
@@ -585,10 +644,13 @@ impl fmt::Display for Record {
         } else if let Some(weight) = &self.weight {
             writeln!(f, "  weight: {weight}")?;
         }
-        if !self.ignored.is_empty() {
-            let ignored: Vec<&str> = self.ignored.iter().map(String::as_str).collect();
-            writeln!(f, "  ignored: {}", ignored.join(", "))?;
-        }
+        names(f, "ignored", &self.ignored, "")?;
+        names(
+            f,
+            "hands out its own keys",
+            &self.self_keyed,
+            &format!(" ({SELF_KEYED_PAGE})"),
+        )?;
         if let Some(shape) = &self.shape {
             writeln!(f, "  shape: {}", shape.why)?;
         }

@@ -194,6 +194,7 @@ pub fn sync(
         return Ok(Record::too_much(weight, why, ignored));
     }
     let mut wrote = Wrote::new(options.max_value.unwrap_or(DEFAULT_MAX_VALUE));
+    wrote.keyed = self_keyed(&plans);
     let unmatched = match write_all(
         plans,
         &mut *source,
@@ -238,9 +239,18 @@ pub fn sync(
     Ok(record)
 }
 
+/// The tables planned whose database hands out their keys.
+fn self_keyed(plans: &[(Table, Hashes, Plan)]) -> std::collections::BTreeSet<String> {
+    plans
+        .iter()
+        .filter(|(table, _, _)| table.self_keyed)
+        .map(|(table, _, _)| table.name.clone())
+        .collect()
+}
+
 /// The record of a run whose tables did `done`, as [`Record::new`] makes
 /// it, that could tell a delete unless `unknown`, with the rows `wrote`
-/// refused.
+/// refused and the tables it names as handing out their keys.
 fn finished(
     (done, ignored, dryrun, weight): (
         BTreeMap<String, record::Table>,
@@ -253,6 +263,7 @@ fn finished(
 ) -> Record {
     let mut record = Record::new(done, ignored, dryrun, weight);
     record.deletes_seen = !unknown;
+    record.self_keyed = wrote.keyed;
     record.refused = wrote.refused;
     record
 }
@@ -283,6 +294,8 @@ struct Wrote {
     max_value: u64,
     /// The rows not moved for a value over the value limit.
     refused: Vec<Refused>,
+    /// The tables planned whose database hands out their keys.
+    keyed: std::collections::BTreeSet<String>,
 }
 
 impl Wrote {
@@ -328,7 +341,12 @@ fn write_all(
 ) -> Result<bool, Error> {
     let mut unmatched = false;
     for (table, last, planned) in plans {
-        done.insert(table.name.clone(), record::table(&planned, dryrun));
+        let part = if table.self_keyed {
+            record::self_keyed_table(&planned, dryrun)
+        } else {
+            record::table(&planned, dryrun)
+        };
+        done.insert(table.name.clone(), part);
         let Plan::Move {
             writes,
             memory: mut next,
@@ -417,8 +435,9 @@ fn steering_named(tables: &[Table], theirs: &[Table], options: &Options) -> Resu
 
 /// Plans every table before any is written, so a first sync can weigh
 /// itself whole. A table whose database hands out its own keys, in either
-/// place, goes into `done` as stopped before any row is read; the run's other
-/// tables go on. A table that stops has its alike rows set in memory, not
+/// place, is planned like any other and marked so, except under `--sync-mode
+/// last`, where it goes into `done` as stopped before any row is read; the
+/// run's other tables go on. A table that stops has its alike rows set in memory, not
 /// saved (FR-SMUGGLR-081).
 fn plan_tables(
     tables: Vec<Table>,
@@ -430,12 +449,11 @@ fn plan_tables(
     done: &mut BTreeMap<String, record::Table>,
 ) -> Result<Vec<(Table, Hashes, Plan)>, Error> {
     let mut plans = Vec::new();
-    for table in tables {
-        if table.self_keyed
-            || theirs
-                .iter()
-                .any(|other| other.name == table.name && other.self_keyed)
-        {
+    for mut table in tables {
+        table.self_keyed |= theirs
+            .iter()
+            .any(|other| other.name == table.name && other.self_keyed);
+        if table.self_keyed && record::self_keyed_stops(options.sync_mode) {
             done.insert(table.name.clone(), record::self_keyed());
             continue;
         }

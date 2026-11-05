@@ -24,3 +24,9 @@ Feature: ignored tables are never read, written, hashed or sent (FR-SMUGGLR-066)
     Given a config whose ignore list holds cache_* and sessions_tmp, and two places holding cache_pages, cache_thumbs and sessions_tmp
     When the agent runs smugglr sync on them with --json
     Then the record's ignored list names cache_pages, cache_thumbs and sessions_tmp once each
+
+  @criterion-01a1ad87-20ee-7706-b0f4-9be8e12416d8 @module-smugglr-core
+  Scenario: migratr's ledger is never synced
+    Given two places whose _migratr_migrations tables differ, with no ignore list
+    When the agent runs smugglr sync on them
+    Then the target's _migratr_migrations is unchanged

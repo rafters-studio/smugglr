@@ -35,8 +35,9 @@ use smugglr_memory::Memory;
 use smugglr_place::{HttpSql, Key, Place, Table, file_path, ident};
 use smugglr_sync::{Options, sync};
 
-/// migratr's ledger, which cannot sync: its key is handed out by the database.
-const LEDGER: &str = "_migratr_migrations";
+/// migratr's ledger, which no sync touches: it is written here, as part of a
+/// migration.
+const LEDGER: &str = smugglr_core::ignore::MIGRATR_LEDGER;
 
 /// One `--migratr` run.
 #[derive(Debug, Clone)]
@@ -118,6 +119,7 @@ pub fn carry(request: &Request, take: &Snapshot) -> Result<Outcome, Error> {
         source: smugglr_place::open(&request.source).map_err(stop)?,
         target: smugglr_place::open(&request.target).map_err(stop)?,
         said: Vec::new(),
+        local_wins: false,
     };
     match file_path(&request.target) {
         Some(target) => run.go(&mut RusqliteExecutor::new(open_file(Path::new(target))?)),
@@ -149,18 +151,15 @@ fn snapshot_path(local: &Path) -> PathBuf {
 }
 
 /// The tables that differ between two databases of the same tables: each row,
-/// as its table and key, that one holds and the other does not hold the same.
-/// Only `only` when given.
+/// as its table and key, that one holds and the other does not hold the same,
+/// the ledger left out.
 fn differing(
     a: &mut dyn Place,
     b: &mut dyn Place,
-    only: Option<&BTreeSet<String>>,
 ) -> Result<Vec<(String, Key)>, smugglr_place::Error> {
     let (ours, theirs) = (a.tables()?, b.tables()?);
     let mut names: BTreeSet<&String> = ours.iter().chain(&theirs).map(|t| &t.name).collect();
-    if let Some(only) = only {
-        names.retain(|name| only.contains(*name));
-    }
+    names.retain(|name| name.as_str() != LEDGER);
     let hashes = |place: &mut dyn Place, tables: &[Table], name: &str| {
         Ok::<_, smugglr_place::Error>(match tables.iter().find(|t| t.name == name) {
             Some(table) if !table.columns.is_empty() => {
@@ -213,6 +212,9 @@ struct Run<'a> {
     source: Box<dyn Place>,
     target: Box<dyn Place>,
     said: Vec<String>,
+    /// The place was found unchanged since the snapshot, so the local
+    /// database's rows win the final sync.
+    local_wins: bool,
 }
 
 impl Run<'_> {
@@ -307,37 +309,15 @@ impl Run<'_> {
             .collect()
     }
 
-    /// The options a sync runs with: the ledger and each table whose key the
-    /// database hands out are left out, each such table reported once.
-    fn options(&mut self) -> Result<Options, Error> {
+    /// The options a sync runs with. Under safe, with the place found
+    /// unchanged since the snapshot, the local database's rows are kept in the
+    /// default mode: every difference came from it.
+    fn options(&self) -> Options {
         let mut options = self.request.options.clone();
-        options.ignore.push(LEDGER.to_owned());
-        for (table, column) in self.self_keyed()? {
-            let said = format!(
-                "{table}: the database hands out its key {column}, so it is not compliant and \
-                 does not sync"
-            );
-            if !self.said.contains(&said) {
-                self.said.push(said);
-            }
-            options.ignore.push(table);
+        if self.local_wins && options.sync_mode == SyncMode::Stop {
+            options.sync_mode = SyncMode::Source;
         }
-        Ok(options)
-    }
-
-    /// Each table whose key the database hands out, in either place, and its
-    /// key column; the ledger is not one of them.
-    fn self_keyed(&mut self) -> Result<BTreeMap<String, String>, Error> {
-        let mut tables = self.source.tables().map_err(stop)?;
-        tables.extend(self.target.tables().map_err(stop)?);
-        Ok(tables
-            .into_iter()
-            .filter(|table| table.self_keyed && table.name != LEDGER)
-            .map(|table| {
-                let column = table.key.first().cloned().unwrap_or_default();
-                (table.name, column)
-            })
-            .collect())
+        options
     }
 
     /// One sync with `options`; a run cut off part way is not done.
@@ -375,7 +355,7 @@ impl Run<'_> {
             return Ok(self.outcome(Finish::Done, None));
         }
         if self.request.safe {
-            let options = self.options()?;
+            let options = self.options();
             let mut preview = options.clone();
             preview.dryrun = true;
             // A preview first, so a run that would stop changes neither place.
@@ -423,7 +403,7 @@ impl Run<'_> {
             .map_err(stop)?
             .ok_or_else(|| stop("the local database cannot be copied"))?;
         let mut copy = smugglr_place::open(&taken.display().to_string()).map_err(stop)?;
-        let differ = differing(self.source.as_mut(), copy.as_mut(), None).map_err(stop)?;
+        let differ = differing(self.source.as_mut(), copy.as_mut()).map_err(stop)?;
         drop(copy);
         if let Some(row) = differ.first() {
             let _ = std::fs::remove_file(&taken);
@@ -487,6 +467,7 @@ impl Run<'_> {
         for migration in adopted {
             record_applied(place, migration).map_err(|err| self.not_done(err))?;
         }
+        self.align(place)?;
         let names: Vec<String> = adopted
             .iter()
             .map(|m| format!("{}_{}", m.version, m.name))
@@ -534,6 +515,7 @@ impl Run<'_> {
         ran: &[Migration],
         behind: &[Migration],
     ) -> Result<Outcome, Error> {
+        self.place_unchanged()?;
         let schema = place.read_schema().map_err(stop)?;
         let Some(at) = first_rebuild(&schema, behind)? else {
             if self.request.options.dryrun {
@@ -545,6 +527,7 @@ impl Run<'_> {
                 return Ok(self.outcome(Finish::Done, None));
             }
             up(place, ran, None).map_err(|err| self.not_done(err))?;
+            self.align(place)?;
             return self.final_sync();
         };
         let local = self.local.read_schema().map_err(stop)?;
@@ -561,7 +544,6 @@ impl Run<'_> {
                  with foreign keys on. Nothing was dropped."
             )));
         }
-        self.may_drop(&plan, &closed)?;
         let to = before.last().map(|m| m.version);
         if self.request.options.dryrun {
             let mut dry = Dry::new(&mut *place);
@@ -582,7 +564,8 @@ impl Run<'_> {
         if to.is_some() {
             up(place, ran, to).map_err(|err| self.not_done(err))?;
         }
-        let statements = plan.statements(place, from)?;
+        let mut statements = plan.statements(place, from)?;
+        statements.extend(self.same_ledger()?);
         self.forget(&closed)?;
         place
             .run_atomic(&statements, false)
@@ -591,35 +574,57 @@ impl Run<'_> {
         self.final_sync()
     }
 
-    /// Stops a rebuild that could not put back what it would drop: a table
-    /// whose key the database hands out, or under safe a row the place changed
-    /// since the snapshot.
-    fn may_drop(&mut self, plan: &Rebuild, closed: &BTreeSet<String>) -> Result<(), Error> {
-        let keyed = self.self_keyed()?;
-        if let Some(table) = plan.drop.iter().find(|table| keyed.contains_key(*table)) {
-            return Err(Error::Stop(format!(
-                "A rebuild would drop {table}, and its rows could not come back: the database \
-                 hands out its key. Nothing was dropped."
-            )));
-        }
-        if !self.request.safe {
-            return Ok(());
-        }
-        // An empty place has no snapshot to answer to, and nothing to drop.
-        if !self.snapshot.exists() {
+    /// Under safe, before any migration reaches the place: a row the place
+    /// changed since the snapshot stops the run, naming it, and a place found
+    /// unchanged lets the local database's rows win the final sync.
+    fn place_unchanged(&mut self) -> Result<(), Error> {
+        // An empty place has no snapshot to answer to.
+        if !self.request.safe || !self.snapshot.exists() {
             return Ok(());
         }
         let mut held = smugglr_place::open(&self.snapshot.display().to_string()).map_err(stop)?;
-        let differ = differing(held.as_mut(), self.target.as_mut(), Some(closed)).map_err(stop)?;
+        let differ = differing(held.as_mut(), self.target.as_mut()).map_err(stop)?;
         if differ.is_empty() {
+            self.local_wins = true;
             return Ok(());
         }
         let rows: Vec<String> = differ.iter().map(row_name).collect();
         Err(Error::Stop(format!(
-            "The place changed since the snapshot, at {}, so nothing was dropped. Bring those \
+            "The place changed since the snapshot, at {}, so nothing changed on it. Bring those \
              rows to the local database, or set safe to false under [migratr].",
             rows.join("; ")
         )))
+    }
+
+    /// The statements that give the place's ledger rows the local database's
+    /// applied times, so the two ledgers are the same rows.
+    fn same_ledger(&self) -> Result<Vec<String>, Error> {
+        let mut statement = self
+            .local
+            .connection()
+            .prepare(&format!("SELECT version, applied_at FROM {LEDGER}"))
+            .map_err(stop)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(stop)?;
+        rows.map(|row| {
+            let (version, at) = row.map_err(stop)?;
+            Ok(format!(
+                "UPDATE {LEDGER} SET applied_at = '{}' WHERE version = {version}",
+                at.replace('\'', "''")
+            ))
+        })
+        .collect()
+    }
+
+    /// Gives the place's ledger the local database's applied times.
+    fn align<E: Executor>(&self, place: &mut E) -> Result<(), Error> {
+        let statements = self.same_ledger()?;
+        place
+            .run_atomic(&statements, false)
+            .map_err(|err| self.not_done(err.source))
     }
 
     /// Clears the pair's memory of `tables`, before they are dropped. A pair
@@ -646,7 +651,7 @@ impl Run<'_> {
     /// Sends the rows of each rebuilt table, parents first, the local
     /// database winning.
     fn send(&mut self, tables: &[String]) -> Result<(), Error> {
-        let mut options = self.options()?;
+        let mut options = self.options();
         options.sync_mode = SyncMode::Source;
         let ignored = Ignore::new(options.ignore.clone());
         for table in tables.iter().filter(|table| !ignored.ignores(table)) {
@@ -669,7 +674,7 @@ impl Run<'_> {
     /// The sync that says whether the run is done. Only in step is done; then
     /// the snapshot has done its work.
     fn final_sync(&mut self) -> Result<Outcome, Error> {
-        let options = self.options()?;
+        let options = self.options();
         let record = self.sync(&options)?;
         if self.request.options.dryrun {
             let finish = if would_stop(&record) {

@@ -38,6 +38,8 @@ pub(crate) struct World {
     pub(crate) carried: Slot<(String, String)>,
     /// What the first `--migratr` run said, kept past the runs after it.
     pub(crate) first_said: Slot<String>,
+    /// The table and the query a scenario's new row is read back with.
+    pub(crate) new_row: Slot<(String, String)>,
     /// The variables smugglr runs with, beside `XDG_CONFIG_HOME`: a hosted
     /// place's credentials and where its API stands in.
     pub(crate) env: Slot<Vec<(String, String)>>,

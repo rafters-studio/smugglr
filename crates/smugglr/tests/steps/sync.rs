@@ -859,10 +859,11 @@ fn a_real_dry_run_writes_nothing_and_keeps_no_memory() -> Result<(), String> {
 }
 
 /// #507 through the real sync: in two SQLite files, a sessions table keyed
-/// INTEGER PRIMARY KEY stops with an empty rows list and its why, and is not
-/// written, while notes, keyed by text, moves.
+/// INTEGER PRIMARY KEY, whose key 1 each place handed out to a different
+/// row, stops on that row with why, and is not written, while notes, keyed by
+/// text, moves (FR-SMUGGLR-069).
 #[test]
-fn a_real_self_keyed_table_stops_and_the_others_move() -> Result<(), String> {
+fn a_real_key_both_places_handed_out_stops_on_that_row_and_the_others_move() -> Result<(), String> {
     const SESSIONS: &str = "CREATE TABLE sessions (id INTEGER PRIMARY KEY, user TEXT)";
     let world = World::default();
     world.source.set(world.place(
@@ -880,9 +881,10 @@ fn a_real_self_keyed_table_stops_and_the_others_move() -> Result<(), String> {
     let sessions = &record["tables"]["sessions"];
     let why = sessions["why"].as_str().unwrap_or_default();
     if sessions["status"] != "stopped"
-        || sessions["rows"] != serde_json::json!([])
-        || !why.contains("two places would hand out the same key")
+        || sessions["rows"] != serde_json::json!(["1"])
+        || !why.contains("Both places handed out")
         || !why.contains("UUIDv7")
+        || record["self_keyed"] != serde_json::json!(["sessions"])
     {
         return Err(format!("sessions: {sessions}"));
     }

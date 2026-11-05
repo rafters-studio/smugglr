@@ -161,7 +161,8 @@ fn run_as(pair: &Pair, mode: SyncMode, dryrun: bool) -> Result<(), String> {
         return Ok(());
     }
     for name in names {
-        if self_keyed.contains(&name) {
+        let keyed = self_keyed.contains(&name);
+        if keyed && record::self_keyed_stops(mode) {
             tables.insert(name, record::self_keyed());
             continue;
         }
@@ -217,11 +218,22 @@ fn run_as(pair: &Pair, mode: SyncMode, dryrun: bool) -> Result<(), String> {
             }
             memory.insert(name.clone(), next.clone());
         }
-        tables.insert(name, record::table(&planned, dryrun));
+        let part = if keyed {
+            record::self_keyed_table(&planned, dryrun)
+        } else {
+            record::table(&planned, dryrun)
+        };
+        tables.insert(name, part);
     }
     // These steps simulate the plan and the record, not a first sync's
     // weigh; that runs end to end in the smugglr crate.
-    let json = Record::new(tables, ignored, dryrun, None).json();
+    let mut record = Record::new(tables, ignored, dryrun, None);
+    record.self_keyed = self_keyed
+        .iter()
+        .filter(|name| !record::self_keyed_stops(mode) && record.tables.contains_key(*name))
+        .cloned()
+        .collect();
+    let json = record.json();
     pair.record
         .set(serde_json::from_str(&json).map_err(|err| format!("the record is not JSON: {err}"))?);
     pair.json.set(json);
@@ -728,6 +740,107 @@ fn sessions_self_keyed(pair: &Pair) -> Result<(), String> {
 #[given("two places whose sessions table is keyed INTEGER PRIMARY KEY")]
 fn sessions_keyed_by_database(pair: &Pair) -> Result<(), String> {
     sessions_self_keyed(pair)
+}
+
+/// A session row as a place holds it: its key and the user.
+fn session(key: &str, user: &str) -> Vec<String> {
+    vec![key.to_owned(), format!("'{user}'")]
+}
+
+#[given(
+    "two places whose sessions table is keyed INTEGER PRIMARY KEY, with a row on the source only"
+)]
+fn sessions_keyed_one_writer(pair: &Pair) -> Result<(), String> {
+    synced(pair)?;
+    change(&pair.source, "sessions", |rows| {
+        rows.insert(vec!["1".to_owned()], session("1", "ada"));
+    })?;
+    pair.self_keyed.set(vec!["sessions".to_owned()]);
+    Ok(())
+}
+
+#[given("two places in step whose sessions table is keyed INTEGER PRIMARY KEY")]
+fn sessions_keyed_in_step(pair: &Pair) -> Result<(), String> {
+    synced(pair)?;
+    for place in [&pair.source, &pair.target] {
+        change(place, "sessions", |rows| {
+            rows.insert(vec!["1".to_owned()], session("1", "ada"));
+        })?;
+    }
+    pair.self_keyed.set(vec!["sessions".to_owned()]);
+    run(pair, SyncMode::Stop)
+}
+
+#[given(
+    "two places whose sessions table is keyed INTEGER PRIMARY KEY, and whose other tables name a steering column"
+)]
+fn sessions_keyed_others_steered(pair: &Pair) -> Result<(), String> {
+    sessions_self_keyed(pair)?;
+    let tables = ["notes", "orders"]
+        .into_iter()
+        .filter_map(|table| Some((table.to_owned(), columns(pair, table).first()?.clone())))
+        .collect();
+    pair.steering.set(smugglr_core::steering::Steering {
+        tables,
+        ..Default::default()
+    });
+    Ok(())
+}
+
+#[given("each place adds a different row under the same new key")]
+fn same_new_key(pair: &Pair) -> Result<(), String> {
+    change(&pair.source, "sessions", |rows| {
+        rows.insert(vec!["2".to_owned()], session("2", "grace"));
+    })?;
+    change(&pair.target, "sessions", |rows| {
+        rows.insert(vec!["2".to_owned()], session("2", "linus"));
+    })
+}
+
+#[when("the agent runs smugglr sync on them with --sync-mode last and --json")]
+fn agent_syncs_last_json(pair: &Pair) -> Result<(), String> {
+    run(pair, SyncMode::Last)
+}
+
+#[then("the record gives sessions the status moved")]
+fn sessions_moved(pair: &Pair) -> Result<(), String> {
+    let sessions = entry(pair, "sessions")?;
+    match sessions.get("status").and_then(Value::as_str) {
+        Some("moved") => Ok(()),
+        _ => Err(format!("sessions did not move: {sessions}")),
+    }
+}
+
+#[then("the record names sessions once as handing out its own keys")]
+fn sessions_named_once(pair: &Pair) -> Result<(), String> {
+    let record = pair.record.get().ok_or("no record")?;
+    match record.get("self_keyed").and_then(Value::as_array) {
+        Some(keyed) if keyed == &[Value::from("sessions")] => Ok(()),
+        _ => Err(format!("the record does not name sessions once: {record}")),
+    }
+}
+
+#[then("the record gives sessions the status stopped naming that key")]
+fn sessions_stopped_on_key(pair: &Pair) -> Result<(), String> {
+    let sessions = entry(pair, "sessions")?;
+    let rows = sessions.get("rows").and_then(Value::as_array);
+    match sessions.get("status").and_then(Value::as_str) {
+        Some("stopped") if rows.is_some_and(|rows| rows == &[Value::from("2")]) => Ok(()),
+        _ => Err(format!("sessions did not stop on key 2: {sessions}")),
+    }
+}
+
+#[then("the why says both places handed out the key and names a random, unique key")]
+fn why_both_handed_out(pair: &Pair) -> Result<(), String> {
+    let sessions = entry(pair, "sessions")?;
+    match sessions.get("why").and_then(Value::as_str) {
+        Some(why)
+            if why.contains("Both places handed out") && why.contains("random, unique key") =>
+        {
+            Ok(())
+        }
+        _ => Err(format!("sessions gives no such why: {sessions}")),
+    }
 }
 
 #[given(

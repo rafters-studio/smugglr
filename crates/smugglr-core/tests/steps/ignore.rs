@@ -66,6 +66,20 @@ fn caches_differ(pair: &Pair) {
     );
 }
 
+#[given("two places whose _migratr_migrations tables differ, with no ignore list")]
+fn ledgers_differ(pair: &Pair) {
+    places(
+        pair,
+        vec![("_migratr_migrations", rows(&[("1", "a"), ("2", "b")]))],
+        vec![("_migratr_migrations", rows(&[("1", "a")]))],
+    );
+}
+
+#[then("the target's _migratr_migrations is unchanged")]
+fn ledger_unchanged(pair: &Pair) -> Result<(), String> {
+    target_unchanged(pair, "_migratr_migrations")
+}
+
 #[given("two places whose sqlite_sequence tables differ")]
 fn sqlite_sequence_differs(pair: &Pair) {
     places(
