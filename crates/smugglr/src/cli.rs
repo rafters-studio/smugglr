@@ -281,7 +281,8 @@ fn sync_once(command: &Sync) -> ExitCode {
 
 /// One `--migratr` run, and what it did as an exit status: 0 done (or a
 /// preview), 3 stopped with nothing changed, 4 changed something and not
-/// done, a first run stopped for its check among them.
+/// done, a first run stopped for its check among them, 5 too much for the
+/// wire.
 fn carry_command(request: &Request, json: bool) -> ExitCode {
     match migratr::carry(request, &|local, name| local.snapshot(name)) {
         Ok(outcome) => {
@@ -298,6 +299,9 @@ fn carry_command(request: &Request, json: bool) -> ExitCode {
             match (outcome.finish, &outcome.record) {
                 (Finish::Done, _) => ExitCode::SUCCESS,
                 // Never from the record's status: a preview's is success.
+                (Finish::Stopped, Some(record)) if record.status == Status::TooMuch => {
+                    ExitCode::from(TOO_MUCH)
+                }
                 (Finish::Stopped, Some(record)) if record.wrote() => ExitCode::from(NOT_DONE),
                 (Finish::Stopped, _) => ExitCode::from(STOPPED),
                 (Finish::Check | Finish::NotDone, _) => ExitCode::from(NOT_DONE),

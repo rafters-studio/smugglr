@@ -9,6 +9,7 @@ use rusqlite::Connection;
 
 const STOPPED: i32 = 3;
 const NOT_DONE: i32 = 4;
+const TOO_MUCH: i32 = 5;
 
 const ADD_TAG: &str = r#"{"up": [{"op": "add_column", "table": "notes",
     "column": {"name": "tag", "type": "TEXT"}}]}"#;
@@ -20,6 +21,13 @@ struct Pair(PathBuf);
 impl Pair {
     /// A local database and a place in step, with a migration not yet run.
     fn new() -> Self {
+        let pair = Self::apart();
+        assert_eq!(pair.run(&[]), Some(0), "the first sync");
+        pair
+    }
+
+    /// The same, before any sync.
+    fn apart() -> Self {
         let folder = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
             "migratr-exit-{}-{}",
             std::process::id(),
@@ -41,7 +49,6 @@ impl Pair {
             pair.sql(db, "CREATE TABLE notes (id TEXT PRIMARY KEY, body TEXT)");
         }
         pair.sql("local.db", "INSERT INTO notes VALUES ('n1', 'one')");
-        assert_eq!(pair.run(&[]), Some(0), "the first sync");
         pair
     }
 
@@ -111,4 +118,13 @@ fn a_dry_run_showing_a_stop_does_not_exit_success() {
     let mut flags = MIGRATR.to_vec();
     flags.push("--dryrun");
     assert_eq!(pair.run(&flags), Some(STOPPED));
+}
+
+#[test]
+fn a_run_too_much_for_the_wire_exits_as_a_plain_sync_does() {
+    let pair = Pair::apart();
+    let settings = pair.0.join("config/smugglr");
+    assert!(std::fs::create_dir_all(&settings).is_ok());
+    assert!(std::fs::write(settings.join("config.toml"), "max_wire = 1\n").is_ok());
+    assert_eq!(pair.run(MIGRATR), Some(TOO_MUCH));
 }
