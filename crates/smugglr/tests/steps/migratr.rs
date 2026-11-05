@@ -428,12 +428,54 @@ fn ran_a_rebuild(world: &World) -> Result<(), String> {
 
 #[given("a place with a row changed since the snapshot")]
 fn place_moved(world: &World) -> Result<(), String> {
-    sql_on(
-        &place_file(world)?,
-        "UPDATE kept SET name = 'moved' WHERE id = 'p1'",
-    )?;
-    world.watched.set("p1".to_owned());
+    // The rebuild scenarios hold a kept table; the others hold notes.
+    let place = place_file(world)?;
+    if columns(&place, "kept").is_ok_and(|columns| !columns.is_empty()) {
+        sql_on(&place, "UPDATE kept SET name = 'moved' WHERE id = 'p1'")?;
+        world.watched.set("p1".to_owned());
+    } else {
+        sql_on(&place, "UPDATE notes SET body = 'moved' WHERE id = 'n2'")?;
+        world.watched.set("n2".to_owned());
+    }
     Ok(())
+}
+
+#[given("a new row on the local database in the table keyed by INTEGER PRIMARY KEY")]
+fn new_counter(world: &World) -> Result<(), String> {
+    sql_on(&local(world)?, "INSERT INTO counters VALUES (2, 7)")?;
+    world.new_row.set((
+        "counters".to_owned(),
+        "SELECT n FROM counters WHERE id = 2".to_owned(),
+    ));
+    Ok(())
+}
+
+#[given("a local database and a place after a run that carried a migration")]
+fn after_a_carry(world: &World) -> Result<(), String> {
+    pair(world, &notes(), &notes())?;
+    migration(world, ADD_TAG_FILE, ADD_TAG)?;
+    first_run(world)?;
+    let output = with_migratr(world, &[])?;
+    if output.status.code() == Some(0) {
+        Ok(())
+    } else {
+        Err(format!("the carry was not done: {}", said(world)?))
+    }
+}
+
+#[given("a local database that has run an added column through the first run")]
+fn added_column_first_run(world: &World) -> Result<(), String> {
+    pair(world, &notes(), &notes())?;
+    migration(world, ADD_TAG_FILE, ADD_TAG)?;
+    first_run(world)
+}
+
+#[given("a row edited on the local database after that run")]
+fn edited_locally(world: &World) -> Result<(), String> {
+    sql_on(
+        &local(world)?,
+        "UPDATE notes SET body = 'edited here' WHERE id = 'n1'",
+    )
 }
 
 #[given("a config with safe set to false under migratr")]
@@ -463,6 +505,10 @@ fn rows_differ_after(world: &World) -> Result<(), String> {
     world.sync_ok()?;
     migration(world, ADD_TAG_FILE, ADD_TAG)?;
     first_run(world)?;
+    // Under safe, a row the place changed stops the run before the place is
+    // migrated, so the final sync can only stop on one with safe off. The
+    // snapshot from the first run stays.
+    safe_off(world)?;
     sql_on(
         &local(world)?,
         "UPDATE notes SET body = 'here' WHERE id = 'n1'",
@@ -568,7 +614,11 @@ fn place_ledger_holds(world: &World) -> Result<(), String> {
 
 #[then("the place holds the new row")]
 fn place_new_row(world: &World) -> Result<(), String> {
-    let rows = rows_of(&place_file(world)?, "SELECT tag FROM notes WHERE id = 'n4'")?;
+    let query = world.new_row.get().map_or_else(
+        || "SELECT tag FROM notes WHERE id = 'n4'".to_owned(),
+        |(_, query)| query,
+    );
+    let rows = rows_of(&place_file(world)?, &query)?;
     if rows.len() == 1 {
         Ok(())
     } else {
@@ -578,9 +628,13 @@ fn place_new_row(world: &World) -> Result<(), String> {
 
 #[then("the run says in step")]
 fn says_in_step(world: &World) -> Result<(), String> {
-    // A whole line: "not in step" holds the same words.
+    // A whole line: "not in step" holds the same words. A --migratr run says
+    // "in step"; a plain sync's record says it is done.
     let text = said(world)?;
-    if text.lines().any(|line| line == "in step") {
+    if text
+        .lines()
+        .any(|line| line == "in step" || line == "smugglr sync: done")
+    {
         Ok(())
     } else {
         Err(format!("the run did not end in step: {text}"))
@@ -706,7 +760,7 @@ fn family(path: &str) -> Result<[Vec<Vec<String>>; 2], String> {
 #[then("the place holds every parent and child row of the local database")]
 fn place_holds_family(world: &World) -> Result<(), String> {
     let (here, there) = (family(&local(world)?)?, family(&place_file(world)?)?);
-    if here[0].len() == 2 && here[1].len() == 3 && here == there {
+    if here.iter().all(|rows| !rows.is_empty()) && here == there {
         Ok(())
     } else {
         Err(format!("local {here:?}, place {there:?}: {}", said(world)?))
@@ -859,4 +913,45 @@ fn says_no_snapshot(world: &World) -> Result<(), String> {
 fn names_ways_on(world: &World) -> Result<(), String> {
     says(world, "migratr down")?;
     says(world, "safe to false")
+}
+
+#[when("the agent runs smugglr sync on them without --migratr")]
+fn plain_sync(world: &World) -> Result<(), String> {
+    world.sync(&[]).map(drop)
+}
+
+#[then("the output names the table as handing out its own keys")]
+fn names_self_keyed(world: &World) -> Result<(), String> {
+    let text = said(world)?;
+    if text
+        .lines()
+        .any(|line| line.contains("hands out its own keys:") && line.contains("counters"))
+    {
+        Ok(())
+    } else {
+        Err(format!("counters is not named: {text}"))
+    }
+}
+
+#[then("the exit status is 0")]
+fn exit_zero(world: &World) -> Result<(), String> {
+    let output = world.output.get().ok_or("smugglr was not run")?;
+    if output.status.code() == Some(0) {
+        Ok(())
+    } else {
+        Err(format!("exit {:?}: {}", output.status.code(), said(world)?))
+    }
+}
+
+#[then("the place holds the edited row")]
+fn place_edited(world: &World) -> Result<(), String> {
+    let rows = rows_of(
+        &place_file(world)?,
+        "SELECT body FROM notes WHERE id = 'n1'",
+    )?;
+    if rows.len() == 1 && rows[0].iter().any(|value| value.contains("edited here")) {
+        Ok(())
+    } else {
+        Err(format!("the place holds {rows:?}: {}", said(world)?))
+    }
 }

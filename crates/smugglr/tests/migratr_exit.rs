@@ -100,11 +100,17 @@ fn a_first_run_exits_not_done_and_a_carried_run_exits_success() {
 }
 
 #[test]
-fn a_final_sync_not_in_step_does_not_exit_success() {
+fn a_place_changed_during_the_check_stops_under_safe_and_is_not_done_without() {
     let pair = Pair::new();
     assert_eq!(pair.run(MIGRATR), Some(NOT_DONE), "the first run");
     pair.sql("local.db", "UPDATE notes SET body = 'here'");
     pair.sql("there/place.db", "UPDATE notes SET body = 'there'");
+    // Safe stops before the place is migrated: nothing changed on it.
+    assert_eq!(pair.run(MIGRATR), Some(STOPPED));
+    // Without safe the migration goes, and the final sync stops on the row.
+    let settings = pair.0.join("config/smugglr");
+    assert!(std::fs::create_dir_all(&settings).is_ok());
+    assert!(std::fs::write(settings.join("config.toml"), "[migratr]\nsafe = false\n").is_ok());
     assert_eq!(pair.run(MIGRATR), Some(NOT_DONE));
 }
 

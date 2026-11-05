@@ -63,7 +63,11 @@ The first place named is the source, the second the target.
                            A rebuild does not lock the target: the app must not
                            write during a rebuild.
                            The snapshot, kept until the final sync is in step,
-                           is the way back.";
+                           is the way back.
+
+A table keyed INTEGER PRIMARY KEY syncs, and the record names it: two places
+handing out the same key make a mess, and under --sync-mode last it stops. Why:
+https://github.com/rafters-studio/smugglr/blob/main/docs/integer-keys.md";
 
 /// A `smugglr sync` command line.
 #[derive(Debug, Default)]
@@ -342,6 +346,12 @@ pub(crate) fn exit(record: &Record) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{HELP, parse};
+
+    #[test]
+    fn help_points_to_why_keys_the_database_hands_out_make_a_mess() {
+        assert!(HELP.contains("INTEGER PRIMARY KEY syncs"));
+        assert!(HELP.contains("docs/integer-keys.md"));
+    }
 
     #[test]
     fn help_says_what_migratr_does_what_safe_does_and_the_way_back() {

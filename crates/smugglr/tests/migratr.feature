@@ -100,7 +100,7 @@ Feature: --migratr carries a migration from a local database to a place (FR-SMUG
     And no table on the place was dropped
 
   @criterion-01a1aa82-c6dc-709e-997b-442a0670b601 @module-smugglr
-  Scenario: safe off skips the checks and keeps the rules
+  Scenario: safe off skips the checks, still refuses what has not run locally, and deletes no local row
     Given a config with safe set to false under migratr
     And a local database that has run a migration
     And a place that has not
@@ -119,23 +119,23 @@ Feature: --migratr carries a migration from a local database to a place (FR-SMUG
     And the snapshot still exists
 
   @criterion-01a1aa82-c6e2-746a-860d-7c05e914452f @module-smugglr
-  Scenario: a self-keyed table is reported and the run moves on
+  Scenario: a self-keyed table is carried and synced
     Given a local database and a place with a table keyed by INTEGER PRIMARY KEY and a table keyed by text
     And a migration the local database has run and the place has not
+    And a new row on the local database in the table keyed by INTEGER PRIMARY KEY
     When the agent runs smugglr sync on them with --migratr
-    Then the output names the table and its column as not compliant
-    And the place has run the migration
-    And the text-keyed table's rows are in step
-    And the run says in step for the rest
+    Then the place has run the migration
+    And the place holds the new row
+    And the output names the table as handing out its own keys
+    And the run says in step
 
   @criterion-01a1aa82-c6e5-7aea-a3ad-8b1279658ae8 @module-smugglr
-  Scenario: a rebuild cannot drop a table it cannot refill
+  Scenario: a rebuild refills a self-keyed child
     Given a child table keyed by INTEGER PRIMARY KEY that references a parent
     And a migration that needs a rebuild of the parent, run on the local database
     When the agent runs smugglr sync on them with --migratr
-    Then the run stops naming the child table
-    And no table on the place was dropped
-    And the place's rows are as they were
+    Then the place holds every parent and child row of the local database
+    And the run says in step
 
   @criterion-01a1aa82-c6e8-70db-9052-bc4e6ac761b2 @module-smugglr
   Scenario: a dry run shows the statements and changes nothing
@@ -153,3 +153,26 @@ Feature: --migratr carries a migration from a local database to a place (FR-SMUG
     Then the run stops saying no verified snapshot exists
     And the output names migratr down and safe
     And the place has not changed
+
+  @criterion-01a1ad0f-dcea-74cb-9ee8-150de399372f @module-smugglr
+  Scenario: a plain sync after a carry is in step
+    Given a local database and a place after a run that carried a migration
+    When the agent runs smugglr sync on them without --migratr
+    Then the run says in step
+    And the exit status is 0
+
+  @criterion-01a1ad0f-dcec-7a36-b78a-6092775a138a @module-smugglr
+  Scenario: safe stops any carry when the place has moved
+    Given a local database that has run an added column through the first run
+    And a place with a row changed since the snapshot
+    When the agent runs smugglr sync on them with --migratr
+    Then the run stops naming the row
+    And the place has not changed
+
+  @criterion-01a1ad0f-dcef-7100-a927-6a214f1da6fa @module-smugglr
+  Scenario: an edit made during the check reaches the place
+    Given a local database that has run an added column through the first run
+    And a row edited on the local database after that run
+    When the agent runs smugglr sync on them with --migratr
+    Then the place holds the edited row
+    And the run says in step
