@@ -137,6 +137,17 @@ impl Place for LocalFile {
             .collect()
     }
 
+    fn parents(&mut self, table: &str) -> Result<Vec<String>, Error> {
+        self.connection
+            .prepare(queries::PARENTS)
+            .and_then(|mut statement| {
+                statement
+                    .query_map([table], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()
+            })
+            .map_err(|source| self.sqlite(source))
+    }
+
     fn hashes(&mut self, table: &Table) -> Result<Vec<(Key, [u8; 16])>, Error> {
         // Hashed here column by column, the same hash the SQL function
         // gives; a large value is read alone, and one too large to quote is

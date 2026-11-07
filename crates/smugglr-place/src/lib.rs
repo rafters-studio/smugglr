@@ -120,6 +120,17 @@ pub trait Place {
         &[]
     }
 
+    /// The tables `table`'s foreign keys reference, itself left out: a write
+    /// into a place that enforces foreign keys puts these tables' rows first
+    /// (#652). None by default.
+    ///
+    /// # Errors
+    /// When the place cannot be read.
+    fn parents(&mut self, table: &str) -> Result<Vec<String>, Error> {
+        let _ = table;
+        Ok(Vec::new())
+    }
+
     /// The place's value limit: the largest value, in bytes, whose
     /// `quote()` text it can build (FR-SMUGGLR-071 rev 11). A local file's,
     /// [`LOCAL_LIMIT`], by default.
