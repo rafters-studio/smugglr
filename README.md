@@ -117,10 +117,10 @@ smugglr sync: done
 
 The D1 token needs D1 edit permission. A missing variable is refused by name, exit 2.
 
-smugglr keeps no secrets and has no environment of its own: it runs inside the environment of the project that calls it. Each project's `.env` holds the two variables, or a secrets manager does. With 1Password Environments:
+smugglr keeps no secrets and has no environment of its own: it reads the two variables from the environment it runs in, however they are set there.
 
 ```
-op run --environment=<id> -- smugglr sync ./shop.db d1://shop
+CLOUDFLARE_ACCOUNT_ID=<account id> CLOUDFLARE_API_TOKEN=<token> smugglr sync ./shop.db d1://shop
 ```
 
 Before it reads a row, smugglr checks that both places hold the same tables with the same columns. A difference stops the run and writes nothing. Tables a sync should not touch in a shared database go in the config's `ignore` list, and the check skips them. `sqlite_*` and D1's `_cf_*` tables are ignored without being listed. `--table` limits which tables move, not which are checked.
