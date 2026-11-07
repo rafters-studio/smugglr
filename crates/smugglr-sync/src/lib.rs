@@ -342,9 +342,16 @@ fn parents_first(
         .collect();
     let mut parents = BTreeMap::new();
     for name in &names {
-        let mut theirs = source.parents(name)?;
+        // SQLite's table names ignore case, so a reference may not match
+        // its table's spelling.
+        let mut theirs: Vec<String> = source.parents(name)?;
         theirs.extend(target.parents(name)?);
-        theirs.retain(|parent| names.contains(parent));
+        let theirs = theirs
+            .iter()
+            .filter_map(|parent| names.iter().find(|n| n.eq_ignore_ascii_case(parent)))
+            .filter(|parent| *parent != name)
+            .cloned()
+            .collect::<Vec<String>>();
         parents.insert(name.clone(), theirs);
     }
     let mut placed: Vec<String> = Vec::new();
@@ -1116,7 +1123,7 @@ mod tests {
         std::fs::create_dir_all(&dir)?;
         let shape = "PRAGMA foreign_keys = ON; \
             CREATE TABLE org (id TEXT PRIMARY KEY, name TEXT NOT NULL); \
-            CREATE TABLE member (id TEXT PRIMARY KEY, org TEXT NOT NULL REFERENCES org(id)); \
+            CREATE TABLE member (id TEXT PRIMARY KEY, org TEXT NOT NULL REFERENCES Org(id)); \
             CREATE TABLE badge (id TEXT PRIMARY KEY, member TEXT NOT NULL REFERENCES member(id));";
         let source = sqlite(
             &dir.join("source.db"),
