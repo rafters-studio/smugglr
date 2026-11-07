@@ -193,6 +193,7 @@ pub fn sync(
         let why = too_much(&weight, source.address(), target.address());
         return Ok(Record::too_much(weight, why, ignored));
     }
+    let plans = parents_first(plans, &mut *source, &mut *target)?;
     let mut wrote = Wrote::new(options.max_value.unwrap_or(DEFAULT_MAX_VALUE));
     wrote.keyed = self_keyed(&plans);
     let unmatched = match write_all(
@@ -324,6 +325,58 @@ impl Wrote {
             .map(|write| write.key)
             .collect()
     }
+}
+
+/// The plans ordered so each table comes after every table its foreign keys
+/// reference in either place, so a place that enforces foreign keys takes a
+/// parent's rows before its children's (#652). Tables in a cycle keep their
+/// order among themselves.
+fn parents_first(
+    plans: Vec<(Table, Hashes, Plan)>,
+    source: &mut dyn Place,
+    target: &mut dyn Place,
+) -> Result<Vec<(Table, Hashes, Plan)>, Error> {
+    let names: std::collections::BTreeSet<String> = plans
+        .iter()
+        .map(|(table, _, _)| table.name.clone())
+        .collect();
+    let mut parents = BTreeMap::new();
+    for name in &names {
+        // SQLite's table names ignore case, so a reference may not match
+        // its table's spelling.
+        let mut theirs: Vec<String> = source.parents(name)?;
+        theirs.extend(target.parents(name)?);
+        let theirs = theirs
+            .iter()
+            .filter_map(|parent| names.iter().find(|n| n.eq_ignore_ascii_case(parent)))
+            .filter(|parent| *parent != name)
+            .cloned()
+            .collect::<Vec<String>>();
+        parents.insert(name.clone(), theirs);
+    }
+    let mut placed: Vec<String> = Vec::new();
+    while placed.len() < names.len() {
+        let ready: Vec<String> = names
+            .iter()
+            .filter(|name| !placed.contains(name))
+            .filter(|name| parents[*name].iter().all(|parent| placed.contains(parent)))
+            .cloned()
+            .collect();
+        if ready.is_empty() {
+            // A cycle: the rest keep their order.
+            let rest: Vec<String> = names
+                .iter()
+                .filter(|name| !placed.contains(name))
+                .cloned()
+                .collect();
+            placed.extend(rest);
+        } else {
+            placed.extend(ready);
+        }
+    }
+    let mut plans = plans;
+    plans.sort_by_key(|(table, _, _)| placed.iter().position(|name| *name == table.name));
+    Ok(plans)
 }
 
 /// Writes each table's planned moves, table by table, recording each in
@@ -1057,6 +1110,41 @@ mod tests {
         );
         assert_eq!(record.tables.keys().collect::<Vec<_>>(), ["notes", "tags"]);
         drop((source, target));
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// A child table that sorts before its parent, into a target that
+    /// enforces foreign keys, copies every row in one run (#652).
+    #[test]
+    fn a_first_sync_writes_parents_before_children() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join(format!("smugglr-parents-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let shape = "PRAGMA foreign_keys = ON; \
+            CREATE TABLE org (id TEXT PRIMARY KEY, name TEXT NOT NULL); \
+            CREATE TABLE member (id TEXT PRIMARY KEY, org TEXT NOT NULL REFERENCES Org(id)); \
+            CREATE TABLE badge (id TEXT PRIMARY KEY, member TEXT NOT NULL REFERENCES member(id));";
+        let source = sqlite(
+            &dir.join("source.db"),
+            &format!(
+                "{shape} INSERT INTO org VALUES ('o1', 'one'); \
+                 INSERT INTO member VALUES ('m1', 'o1'); INSERT INTO badge VALUES ('b1', 'm1');"
+            ),
+        )?;
+        let target = sqlite(&dir.join("target.db"), shape)?;
+        let options = Options {
+            config_dir: Some(dir.join("config")),
+            ..Options::default()
+        };
+        let mut here = LocalFile::open(dir.join("source.db"))?;
+        let mut there = LocalFile::open(dir.join("target.db"))?;
+        let record = sync(&mut here, &mut there, &options)?;
+        assert_eq!(record.status, smugglr_core::record::Status::Done);
+        for table in ["org", "member", "badge"] {
+            assert_eq!(dump(&target, table)?.len(), 1, "{table}");
+        }
+        drop((here, there, source, target));
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }

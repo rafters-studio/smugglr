@@ -10,6 +10,10 @@ pub(crate) const ROW_HASH: &str = "smugglr_row_hash";
 pub(crate) const TABLES: &str = "SELECT name FROM sqlite_schema \
      WHERE type = 'table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY name";
 
+/// The tables a table's foreign keys reference, itself left out.
+pub(crate) const PARENTS: &str =
+    "SELECT DISTINCT \"table\" FROM pragma_foreign_key_list(?1) WHERE \"table\" <> ?1 ORDER BY 1";
+
 /// A table's columns, where each sits in the primary key (0 when not), and
 /// each one's declared type.
 pub(crate) const COLUMNS: &str = "SELECT name, pk, type FROM pragma_table_info(?1) ORDER BY cid";

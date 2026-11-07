@@ -264,6 +264,18 @@ impl Place for HttpSql {
         self.transport.value_limit()
     }
 
+    fn parents(&mut self, table: &str) -> Result<Vec<String>, Error> {
+        self.query(queries::PARENTS, &[json!(table)])?
+            .iter()
+            .map(|row| {
+                row.first()
+                    .and_then(Json::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| self.failed(format_args!("the parents of {table}")))
+            })
+            .collect()
+    }
+
     fn tables(&mut self) -> Result<Vec<Table>, Error> {
         let own = Ignore::new(self.own_tables().iter().copied());
         let names = self.query(queries::TABLES, &[])?;
