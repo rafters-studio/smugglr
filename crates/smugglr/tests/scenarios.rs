@@ -7,6 +7,8 @@
 mod cli;
 #[path = "steps/d1.rs"]
 mod d1;
+#[path = "steps/exec.rs"]
+mod exec_steps;
 #[path = "steps/http_sql.rs"]
 mod http_sql;
 #[path = "steps/mesh.rs"]
@@ -26,6 +28,7 @@ mod whole;
 
 use std::process::{Command, Output};
 
+use exec_steps::{Exec, exec};
 use mesh::{Front, front};
 use multi::{Devices, devices};
 use rstest::fixture;
@@ -75,6 +78,7 @@ scenarios!(
         world: World,
         soak: Soak,
         devices: Devices,
-        front: Front
+        front: Front,
+        exec: Exec
     ]
 );
