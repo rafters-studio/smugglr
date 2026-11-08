@@ -51,7 +51,11 @@ fn exec(args: &[&str], batch: &[&str]) -> Result<(Option<i32>, Json), String> {
         .take()
         .ok_or("no stdin")?
         .write_all(input.as_bytes())
-        .map_err(error)?;
+        // A call that reads no batch may have exited already.
+        .or_else(|err| match err.kind() {
+            std::io::ErrorKind::BrokenPipe => Ok(()),
+            _ => Err(error(err)),
+        })?;
     let output = child.wait_with_output().map_err(error)?;
     let said = serde_json::from_slice(&output.stdout).unwrap_or(Json::Null);
     Ok((output.status.code(), said))

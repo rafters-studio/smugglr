@@ -102,7 +102,11 @@ fn run(world: &World, args: &[&str], batch: &[String]) -> Result<Output, String>
         .take()
         .ok_or("no stdin")?
         .write_all(input.as_bytes())
-        .map_err(|err| err.to_string())?;
+        // A call that reads no batch may have exited already.
+        .or_else(|err| match err.kind() {
+            std::io::ErrorKind::BrokenPipe => Ok(()),
+            _ => Err(err.to_string()),
+        })?;
     child.wait_with_output().map_err(|err| err.to_string())
 }
 
