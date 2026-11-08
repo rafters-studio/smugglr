@@ -88,6 +88,11 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
             println!("smugglr {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
+        // migratr checks this before it uses exec (FR-SMUGGLR-084).
+        Some((flag, [])) if flag == "--version" || flag == "-V" => {
+            println!("smugglr {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
         Some((command, rest)) if command == "sync" => {
             if let Some(at) = rest
                 .windows(2)
