@@ -1,5 +1,5 @@
 # Generated from the legion requirement. Do not hand-edit this file.
-# FR-SMUGGLR-084 rev 6.
+# FR-SMUGGLR-084 rev 7.
 Feature: exec runs migratr's statements on a place, gated by fingerprints both ways (FR-SMUGGLR-084)
 
   @criterion-01a1b3a8-87b2-7f13-9deb-9e46373e30d0 @module-smugglr
@@ -42,7 +42,7 @@ Feature: exec runs migratr's statements on a place, gated by fingerprints both w
     When the agent runs smugglr --help
     Then exec is not named
 
-  @criterion-01a1b8b3-911f-7873-b069-969235e698fa @module-smugglr @network @credentialed
+  @criterion-01a1b8b3-911f-7873-b069-969235e698fa @module-smugglr
   Scenario: one fingerprint on D1 and on a file
     Given a d1:// place and a local file holding the same schema with a CHECK, a UNIQUE item, a trigger and a view
     When migratr runs exec's read form on each
