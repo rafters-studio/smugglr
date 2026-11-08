@@ -51,6 +51,20 @@ pub trait Transport: std::fmt::Debug {
         crate::LOCAL_LIMIT
     }
 
+    /// The service's table limit ([`Place::table_limit`]); none by default.
+    fn table_limit(&self) -> Option<u64> {
+        None
+    }
+
+    /// Who the service is, beside its address ([`Place::identity`]): for
+    /// D1, the account and the database's uuid. None by default.
+    ///
+    /// # Errors
+    /// When the service cannot be asked, in the transport's own words.
+    fn identity(&self) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
     /// The service runs the engine's row hash as `smugglr_row_hash`, a
     /// function registered on its connection, as the browser's SQLite does:
     /// each row is then hashed where it lives. False by default.
@@ -262,6 +276,19 @@ impl Place for HttpSql {
 
     fn value_limit(&self) -> u64 {
         self.transport.value_limit()
+    }
+
+    fn table_limit(&self) -> Option<u64> {
+        self.transport.table_limit()
+    }
+
+    fn identity(&mut self) -> Result<String, Error> {
+        Ok(
+            match self.transport.identity().map_err(|err| self.failed(err))? {
+                Some(who) => format!("{}, {who}", self.address),
+                None => self.address.clone(),
+            },
+        )
     }
 
     fn parents(&mut self, table: &str) -> Result<Vec<String>, Error> {
