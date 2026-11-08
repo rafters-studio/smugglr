@@ -37,6 +37,9 @@ socket2 = { version = "0.6", features = ["all"] }
 # The HTTP-SQL place (smugglr-place). Blocking, because a place is
 # synchronous; `rustls`: https, so a hosted service is reached over TLS.
 ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
+# The hash of a batch exec runs and the fingerprint of a shape (smugglr,
+# the CLI): the release migratr already builds.
+sha2 = "0.10.9"
 # The row hash (smugglr-core); does no I/O and reads no clock.
 # `pure`: the portable Rust build, no C or assembly, so it builds for wasm32.
 blake3 = { version = "1.8.7", default-features = false, features = ["pure"] }
