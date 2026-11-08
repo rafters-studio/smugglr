@@ -528,8 +528,49 @@ pub(crate) fn run(source: &str, target: &str, ignore: &[String], json: bool) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{Reader, parents_first};
+    use super::{Reader, Report, blocking, parents_first, report};
     use ::migratr::read_schema_through;
+    use smugglr_core::ignore::Ignore;
+
+    const NOTES: &str = "CREATE TABLE notes (id TEXT PRIMARY KEY, body TEXT); \
+         INSERT INTO notes VALUES ('n1', 'first');";
+
+    fn place(sql: &str) -> Result<Report, String> {
+        let connection = rusqlite::Connection::open_in_memory().map_err(|e| e.to_string())?;
+        connection.execute_batch(sql).map_err(|e| e.to_string())?;
+        report(
+            &mut Reader::File(connection, ":memory:".to_owned()),
+            &Ignore::default(),
+        )
+    }
+
+    fn kinds(source: &Report, target: &Report) -> Vec<String> {
+        blocking(source, target)
+            .iter()
+            .filter_map(|found| found["kind"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    #[test]
+    fn places_alike_and_small_have_nothing_blocking() -> Result<(), String> {
+        assert_eq!(kinds(&place(NOTES)?, &place(NOTES)?), Vec::<String>::new());
+        Ok(())
+    }
+
+    #[test]
+    fn a_shape_difference_blocks() -> Result<(), String> {
+        let wider = place(&format!("{NOTES} ALTER TABLE notes ADD COLUMN n INTEGER;"))?;
+        assert_eq!(kinds(&place(NOTES)?, &wider), ["shape"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_table_over_the_place_limit_blocks() -> Result<(), String> {
+        let mut limited = place(NOTES)?;
+        limited.limit = Some(1);
+        assert_eq!(kinds(&place(NOTES)?, &limited), ["over limit"]);
+        Ok(())
+    }
 
     fn schema(sql: &str) -> Result<::migratr::SchemaSnapshot, String> {
         let connection = rusqlite::Connection::open_in_memory().map_err(|e| e.to_string())?;
