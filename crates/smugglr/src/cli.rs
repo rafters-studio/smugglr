@@ -110,6 +110,8 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
             crate::multi::run(command == "stash", rest)
         }
         Some((command, rest)) if command == "mesh" => crate::mesh::run(rest),
+        // migratr's way to reach a place; not named in any help.
+        Some((command, rest)) if command == "exec" => smugglr::exec::run(rest),
         Some(_) => usage("smugglr knows sync, stash, retrieve and mesh"),
     }
 }

@@ -132,7 +132,7 @@ fn snapshot(world: &World) -> Result<PathBuf, String> {
 }
 
 /// Everything a SQLite file holds.
-fn state(path: &str) -> Result<String, String> {
+pub(crate) fn state(path: &str) -> Result<String, String> {
     let mut all = vec![format!(
         "{:?}",
         rows_of(

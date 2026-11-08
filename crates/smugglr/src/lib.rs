@@ -6,6 +6,8 @@
 //! [`Config`] reads the person's config, as the CLI does.
 
 pub mod config;
+#[doc(hidden)]
+pub mod exec;
 pub mod migratr;
 
 pub use config::Config;

@@ -131,7 +131,7 @@ pub fn carry(request: &Request, take: &Snapshot) -> Result<Outcome, Error> {
 }
 
 /// Opens the SQLite file at `path`, never creating it, as a place does.
-fn open_file(path: &Path) -> Result<Connection, Error> {
+pub(crate) fn open_file(path: &Path) -> Result<Connection, Error> {
     Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
         .map_err(|err| Error::Stop(format!("{}: {err}", path.display())))
 }
@@ -1005,7 +1005,7 @@ impl<E: Executor> Executor for Dry<'_, E> {
 /// A service that speaks HTTP-SQL, as migratr's [`Executor`]. Nothing here
 /// knows which service it is.
 #[derive(Debug)]
-struct Hosted(HttpSql);
+pub(crate) struct Hosted(pub(crate) HttpSql);
 
 impl SqlReader for Hosted {
     type Error = smugglr_place::Error;
