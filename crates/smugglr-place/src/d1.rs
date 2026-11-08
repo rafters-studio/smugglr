@@ -397,6 +397,10 @@ fn blob(value: Json) -> Result<Json, String> {
 /// local file (FR-SMUGGLR-071 rev 11).
 const VALUE_LIMIT: u64 = 950_000;
 
+/// D1's table limit: the most bytes one result carries from D1, 50 MB
+/// (FR-SMUGGLR-085, research 01a1b330).
+const TABLE_LIMIT: u64 = 50_000_000;
+
 impl Transport for D1 {
     fn send(&self, request: &Json) -> Result<(bool, Json), String> {
         let (statements, single) = match request["batch"].as_array() {
@@ -422,6 +426,17 @@ impl Transport for D1 {
 
     fn value_limit(&self) -> u64 {
         VALUE_LIMIT
+    }
+
+    fn table_limit(&self) -> Option<u64> {
+        Some(TABLE_LIMIT)
+    }
+
+    fn identity(&self) -> Result<Option<String>, String> {
+        match self.id()? {
+            Ok(id) => Ok(Some(format!("account {}, database {id}", self.account))),
+            Err((code, message)) => Err(format!("{code} {message}")),
+        }
     }
 }
 

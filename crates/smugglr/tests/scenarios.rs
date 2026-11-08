@@ -7,6 +7,8 @@
 mod cli;
 #[path = "steps/d1.rs"]
 mod d1;
+#[path = "steps/discover.rs"]
+mod discover;
 #[path = "steps/http_sql.rs"]
 mod http_sql;
 #[path = "steps/mesh.rs"]

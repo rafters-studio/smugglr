@@ -138,7 +138,12 @@ fn nothing_changed(world: &World) -> Result<(), String> {
     let refused = output.status.code() == Some(2)
         && String::from_utf8_lossy(&output.stderr)
             .contains("--sync-mode last needs a steering column for:");
-    if !refused && !String::from_utf8_lossy(&output.stdout).starts_with("smugglr sync:") {
+    // --discover's report begins with what blocks a sync, or the source.
+    let said = String::from_utf8_lossy(&output.stdout);
+    let reported = ["smugglr sync:", "blocking: ", "source: "]
+        .iter()
+        .any(|start| said.starts_with(start));
+    if !refused && !reported {
         return Err(format!(
             "smugglr printed no record, saying {:?}",
             String::from_utf8_lossy(&output.stderr)

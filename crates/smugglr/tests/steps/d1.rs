@@ -601,3 +601,31 @@ fn d1_batch_send_time() -> Result<(), String> {
     );
     Ok(())
 }
+
+#[given("a d1:// place")]
+fn a_d1_place(world: &World) -> Result<(), String> {
+    let (place, _) = d1(world, "shop", "hosted.db", NOTES)?;
+    world.source.set(place);
+    world.target.set(world.place("local.db", NOTES)?);
+    Ok(())
+}
+
+#[then("the identity names the account and the database's uuid")]
+fn names_account_and_uuid(world: &World) -> Result<(), String> {
+    let output = world.output.get().ok_or("smugglr was not run")?;
+    let said = String::from_utf8_lossy(&output.stdout);
+    let identity = said
+        .lines()
+        .find(|line| line.starts_with("source: "))
+        .ok_or_else(|| {
+            format!(
+                "no source in {said:?}, saying {:?}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })?;
+    if identity == format!("source: d1://shop, account {ACCOUNT}, database {UUID}") {
+        Ok(())
+    } else {
+        Err(format!("the identity is {identity:?}"))
+    }
+}

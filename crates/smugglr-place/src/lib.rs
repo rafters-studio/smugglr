@@ -138,6 +138,23 @@ pub trait Place {
         LOCAL_LIMIT
     }
 
+    /// The most bytes of a table's rows one result can carry from the
+    /// place: a table over it cannot be read whole (FR-SMUGGLR-085). None,
+    /// no limit, by default, as for a local file.
+    fn table_limit(&self) -> Option<u64> {
+        None
+    }
+
+    /// Who the place is: its address by default, and for a hosted place
+    /// what names it there, such as a D1 database's account and uuid
+    /// (FR-SMUGGLR-085).
+    ///
+    /// # Errors
+    /// When the place cannot be asked.
+    fn identity(&mut self) -> Result<String, Error> {
+        Ok(self.address().to_owned())
+    }
+
     /// Every table the place holds, except SQLite's own. A table of the
     /// host's own ([`Place::own_tables`]) is named and never read, so it has
     /// no columns.

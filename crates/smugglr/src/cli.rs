@@ -23,14 +23,14 @@ pub(crate) const STOPPED: u8 = 3;
 pub(crate) const NOT_DONE: u8 = 4;
 
 /// Exit status for a run too much for the wire.
-const TOO_MUCH: u8 = 5;
+pub(crate) const TOO_MUCH: u8 = 5;
 
 /// Seconds between runs under `--watch` when no number is given.
 const WATCH_SECONDS: u64 = 60;
 
 const HELP: &str = "usage: smugglr sync <source> <target> [--dryrun] [--json] \
      [--sync-type direct|mesh] [--sync-mode stop|source|target|last] [--table <name>]... \
-     [--watch [seconds]] [--migratr [dir]]
+     [--watch [seconds]] [--migratr [dir]] [--discover]
 
 The first place named is the source, the second the target.
   --dryrun                 show what the sync would do; write nothing
@@ -64,6 +64,11 @@ The first place named is the source, the second the target.
                            write during a rebuild.
                            The snapshot, kept until the final sync is in step,
                            is the way back.
+  --discover               write nothing; say what each place is (identity,
+                           ledger, tables with rows and estimated bytes, copy
+                           order, triggers, views, indexes, ignored tables)
+                           and, first, what a sync could not get past. Exits
+                           3 when a sync would stop, 0 when it could go ahead
 
 A table keyed INTEGER PRIMARY KEY syncs, and the record names it: two places
 handing out the same key make a mess, and under --sync-mode last it stops. Why:
@@ -79,6 +84,8 @@ struct Sync {
     migratr: bool,
     /// The directory `--migratr` names, if any.
     migrations: Option<PathBuf>,
+    /// `--discover`.
+    discover: bool,
 }
 
 /// Runs the command line `args` (without the program name).
@@ -165,6 +172,7 @@ fn parse(args: &[String]) -> Result<Sync, String> {
                 command.options.watch = Some(Duration::from_secs(seconds.unwrap_or(WATCH_SECONDS)));
             }
             "--migratr" => command.migratr = true,
+            "--discover" => command.discover = true,
             flag if flag.starts_with("--") => return Err(format!("unknown flag {flag}")),
             // Once the two places are named, a word after --migratr is its
             // directory.
@@ -202,7 +210,8 @@ fn parse(args: &[String]) -> Result<Sync, String> {
 
 /// One run, or under `--watch` a run every interval until stopped.
 fn sync_command(command: &Sync) -> ExitCode {
-    let Some(interval) = command.options.watch else {
+    // --discover reads the places once and writes nothing.
+    let Some(interval) = command.options.watch.filter(|_| !command.discover) else {
         return sync_once(command);
     };
     loop {
@@ -212,7 +221,20 @@ fn sync_command(command: &Sync) -> ExitCode {
     }
 }
 
+/// One run; a run that stops (3, or 5 for too much) ends its stderr naming
+/// `--discover` (FR-SMUGGLR-085).
 fn sync_once(command: &Sync) -> ExitCode {
+    let code = sync_run(command);
+    if !command.discover && (code == ExitCode::from(STOPPED) || code == ExitCode::from(TOO_MUCH)) {
+        eprintln!(
+            "To see what the places are and what a sync meets: smugglr sync {} {} --discover",
+            command.places[0], command.places[1]
+        );
+    }
+    code
+}
+
+fn sync_run(command: &Sync) -> ExitCode {
     // The tables to ignore, max_wire, max_value and the steering columns come
     // from the config, never from a flag.
     let mut options = command.options.clone();
@@ -239,6 +261,9 @@ fn sync_once(command: &Sync) -> ExitCode {
     let [source, target] = command.places.as_slice() else {
         return usage("smugglr sync takes two places");
     };
+    if command.discover {
+        return crate::discover::run(source, target, &options.ignore, command.json);
+    }
     let places =
         smugglr_place::open(source).and_then(|source| Ok((source, smugglr_place::open(target)?)));
     let (mut source, mut target) = match places {
