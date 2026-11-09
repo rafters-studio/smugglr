@@ -6,7 +6,7 @@ smugglr is not a database. It moves rows between databases and keeps its own mem
 
 ## Install
 
-The GitHub release for tag v0.6.2 (https://github.com/rafters-studio/smugglr/releases) carries one archive per target: `smugglr-<target>.tar.gz` for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin` and `aarch64-apple-darwin`, and `smugglr-x86_64-pc-windows-msvc.zip` for Windows. smugglr publishes no checksum file.
+The GitHub release for tag v0.6.3 (https://github.com/rafters-studio/smugglr/releases) carries one archive per target: `smugglr-<target>.tar.gz` for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin` and `aarch64-apple-darwin`, and `smugglr-x86_64-pc-windows-msvc.zip` for Windows. smugglr publishes no checksum file.
 
 With `install.sh`, on Linux and macOS, x86_64 or aarch64:
 
@@ -14,12 +14,12 @@ With `install.sh`, on Linux and macOS, x86_64 or aarch64:
 curl -fsSL https://raw.githubusercontent.com/rafters-studio/smugglr/main/install.sh | bash
 ```
 
-It installs the latest release's binary to `~/.local/bin/smugglr`, and says how to add that directory to `PATH` when it is not on it. `SMUGGLR_VERSION=v0.6.2 bash install.sh` installs that tag.
+It installs the latest release's binary to `~/.local/bin/smugglr`, and says how to add that directory to `PATH` when it is not on it. `SMUGGLR_VERSION=v0.6.3 bash install.sh` installs that tag.
 
 From source:
 
 ```
-cargo install --git https://github.com/rafters-studio/smugglr --tag v0.6.2 smugglr
+cargo install --git https://github.com/rafters-studio/smugglr --tag v0.6.3 smugglr
 ```
 
 ## First sync
@@ -325,7 +325,7 @@ n1|back again
 
 Designed and tested for up to 50 nodes. Clocks should agree to within one twelfth of the sunset.
 
-### Not in 0.6.2
+### Not in 0.6.3
 
 - Retiring the previous key. A node accepts the key before the newest with no end date; nothing removes it but taking it out of the key file.
 

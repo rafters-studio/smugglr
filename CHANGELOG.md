@@ -6,6 +6,66 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-11-08
+
+The exec release. `smugglr exec` runs a migration's statements on a place for
+migratr, and only when the statements are the ones the local database ran and
+the place is in the shape expected, so migratr's migrate-and-smuggle flow can
+carry a schema change to D1 through smugglr. `smugglr sync <a> <b> --discover`
+writes nothing and says what two places are and what a sync between them would
+meet. A sync now writes a parent's rows before its children's, so a place that
+enforces foreign keys, as D1 always does, takes them. Patch release: exec and
+`--discover` are additive; direct sync, the stash blob, the memory format and
+the mesh wire are unchanged.
+
+### Added
+
+- `smugglr exec <local> <place> --version <v> --up|--down --expect <fp>`
+  (#657, PR #664). It reads the batch on stdin and runs it on the place in one
+  all-or-nothing batch with the version's ledger row, or its removal for
+  `--down`, only when the batch's SHA-256 equals the up or down hash the local
+  database recorded and the place's structural fingerprint is the one
+  `--expect` names; a down batch needs the local database to have run the down
+  first. It prints the place's fingerprint after. `smugglr exec <db> --read`
+  prints the schema, the ledger and the fingerprint, and takes no query. A
+  D1 place and a file in the same shape have the same fingerprint. A refusal
+  exits 3 and leaves the place as it was, a failing statement exits 1 with
+  nothing changed, and a usage error exits 2. Exec is for migratr, so
+  `--help` does not name it.
+- `smugglr sync <a> <b> --discover` (#659, PR #665). It writes nothing and
+  prints, first, every finding a sync could not get past: a table over the
+  place's limit (50,000,000 bytes for D1), a foreign-key cycle, a shape
+  difference. Then, for each place, its identity (for D1, the account and the
+  database's uuid), its ledger, its tables with rows and bytes estimated from
+  a 1,000-row sample, the copy order, self-references, triggers, views,
+  indexes and ignored tables. It exits 3 when a sync would stop and 0
+  otherwise; with `--json` the output carries `identity`, `ledger`,
+  `blocking` and `shapes_match`. A sync that stops with exit 3 or 5 ends its
+  stderr with the `--discover` command for the same two places.
+
+### Changed
+
+- The scenario that checks D1 and a file share one fingerprint runs locally
+  on D1's own engine through miniflare, and is no longer tagged network or
+  credentialed (#666, PR #667).
+
+### Fixed
+
+- A sync wrote tables in name order, so into a place that enforces foreign
+  keys a child table that sorts before its parent failed every row on every
+  run. A place now names each table's parents from `pragma_foreign_key_list`,
+  and a sync writes parents first. A reference names its parent in any case,
+  as SQLite's table names do, so `REFERENCES Org(id)` names the
+  table `org` (#652, PR #656).
+- `smugglr --version` and `-V` print the version and exit 0. They exited 2
+  with the usage text, and only a bare `smugglr` printed the version; migratr
+  checks `smugglr --version` before it uses exec (#662, PR #663).
+- The linear-cost tests compare ten times the rows against a limit of thirty
+  times as long, counting the quickest of three smaller runs, so a runner's
+  noise no longer fails linear code; the larger run has a deadline, so a scan
+  per row fails in about a minute instead of running to the job's time limit
+  (#648, PR #649).
+
 ## [0.6.2] - 2026-11-05
 
 The D1 schema release. `smugglr sync <local> <place> --migratr [dir]` carries

@@ -1441,7 +1441,7 @@ checksum = "e8e2fb0f499abb4d162f2bedad68f5ef91a1682b5a03596ddb67efd37768d100"
 
 [[package]]
 name = "smugglr"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "blake3",
  "chacha20poly1305",
@@ -1466,7 +1466,7 @@ dependencies = [
 
 [[package]]
 name = "smugglr-core"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "blake3",
  "rstest",
@@ -1478,7 +1478,7 @@ dependencies = [
 
 [[package]]
 name = "smugglr-memory"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "serde_json",
  "smugglr-core",
@@ -1487,7 +1487,7 @@ dependencies = [
 
 [[package]]
 name = "smugglr-mesh"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "blake3",
  "chacha20poly1305",
@@ -1506,7 +1506,7 @@ dependencies = [
 
 [[package]]
 name = "smugglr-multi"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "blake3",
  "serde_json",
@@ -1518,7 +1518,7 @@ dependencies = [
 
 [[package]]
 name = "smugglr-place"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "rusqlite",
  "serde_json",
@@ -1529,7 +1529,7 @@ dependencies = [
 
 [[package]]
 name = "smugglr-sync"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "rusqlite",
  "smugglr-core",
@@ -1540,7 +1540,7 @@ dependencies = [
 
 [[package]]
 name = "smugglr-web"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "rstest",
  "rstest-bdd",
@@ -2230,7 +2230,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "cargo_metadata",
  "rstest",
