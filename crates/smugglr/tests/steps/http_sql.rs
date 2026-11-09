@@ -160,11 +160,7 @@ fn statement(connection: &Connection, sql: &str, params: &Json) -> Result<Json, 
         .as_array()
         .map_or(Ok(Vec::new()), |params| params.iter().map(param).collect())?;
     let mut statement = connection.prepare(sql).map_err(error)?;
-    let columns: Vec<String> = statement
-        .column_names()
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
+    let columns: Vec<String> = statement.column_names().map(str::to_owned).collect();
     if columns.is_empty() {
         let affected = statement.execute(params_from_iter(params)).map_err(error)?;
         return Ok(

@@ -5,7 +5,7 @@ members = ["crates/*", "xtask"]
 [workspace.package]
 version = "0.6.3"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 license = "MIT"
 repository = "https://github.com/rafters-studio/smugglr"
 authors = ["Rafters Studio"]
@@ -20,12 +20,12 @@ smugglr-sync = { path = "crates/smugglr-sync", version = "0.6.3" }
 # The local file place (smugglr-place). `bundled`: SQLite is built in, so the
 # binary reads any file the same way; `functions`: the row hash runs as a SQL
 # function on the connection, where the data lives.
-rusqlite = { version = "0.40", features = ["bundled", "functions"] }
+rusqlite = { version = "0.41", features = ["bundled", "functions"] }
 thiserror = "2"
 # The migrations `smugglr sync --migratr` carries (smugglr, the CLI): the
 # release that says whether a migration rebuilds, records one without running
 # it, and reads a schema through anything that can run SQL.
-migratr = "0.1.4"
+migratr = "0.3"
 # The mesh (smugglr-mesh): each datagram sealed with XChaCha20-Poly1305
 # under a key derived from the shared key, with a fresh random 24-byte nonce
 # (FR-SMUGGLR-078 rev 11); `getrandom` gives the nonces, the echo waits and
