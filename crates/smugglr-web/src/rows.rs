@@ -42,6 +42,11 @@ impl Rows {
                     self_keyed: table["self_keyed"].as_bool().unwrap_or(false),
                     autoincrement: table["autoincrement"].as_bool().unwrap_or(false),
                 };
+                // Rows are held by key, so a table without one would hold
+                // only its last row; it is refused, never dropped.
+                if table_of.key.is_empty() {
+                    return Err(format!("the table {name} has no primary key"));
+                }
                 let rows = table["rows"]
                     .as_array()
                     .ok_or_else(|| format!("{name} has no rows list"))?
@@ -196,6 +201,22 @@ mod tests {
             .query_map([], |row| (0..width).map(|i| row.get(i)).collect())
             .and_then(Iterator::collect)
             .map_err(|err| err.to_string())
+    }
+
+    #[test]
+    fn a_table_without_a_primary_key_is_refused_not_dropped() {
+        let rows = json!([
+            {"name": "log", "columns": ["a", "b"], "types": ["", ""], "key": [],
+             "self_keyed": false, "rows": [["'1'", "'x'"], ["'2'", "'y'"]]}
+        ]);
+        let result = stash(
+            &rows.to_string(),
+            &settings(Arc::new(Once::default()), "server"),
+        );
+        assert_eq!(
+            result.err().as_deref(),
+            Some("the table log has no primary key")
+        );
     }
 
     #[test]
