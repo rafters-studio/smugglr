@@ -42,11 +42,6 @@ impl Rows {
                     self_keyed: table["self_keyed"].as_bool().unwrap_or(false),
                     autoincrement: table["autoincrement"].as_bool().unwrap_or(false),
                 };
-                // Rows are held by key, so a table without one would hold
-                // only its last row; it is refused, never dropped.
-                if table_of.key.is_empty() {
-                    return Err(format!("the table {name} has no primary key"));
-                }
                 let rows = table["rows"]
                     .as_array()
                     .ok_or_else(|| format!("{name} has no rows list"))?
@@ -54,12 +49,13 @@ impl Rows {
                     .map(|row| {
                         let row = texts(row);
                         if row.len() == table_of.columns.len() {
-                            Ok((table_of.key_of(&row), row))
+                            Ok(row)
                         } else {
                             Err(format!("a row of {name} does not fit its columns"))
                         }
                     })
                     .collect::<Result<_, String>>()?;
+                let rows = table_of.keyed(rows).into_iter().collect();
                 Ok((table_of, rows))
             })
             .collect::<Result<_, String>>()?;
@@ -150,8 +146,7 @@ fn stash(tables: &str, settings: &Settings) -> Result<Blob, String> {
 /// graveyard, now}`, as a tab's stash takes them.
 ///
 /// # Errors
-/// When the tables or settings are not as described, or a table has no
-/// primary key.
+/// When the tables or settings are not as described.
 #[wasm_bindgen(js_name = stashRows)]
 pub fn stash_rows(tables: &str, settings: &str) -> Result<String, JsValue> {
     let settings = multi_settings(settings, Arc::new(Once::default()), Vec::new())?;
@@ -204,19 +199,44 @@ mod tests {
     }
 
     #[test]
-    fn a_table_without_a_primary_key_is_refused_not_dropped() {
+    fn a_device_retrieving_a_stash_of_a_keyless_table_holds_every_copy() -> Result<(), String> {
+        let text = |err: &dyn std::fmt::Display| err.to_string();
         let rows = json!([
-            {"name": "log", "columns": ["a", "b"], "types": ["", ""], "key": [],
-             "self_keyed": false, "rows": [["'1'", "'x'"], ["'2'", "'y'"]]}
+            {"name": "log", "columns": ["a", "b"], "types": ["TEXT", "TEXT"], "key": [],
+             "self_keyed": false,
+             "rows": [["'1'", "'x'"], ["'1'", "'x'"], ["'2'", "'y'"]]}
         ]);
-        let result = stash(
+        let blob = stash(
             &rows.to_string(),
             &settings(Arc::new(Once::default()), "server"),
-        );
-        assert_eq!(
-            result.err().as_deref(),
-            Some("the table log has no primary key")
-        );
+        )?;
+
+        let folder =
+            std::env::temp_dir().join(format!("smugglr-web-keyless-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).map_err(|err| text(&err))?;
+        let path = folder.join("tab.db");
+        Connection::open(&path)
+            .and_then(|db| db.execute_batch("CREATE TABLE log (a TEXT, b TEXT);"))
+            .map_err(|err| text(&err))?;
+        let mut place = LocalFile::open(&path).map_err(|err| text(&err))?;
+        let record = smugglr_multi::retrieve(
+            &mut place,
+            &[blob],
+            &settings(Arc::new(Files::new(folder.join("memory"))), "tab"),
+            &[],
+        )
+        .map_err(|err| text(&err))?;
+
+        let db = Connection::open(&path).map_err(|err| text(&err))?;
+        let log = quoted(&db, "SELECT quote(a), quote(b) FROM log ORDER BY a, b")?;
+        // Windows removes no file a connection still holds open.
+        drop(db);
+        drop(place);
+        std::fs::remove_dir_all(&folder).map_err(|err| text(&err))?;
+
+        assert_eq!(record.status, Status::Done);
+        assert_eq!(log, [["'1'", "'x'"], ["'1'", "'x'"], ["'2'", "'y'"]]);
+        Ok(())
     }
 
     #[test]
