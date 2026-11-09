@@ -538,7 +538,7 @@ impl Run<'_> {
         let local = self.local.read_schema().map_err(stop)?;
         let (before, from) = behind.split_at(at);
         no_raw_sql(from)?;
-        let closed = closure(&named_tables(from), &[&schema, &local]);
+        let closed = closure(&named_tables(from)?, &[&schema, &local]);
         if let Some(table) = closed.iter().find(|table| self.ignore.ignores(table)) {
             return Err(Error::Stop(format!(
                 "A rebuild would drop {table}, which the config's ignore list keeps smugglr \
@@ -818,8 +818,9 @@ fn in_a_cycle<'a>(tables: &'a BTreeSet<String>, schemas: &[&SchemaSnapshot]) -> 
     })
 }
 
-/// The tables `migrations` name.
-fn named_tables(migrations: &[Migration]) -> BTreeSet<String> {
+/// The tables `migrations` name. An operation this build does not know names
+/// tables it cannot see, so, like raw SQL, it never reaches a rebuild.
+fn named_tables(migrations: &[Migration]) -> Result<BTreeSet<String>, Error> {
     let mut tables = BTreeSet::new();
     for migration in migrations {
         for op in &migration.up {
@@ -839,11 +840,25 @@ fn named_tables(migrations: &[Migration]) -> BTreeSet<String> {
                 Op::DropIndex { definition } => {
                     tables.insert(definition.table.clone());
                 }
+                Op::AddForeignKey(definition) | Op::DropForeignKey { definition } => {
+                    tables.insert(definition.table.clone());
+                }
+                Op::CreateTrigger(definition) | Op::DropTrigger { definition } => {
+                    tables.insert(definition.table.clone());
+                }
                 Op::RawSql { .. } => {}
+                _ => {
+                    return Err(Error::Stop(format!(
+                        "Migration {}_{} holds an operation this smugglr does not know, at or \
+                         after a rebuild, so nothing changed on the place. Carry the rebuild \
+                         in a run of its own, before that migration.",
+                        migration.version, migration.name
+                    )));
+                }
             }
         }
     }
-    tables
+    Ok(tables)
 }
 
 /// `tables` and every table referencing one, in any of `schemas`.
