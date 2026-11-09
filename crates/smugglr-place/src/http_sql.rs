@@ -14,9 +14,9 @@ use smugglr_core::hex::unhex;
 use smugglr_core::ignore::Ignore;
 use smugglr_core::row_hash::row_hash;
 
-use crate::queries;
 use crate::value::param;
 use crate::{Error, Key, Place, Table};
+use crate::{keyless, queries};
 
 /// A service that speaks HTTP-SQL: at an `http://` or `https://` address,
 /// or reached through an adapter ([`Transport`]).
@@ -230,6 +230,52 @@ impl HttpSql {
     }
 }
 
+impl HttpSql {
+    /// Every row of a table without a primary key, as [`keyless::all`]
+    /// reads it.
+    fn keyless_rows(&self, table: &Table) -> Result<Vec<Vec<String>>, Error> {
+        self.query(&keyless::all(table, self.value_limit()), &[])?
+            .iter()
+            .map(|row| self.texts(row))
+            .collect()
+    }
+
+    /// Writes `changes` to a table without a primary key, each copy only
+    /// where the count of its values allows, in one batch, and returns the
+    /// keys written.
+    fn keyless_write(&self, table: &Table, changes: &[Change]) -> Result<Vec<Key>, Error> {
+        let held = keyless::by_identity(self.keyless_rows(table)?);
+        let quoted = |row: &[String]| row.iter().cloned().map(Json::String).collect::<Vec<_>>();
+        let mut statements = Vec::new();
+        let mut keys = Vec::new();
+        for change in keyless::ordered(changes) {
+            let copy = json!(keyless::copy(&change.key));
+            let statement = if change.op == Op::Down {
+                let Some(row) = change.key.first().and_then(|id| held.get(id)) else {
+                    continue;
+                };
+                let mut values = quoted(row);
+                values.push(copy);
+                (keyless::delete(table), values)
+            } else {
+                let mut values = params(&change.values)?;
+                values.extend(quoted(&change.values));
+                values.push(copy);
+                (keyless::insert(table), values)
+            };
+            statements.push(statement);
+            keys.push(change.key.clone());
+        }
+        let results = self.batch(&statements, true)?;
+        Ok(keys
+            .into_iter()
+            .zip(results)
+            .filter(|(_, result)| result["rowsAffected"].as_u64().unwrap_or(0) > 0)
+            .map(|(key, _)| key)
+            .collect())
+    }
+}
+
 fn params(texts: &[String]) -> Result<Vec<Json>, Error> {
     texts.iter().map(|text| param(text)).collect()
 }
@@ -321,6 +367,7 @@ impl Place for HttpSql {
                         types: Vec::new(),
                         key: Vec::new(),
                         self_keyed: false,
+                        autoincrement: false,
                     });
                 }
                 let mut columns = Vec::new();
@@ -352,18 +399,36 @@ impl Place for HttpSql {
                         Some(Json::Number(n)) if n.as_i64() != Some(0)
                     ))
                 })?;
+                // Only a rowid key can count itself up.
+                let autoincrement = self_keyed
+                    && self
+                        .query(queries::TABLE_SQL, &[json!(name)])?
+                        .first()
+                        .and_then(|row| row.first())
+                        .and_then(Json::as_str)
+                        .is_some_and(queries::autoincrement);
                 Ok(Table {
                     name: name.to_owned(),
                     columns,
                     types,
                     key: key.into_iter().map(|(_, column, _)| column).collect(),
                     self_keyed,
+                    autoincrement,
                 })
             })
             .collect()
     }
 
     fn hashes(&mut self, table: &Table) -> Result<Vec<(Key, [u8; 16])>, Error> {
+        if table.key.is_empty() {
+            return Ok(keyless::keyed(self.keyless_rows(table)?)
+                .into_iter()
+                .map(|(key, row)| {
+                    let columns: Vec<&str> = row.iter().map(String::as_str).collect();
+                    (key, row_hash(&columns))
+                })
+                .collect());
+        }
         let width = table.key.len();
         if self.transport.hashes_where_rows_live() {
             return self
@@ -392,11 +457,17 @@ impl Place for HttpSql {
     }
 
     fn rows(&mut self, table: &Table, keys: &[Key]) -> Result<Vec<Vec<String>>, Error> {
+        if table.key.is_empty() {
+            return Ok(keyless::wanted(self.keyless_rows(table)?, keys));
+        }
         let keys: Vec<&Key> = keys.iter().collect();
         Ok(self.read(table, &keys)?.into_iter().flatten().collect())
     }
 
     fn write(&mut self, table: &Table, changes: &[Change]) -> Result<Vec<Key>, Error> {
+        if table.key.is_empty() {
+            return self.keyless_write(table, changes);
+        }
         let conditional: Vec<&Key> = changes
             .iter()
             .filter(|change| change.from.is_some())
@@ -441,6 +512,7 @@ mod tests {
             types: vec!["TEXT".to_owned(), "INTEGER".to_owned()],
             key: vec!["id".to_owned()],
             self_keyed: false,
+            autoincrement: false,
         }
     }
 

@@ -42,7 +42,7 @@ pub enum Error {
     /// What smugglr keeps for the device could not be read or written.
     #[error(transparent)]
     Memory(#[from] smugglr_memory::Error),
-    /// A table has no primary key; nothing is read.
+    /// A table uses AUTOINCREMENT; nothing is read.
     #[error("{0}")]
     Shape(String),
     /// The caller could not keep the blob; the device's stash is as it was.
@@ -258,9 +258,9 @@ fn tables(
             .map(str::to_owned),
     );
     let (tables, ignored) = ignore.split(place.tables()?, |table| &table.name);
-    if let Some(table) = tables.iter().find(|table| table.key.is_empty()) {
+    if let Some(table) = tables.iter().find(|table| table.autoincrement) {
         return Err(Error::Shape(format!(
-            "the table {} in {} has no primary key",
+            "the table {} in {} uses AUTOINCREMENT, which smugglr never syncs",
             table.name,
             place.address()
         )));
@@ -296,9 +296,5 @@ fn rows(
     table: &Table,
     keys: &[Key],
 ) -> Result<BTreeMap<Key, Vec<String>>, Error> {
-    Ok(place
-        .rows(table, keys)?
-        .into_iter()
-        .map(|row| (table.key_of(&row), row))
-        .collect())
+    Ok(table.keyed(place.rows(table, keys)?).into_iter().collect())
 }

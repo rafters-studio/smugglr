@@ -6,9 +6,22 @@ use crate::Table;
 /// The name of the row-hash function registered on each connection.
 pub(crate) const ROW_HASH: &str = "smugglr_row_hash";
 
-/// Every table except SQLite's own.
-pub(crate) const TABLES: &str = "SELECT name FROM sqlite_schema \
-     WHERE type = 'table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY name";
+/// Every table except SQLite's own and a virtual table's shadow tables,
+/// which the virtual table writes itself (FR-SMUGGLR-086).
+pub(crate) const TABLES: &str = "SELECT name FROM pragma_table_list \
+     WHERE schema = 'main' AND type IN ('table', 'virtual') \
+     AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY name";
+
+/// A table's `CREATE` statement.
+pub(crate) const TABLE_SQL: &str =
+    "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?1";
+
+/// Whether a table's `CREATE` statement, `sql`, uses AUTOINCREMENT: the
+/// keyword as a word of its own.
+pub(crate) fn autoincrement(sql: &str) -> bool {
+    sql.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(|word| word.eq_ignore_ascii_case("AUTOINCREMENT"))
+}
 
 /// The tables a table's foreign keys reference, itself left out.
 pub(crate) const PARENTS: &str =
@@ -65,7 +78,7 @@ fn by_key(key: &[String], first: usize) -> String {
 /// for a value over `limit` bytes outside the key, which is never quoted.
 ///
 /// [`unquotable`]: smugglr_core::weight::unquotable
-fn quoted_within(table: &Table, limit: u64) -> String {
+pub(crate) fn quoted_within(table: &Table, limit: u64) -> String {
     table
         .columns
         .iter()
@@ -393,6 +406,7 @@ mod tests {
             types: vec!["TEXT".to_owned(), "TEXT".to_owned()],
             key: vec!["id".to_owned()],
             self_keyed: false,
+            autoincrement: false,
         }
     }
 
@@ -426,6 +440,7 @@ mod tests {
             types: vec![String::new(); 3],
             key: vec!["id".to_owned()],
             self_keyed: false,
+            autoincrement: false,
         };
         let kinds = [
             Kind::Integer,

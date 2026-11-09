@@ -13,6 +13,7 @@ smugglr-core = { workspace = true }
 rusqlite = { workspace = true, optional = true }
 thiserror = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 ureq = { workspace = true, optional = true }
 
 [features]

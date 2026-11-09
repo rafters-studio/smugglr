@@ -137,6 +137,7 @@ fn program_syncs_adapter(world: &World) -> Result<(), String> {
         types: vec!["TEXT".to_owned(), "TEXT".to_owned(), "INTEGER".to_owned()],
         key: vec!["id".to_owned()],
         self_keyed: false,
+        autoincrement: false,
     };
     let mut shelf = Shelf::default();
     shelf

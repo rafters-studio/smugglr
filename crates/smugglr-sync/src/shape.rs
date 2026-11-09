@@ -31,7 +31,8 @@ fn shape_of(tables: &[Table]) -> Shape {
 /// `ours` and `theirs`, differ; `None` when they are the same. Reads no row.
 ///
 /// # Errors
-/// When a table has no primary key.
+/// When a table uses AUTOINCREMENT, which smugglr never syncs
+/// (FR-SMUGGLR-086).
 pub(crate) fn check(
     source: &str,
     target: &str,
@@ -43,9 +44,9 @@ pub(crate) fn check(
         return Ok(mismatch);
     }
     for (tables, here) in [(ours, source), (theirs, target)] {
-        if let Some(table) = tables.iter().find(|table| table.key.is_empty()) {
+        if let Some(table) = tables.iter().find(|table| table.autoincrement) {
             return Err(Error::Shape(format!(
-                "the table {} in {here} has no primary key",
+                "the table {} in {here} uses AUTOINCREMENT, which smugglr never syncs",
                 table.name
             )));
         }

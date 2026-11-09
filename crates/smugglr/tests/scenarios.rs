@@ -13,6 +13,8 @@ mod discover;
 mod exec_steps;
 #[path = "steps/http_sql.rs"]
 mod http_sql;
+#[path = "steps/keyless.rs"]
+mod keyless;
 #[path = "steps/mesh.rs"]
 mod mesh;
 #[path = "steps/migratr.rs"]

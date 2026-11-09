@@ -40,6 +40,7 @@ impl Rows {
                     types: texts(&table["types"]),
                     key: texts(&table["key"]),
                     self_keyed: table["self_keyed"].as_bool().unwrap_or(false),
+                    autoincrement: table["autoincrement"].as_bool().unwrap_or(false),
                 };
                 let rows = table["rows"]
                     .as_array()
