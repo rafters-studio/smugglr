@@ -833,7 +833,7 @@ mod tests {
     use smugglr_core::shape::Stamp;
     use smugglr_memory::Files;
 
-    use super::{HELD_PAST, LAST_RESEND, LONGEST, Outbox, Timing};
+    use super::{HELD_PAST, LAST_RESEND, LONGEST, MADE_FOR, Outbox, Timing};
 
     const PEER: &str = "peer";
 
@@ -1019,6 +1019,29 @@ mod tests {
             "no peer yet: it still waits for one"
         );
         assert!(!outbox.holds(&[3; 32]), "owed to nobody now");
+        Ok(())
+    }
+
+    /// #684: a peer back after minutes away acknowledges a change resent
+    /// to it, the outbox lets the change go, and only then does the node's
+    /// own copy of that resend come back to it: still its own.
+    #[test]
+    fn a_change_resent_long_after_its_first_send_is_still_made_here_once_let_go()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut outbox = sent("made-resent", 1)?;
+        let back = Instant::now() + MADE_FOR * 5;
+        assert_eq!(
+            outbox
+                .resends(back, &HashMap::new(), 10, |_, _| false)?
+                .len(),
+            1
+        );
+        outbox.ack(&[1; 32], PEER);
+        outbox.prune(0)?;
+        assert!(!outbox.holds(&[1; 32]), "acknowledged by every target");
+        let heard = back + Duration::from_millis(50);
+        assert!(outbox.made(&[1; 32], heard), "its own resend, heard back");
+        assert!(!outbox.made(&[9; 32], heard), "never sent here");
         Ok(())
     }
 
