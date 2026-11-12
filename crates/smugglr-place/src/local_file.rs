@@ -366,6 +366,27 @@ mod tests {
             address: path.display().to_string(),
             source,
         };
+        // The connection waits 10 seconds for a held lock, as BUSY says.
+        // Checked before the busy handler below replaces that wait.
+        let timeout: i64 = place
+            .connection
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .map_err(sqlite)?;
+        assert_eq!(timeout, 10_000);
+        // SQLite calls the busy handler when the write meets the held lock:
+        // the first call tells the test, and a bound makes a write that never
+        // gets the lock fail instead of hanging.
+        let (meets, met) = std::sync::mpsc::channel();
+        place
+            .connection
+            .busy_handler(Some(move |count: i32| {
+                if count == 0 {
+                    let _ = meets.send(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                count < 10_000
+            }))
+            .map_err(sqlite)?;
         // Another connection holds the file's lock until the test lets go.
         let holder = rusqlite::Connection::open(&path).map_err(sqlite)?;
         holder.execute_batch("BEGIN EXCLUSIVE").map_err(sqlite)?;
@@ -378,32 +399,20 @@ mod tests {
             to: Some(row_hash(&row)),
             values: row.iter().map(|&c| c.to_owned()).collect(),
         };
-        let (begun, started) = std::sync::mpsc::channel();
-        let (done, wrote) = std::sync::mpsc::channel();
         let sent = change.clone();
-        let writer = std::thread::spawn(move || {
-            let _ = begun.send(());
-            let _ = done.send(place.write(&table, std::slice::from_ref(&sent)));
-        });
-        let _ = started.recv();
-        // While the lock is held the write has not come back: it waits,
-        // it does not fail on the busy file.
-        let early = wrote.recv_timeout(std::time::Duration::from_millis(200));
+        let writer = std::thread::spawn(move || place.write(&table, std::slice::from_ref(&sent)));
+        // The write is blocked on the lock: SQLite has called the handler.
+        // If the write ends without meeting the lock, the handler is dropped
+        // with the place and this returns an error instead.
+        let blocked = met.recv();
         let released = holder.execute_batch("ROLLBACK").map_err(sqlite);
-        let wrote = wrote.recv();
-        let joined = writer.join();
+        let wrote = writer.join();
         drop(holder);
         let _ = std::fs::remove_file(&path);
-        assert!(
-            matches!(early, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
-            "the write came back while the lock was held: {early:?}"
-        );
+        assert!(blocked.is_ok(), "the write never met the held lock");
         released?;
-        assert!(joined.is_ok(), "the writer panicked");
-        assert_eq!(
-            wrote.map_err(|_| Error::Adapter("no write".to_owned()))??,
-            vec![change.key]
-        );
+        let wrote = wrote.map_err(|_| Error::Adapter("the writer panicked".to_owned()))?;
+        assert_eq!(wrote?, vec![change.key]);
         Ok(())
     }
 
