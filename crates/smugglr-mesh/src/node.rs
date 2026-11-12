@@ -97,10 +97,6 @@ const NOTE_RAN: Duration = Duration::from_secs(1);
 /// taken, which ask after nothing else.
 const NAME_ONLY: u64 = 0;
 
-/// How long this node remembers a change it sent, to tell its own from a
-/// change under its name that another machine made.
-const MADE_FOR: Duration = Duration::from_secs(60);
-
 /// How often at most the record names resends, or datagrams that did not
 /// open.
 const SAY_EVERY: Duration = Duration::from_secs(60);
@@ -266,7 +262,6 @@ pub fn run(place: &mut dyn Place, settings: &Settings, stop: &AtomicBool) -> Res
         removed,
         removed_file,
         clash: None,
-        made: HashMap::new(),
         named: named.clone(),
         silent: HashMap::new(),
         keys: HashMap::new(),
@@ -591,8 +586,6 @@ struct Node<'a> {
     removed_file: String,
     /// Why this node must stop: its name belongs to another.
     clash: Option<Error>,
-    /// The changes it sent lately, which may yet come back to it.
-    made: HashMap<[u8; 32], Instant>,
     /// What the peers setting's names resolve to now.
     named: Arc<Mutex<Vec<SocketAddr>>>,
     /// Each peer the record has named as silent: since when, and when it
@@ -742,7 +735,7 @@ impl Node<'_> {
             self.outbox.prune(epoch)?;
             self.receiving.tidy();
             self.heard.retain(|_, heard| epoch <= heard.sunset);
-            self.made.retain(|_, at| at.elapsed() < MADE_FOR);
+            self.outbox.forget_made(Instant::now());
             if !self.waiting.is_empty() {
                 // A change waiting past its sunset is dropped.
                 self.apply(place, Vec::new())?;
@@ -891,8 +884,7 @@ impl Node<'_> {
             }
             Message::Change { envelope, .. }
                 if envelope.node == *name
-                    && !self.outbox.holds(&envelope.signature)
-                    && !self.made.contains_key(&envelope.signature) =>
+                    && !self.outbox.made(&envelope.signature, Instant::now()) =>
             {
                 self.clash = Some(Error::NameClash(name.clone()));
             }
@@ -2050,9 +2042,6 @@ impl Node<'_> {
     fn send_firsts(&mut self) -> Result<Option<(usize, usize)>, Error> {
         let to = self.destinations();
         let firsts = self.outbox.first_sends(self.room(0))?;
-        let made = Instant::now();
-        self.made
-            .extend(firsts.iter().map(|envelope| (envelope.signature, made)));
         let mut sent = 0;
         'firsts: for (at, envelope) in firsts.iter().enumerate() {
             let (message, large) = self.message(envelope, false);

@@ -21,6 +21,10 @@ use smugglr_memory::Store;
 
 use crate::Error;
 
+/// How long the outbox remembers a change it sent, to tell the node's own
+/// from a change under its name that another machine made.
+const MADE_FOR: Duration = Duration::from_secs(60);
+
 /// The most envelopes one segment file holds.
 const SEGMENT: usize = 1_000;
 
@@ -174,6 +178,9 @@ pub(crate) struct Outbox {
     /// The changes found past their sunset at the start, not acknowledged by
     /// the peers named, as the record says them (toy X).
     expired: BTreeMap<String, Vec<String>>,
+    /// The changes sent lately, which may yet come back to the node, each
+    /// with when it was sent.
+    made: HashMap<[u8; 32], Instant>,
 }
 
 impl Outbox {
@@ -193,6 +200,7 @@ impl Outbox {
             index_bytes: 0,
             settled: false,
             expired: BTreeMap::new(),
+            made: HashMap::new(),
         };
         let mut expired: HashMap<[u8; 32], (BTreeSet<String>, String)> = HashMap::new();
         let index: Vec<u64> = outbox
@@ -355,6 +363,22 @@ impl Outbox {
         self.entries.contains_key(change)
     }
 
+    /// Whether the node made `change`, as far as it can tell at `now`: the
+    /// outbox holds it, or sent it lately.
+    pub(crate) fn made(&self, change: &[u8; 32], now: Instant) -> bool {
+        self.holds(change)
+            || self
+                .made
+                .get(change)
+                .is_some_and(|at| now.saturating_duration_since(*at) < MADE_FOR)
+    }
+
+    /// Forgets the changes sent longer ago than [`MADE_FOR`] at `now`.
+    pub(crate) fn forget_made(&mut self, now: Instant) {
+        self.made
+            .retain(|_, at| now.saturating_duration_since(*at) < MADE_FOR);
+    }
+
     /// Whether `change` is still owed to `peer`.
     pub(crate) fn owes(&self, change: &[u8; 32], peer: &str) -> bool {
         self.entries
@@ -499,6 +523,7 @@ impl Outbox {
                 entry.seq = self.seq;
                 entry.sent_at = now;
                 entry.resend_at = now + entry.interval;
+                self.made.insert(change, now);
             }
             out.push(envelope);
         }
