@@ -21,6 +21,10 @@ use smugglr_memory::Store;
 
 use crate::Error;
 
+/// How long the outbox remembers a change it sent, to tell the node's own
+/// from a change under its name that another machine made.
+const MADE_FOR: Duration = Duration::from_secs(60);
+
 /// The most envelopes one segment file holds.
 const SEGMENT: usize = 1_000;
 
@@ -174,6 +178,9 @@ pub(crate) struct Outbox {
     /// The changes found past their sunset at the start, not acknowledged by
     /// the peers named, as the record says them (toy X).
     expired: BTreeMap<String, Vec<String>>,
+    /// The changes sent or resent lately, which may yet come back to the
+    /// node, each with when it last went.
+    made: HashMap<[u8; 32], Instant>,
 }
 
 impl Outbox {
@@ -193,6 +200,7 @@ impl Outbox {
             index_bytes: 0,
             settled: false,
             expired: BTreeMap::new(),
+            made: HashMap::new(),
         };
         let mut expired: HashMap<[u8; 32], (BTreeSet<String>, String)> = HashMap::new();
         let index: Vec<u64> = outbox
@@ -355,6 +363,22 @@ impl Outbox {
         self.entries.contains_key(change)
     }
 
+    /// Whether the node made `change`, as far as it can tell at `now`: the
+    /// outbox holds it, or sent it lately.
+    pub(crate) fn made(&self, change: &[u8; 32], now: Instant) -> bool {
+        self.holds(change)
+            || self
+                .made
+                .get(change)
+                .is_some_and(|at| now.saturating_duration_since(*at) < MADE_FOR)
+    }
+
+    /// Forgets the changes sent longer ago than [`MADE_FOR`] at `now`.
+    pub(crate) fn forget_made(&mut self, now: Instant) {
+        self.made
+            .retain(|_, at| now.saturating_duration_since(*at) < MADE_FOR);
+    }
+
     /// Whether `change` is still owed to `peer`.
     pub(crate) fn owes(&self, change: &[u8; 32], peer: &str) -> bool {
         self.entries
@@ -499,6 +523,7 @@ impl Outbox {
                 entry.seq = self.seq;
                 entry.sent_at = now;
                 entry.resend_at = now + entry.interval;
+                self.made.insert(change, now);
             }
             out.push(envelope);
         }
@@ -637,6 +662,8 @@ impl Outbox {
                     .insert(peer.clone(), (guesses.saturating_add(1), now));
             }
             entry.resent = true;
+            // Its own copy may come back after an acknowledgement lets it go.
+            self.made.insert(*change, now);
             for peer in to {
                 entry.unsent_to.remove(peer);
                 entry.resent_by.insert(peer.clone(), latest);
@@ -808,7 +835,7 @@ mod tests {
     use smugglr_core::shape::Stamp;
     use smugglr_memory::Files;
 
-    use super::{HELD_PAST, LAST_RESEND, LONGEST, Outbox, Timing};
+    use super::{HELD_PAST, LAST_RESEND, LONGEST, MADE_FOR, Outbox, Timing};
 
     const PEER: &str = "peer";
 
@@ -994,6 +1021,29 @@ mod tests {
             "no peer yet: it still waits for one"
         );
         assert!(!outbox.holds(&[3; 32]), "owed to nobody now");
+        Ok(())
+    }
+
+    /// #684: a peer back after minutes away acknowledges a change resent
+    /// to it, the outbox lets the change go, and only then does the node's
+    /// own copy of that resend come back to it: still its own.
+    #[test]
+    fn a_change_resent_long_after_its_first_send_is_still_made_here_once_let_go()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut outbox = sent("made-resent", 1)?;
+        let back = Instant::now() + MADE_FOR * 5;
+        assert_eq!(
+            outbox
+                .resends(back, &HashMap::new(), 10, |_, _| false)?
+                .len(),
+            1
+        );
+        outbox.ack(&[1; 32], PEER);
+        outbox.prune(0)?;
+        assert!(!outbox.holds(&[1; 32]), "acknowledged by every target");
+        let heard = back + Duration::from_millis(50);
+        assert!(outbox.made(&[1; 32], heard), "its own resend, heard back");
+        assert!(!outbox.made(&[9; 32], heard), "never sent here");
         Ok(())
     }
 
