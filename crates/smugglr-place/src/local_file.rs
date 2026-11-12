@@ -362,18 +362,13 @@ mod tests {
             .into_iter()
             .next()
             .ok_or(Error::Adapter("no table".to_owned()))?;
-        // Another writer holds the file's lock for 7 seconds, longer than
-        // rusqlite's implicit 5.
-        let (locked, held) = std::sync::mpsc::channel();
-        let other = path.clone();
-        let holder = std::thread::spawn(move || -> rusqlite::Result<()> {
-            let connection = rusqlite::Connection::open(other)?;
-            connection.execute_batch("BEGIN EXCLUSIVE")?;
-            let _ = locked.send(());
-            std::thread::sleep(std::time::Duration::from_secs(7));
-            connection.execute_batch("ROLLBACK")
-        });
-        let _ = held.recv();
+        let sqlite = |source| Error::Sqlite {
+            address: path.display().to_string(),
+            source,
+        };
+        // Another connection holds the file's lock until the test lets go.
+        let holder = rusqlite::Connection::open(&path).map_err(sqlite)?;
+        holder.execute_batch("BEGIN EXCLUSIVE").map_err(sqlite)?;
         let row = ["'a'", "1"];
         let change = Change {
             op: Op::Up,
@@ -383,14 +378,32 @@ mod tests {
             to: Some(row_hash(&row)),
             values: row.iter().map(|&c| c.to_owned()).collect(),
         };
-        let wrote = place.write(&table, std::slice::from_ref(&change));
-        let released = holder.join();
+        let (begun, started) = std::sync::mpsc::channel();
+        let (done, wrote) = std::sync::mpsc::channel();
+        let sent = change.clone();
+        let writer = std::thread::spawn(move || {
+            let _ = begun.send(());
+            let _ = done.send(place.write(&table, std::slice::from_ref(&sent)));
+        });
+        let _ = started.recv();
+        // While the lock is held the write has not come back: it waits,
+        // it does not fail on the busy file.
+        let early = wrote.recv_timeout(std::time::Duration::from_millis(200));
+        let released = holder.execute_batch("ROLLBACK").map_err(sqlite);
+        let wrote = wrote.recv();
+        let joined = writer.join();
+        drop(holder);
         let _ = std::fs::remove_file(&path);
         assert!(
-            matches!(released, Ok(Ok(()))),
-            "the holder failed: {released:?}"
+            matches!(early, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+            "the write came back while the lock was held: {early:?}"
         );
-        assert_eq!(wrote?, vec![change.key]);
+        released?;
+        assert!(joined.is_ok(), "the writer panicked");
+        assert_eq!(
+            wrote.map_err(|_| Error::Adapter("no write".to_owned()))??,
+            vec![change.key]
+        );
         Ok(())
     }
 
