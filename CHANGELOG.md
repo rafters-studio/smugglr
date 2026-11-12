@@ -6,6 +6,53 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.4] - 2026-11-11
+
+The publishing release. The SQLite built into smugglr moves to 3.54.1, past
+RUSTSEC-2026-0459, and pushing a version tag now publishes smugglr's eight
+crates to crates.io, each with a README. Patch release: direct sync, the
+stash blob, the memory format and the mesh wire are unchanged.
+
+### Added
+
+- A release publishes the eight crates to crates.io in dependency order,
+  through crates.io trusted publishing (#675, PR #676): smugglr-core,
+  smugglr-place, smugglr-memory, smugglr-sync, smugglr-multi, smugglr-mesh,
+  smugglr-web, smugglr. It refuses a tag that does not name the version in
+  `[workspace.package]`, before anything is published, and skips a crate
+  whose version is already there, so a run that failed partway can be re-run.
+  Every crate has a README; the smugglr crate's is this repository's.
+  RELEASING.md gives the first publish of the six crates not yet on
+  crates.io to the operator.
+
+### Changed
+
+- rusqlite 0.41 and migratr 0.3 (#673, PR #674). smugglr builds with Rust
+  1.89 or later; it needed 1.88. SQLite links once per build, so migratr
+  moves with rusqlite. migratr 0.3 adds foreign key and trigger operations:
+  each names its table for a rebuild that `--migratr` carries, and an
+  operation this smugglr does not know, at or after a rebuild, stops the
+  carry with nothing changed on the place, as raw SQL does.
+- The two linear-cost tests that timed a sync and a retrieve with the wall
+  clock are deleted; they failed at random on busy shared runners (#677,
+  PR #681).
+- The test that a local file waits for another writer's lock no longer
+  sleeps seven seconds. It checks the connection's busy timeout is 10
+  seconds and sees through SQLite's busy handler that the write met the
+  held lock (#679, PR #682).
+
+### Security
+
+- RUSTSEC-2026-0459: a SQLite before 3.54.0 can return uninitialized memory
+  for a crafted `-wal` file. smugglr bundles SQLite: 0.6.3 bundles 3.53.2,
+  and 0.6.4 bundles 3.54.1, through libsqlite3-sys 0.39 (#673, PR #674).
+
+### Known issues
+
+- A mesh node that restarts is taken by the others for a second machine
+  under its name, and they stop with "two machines share the name" (#684).
+  It is in 0.6.3 too.
+
 ## [0.6.3] - 2026-11-08
 
 The exec release. `smugglr exec` runs a migration's statements on a place for
