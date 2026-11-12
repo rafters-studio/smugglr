@@ -51,3 +51,92 @@ jobs:
           target: ${{ matrix.target }}
           archive: smugglr-${{ matrix.target }}
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-crates:
+    name: Publish to crates.io
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Refuse before anything is published: the tag must name the version
+      # in [workspace.package].
+      - name: Check tag matches workspace version
+        run: |
+          version="$(awk '
+            /^\[/ { in_pkg = ($0 == "[workspace.package]") }
+            in_pkg && /^version[[:space:]]*=/ { split($0, parts, "\""); print parts[2]; exit }
+          ' Cargo.toml)"
+          if [ -z "$version" ]; then
+            echo "::error::no version found in [workspace.package] of Cargo.toml"
+            exit 1
+          fi
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match workspace version v$version"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Authenticate to crates.io
+        uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+
+      # Dependency order: core has no internal deps; place and memory need
+      # core; sync and multi need core, memory and place; mesh needs those
+      # and multi; web needs those and sync; smugglr needs core, memory,
+      # mesh, multi, place and sync. A crate whose version is already
+      # on crates.io counts as published, so a run that failed partway can
+      # be re-run and publishes only what is missing. A false "not
+      # published" is safe (the publish is attempted and "already exists"
+      # is success); a false "published" is not, so lookups fail toward
+      # attempting.
+      - name: Publish crates
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          set -euo pipefail
+
+          publish_crate() {
+            crate="$1"
+            version="$(cargo metadata --format-version 1 --no-deps \
+              | jq -r --arg n "$crate" '.packages[] | select(.name == $n) | .version')"
+            if [ -z "$version" ]; then
+              echo "::error::publish failed for $crate: not found in the workspace"
+              return 1
+            fi
+
+            case "${#crate}" in
+              1) index_path="1/$crate" ;;
+              2) index_path="2/$crate" ;;
+              3) index_path="3/${crate:0:1}/$crate" ;;
+              *) index_path="${crate:0:2}/${crate:2:2}/$crate" ;;
+            esac
+
+            if body="$(curl -sf --max-time 30 "https://index.crates.io/$index_path")" \
+              && printf '%s' "$body" | jq -e --arg v "$version" 'select(.vers == $v)' > /dev/null; then
+              echo "$crate@$version already on crates.io, skipping"
+              return 0
+            fi
+
+            echo "publishing $crate@$version"
+            if output="$(cargo publish -p "$crate" 2>&1)"; then
+              echo "$output"
+              return 0
+            fi
+            echo "$output"
+            if printf '%s' "$output" | grep -q "already exists"; then
+              echo "$crate@$version was already published; treating as success"
+              return 0
+            fi
+            echo "::error::publish failed for $crate@$version"
+            return 1
+          }
+
+          for crate in smugglr-core smugglr-place smugglr-memory smugglr-sync smugglr-multi smugglr-mesh smugglr-web smugglr; do
+            publish_crate "$crate"
+          done
