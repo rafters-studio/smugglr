@@ -178,8 +178,8 @@ pub(crate) struct Outbox {
     /// The changes found past their sunset at the start, not acknowledged by
     /// the peers named, as the record says them (toy X).
     expired: BTreeMap<String, Vec<String>>,
-    /// The changes sent lately, which may yet come back to the node, each
-    /// with when it was sent.
+    /// The changes sent or resent lately, which may yet come back to the
+    /// node, each with when it last went.
     made: HashMap<[u8; 32], Instant>,
 }
 
@@ -662,6 +662,8 @@ impl Outbox {
                     .insert(peer.clone(), (guesses.saturating_add(1), now));
             }
             entry.resent = true;
+            // Its own copy may come back after an acknowledgement lets it go.
+            self.made.insert(*change, now);
             for peer in to {
                 entry.unsent_to.remove(peer);
                 entry.resent_by.insert(peer.clone(), latest);
