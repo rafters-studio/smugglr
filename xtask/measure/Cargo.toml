@@ -1,0 +1,18 @@
+[package]
+name = "measure"
+description = "The smugglr measurements that run in real time against the built binary (NFR-SMUGGLR-003, -005, -006)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+rusqlite = { workspace = true }
+serde_json = { workspace = true }
+socket2 = { workspace = true }
+
+[lints]
+workspace = true
