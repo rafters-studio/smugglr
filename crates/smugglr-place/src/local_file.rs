@@ -362,18 +362,34 @@ mod tests {
             .into_iter()
             .next()
             .ok_or(Error::Adapter("no table".to_owned()))?;
-        // Another writer holds the file's lock for 7 seconds, longer than
-        // rusqlite's implicit 5.
-        let (locked, held) = std::sync::mpsc::channel();
-        let other = path.clone();
-        let holder = std::thread::spawn(move || -> rusqlite::Result<()> {
-            let connection = rusqlite::Connection::open(other)?;
-            connection.execute_batch("BEGIN EXCLUSIVE")?;
-            let _ = locked.send(());
-            std::thread::sleep(std::time::Duration::from_secs(7));
-            connection.execute_batch("ROLLBACK")
-        });
-        let _ = held.recv();
+        let sqlite = |source| Error::Sqlite {
+            address: path.display().to_string(),
+            source,
+        };
+        // The connection waits 10 seconds for a held lock, as BUSY says.
+        // Checked before the busy handler below replaces that wait.
+        let timeout: i64 = place
+            .connection
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .map_err(sqlite)?;
+        assert_eq!(timeout, 10_000);
+        // SQLite calls the busy handler when the write meets the held lock:
+        // the first call tells the test, and a bound makes a write that never
+        // gets the lock fail instead of hanging.
+        let (meets, met) = std::sync::mpsc::channel();
+        place
+            .connection
+            .busy_handler(Some(move |count: i32| {
+                if count == 0 {
+                    let _ = meets.send(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                count < 10_000
+            }))
+            .map_err(sqlite)?;
+        // Another connection holds the file's lock until the test lets go.
+        let holder = rusqlite::Connection::open(&path).map_err(sqlite)?;
+        holder.execute_batch("BEGIN EXCLUSIVE").map_err(sqlite)?;
         let row = ["'a'", "1"];
         let change = Change {
             op: Op::Up,
@@ -383,13 +399,19 @@ mod tests {
             to: Some(row_hash(&row)),
             values: row.iter().map(|&c| c.to_owned()).collect(),
         };
-        let wrote = place.write(&table, std::slice::from_ref(&change));
-        let released = holder.join();
+        let sent = change.clone();
+        let writer = std::thread::spawn(move || place.write(&table, std::slice::from_ref(&sent)));
+        // The write is blocked on the lock: SQLite has called the handler.
+        // If the write ends without meeting the lock, the handler is dropped
+        // with the place and this returns an error instead.
+        let blocked = met.recv();
+        let released = holder.execute_batch("ROLLBACK").map_err(sqlite);
+        let wrote = writer.join();
+        drop(holder);
         let _ = std::fs::remove_file(&path);
-        assert!(
-            matches!(released, Ok(Ok(()))),
-            "the holder failed: {released:?}"
-        );
+        assert!(blocked.is_ok(), "the write never met the held lock");
+        released?;
+        let wrote = wrote.map_err(|_| Error::Adapter("the writer panicked".to_owned()))?;
         assert_eq!(wrote?, vec![change.key]);
         Ok(())
     }
