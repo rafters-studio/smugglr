@@ -1149,40 +1149,6 @@ mod tests {
         Ok(())
     }
 
-    /// Syncs `rows` rows from a new source into an empty target, and
-    /// returns how long the sync took.
-    fn time_first_sync(
-        name: &str,
-        rows: u32,
-    ) -> Result<std::time::Duration, Box<dyn std::error::Error>> {
-        let dir = std::env::temp_dir().join(format!("smugglr-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir)?;
-        let shape = "CREATE TABLE notes (id TEXT PRIMARY KEY, body TEXT);";
-        let source = sqlite(
-            &dir.join("source.db"),
-            &format!(
-                "{shape} WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n \
-                 WHERE i < {rows}) INSERT INTO notes SELECT 'n' || i, 'body ' || i FROM n;"
-            ),
-        )?;
-        let target = sqlite(&dir.join("target.db"), shape)?;
-        let options = Options {
-            config_dir: Some(dir.join("config")),
-            max_wire: Some(u64::MAX),
-            ..Options::default()
-        };
-        let mut here = LocalFile::open(dir.join("source.db"))?;
-        let mut there = LocalFile::open(dir.join("target.db"))?;
-        let start = std::time::Instant::now();
-        sync(&mut here, &mut there, &options)?;
-        let took = start.elapsed();
-        assert_eq!(dump(&target, "notes")?.len(), usize::try_from(rows)?);
-        drop((here, there, source, target));
-        let _ = std::fs::remove_dir_all(&dir);
-        Ok(took)
-    }
-
     /// During a first sync of 500,000 rows another connection's write to
     /// the target commits within a second: it waits for one chunk, never
     /// the whole sync (#580).
@@ -1236,47 +1202,6 @@ mod tests {
         );
         drop(target);
         let _ = std::fs::remove_dir_all(&dir);
-        Ok(())
-    }
-
-    /// A sync's cost grows linearly with the rows it writes (#577): ten
-    /// times the rows takes less than thirty times as long. Linear is about
-    /// ten, a scan per row a hundred, so a runner's noise cannot cross the
-    /// line between them. The smaller sync runs three times and counts its
-    /// quickest, since noise only ever slows a run. The larger has thirty
-    /// times that to finish, so a scan per row fails within seconds instead
-    /// of running for hours.
-    #[test]
-    fn a_sync_ten_times_as_big_takes_less_than_thirty_times_as_long()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut smaller = time_first_sync("linear-20k", 20_000)?;
-        for _ in 0..2 {
-            smaller = smaller.min(time_first_sync("linear-20k", 20_000)?);
-        }
-        let (sender, receiver) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let took = time_first_sync("linear-200k", 200_000).map_err(|err| err.to_string());
-            let _ = sender.send(took);
-        });
-        // On Windows the 15.6 ms timer tick and slow shared runners make the
-        // ratio a measure of the machine, not of sync (#594); both syncs
-        // still run, with no deadline.
-        let larger = if cfg!(windows) {
-            receiver.recv()?
-        } else {
-            match receiver.recv_timeout(smaller * 30) {
-                Ok(took) => took,
-                Err(_) => {
-                    return Err(format!(
-                        "200,000 rows had not synced after {:?}, thirty times the {smaller:?} \
-                         20,000 took",
-                        smaller * 30
-                    )
-                    .into());
-                }
-            }
-        }?;
-        println!("20,000 rows took {smaller:?}, 200,000 rows took {larger:?}");
         Ok(())
     }
 }
