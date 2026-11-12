@@ -3,7 +3,9 @@
 Real `smugglr` processes against the built binary, in real time. These are measurements, not tests: they take minutes, so they are not part of `cargo test`. Each prints its seed, so a run can be repeated, and then its result. It exits 0 when the measurement meets its NFR and 1 when it does not.
 
     cargo build -p smugglr
-    cargo run -p measure -- <subcommand> target/debug/smugglr <work dir>
+    cargo run -p measure -- <subcommand> <smugglr binary> <work dir>
+
+The smugglr binary is `target/debug/smugglr`, or `target\debug\smugglr.exe` on Windows.
 
 | Subcommand | What it measures | How long | NFR |
 |---|---|---|---|

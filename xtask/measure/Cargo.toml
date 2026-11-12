@@ -9,6 +9,12 @@ repository.workspace = true
 authors.workspace = true
 publish = false
 
+# A measurement tool, not a test: cargo test builds no target of it.
+[[bin]]
+name = "measure"
+path = "src/main.rs"
+test = false
+
 [dependencies]
 rusqlite = { workspace = true }
 serde_json = { workspace = true }
