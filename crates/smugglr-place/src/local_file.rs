@@ -13,6 +13,7 @@ use rusqlite::{Connection, OpenFlags, params_from_iter};
 use smugglr_core::change::{Change, Op};
 use smugglr_core::row_hash::{RowHasher, row_hash};
 
+use crate::keyless;
 use crate::queries::{self, ROW_HASH};
 use crate::value::{Value, unquote};
 use crate::{Error, Key, LOCAL_LIMIT, Place, Table};
@@ -106,13 +107,101 @@ impl LocalFile {
             self.connection
                 .query_row(queries::KEY_INDEXED, [name], |row| row.get::<_, bool>(0))
         })?;
+        // Only a rowid key can count itself up.
+        let autoincrement = self_keyed
+            && self
+                .connection
+                .query_row(queries::TABLE_SQL, [name], |row| {
+                    row.get::<_, Option<String>>(0)
+                })?
+                .is_some_and(|sql| queries::autoincrement(&sql));
         Ok(Table {
             name: name.to_owned(),
             columns,
             types,
             key: key.into_iter().map(|(_, column, _)| column).collect(),
             self_keyed,
+            autoincrement,
         })
+    }
+
+    /// Every row of a table without a primary key, as [`keyless::all`]
+    /// reads it, each passed to `each` with its key as it is read, so no
+    /// more than one row is held.
+    fn keyless_each<T>(
+        &self,
+        table: &Table,
+        mut each: impl FnMut(Key, Vec<String>) -> Option<T>,
+    ) -> Result<Vec<T>, Error> {
+        let width = table.columns.len();
+        let mut copies = keyless::Copies::default();
+        let mut found = Vec::new();
+        self.connection
+            .prepare(&keyless::all(table, LOCAL_LIMIT))
+            .and_then(|mut statement| {
+                let mut rows = statement.query([])?;
+                while let Some(row) = rows.next()? {
+                    let row = (0..width)
+                        .map(|i| row.get::<_, String>(i))
+                        .collect::<rusqlite::Result<Vec<String>>>()?;
+                    found.extend(each(copies.key(&row), row));
+                }
+                Ok(())
+            })
+            .map_err(|source| self.sqlite(source))?;
+        Ok(found)
+    }
+
+    /// Every row of a table without a primary key.
+    fn keyless_rows(&self, table: &Table) -> Result<Vec<Vec<String>>, Error> {
+        self.keyless_each(table, |_, row| Some(row))
+    }
+
+    /// Writes `changes` to a table without a primary key, each copy only
+    /// where the count of its values allows, and returns the keys written.
+    fn keyless_write(&mut self, table: &Table, changes: &[Change]) -> Result<Vec<Key>, Error> {
+        let held = keyless::by_identity(self.keyless_rows(table)?);
+        let address = self.address.clone();
+        let sqlite = |source| Error::Sqlite {
+            address: address.clone(),
+            source,
+        };
+        let transaction = self.connection.transaction().map_err(sqlite)?;
+        let mut written = Vec::new();
+        {
+            let mut insert = transaction
+                .prepare(&keyless::insert(table))
+                .map_err(sqlite)?;
+            let mut delete = transaction
+                .prepare(&keyless::delete(table))
+                .map_err(sqlite)?;
+            for change in keyless::ordered(changes) {
+                let copy = Value::Integer(keyless::copy(&change.key));
+                let quoted = |row: &[String]| row.iter().cloned().map(Value::Text).collect();
+                let count = if change.op == Op::Down {
+                    let Some(row) = change.key.first().and_then(|id| held.get(id)) else {
+                        continue;
+                    };
+                    let mut params: Vec<Value> = quoted(row);
+                    params.push(copy);
+                    delete.execute(params_from_iter(params)).map_err(sqlite)?
+                } else {
+                    let mut params = change
+                        .values
+                        .iter()
+                        .map(|text| unquote(text))
+                        .collect::<Result<Vec<Value>, Error>>()?;
+                    params.extend::<Vec<Value>>(quoted(&change.values));
+                    params.push(copy);
+                    insert.execute(params_from_iter(params)).map_err(sqlite)?
+                };
+                if count > 0 {
+                    written.push(change.key.clone());
+                }
+            }
+        }
+        transaction.commit().map_err(sqlite)?;
+        Ok(written)
     }
 }
 
@@ -149,6 +238,12 @@ impl Place for LocalFile {
     }
 
     fn hashes(&mut self, table: &Table) -> Result<Vec<(Key, [u8; 16])>, Error> {
+        if table.key.is_empty() {
+            return self.keyless_each(table, |key, row| {
+                let columns: Vec<&str> = row.iter().map(String::as_str).collect();
+                Some((key, row_hash(&columns)))
+            });
+        }
         // Hashed here column by column, the same hash the SQL function
         // gives; a large value is read alone, and one too large to quote is
         // hashed as its unquotable text, so its row reads as changed and is
@@ -198,6 +293,11 @@ impl Place for LocalFile {
     }
 
     fn weights(&mut self, table: &Table) -> Result<Vec<(Key, u64)>, Error> {
+        if table.key.is_empty() {
+            return self.keyless_each(table, |key, row| {
+                Some((key, row.iter().map(|column| column.len() as u64).sum()))
+            });
+        }
         let width = table.key.len();
         self.connection
             .prepare(&queries::weights(table, LOCAL_LIMIT))
@@ -217,6 +317,14 @@ impl Place for LocalFile {
     }
 
     fn rows(&mut self, table: &Table, keys: &[Key]) -> Result<Vec<Vec<String>>, Error> {
+        if table.key.is_empty() {
+            let ids = keyless::identities(keys);
+            return self.keyless_each(table, |key, row| {
+                key.first()
+                    .is_some_and(|id| ids.contains(id))
+                    .then_some(row)
+            });
+        }
         let width = table.columns.len();
         let address = self.address.clone();
         let sqlite = |source| Error::Sqlite {
@@ -251,6 +359,9 @@ impl Place for LocalFile {
     }
 
     fn write(&mut self, table: &Table, changes: &[Change]) -> Result<Vec<Key>, Error> {
+        if table.key.is_empty() {
+            return self.keyless_write(table, changes);
+        }
         let address = self.address.clone();
         let sqlite = |source| Error::Sqlite {
             address: address.clone(),

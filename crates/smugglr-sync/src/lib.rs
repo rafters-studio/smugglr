@@ -79,7 +79,7 @@ pub enum Error {
     /// smugglr's memory could not be read or written.
     #[error(transparent)]
     Memory(#[from] smugglr_memory::Error),
-    /// A table has no primary key, or no place has a table the run is
+    /// A table uses AUTOINCREMENT, or no place has a table the run is
     /// limited to; the run stops before any row is read.
     #[error("{0}")]
     Shape(String),
@@ -114,7 +114,7 @@ pub enum Error {
 /// # Errors
 /// When a place cannot be reached, read or written, or memory cannot be
 /// kept; and before any row is read, when the run is named wrong (a table no
-/// place has, a table without a primary key, or `--sync-mode last` without a
+/// place has, a table using AUTOINCREMENT, or `--sync-mode last` without a
 /// steering column). Once a journal line is written, a failure is
 /// [`Error::CutOff`], carrying the run's record: the table being written
 /// stopped, naming the rows it wrote.
@@ -577,10 +577,10 @@ fn steered(
         let mut values = BTreeMap::new();
         for keys in keys.chunks(CHUNK) {
             values.extend(
-                place
-                    .rows(table, keys)?
+                table
+                    .keyed(place.rows(table, keys)?)
                     .into_iter()
-                    .filter_map(|row| Some((key_of(table, &row)?, row.get(column)?.clone()))),
+                    .filter_map(|(key, row)| Some((key, row.get(column)?.clone()))),
             );
         }
         Ok(values)
@@ -705,10 +705,15 @@ fn read_hashes(
 ) -> Result<Hashes, Error> {
     let mut hashes = Hashes::new();
     for keys in keys.chunks(CHUNK) {
-        hashes.extend(place.rows(table, keys)?.into_iter().filter_map(|row| {
-            let columns: Vec<&str> = row.iter().map(String::as_str).collect();
-            Some((key_of(table, &row)?, row_hash(&columns)))
-        }));
+        hashes.extend(
+            table
+                .keyed(place.rows(table, keys)?)
+                .into_iter()
+                .map(|(key, row)| {
+                    let columns: Vec<&str> = row.iter().map(String::as_str).collect();
+                    (key, row_hash(&columns))
+                }),
+        );
     }
     Ok(hashes)
 }
@@ -821,18 +826,6 @@ fn carry(
     Ok(mismatched)
 }
 
-/// A row's key, from its columns in column order.
-fn key_of(table: &Table, row: &[String]) -> Option<Vec<String>> {
-    table
-        .key
-        .iter()
-        .map(|column| {
-            let i = table.columns.iter().position(|c| c == column)?;
-            row.get(i).cloned()
-        })
-        .collect()
-}
-
 /// The rows of `writes` a run would refuse for a value over the value
 /// limit, each read from the place it is copied from, `CHUNK` at a time.
 fn refused(
@@ -906,10 +899,7 @@ fn changes(
         .collect();
     let mut refused = Vec::new();
     let mut rows: BTreeMap<Vec<String>, Vec<String>> = BTreeMap::new();
-    for row in from.rows(table, &wanted)? {
-        let Some(key) = key_of(table, &row) else {
-            continue;
-        };
+    for (key, row) in table.keyed(from.rows(table, &wanted)?) {
         match Refused::find(&table.name, &table.columns, &key, &row, (limit, place)) {
             Some(over) => refused.push(over),
             None => drop(rows.insert(key, row)),
@@ -960,6 +950,7 @@ mod tests {
                 types: vec!["TEXT".to_owned()],
                 key: vec!["id".to_owned()],
                 self_keyed: false,
+                autoincrement: false,
             }])
         }
         fn hashes(&mut self, _: &Table) -> Result<Vec<(Key, [u8; 16])>, PlaceError> {
@@ -1056,11 +1047,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("smugglr-ignore-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir)?;
-        // tags is in step, but each place's sqlite_sequence counts it
-        // differently; SQLite itself moves the counter of a table written.
         // notes is keyed by text: a rowid key would stop it (#507).
         let shape = "CREATE TABLE notes (id TEXT PRIMARY KEY, body TEXT); \
-                     CREATE TABLE tags (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT); \
+                     CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT); \
                      CREATE TABLE sessions_tmp (id TEXT PRIMARY KEY, who TEXT);";
         let source = sqlite(
             &dir.join("source.db"),
@@ -1074,12 +1063,9 @@ mod tests {
         )?;
         let target = sqlite(
             &dir.join("target.db"),
-            &format!(
-                "{shape} INSERT INTO tags (name) VALUES ('t'), ('gone'); \
-                 DELETE FROM tags WHERE name = 'gone';"
-            ),
+            &format!("{shape} INSERT INTO tags (name) VALUES ('t');"),
         )?;
-        let watched = ["sqlite_sequence", "sessions_tmp"];
+        let watched = ["sessions_tmp"];
         let before = watched
             .iter()
             .map(|table| dump(&target, table))

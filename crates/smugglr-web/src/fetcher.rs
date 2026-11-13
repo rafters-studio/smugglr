@@ -90,6 +90,7 @@ impl Place for Fetcher {
                     types: self.texts(&table["types"])?,
                     key: self.texts(&table["key"])?,
                     self_keyed: table["self_keyed"].as_bool().unwrap_or(false),
+                    autoincrement: table["autoincrement"].as_bool().unwrap_or(false),
                 })
             })
             .collect()

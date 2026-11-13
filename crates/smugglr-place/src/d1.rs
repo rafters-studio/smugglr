@@ -506,6 +506,7 @@ mod tests {
             types: vec![String::new(); 4],
             key: vec!["id".to_owned()],
             self_keyed: false,
+            autoincrement: false,
         };
         let sql = crate::queries::insert(&table);
         let batch: Vec<serde_json::Value> = (0..ROWS)

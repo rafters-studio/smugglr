@@ -15,6 +15,7 @@
 #[cfg(feature = "native")]
 pub mod d1;
 pub mod http_sql;
+mod keyless;
 #[cfg(feature = "native")]
 pub mod local_file;
 #[cfg_attr(not(feature = "native"), allow(dead_code))]
@@ -71,7 +72,9 @@ pub enum Error {
 pub const LOCAL_LIMIT: u64 = 475_000_000;
 
 /// A row's key: SQLite's `quote()` text of each primary-key column, in key
-/// order.
+/// order. A row of a table without a primary key is keyed by the SHA-256 of
+/// all its values, as quoted hex text, and which copy of those values it is,
+/// from 1 (FR-SMUGGLR-086).
 pub type Key = Vec<String>;
 
 /// One table of a place.
@@ -90,6 +93,9 @@ pub struct Table {
     /// The database hands out the table's keys itself: in SQLite, its key is
     /// one column declared `INTEGER PRIMARY KEY`, the rowid.
     pub self_keyed: bool,
+    /// The table uses AUTOINCREMENT, which smugglr never syncs
+    /// (FR-SMUGGLR-086).
+    pub autoincrement: bool,
 }
 
 impl Table {
@@ -101,6 +107,21 @@ impl Table {
             .filter_map(|column| self.columns.iter().position(|c| c == column))
             .filter_map(|i| row.get(i).cloned())
             .collect()
+    }
+
+    /// Each of `rows`, rows of this table in column order, with its key. A
+    /// row of a table without a primary key is keyed by its values and its
+    /// copy among the identical rows of `rows`, in order, so `rows` holds
+    /// every copy of the values it holds, as [`Place::rows`] returns them.
+    #[must_use]
+    pub fn keyed(&self, rows: Vec<Vec<String>>) -> Vec<(Key, Vec<String>)> {
+        if self.key.is_empty() {
+            keyless::keyed(rows)
+        } else {
+            rows.into_iter()
+                .map(|row| (self.key_of(&row), row))
+                .collect()
+        }
     }
 }
 
@@ -170,7 +191,8 @@ pub trait Place {
     fn hashes(&mut self, table: &Table) -> Result<Vec<(Key, [u8; 16])>, Error>;
 
     /// The columns of each row whose key is asked for, in column order; a key
-    /// with no row is left out.
+    /// with no row is left out. For a table without a primary key, every
+    /// copy of the values each key names, so [`Table::keyed`] keys them.
     ///
     /// # Errors
     /// When the place cannot be read.
@@ -191,13 +213,10 @@ pub trait Place {
             .into_iter()
             .map(|(key, _)| key)
             .collect();
-        Ok(self
-            .rows(table, &keys)?
+        Ok(table
+            .keyed(self.rows(table, &keys)?)
             .into_iter()
-            .map(|row| {
-                let weight = row.iter().map(|column| column.len() as u64).sum();
-                (table.key_of(&row), weight)
-            })
+            .map(|(key, row)| (key, row.iter().map(|column| column.len() as u64).sum()))
             .collect())
     }
 

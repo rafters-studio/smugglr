@@ -1609,6 +1609,7 @@ version = "0.6.4"
 dependencies = [
  "rusqlite",
  "serde_json",
+ "sha2 0.10.9",
  "smugglr-core",
  "thiserror 2.0.21",
  "ureq",

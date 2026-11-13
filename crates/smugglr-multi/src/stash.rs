@@ -19,7 +19,7 @@ use crate::{Blob, Error, Settings, hashes, rows, stamp, tables};
 /// change since the last blob that was.
 ///
 /// # Errors
-/// When the place cannot be read, a table has no primary key, `keep` fails
+/// When the place cannot be read, a table uses AUTOINCREMENT, `keep` fails
 /// ([`Error::Keep`]), or what the device keeps cannot be read or written.
 pub fn stash(
     place: &mut dyn Place,

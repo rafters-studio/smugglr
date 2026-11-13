@@ -133,3 +133,57 @@ fn a_value_a_service_cannot_quote_is_refused_and_named_and_the_rest_moves()
     let _ = std::fs::remove_dir_all(&folder);
     Ok(())
 }
+
+/// A table without a primary key syncs through HTTP-SQL as through a file:
+/// identical rows each kept, a changed row a delete and an insert
+/// (FR-SMUGGLR-086).
+#[test]
+fn a_keyless_table_syncs_through_http_sql() -> Result<(), Box<dyn std::error::Error>> {
+    let folder = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("http-sql-keyless-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&folder);
+    std::fs::create_dir_all(&folder)?;
+    let shape = "CREATE TABLE notes (body TEXT, n INTEGER);";
+    Connection::open(folder.join("service.db"))?.execute_batch(shape)?;
+    let file = Connection::open(folder.join("file.db"))?;
+    file.execute_batch(&format!(
+        "{shape} INSERT INTO notes VALUES ('a', 1), ('a', 1), ('b', 2);"
+    ))?;
+    let options = Options {
+        config_dir: Some(folder.join("config")),
+        ..Options::default()
+    };
+    let held = || -> Result<Vec<(String, i64)>, rusqlite::Error> {
+        Connection::open(folder.join("service.db"))?
+            .prepare("SELECT body, n FROM notes ORDER BY body, n")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect()
+    };
+    let run = || -> Result<(), Box<dyn std::error::Error>> {
+        let service = Connection::open(folder.join("service.db"))?;
+        let mut remote = HttpSql::through("http://small.example/", Box::new(Small(service)));
+        let record = sync(
+            &mut LocalFile::open(folder.join("file.db"))?,
+            &mut remote,
+            &options,
+        )?;
+        assert_eq!(
+            record.status,
+            smugglr_core::record::Status::Done,
+            "{record}"
+        );
+        Ok(())
+    };
+    run()?;
+    let row = |body: &str, n| (body.to_owned(), n);
+    assert_eq!(held()?, [row("a", 1), row("a", 1), row("b", 2)]);
+    file.execute_batch(
+        "DELETE FROM notes WHERE rowid = (SELECT min(rowid) FROM notes WHERE body = 'a'); \
+         UPDATE notes SET body = 'z' WHERE body = 'b';",
+    )?;
+    run()?;
+    assert_eq!(held()?, [row("a", 1), row("z", 2)]);
+    drop(file);
+    let _ = std::fs::remove_dir_all(&folder);
+    Ok(())
+}

@@ -31,7 +31,7 @@ use crate::{Blob, Error, Settings, columns, hashes, rows, stamp, tables};
 /// device.
 ///
 /// # Errors
-/// When the place cannot be read or written, a table has no primary key,
+/// When the place cannot be read or written, a table uses AUTOINCREMENT,
 /// or what the device keeps cannot be read or written.
 pub fn retrieve(
     place: &mut dyn Place,

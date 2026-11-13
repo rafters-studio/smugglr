@@ -164,9 +164,9 @@ impl Local {
                 .map(str::to_owned),
         );
         let (tables, _) = ignore.split(place.tables()?, |table| &table.name);
-        if let Some(table) = tables.iter().find(|table| table.key.is_empty()) {
+        if let Some(table) = tables.iter().find(|table| table.autoincrement) {
             return Err(Error::Shape(format!(
-                "the table {} in {} has no primary key",
+                "the table {} in {} uses AUTOINCREMENT, which smugglr never syncs",
                 table.name,
                 place.address()
             )));
@@ -339,11 +339,8 @@ impl Local {
             );
             for chunk in moved.chunks(1_000) {
                 let keys: Vec<Key> = chunk.iter().map(|(key, _)| key.clone()).collect();
-                let rows: BTreeMap<Key, Vec<String>> = place
-                    .rows(table, &keys)?
-                    .into_iter()
-                    .map(|row| (table.key_of(&row), row))
-                    .collect();
+                let rows: BTreeMap<Key, Vec<String>> =
+                    table.keyed(place.rows(table, &keys)?).into_iter().collect();
                 for (key, from) in chunk {
                     let values = rows.get(key).cloned().unwrap_or_default();
                     let to = rows.get(key).map(|values| {
@@ -416,11 +413,8 @@ impl Local {
                 .column(name)
                 .and_then(|column| table.columns.iter().position(|c| c == column));
             let keys: Vec<Key> = keys.into_iter().collect();
-            let rows: BTreeMap<Key, Vec<String>> = place
-                .rows(table, &keys)?
-                .into_iter()
-                .map(|row| (table.key_of(&row), row))
-                .collect();
+            let rows: BTreeMap<Key, Vec<String>> =
+                table.keyed(place.rows(table, &keys)?).into_iter().collect();
             for key in keys {
                 let row = rows.get(&key);
                 let hash = row.map(|values| {
@@ -545,9 +539,9 @@ impl Local {
                 continue;
             };
             let keys: Vec<Key> = keys.into_iter().collect();
-            for row in place.rows(table, &keys)? {
+            for (key, row) in table.keyed(place.rows(table, &keys)?) {
                 let columns: Vec<&str> = row.iter().map(String::as_str).collect();
-                hashes.insert((name.to_owned(), table.key_of(&row)), row_hash(&columns));
+                hashes.insert((name.to_owned(), key), row_hash(&columns));
             }
         }
         Ok(lines
@@ -838,12 +832,12 @@ fn read_back(
     keys: &BTreeSet<Key>,
 ) -> Result<HashMap<Key, [u8; 16]>, Error> {
     let keys: Vec<Key> = keys.iter().cloned().collect();
-    Ok(place
-        .rows(table, &keys)?
+    Ok(table
+        .keyed(place.rows(table, &keys)?)
         .into_iter()
-        .map(|row| {
+        .map(|(key, row)| {
             let columns: Vec<&str> = row.iter().map(String::as_str).collect();
-            (table.key_of(&row), row_hash(&columns))
+            (key, row_hash(&columns))
         })
         .collect())
 }
