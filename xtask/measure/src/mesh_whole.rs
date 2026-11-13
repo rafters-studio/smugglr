@@ -8,8 +8,8 @@
 //! #520 holds the awake nodes to 0 lost (10% loss); the sleeper's result is
 //! printed as found, since its catch-up is #521's.
 //!
-//! It runs in real time, about twelve minutes, so it runs only when asked:
-//! `cargo test -p smugglr --test mesh_whole -- --ignored --nocapture`.
+//! It runs in real time, about twelve minutes:
+//! `measure mesh-whole <smugglr binary> <work dir>`.
 
 use std::collections::{BTreeMap, HashSet};
 use std::net::{SocketAddr, UdpSocket};
@@ -163,13 +163,13 @@ struct Node {
 }
 
 impl Node {
-    fn start(&mut self, key: &Path) -> Result<(), String> {
+    fn start(&mut self, binary: &Path, key: &Path) -> Result<(), String> {
         let bin = self.config.join("bin");
         let rest = std::env::var_os("PATH").unwrap_or_default();
         let path =
             std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(&rest)))
                 .unwrap_or(rest);
-        let child = Command::new(env!("CARGO_BIN_EXE_smugglr"))
+        let child = Command::new(binary)
             .arg("mesh")
             .arg(&self.path)
             .arg("--key-file")
@@ -254,23 +254,22 @@ impl People {
     }
 }
 
-#[test]
-#[ignore = "the NFR-SMUGGLR-005 measurement: about twelve minutes in real time"]
+/// Five nodes stay whole through loss and a sleeper.
 #[expect(
     clippy::too_many_lines,
     reason = "the measurement reads top to bottom as it is written"
 )]
-fn five_nodes_stay_whole_through_loss_and_a_sleeper() -> Result<(), String> {
+pub(crate) fn run(binary: &Path, work: &Path) -> Result<(), String> {
     let seed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(1, |since| {
             u64::try_from(since.as_nanos() & u128::from(u64::MAX)).unwrap_or(1) | 1
         });
     println!("seed {seed}");
-    let folder = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("mesh-whole-{seed}"));
+    let folder = work.join(format!("mesh-whole-{seed}"));
     std::fs::create_dir_all(&folder).map_err(|err| err.to_string())?;
     let key = folder.join("mesh.key");
-    let keygen = Command::new(env!("CARGO_BIN_EXE_smugglr"))
+    let keygen = Command::new(binary)
         .args(["mesh", "keygen", "--key-file"])
         .arg(&key)
         .output()
@@ -311,7 +310,7 @@ fn five_nodes_stay_whole_through_loss_and_a_sleeper() -> Result<(), String> {
         });
     }
     for node in &mut nodes {
-        node.start(&key)?;
+        node.start(binary, &key)?;
         sleep(Duration::from_millis(500));
     }
     sleep(Duration::from_secs(2));
@@ -333,7 +332,7 @@ fn five_nodes_stay_whole_through_loss_and_a_sleeper() -> Result<(), String> {
             people.round(&nodes, &others)?;
         }
         sleep(ASLEEP.saturating_sub(slept.elapsed()));
-        nodes[SLEEPER].start(&key)?;
+        nodes[SLEEPER].start(binary, &key)?;
         println!("node {SLEEPER} restarted after {:?}", slept.elapsed());
         sleep(Duration::from_secs(2));
         for _ in 0..10 {

@@ -5,8 +5,8 @@
 //! device changes only rows it made), blobs retrieved in shuffled order; each
 //! device is then compared with what the people meant.
 //!
-//! It runs in real time, about a minute, so it runs only when asked:
-//! `cargo test -p smugglr --test multi_whole -- --ignored --nocapture`.
+//! It runs in real time, about a minute:
+//! `measure multi-whole <smugglr binary> <work dir>`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -73,7 +73,8 @@ struct Stashed {
     crossed: BTreeSet<String>,
 }
 
-struct Run {
+struct Run<'a> {
+    binary: &'a Path,
     folder: PathBuf,
     random: Random,
     meant: Rows,
@@ -81,8 +82,8 @@ struct Run {
     bucket: BTreeMap<PathBuf, Stashed>,
 }
 
-impl Run {
-    fn new(folder: PathBuf, seed: u64) -> Result<Self, String> {
+impl<'a> Run<'a> {
+    fn new(binary: &'a Path, folder: PathBuf, seed: u64) -> Result<Self, String> {
         let _ = std::fs::remove_dir_all(&folder);
         std::fs::create_dir_all(folder.join("config/smugglr")).map_err(|err| err.to_string())?;
         std::fs::write(
@@ -92,6 +93,7 @@ impl Run {
         .map_err(|err| err.to_string())?;
         std::fs::write(folder.join("multi.key"), "07".repeat(32)).map_err(|err| err.to_string())?;
         let mut run = Self {
+            binary,
             folder,
             random: Random(seed),
             meant: Rows::new(),
@@ -115,7 +117,7 @@ impl Run {
     }
 
     fn smugglr(&self, args: &[&str]) -> Result<std::process::Output, String> {
-        Command::new(env!("CARGO_BIN_EXE_smugglr"))
+        Command::new(self.binary)
             .args(args)
             .env("XDG_CONFIG_HOME", self.folder.join("config"))
             .output()
@@ -379,10 +381,10 @@ fn seed() -> Result<u64, String> {
 
 /// Runs rounds for `away`, `offline` changing rows but neither stashing nor
 /// retrieving, then brings it back, settles, and measures.
-fn offline_for(name: &str, away: Duration) -> Result<Harm, String> {
+fn offline_for(binary: &Path, work: &Path, name: &str, away: Duration) -> Result<Harm, String> {
     let seed = seed()?;
-    let folder = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("multi-whole-{name}"));
-    let mut run = Run::new(folder, seed)?;
+    let folder = work.join(format!("multi-whole-{name}"));
+    let mut run = Run::new(binary, folder, seed)?;
     for _ in 0..4 {
         run.round(&DEVICES, true, 4)?;
     }
@@ -404,17 +406,23 @@ fn offline_for(name: &str, away: Duration) -> Result<Harm, String> {
     Ok(harm)
 }
 
-#[test]
-#[ignore = "the NFR-SMUGGLR-006 measurement: real time, about a minute"]
-fn multi_stays_whole() -> Result<(), String> {
+/// Multi stays whole.
+pub(crate) fn run(binary: &Path, work: &Path) -> Result<(), String> {
     let inside = offline_for(
+        binary,
+        work,
         "offline two thirds of the sunset",
         Duration::from_secs(SUNSET * 2 / 3),
     )?;
-    let past = offline_for("offline five sunsets", Duration::from_secs(5 * SUNSET))?;
+    let past = offline_for(
+        binary,
+        work,
+        "offline five sunsets",
+        Duration::from_secs(5 * SUNSET),
+    )?;
     let seed = seed()?;
-    let folder = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("multi-whole-any-order");
-    let mut run = Run::new(folder, seed)?;
+    let folder = work.join("multi-whole-any-order");
+    let mut run = Run::new(binary, folder, seed)?;
     for _ in 0..12 {
         // Each blob is retrieved in a round with chance 1 in 2, so blobs
         // arrive across rounds in any order.

@@ -3,12 +3,11 @@
 //! edited and deleted on both sides before and after the cut, each followed
 //! by a rerun; both files are then compared with what the people meant.
 //!
-//! It takes minutes, so it runs only when asked:
-//! `cargo test -p smugglr --test cut_off -- --ignored --nocapture`.
+//! It takes minutes: `measure cut-off <smugglr binary> <work dir>`.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -83,8 +82,8 @@ fn change(
     sql(path, &statements)
 }
 
-fn smugglr(folder: &Path, source: &Path, target: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_smugglr"));
+fn smugglr(binary: &Path, folder: &Path, source: &Path, target: &Path) -> Command {
+    let mut command = Command::new(binary);
     command
         .arg("sync")
         .arg(source)
@@ -95,8 +94,13 @@ fn smugglr(folder: &Path, source: &Path, target: &Path) -> Command {
     command
 }
 
-fn sync_until_done(folder: &Path, source: &Path, target: &Path) -> Result<(), String> {
-    let status = smugglr(folder, source, target)
+fn sync_until_done(
+    binary: &Path,
+    folder: &Path,
+    source: &Path,
+    target: &Path,
+) -> Result<(), String> {
+    let status = smugglr(binary, folder, source, target)
         .status()
         .map_err(|err| err.to_string())?;
     if status.success() {
@@ -125,9 +129,8 @@ fn compare(meant: &Rows, held: &Rows, harm: &mut Harm) {
     harm.deletes_undone += held.keys().filter(|id| !meant.contains_key(*id)).count();
 }
 
-#[test]
-#[ignore = "the NFR-SMUGGLR-003 measurement: 2,000 killed runs, minutes long"]
-fn runs_killed_at_random_points_do_no_harm() -> Result<(), String> {
+/// Runs killed at random points do no harm.
+pub(crate) fn run(binary: &Path, work: &Path) -> Result<(), String> {
     let seed: u64 = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|err| err.to_string())?
@@ -136,7 +139,7 @@ fn runs_killed_at_random_points_do_no_harm() -> Result<(), String> {
     let seed = seed | 1;
     println!("seed {seed}");
     let mut random = Random(seed);
-    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("cut-off");
+    let root = work.join("cut-off");
     let mut harm = Harm::default();
     let mut longest = Duration::from_millis(20);
     for run in 0..RUNS {
@@ -153,12 +156,12 @@ fn runs_killed_at_random_points_do_no_harm() -> Result<(), String> {
         change(&mut random, &source, "s", &mut ours, 0)?;
         change(&mut random, &target, "t", &mut theirs, 0)?;
         let first = Instant::now();
-        sync_until_done(&folder, &source, &target)?;
+        sync_until_done(binary, &folder, &source, &target)?;
         longest = longest.max(first.elapsed());
         change(&mut random, &source, "s", &mut ours, 1)?;
         change(&mut random, &target, "t", &mut theirs, 1)?;
         // The run, killed at a random point within the time a run takes.
-        let mut child = smugglr(&folder, &source, &target)
+        let mut child = smugglr(binary, &folder, &source, &target)
             .spawn()
             .map_err(|err| err.to_string())?;
         let budget = u64::try_from(longest.as_micros()).unwrap_or(u64::MAX);
@@ -167,7 +170,7 @@ fn runs_killed_at_random_points_do_no_harm() -> Result<(), String> {
         let _ = child.wait();
         change(&mut random, &source, "s", &mut ours, 2)?;
         change(&mut random, &target, "t", &mut theirs, 2)?;
-        if sync_until_done(&folder, &source, &target).is_err() {
+        if sync_until_done(binary, &folder, &source, &target).is_err() {
             harm.reruns_not_done += 1;
         }
         meant.extend(ours);
