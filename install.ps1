@@ -1,15 +1,15 @@
 # install.ps1: installs the smugglr binary from a GitHub release.
 #
 #   irm https://raw.githubusercontent.com/rafters-studio/smugglr/main/install.ps1 | iex
-#   $env:SMUGGLR_VERSION = 'v0.6.1'; irm https://raw.githubusercontent.com/rafters-studio/smugglr/main/install.ps1 | iex
+#   $env:SMUGGLR_VERSION = 'v0.6.3'; irm https://raw.githubusercontent.com/rafters-studio/smugglr/main/install.ps1 | iex
 #
 # Windows x86_64, in Windows PowerShell 5.1 and PowerShell 7. It writes one file,
 # $HOME\.local\bin\smugglr.exe, and only after the downloaded binary has run from
 # that directory.
 #
 # iex runs this in the caller's session, so everything lives in one function:
-# nothing it sets outlives the install, and a failure throws instead of calling
-# exit, which would close the caller's window.
+# its preferences and variables stay inside it, and a failure throws instead of
+# calling exit, which would close the caller's window.
 
 function Install-Smugglr {
   $ErrorActionPreference = 'Stop'
