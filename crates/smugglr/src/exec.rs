@@ -44,7 +44,6 @@ const HELP: &str = "usage: smugglr exec <local> <place> --version <v> --up|--dow
        smugglr exec <database-or-place> --read";
 
 /// Runs `smugglr exec` with `args` (after `exec`), the batch read from stdin.
-#[must_use]
 pub fn run(args: &[String]) -> ExitCode {
     if let [address, flag] = args
         && flag == "--read"
