@@ -77,7 +77,8 @@ jobs:
       - run: bash .github/install-check.sh
 
   # install.ps1 against the published release, in Windows PowerShell 5.1 and
-  # PowerShell 7, piped to iex from its raw URL at this commit.
+  # PowerShell 7, piped to iex from its raw URL at this commit, twice per shell
+  # so the second run replaces an existing install.
   install-windows:
     name: install (windows-latest)
     runs-on: windows-latest
@@ -89,11 +90,15 @@ jobs:
         run: |
           $PSVersionTable.PSVersion.ToString()
           irm $env:INSTALL_PS1 | iex
+          # Again, over the install just made: the replace path.
+          irm $env:INSTALL_PS1 | iex
           & "$HOME\.local\bin\smugglr.exe" --version
       - name: install.ps1 in PowerShell 7
         shell: pwsh
         run: |
           $PSVersionTable.PSVersion.ToString()
+          irm $env:INSTALL_PS1 | iex
+          # Again, over the install just made: the replace path.
           irm $env:INSTALL_PS1 | iex
           & "$HOME\.local\bin\smugglr.exe" --version
 
