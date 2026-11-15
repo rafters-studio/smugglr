@@ -34,9 +34,17 @@ Check (-not $r.err) 'reinstall over an existing install'
 Check ($r.files -eq 'smugglr.exe') 'only smugglr.exe after replace'
 Check ($r.out -notlike '*not on your PATH*') 'no PATH advice when on PATH'
 
-$r = Run-Case 'pinned-no-v' { $env:SMUGGLR_VERSION = '0.6.1' }
+$r = Run-Case 'pinned-before-version-flag' { $env:SMUGGLR_VERSION = 'v0.6.1' }
+Check ($r.err -like "*did not run 'smugglr --version'; nothing was installed*") 'v0.6.1 binary has no --version: refused'
+Check ($r.files -eq 'smugglr.exe') 'no staged file left behind'
+$v = & $exe --version; Write-Host $v
+Check ($v -eq 'smugglr 0.6.4') 'earlier v0.6.4 install untouched by the failed verify'
+
+$r = Run-Case 'pinned-no-v' { $env:SMUGGLR_VERSION = '0.6.3' }
 Check (-not $r.err) 'pinned installs'
-Check ($r.out -like '*smugglr v0.6.1*') 'pinned without v reports v0.6.1'
+Check ($r.out -like '*smugglr v0.6.3*') 'pinned without v reports v0.6.3'
+$v = & $exe --version; Write-Host $v
+Check ($v -eq 'smugglr 0.6.3') 'installed binary is 0.6.3'
 
 Set-Content -LiteralPath $exe -Value 'earlier install'
 $r = Run-Case 'no-archive' { $env:SMUGGLR_VERSION = 'v0.5.0' }
